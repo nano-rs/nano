@@ -9,9 +9,12 @@
 
 use clickhouse::Client as ClickHouseClient;
 use sqlx::{PgPool, Row};
+use std::collections::BTreeSet;
 use thiserror::Error;
 use tracing::debug;
 use uuid::Uuid;
+
+use crate::search::service::source_scope_sql_predicate;
 
 use super::types::{Feed, FeedHealthMetrics, FeedHistoryPoint, FeedStats, NewFeed, UpdateFeed};
 
@@ -44,7 +47,25 @@ impl FeedRepository {
     /// 1. Use `match_values` if set (exact match on source_type)
     /// 2. Use `match_pattern` if set (regex match on source_type)
     /// 3. Fall back to matching source_type = feed.name
-    fn build_feed_where_clause(feed: &Feed) -> String {
+    ///
+    /// NAN-1801 (P3 side-doors): `deny_set` is the viewer's effective
+    /// per-source deny set. When non-empty, the shared
+    /// `lower(source_type) NOT IN (...)` predicate is AND-composed so a
+    /// scoped viewer cannot recover per-source volume / last-seen through
+    /// feed stats (a feed's match_pattern regex could otherwise sweep in a
+    /// denied source). Empty deny set returns the base clause unchanged —
+    /// byte-identical SQL.
+    fn build_feed_where_clause(feed: &Feed, deny_set: &BTreeSet<String>) -> String {
+        let base = Self::build_feed_match_expr(feed);
+        match source_scope_sql_predicate("source_type", deny_set) {
+            Some(pred) => format!("({base}) AND ({pred})"),
+            None => base,
+        }
+    }
+
+    /// The feed-matching expression WITHOUT scope predication — see
+    /// [`Self::build_feed_where_clause`] for the composed form.
+    fn build_feed_match_expr(feed: &Feed) -> String {
         // If match_values is set, use IN clause
         if let Some(ref values) = feed.match_values {
             if !values.is_empty() {
@@ -323,13 +344,23 @@ impl FeedRepository {
     }
 
     /// Get feed statistics (event counts)
+    ///
+    /// NAN-1801: no API handler currently consumes `FeedService` (it is
+    /// constructed on `AppState` but never called from a route), so there is
+    /// no viewer `AuthContext` to thread a per-source deny set from. The
+    /// ClickHouse builders below are deny-aware; this public surface passes
+    /// an EMPTY deny set (byte-identical SQL). If a feeds endpoint is
+    /// (re)introduced, add a `deny_set: &BTreeSet<String>` parameter here and
+    /// in `FeedService`, composed from
+    /// `AuthContext::effective_source_deny_set()`.
     pub async fn get_stats(&self) -> Result<Vec<FeedStats>, FeedRepositoryError> {
         // Get all enabled feeds first
         let feeds = self.list_enabled().await?;
 
         if let Some(ref ch_client) = self.ch_client {
             // Use ClickHouse for log statistics
-            self.get_stats_clickhouse(ch_client, &feeds).await
+            self.get_stats_clickhouse(ch_client, &feeds, &BTreeSet::new())
+                .await
         } else {
             // Legacy: use PostgreSQL
             self.get_stats_postgres(&feeds).await
@@ -341,6 +372,7 @@ impl FeedRepository {
         &self,
         ch_client: &ClickHouseClient,
         feeds: &[Feed],
+        deny_set: &BTreeSet<String>,
     ) -> Result<Vec<FeedStats>, FeedRepositoryError> {
         let mut stats = Vec::new();
 
@@ -349,7 +381,7 @@ impl FeedRepository {
         // `read_bare` returns the bare `logs` on single-node — byte-identical.
         let logs_table = self.table_names.read_bare("logs");
         for feed in feeds {
-            let where_clause = Self::build_feed_where_clause(feed);
+            let where_clause = Self::build_feed_where_clause(feed, deny_set);
             let sql = format!(
                 r#"
                 SELECT
@@ -446,6 +478,9 @@ impl FeedRepository {
     }
 
     /// Get detailed health metrics for a specific feed
+    ///
+    /// NAN-1801: empty deny set — see [`Self::get_stats`] for the threading
+    /// contract when a feeds endpoint consumes this again.
     pub async fn get_health_metrics(
         &self,
         feed_id: Uuid,
@@ -455,7 +490,8 @@ impl FeedRepository {
 
         if let Some(ref ch_client) = self.ch_client {
             // Use ClickHouse for log statistics
-            self.get_health_metrics_clickhouse(ch_client, &feed).await
+            self.get_health_metrics_clickhouse(ch_client, &feed, &BTreeSet::new())
+                .await
         } else {
             // Legacy: use PostgreSQL
             self.get_health_metrics_postgres(&feed).await
@@ -467,8 +503,9 @@ impl FeedRepository {
         &self,
         ch_client: &ClickHouseClient,
         feed: &Feed,
+        deny_set: &BTreeSet<String>,
     ) -> Result<FeedHealthMetrics, FeedRepositoryError> {
-        let where_clause = Self::build_feed_where_clause(feed);
+        let where_clause = Self::build_feed_where_clause(feed, deny_set);
 
         // NAN-1728 (H5): route through the `_distributed` wrapper on a cluster so
         // feed health metrics cover all shards; bare `logs` on single-node.
@@ -782,7 +819,9 @@ impl FeedRepository {
 
         if let Some(ref ch_client) = self.ch_client {
             // Use ClickHouse for log statistics
-            self.get_ingestion_history_clickhouse(ch_client, &feed)
+            // NAN-1801: empty deny set — see `get_stats` for the threading
+            // contract when a feeds endpoint consumes this again.
+            self.get_ingestion_history_clickhouse(ch_client, &feed, &BTreeSet::new())
                 .await
         } else {
             // Legacy: use PostgreSQL
@@ -795,8 +834,9 @@ impl FeedRepository {
         &self,
         ch_client: &ClickHouseClient,
         feed: &Feed,
+        deny_set: &BTreeSet<String>,
     ) -> Result<Vec<FeedHistoryPoint>, FeedRepositoryError> {
-        let where_clause = Self::build_feed_where_clause(feed);
+        let where_clause = Self::build_feed_where_clause(feed, deny_set);
 
         // NAN-1728 (H5): route through the `_distributed` wrapper on a cluster so
         // the ingestion-history buckets cover all shards; bare `logs` on single-node.
@@ -891,12 +931,18 @@ impl FeedRepository {
     }
 
     /// Get distinct sourcetypes from logs (for discovery)
+    ///
+    /// NAN-1801: empty deny set — see [`Self::get_stats`] for the threading
+    /// contract when a feeds endpoint consumes this again. This is the most
+    /// existence-leaky feed read (it enumerates every source_type seen in 7
+    /// days), so any future consumer MUST thread the viewer deny set.
     pub async fn get_discovered_sourcetypes(
         &self,
     ) -> Result<Vec<(String, i64)>, FeedRepositoryError> {
         if let Some(ref ch_client) = self.ch_client {
             // Use ClickHouse
-            self.get_discovered_sourcetypes_clickhouse(ch_client).await
+            self.get_discovered_sourcetypes_clickhouse(ch_client, &BTreeSet::new())
+                .await
         } else {
             // Legacy: use PostgreSQL
             self.get_discovered_sourcetypes_postgres().await
@@ -912,18 +958,24 @@ impl FeedRepository {
     async fn get_discovered_sourcetypes_clickhouse(
         &self,
         ch_client: &ClickHouseClient,
+        deny_set: &BTreeSet<String>,
     ) -> Result<Vec<(String, i64)>, FeedRepositoryError> {
         let rollup = self.table_names.read("logs_per_source_5m");
+        // NAN-1801: per-source enumeration — a denied source must not appear
+        // at all (existence + volume leak). Empty deny set emits nothing.
+        let scope_and = source_scope_sql_predicate("source_type", deny_set)
+            .map(|pred| format!(" AND {pred}"))
+            .unwrap_or_default();
         let sql = format!(
             "SELECT \
                 source_type AS sourcetype, \
                 sum(events) AS count \
              FROM {} \
-             WHERE bucket_start > now() - INTERVAL 7 DAY \
+             WHERE bucket_start > now() - INTERVAL 7 DAY{} \
              GROUP BY source_type \
              ORDER BY count DESC \
              LIMIT 100",
-            rollup
+            rollup, scope_and
         );
 
         debug!("ClickHouse discovered sourcetypes query: {}", sql);
@@ -987,6 +1039,76 @@ impl FeedRepository {
                 (sourcetype, count)
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feed(
+        name: &str,
+        match_pattern: Option<&str>,
+        match_values: Option<Vec<&str>>,
+    ) -> Feed {
+        Feed {
+            id: Uuid::nil(),
+            name: name.to_string(),
+            description: None,
+            match_field: None,
+            match_pattern: match_pattern.map(str::to_string),
+            match_values: match_values.map(|v| v.iter().map(|s| s.to_string()).collect()),
+            category: None,
+            vendor: None,
+            product: None,
+            icon: None,
+            color: None,
+            enabled: true,
+            stale_alert_enabled: false,
+            stale_threshold_minutes: 60,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn feed_where_clause_empty_deny_is_byte_identical_to_base() {
+        let deny = BTreeSet::new();
+        let f = feed("apache_access", None, Some(vec!["apache_access", "nginx"]));
+        assert_eq!(
+            FeedRepository::build_feed_where_clause(&f, &deny),
+            "source_type IN ('apache_access', 'nginx')"
+        );
+        let f = feed("edr", Some("^lima.*"), None);
+        assert_eq!(
+            FeedRepository::build_feed_where_clause(&f, &deny),
+            "match(source_type, '^lima.*')"
+        );
+        let f = feed("audit", None, None);
+        assert_eq!(
+            FeedRepository::build_feed_where_clause(&f, &deny),
+            "source_type = 'audit'"
+        );
+    }
+
+    #[test]
+    fn feed_where_clause_composes_scope_predicate_over_every_match_form() {
+        // NAN-1801: the predicate must also constrain regex feeds — a broad
+        // match_pattern is the sneak path to a denied source's volume.
+        let deny: BTreeSet<String> = ["audit".to_string()].into_iter().collect();
+        let f = feed("edr", Some(".*"), None);
+        assert_eq!(
+            FeedRepository::build_feed_where_clause(&f, &deny),
+            "(match(source_type, '.*')) AND (lower(source_type) != 'audit')"
+        );
+
+        let deny: BTreeSet<String> =
+            ["audit".to_string(), "limacharlie_edr".to_string()].into_iter().collect();
+        let f = feed("apache_access", None, None);
+        assert_eq!(
+            FeedRepository::build_feed_where_clause(&f, &deny),
+            "(source_type = 'apache_access') AND (lower(source_type) NOT IN ('audit', 'limacharlie_edr'))"
+        );
     }
 }
 

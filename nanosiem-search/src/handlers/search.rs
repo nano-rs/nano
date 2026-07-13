@@ -37,18 +37,26 @@ async fn reserve_query_owner(
     }
 }
 
-/// Enforce audit exclusion at AST level (prevents OR-based bypasses).
+/// Compose the caller's EFFECTIVE source-scope deny-set (NAN-1799).
 ///
-/// NAN-704: thin shim mapping `nanosiem_core::SearchError` from the
-/// canonical implementation to this crate's local `SearchError` for
-/// handler ergonomics.
-fn enforce_non_audit_query(query: &str) -> Result<String, SearchError> {
-    nanosiem_core::search::query_processing::enforce_non_audit_query(query).map_err(|e| {
-        SearchError::QueryError(format!(
-            "Query parsing failed for access control enforcement: {}",
-            e
-        ))
-    })
+/// The per-user `denied_sources` resolved by the middleware (fail-closed —
+/// a resolver outage 503s the request before it reaches any handler) is
+/// unioned with the `audit` source unless the caller holds `audit:view`.
+/// An empty result is the unrestricted scope, which generates byte-identical
+/// SQL to the pre-scoping behavior for audit-view admins.
+///
+/// This REPLACES the old handler-level `enforce_non_audit_query` rewrite of
+/// the nPL text: the `SearchService` now injects the exclusion from the
+/// `ScopeSet` itself on every nPL path, so handlers pass the composed scope
+/// instead of pre-mangling `request.query`. The same composed scope MUST be
+/// folded into every cache key (see `cache.rs`) — the scope changes the
+/// executed SQL, so it is part of result identity.
+pub(crate) fn effective_scope(auth: &crate::AuthContext) -> nanosiem_core::auth::ScopeSet {
+    let mut deny = auth.denied_sources.deny_set().clone();
+    if !auth.claims.has_permission(permissions::AUDIT_VIEW) {
+        deny.insert("audit".to_string());
+    }
+    nanosiem_core::auth::ScopeSet::from_denied(deny)
 }
 
 /// Execute a piped query
@@ -75,16 +83,17 @@ pub async fn search(
     State(state): State<SearchState>,
     axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
-    Json(mut request): Json<SearchRequest>,
+    Json(request): Json<SearchRequest>,
 ) -> Result<(axum::http::HeaderMap, Json<SearchResultResponse>), SearchError> {
     use crate::cache::cache_status_headers;
     use nanosiem_core::search::QueryPriority;
 
-    // H1 fix: Users without audit:view permission cannot query audit source_type.
-    // Inject a source_type exclusion into the nPL query so it is enforced server-side.
-    if !auth.claims.has_permission(permissions::AUDIT_VIEW) {
-        request.query = enforce_non_audit_query(&request.query)?;
-    }
+    // NAN-1799: compose the effective deny-set (per-user source scope ∪ audit
+    // gate) ONCE, before the cache lookup — the scope is folded into the cache
+    // key, and the service injects the exclusion into the executed SQL. This
+    // replaces the old H1 `enforce_non_audit_query` rewrite of request.query.
+    let scope = effective_scope(&auth);
+
     if let Some(request_id) = request.request_id.clone() {
         reserve_query_owner(&state, request_id, auth.claims.sub).await?;
     }
@@ -99,7 +108,7 @@ pub async fn search(
     if request.async_mode {
         let job_id = state
             .search
-            .search_async_with_admission(request, user_id, priority)
+            .search_async_with_admission(request, user_id, priority, &scope)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to start async search");
@@ -119,11 +128,16 @@ pub async fn search(
 
     // Check search result cache (Dragonfly/Redis). NAN-1595: skip on refresh
     // bypass; stamp x-nano-cache hit/age so the UI can show the cached notice.
+    // NAN-1799: the effective deny-set is folded into the cache key (computed
+    // above, BEFORE this lookup) so differently-scoped users never share an
+    // entry.
     if !bypass {
         if let Some(ref cache) = state.result_cache {
-            if let Some(cached) = cache.get(&request).await {
+            if let Some(cached) = cache.get(&request, &scope).await {
                 record_search_query("piped_cached", 0.0, true);
-                let age = cache.age_secs(&crate::cache::SearchResultCache::cache_key(&request)).await;
+                let age = cache
+                    .age_secs(&crate::cache::SearchResultCache::cache_key(&request, &scope))
+                    .await;
                 return Ok((
                     cache_status_headers(true, age),
                     Json(SearchResultResponse::Sync(cached)),
@@ -139,20 +153,22 @@ pub async fn search(
     let start = Instant::now();
     let result = state
         .search
-        .search_with_admission(request.clone(), user_id, priority)
+        .search_with_admission(request.clone(), user_id, priority, &scope)
         .await;
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     record_search_query("piped", duration_ms, result.is_ok());
 
-    // Cache successful results in the background
+    // Cache successful results in the background, keyed under the scope the
+    // query executed with.
     if let Ok(ref response) = result {
         if let Some(ref cache) = state.result_cache {
             let cache = cache.clone();
             let req = request.clone();
+            let scope_for_cache = scope.clone();
             let resp = response.clone();
             tokio::spawn(async move {
-                cache.set(&req, &resp).await;
+                cache.set(&req, &resp, &scope_for_cache).await;
             });
         }
     }
@@ -277,8 +293,13 @@ pub async fn search_sql(
             })?;
     }
 
+    // NAN-1799 FAIL-CLOSED: raw SQL cannot be AST-injected with a per-source
+    // exclusion, so the service refuses outright (SqlValidationError) when the
+    // caller has ANY restricted source. We pass the SOURCE deny-set only —
+    // the audit gate stays handler-injected above so callers whose only
+    // restriction is the audit gate keep raw SQL working exactly as before.
     let start = Instant::now();
-    let result = state.search.search_sql(request).await;
+    let result = state.search.search_sql(request, &auth.denied_sources).await;
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     record_search_query("sql", duration_ms, result.is_ok());
@@ -296,9 +317,9 @@ pub struct ExplainRequest {
     /// Show SQL with table_view field pruning (matches actual search behavior)
     #[serde(default)]
     pub table_view: bool,
-    /// Per-query dataset (`logs`/`spans`/`metrics`) so the explained SQL matches
-    /// the executed table — without it, Inspect SQL shows `FROM logs` for a
-    /// spans/metrics query (NAN-1569).
+    /// Per-query dataset (`logs`/`spans`/`metrics`/`risk`) so the explained SQL
+    /// matches the executed source — without it, Inspect SQL shows `FROM logs`
+    /// for a spans/metrics/risk query (NAN-1569, NAN-1798).
     #[serde(default)]
     pub dataset: Option<String>,
 }
@@ -328,11 +349,11 @@ pub struct ExplainResponse {
 pub async fn explain(
     State(state): State<SearchState>,
     axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
-    Json(mut request): Json<ExplainRequest>,
+    Json(request): Json<ExplainRequest>,
 ) -> Result<Json<ExplainResponse>, SearchError> {
-    if !auth.claims.has_permission(permissions::AUDIT_VIEW) {
-        request.query = enforce_non_audit_query(&request.query)?;
-    }
+    // NAN-1799: pass the composed scope so "Inspect SQL" renders the exact
+    // gated SQL the executed path runs for this caller.
+    let scope = effective_scope(&auth);
     let start = Instant::now();
     let result = state
         .search
@@ -341,6 +362,7 @@ pub async fn explain(
             &request.time_range,
             request.table_view,
             request.dataset.as_deref(),
+            &scope,
         )
         .await;
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -415,9 +437,11 @@ pub async fn fetch_log(
     axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     Json(request): Json<FetchLogRequest>,
 ) -> Result<Json<FetchLogResponse>, SearchError> {
-    // NAN-694: callers without audit:view must not retrieve audit rows by direct id.
-    // Apply the exclusion at the SQL layer to match the rest of the search surface.
-    let exclude_audit = !auth.claims.has_permission(permissions::AUDIT_VIEW);
+    // NAN-694 / NAN-1799: callers must not retrieve denied rows by direct id —
+    // audit (without audit:view) or any source-scope-denied source_type. The
+    // composed ScopeSet is applied at the SQL layer to match the rest of the
+    // search surface.
+    let scope = effective_scope(&auth);
 
     let start = Instant::now();
     let result = state
@@ -426,7 +450,7 @@ pub async fn fetch_log(
             &request.id,
             request.time_range.as_ref(),
             request.source_type.as_deref(),
-            exclude_audit,
+            &scope,
         )
         .await;
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -466,19 +490,20 @@ pub async fn prevalence_artifacts(
     State(state): State<SearchState>,
     axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
-    Json(mut request): Json<SearchRequest>,
+    Json(request): Json<SearchRequest>,
 ) -> Result<(axum::http::HeaderMap, Json<PrevalenceScatterData>), SearchError> {
-    if !auth.claims.has_permission(permissions::AUDIT_VIEW) {
-        request.query = enforce_non_audit_query(&request.query)?;
-    }
+    // NAN-1799: the service injects the composed deny-set into the nPL path
+    // itself — no more pre-rewrite of request.query here.
+    let scope = effective_scope(&auth);
 
     // NAN-1593: the prevalence-artifacts scatter fires on every search-page
     // load / shared-link follow, separately from the main search — cache it
     // through the same Dragonfly layer so reloads don't re-extract artifacts
-    // and re-run their prevalence lookups. Keyed on the post-permission
-    // `query` (audit enforcement may rewrite it) plus the time range and
-    // dataset; `request_id` is excluded since it's a per-request cancellation
-    // handle, not part of result identity.
+    // and re-run their prevalence lookups. Keyed on the raw `query` plus the
+    // time range and dataset, with the caller's effective deny-set folded in
+    // by `companion_key` (NAN-1799 — the scope changes the executed SQL, so
+    // it is part of result identity); `request_id` is excluded since it's a
+    // per-request cancellation handle, not part of result identity.
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "prevart",
         &[
@@ -487,6 +512,7 @@ pub async fn prevalence_artifacts(
             request.time_range.end.timestamp_micros().to_string().as_bytes(),
             request.dataset.as_deref().unwrap_or("logs").as_bytes(),
         ],
+        &scope,
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -499,7 +525,7 @@ pub async fn prevalence_artifacts(
     }
 
     let start = Instant::now();
-    let result = state.search.get_prevalence_artifacts(&request).await;
+    let result = state.search.get_prevalence_artifacts(&request, &scope).await;
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     record_search_query("prevalence_artifacts", duration_ms, result.is_ok());
@@ -545,11 +571,10 @@ pub async fn field_stats_for_query(
 ) -> Result<(axum::http::HeaderMap, Json<FieldStatsResponse>), SearchError> {
     use nanosiem_core::search::QueryPriority;
 
-    let query = if !auth.claims.has_permission(permissions::AUDIT_VIEW) {
-        enforce_non_audit_query(&request.query)?
-    } else {
-        request.query.clone()
-    };
+    // NAN-1799: the service injects the composed deny-set into the nPL path
+    // itself — no more pre-rewrite of the query here.
+    let scope = effective_scope(&auth);
+    let query = request.query.clone();
 
     let time_range = TimeRangeInput {
         start: request.start,
@@ -559,9 +584,10 @@ pub async fn field_stats_for_query(
     // NAN-1593: the field-stats panel fires on every search-page load and
     // shared-link follow, separately from the main search — cache it through
     // the same Dragonfly layer so reloads don't re-run the aggregation. Keyed
-    // on the post-permission `query` (audit enforcement may rewrite it) plus
-    // the time range / column subset / dataset; `request_id` is excluded since
-    // it's a per-request cancellation handle, not part of result identity.
+    // on the raw `query` plus the time range / column subset / dataset, with
+    // the caller's effective deny-set folded in by `companion_key` (NAN-1799);
+    // `request_id` is excluded since it's a per-request cancellation handle,
+    // not part of result identity.
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "fstats",
         &[
@@ -573,6 +599,7 @@ pub async fn field_stats_for_query(
             serde_json::to_string(&request.columns).unwrap_or_default().as_bytes(),
             request.dataset.as_deref().unwrap_or("logs").as_bytes(),
         ],
+        &scope,
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -604,6 +631,7 @@ pub async fn field_stats_for_query(
             auth.claims.sub,
             QueryPriority::Interactive,
             request.dataset.as_deref(),
+            &scope,
         )
         .await?;
     let total_events = fields.iter().map(|f| f.count).max().unwrap_or(0);
@@ -646,11 +674,10 @@ pub async fn field_values(
 ) -> Result<(axum::http::HeaderMap, Json<FieldValuesResponse>), SearchError> {
     let start = Instant::now();
 
-    let query = if !auth.claims.has_permission(permissions::AUDIT_VIEW) {
-        enforce_non_audit_query(&request.query)?
-    } else {
-        request.query.clone()
-    };
+    // NAN-1799: the service injects the composed deny-set into the nPL path
+    // itself — no more pre-rewrite of the query here.
+    let scope = effective_scope(&auth);
+    let query = request.query.clone();
 
     let time_range = TimeRangeInput {
         start: request.start,
@@ -659,9 +686,9 @@ pub async fn field_values(
 
     // NAN-1593: drill-in field values are re-requested whenever the user
     // re-expands a field, and re-fetched on shared-link follow — cache them
-    // through the same Dragonfly layer. Keyed on the post-permission `query`
-    // (audit enforcement may rewrite it) plus the field, time range, limit,
-    // and dataset.
+    // through the same Dragonfly layer. Keyed on the raw `query` plus the
+    // field, time range, limit, and dataset, with the caller's effective
+    // deny-set folded in by `companion_key` (NAN-1799).
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "fvalues",
         &[
@@ -672,6 +699,7 @@ pub async fn field_values(
             request.limit.to_string().as_bytes(),
             request.dataset.as_deref().unwrap_or("logs").as_bytes(),
         ],
+        &scope,
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -691,6 +719,7 @@ pub async fn field_values(
             &time_range,
             request.limit,
             request.dataset.as_deref(),
+            &scope,
         )
         .await;
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -730,10 +759,10 @@ pub struct FieldValuesRequest {
     /// Maximum number of values to return (default 100)
     #[serde(default = "default_field_values_limit")]
     pub limit: usize,
-    /// Per-query dataset selector (NAN-1559): `logs` (default), `spans`, or
-    /// `metrics`. Drill-in must resolve the field and base table against the
-    /// same dataset the search targeted, else a spans/metrics field reads the
-    /// UDM `logs` table and returns nothing.
+    /// Per-query dataset selector (NAN-1559): `logs` (default), `spans`,
+    /// `metrics`, or `risk`. Drill-in must resolve the field and base source
+    /// against the same dataset the search targeted, else a spans/metrics/risk
+    /// field reads the UDM `logs` table and returns nothing.
     #[serde(default)]
     pub dataset: Option<String>,
 }
@@ -775,10 +804,10 @@ pub struct FieldStatsRequest {
     /// falls back to the full set). Omit for the full column inventory.
     #[serde(default)]
     pub columns: Option<Vec<String>>,
-    /// Per-query dataset selector (NAN-1559): `logs` (default), `spans`, or
-    /// `metrics`. The companion enumerates the dataset's columns and wraps the
-    /// dataset's base SQL — without it a spans/metrics search's field panel
-    /// runs the UDM column list against `otel_spans` and ClickHouse 47's.
+    /// Per-query dataset selector (NAN-1559): `logs` (default), `spans`,
+    /// `metrics`, or `risk`. The companion enumerates the dataset's columns and
+    /// wraps the dataset's base SQL — without it a spans/metrics search's field
+    /// panel runs the UDM column list against `otel_spans` and ClickHouse 47's.
     #[serde(default)]
     pub dataset: Option<String>,
 }

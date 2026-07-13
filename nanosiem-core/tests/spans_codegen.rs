@@ -268,3 +268,109 @@ fn logs_keep_the_audit_exclusion() {
         );
     }
 }
+
+// --- NAN-1794: the gate must reach SUBSEARCHES, per-dataset -----------------
+
+fn gate_count(sql: &str) -> usize {
+    sql.matches("!= 'audit'").count()
+}
+
+/// The headline bypass, proven at the SQL layer: a subsearch is a second scan of
+/// the log table, so it needs its OWN gate. Before NAN-1794 these emitted exactly
+/// ONE gate (the main scan) and the subsearch read `source_type = 'audit'`
+/// unrestricted — a normal analyst could exfiltrate the audit log through
+/// `join` / `append` / `IN [ … ]`.
+#[test]
+fn logs_gate_reaches_every_subsearch() {
+    for q in [
+        r#"error | join type=inner user [search source_type="audit"]"#,
+        r#"error | append [search source_type="audit"]"#,
+        r#"user IN [search source_type="audit" | return user]"#,
+        r#"error | where user IN [search source_type="audit" | return user]"#,
+    ] {
+        let sql = audit_gated_sql(q, Dataset::Logs);
+        assert!(
+            gate_count(&sql) >= 2,
+            "every scan (main + subsearch) must carry the audit gate for `{q}`; \
+             found {} gate(s): {sql}",
+            gate_count(&sql)
+        );
+    }
+}
+
+/// Nested subsearches are gated at every depth, not just one level down:
+/// main scan + outer subsearch + inner subsearch = three gates.
+#[test]
+fn logs_gate_reaches_nested_subsearches() {
+    for q in [
+        r#"error | append [search user IN [search source_type="audit" | return user]]"#,
+        r#"error | join user [search user IN [search source_type="audit" | return user]]"#,
+        r#"user IN [search dest_user IN [search source_type="audit" | return user] | return user]"#,
+    ] {
+        let sql = audit_gated_sql(q, Dataset::Logs);
+        assert_eq!(
+            gate_count(&sql),
+            3,
+            "every scan at every depth must be gated for `{q}`: {sql}"
+        );
+    }
+}
+
+/// A `join` nested inside an `append` subsearch is REJECTED by the SQL generator
+/// ("Join should be handled via CTE generation") — a pre-existing limitation,
+/// unrelated to this gate (it errors identically for an `audit:view` user). Pin
+/// it, because "the generator refuses" is what makes this shape fail CLOSED: it
+/// must never degrade into emitting the subsearch without its gate.
+#[test]
+fn unsupported_nested_join_fails_closed() {
+    let q = r#"error | append [search error | join user [search source_type="audit"]]"#;
+    let enforced = nanosiem_core::search::query_processing::enforce_non_audit_query(q).unwrap();
+    let result =
+        ClickHouseSqlGenerator::new().generate(&parse_query(&enforced).unwrap(), &tr());
+    assert!(
+        result.is_err(),
+        "nested join-in-append must be rejected, not silently generated: {result:?}"
+    );
+}
+
+/// The spans strip (NAN-1733) must extend to subsearches: a subsearch with no
+/// `dataset=` selector inherits the outer dataset, so on a spans query it reads
+/// SPANS and must not carry a `source_type` Map probe.
+#[test]
+fn spans_subsearch_drops_the_audit_gate() {
+    let q = r#"service_name="checkout" | append [search span_kind="server"]"#;
+    let sql = audit_gated_sql(q, Dataset::Spans);
+    assert!(
+        !sql.contains("'audit'"),
+        "spans subsearch must not carry the audit gate: {sql}"
+    );
+}
+
+/// SECURITY, cross-dataset (NAN-1562): a spans query may pull a subsearch from
+/// the LOGS dataset. That subsearch reads the audit-bearing table, so it MUST
+/// keep its gate even though the outer query is spans — this is precisely the
+/// scan a "strip the gate on spans queries" shortcut would wrongly expose.
+#[test]
+fn cross_dataset_logs_subsearch_from_spans_keeps_the_gate() {
+    let q = r#"service_name="checkout" | join trace_id [dataset=logs search source_type="audit"]"#;
+    let sql = audit_gated_sql(q, Dataset::Spans);
+    assert_eq!(
+        gate_count(&sql),
+        1,
+        "the logs subsearch of a spans query must keep exactly its own audit gate \
+         (outer spans scan keeps none): {sql}"
+    );
+}
+
+/// The inverse: a logs query pulling a spans subsearch keeps the gate on the
+/// logs scan only — the spans scan has no `source_type` column.
+#[test]
+fn cross_dataset_spans_subsearch_from_logs_gates_only_the_logs_scan() {
+    let q = r#"status=500 | join trace_id [dataset=spans search span_kind="server"]"#;
+    let sql = audit_gated_sql(q, Dataset::Logs);
+    assert_eq!(
+        gate_count(&sql),
+        1,
+        "only the outer logs scan should be gated: {sql}"
+    );
+}

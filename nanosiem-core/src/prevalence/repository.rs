@@ -1384,13 +1384,20 @@ impl PrevalenceRepository {
     }
 
     /// Get artifact detail from the logs table — top hosts, users, source types, and contextual data
-    #[instrument(skip(self, profile))]
+    ///
+    /// `scope` is the caller's source-scope (NAN-1801): its deny set is AND-ed
+    /// into the shared WHERE clause so every sub-query — including the
+    /// `source_type` GROUP BY, a direct existence leak — only sees rows from
+    /// sources the caller may read. Unrestricted (empty) scope emits
+    /// byte-identical SQL to the pre-scoping form.
+    #[instrument(skip(self, profile, scope))]
     pub async fn get_artifact_detail(
         &self,
         artifact: &str,
         artifact_type: &ArtifactType,
         logs_table: &str,
         profile: &dyn crate::schema::SchemaProfile,
+        scope: &crate::auth::ScopeSet,
         time_window: TimeWindow,
     ) -> Result<ArtifactDetailResponse, clickhouse::error::Error> {
         let cutoff = Self::get_cutoff_time(time_window);
@@ -1439,6 +1446,21 @@ impl PrevalenceRepository {
                     return Ok(Self::empty_artifact_detail(artifact, artifact_type));
                 }
             }
+        };
+
+        // NAN-1801 (P3 side-doors): AND the caller's source-scope predicate
+        // into the SHARED artifact where_clause so all seven tokio::join!
+        // sub-queries below inherit it — these are raw-logs drilldowns that
+        // bypass the nPL search-path scope injector. The handler composes the
+        // deny set via `effective_source_deny_set()` (per-source RBAC ∪ audit
+        // unless `audit:view`), so audit rows are covered too. Empty deny set
+        // appends nothing — byte-identical SQL for unrestricted callers.
+        let where_clause = match crate::search::service::source_scope_sql_predicate(
+            "source_type",
+            scope.deny_set(),
+        ) {
+            Some(pred) => format!("{where_clause} AND ({pred})"),
+            None => where_clause,
         };
 
         let time_filter = format!("timestamp >= toDateTime('{}')", cutoff_str);
@@ -1700,7 +1722,11 @@ impl PrevalenceRepository {
     /// — see the constant for the rationale. Today the handler caps `limit`
     /// at 200, so this is belt-and-suspenders for a future caller that
     /// raises or skips that cap.
-    #[instrument(skip(self, profile, hash_artifacts, ip_artifacts, domain_artifacts))]
+    /// `scope` (NAN-1801): the caller's source-scope deny set is AND-ed into
+    /// the shared time filter so every bucket query — each of which carries an
+    /// `argMax(source_type, …) AS top_source_type` leg — only aggregates rows
+    /// from sources the caller may read. Unrestricted scope is byte-identical.
+    #[instrument(skip(self, profile, scope, hash_artifacts, ip_artifacts, domain_artifacts))]
     #[allow(clippy::too_many_arguments)]
     pub async fn bulk_artifact_inline_context(
         &self,
@@ -1709,6 +1735,7 @@ impl PrevalenceRepository {
         domain_artifacts: &[String],
         logs_table: &str,
         profile: &dyn crate::schema::SchemaProfile,
+        scope: &crate::auth::ScopeSet,
         time_window: TimeWindow,
     ) -> std::collections::HashMap<String, ArtifactInlineContext> {
         use std::collections::HashMap;
@@ -1753,6 +1780,20 @@ impl PrevalenceRepository {
         let cutoff = Self::get_cutoff_time(time_window);
         let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
         let time_filter = format!("timestamp >= toDateTime('{}')", cutoff_str);
+
+        // NAN-1801 (P3 side-doors): AND the caller's source-scope predicate
+        // into the shared `{pre}` fragment so all bucket queries (hash file/
+        // process, IP, domain) inherit it — each has a `top_source_type` leg
+        // that would otherwise leak denied-source names, and the counts would
+        // include denied-source rows. Empty deny set appends nothing —
+        // byte-identical SQL for unrestricted callers.
+        let time_filter = match crate::search::service::source_scope_sql_predicate(
+            "source_type",
+            scope.deny_set(),
+        ) {
+            Some(pred) => format!("{time_filter} AND ({pred})"),
+            None => time_filter,
+        };
 
         // --- Hashes: top file_name, top process_name+command_line, user_count, top source_type ---
         // Requires file_hash + file_name + user columns; skip the whole bucket if

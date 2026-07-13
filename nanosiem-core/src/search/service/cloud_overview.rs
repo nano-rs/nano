@@ -13,7 +13,9 @@
 //! UI's empty-state fallbacks don't mask real failures in log dashboards —
 //! same rule we learned porting NAN-393.
 
+use super::lateral::source_scope_sql_predicate;
 use super::SearchService;
+use crate::auth::ScopeSet;
 use crate::extensions::CloudRiskProvider;
 use crate::query::TimeRange;
 use crate::risk::{EntityRiskSummary, RiskFilter, RiskTimeWindow};
@@ -252,11 +254,18 @@ fn window_label(time_range: &TimeRange) -> String {
 // ============================================================================
 
 impl SearchService {
+    /// NAN-1801: this aggregate builds its own hand-rolled SQL over `logs` /
+    /// `signals` (it does NOT go through the nPL source-scope injection), so
+    /// the caller's `ScopeSet` is threaded down here and its deny-set
+    /// exclusion is ANDed into EVERY subquery's scan (see
+    /// [`source_scope_sql_predicate`]). An empty deny set emits nothing —
+    /// byte-identical SQL to the pre-scoping form.
     pub async fn query_cloud_overview(
         &self,
         provider_filter: Option<&str>,
         account_filter: Option<&str>,
         time_range: &TimeRange,
+        scope: &ScopeSet,
     ) -> Result<CloudOverview, SearchError> {
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
@@ -335,6 +344,21 @@ impl SearchService {
             q
         };
 
+        // NAN-1801: render the caller's source-scope deny-set ONCE; ANDed into
+        // every hand-built logs scan below (both the mapped and the zero-row
+        // fallback query shapes, so a future schema change can't silently drop
+        // the gate). The anomalies join reads logs through the `l` alias, so
+        // it gets its own alias-qualified rendering. No bind values — the
+        // predicate is rendered inline — so `extra_bind`'s placeholder
+        // accounting is untouched. `None` (unrestricted) splices an empty
+        // string: byte-identical SQL to the pre-scoping form.
+        let scope_and = source_scope_sql_predicate("source_type", scope.deny_set())
+            .map(|pred| format!("\n              AND {pred}"))
+            .unwrap_or_default();
+        let anomaly_scope_and = source_scope_sql_predicate("l.source_type", scope.deny_set())
+            .map(|pred| format!("\n              AND {pred}"))
+            .unwrap_or_default();
+
         // --- 1. Header / totals ---------------------------------------------
         // Scope = "any log row with cloud context populated". Parsers set
         // cloud_provider up-front (e.g. aws_cloudtrail sets "aws" at the top
@@ -409,7 +433,7 @@ impl SearchService {
             PREWHERE timestamp BETWEEN ? AND ?
               {cloud_scope_predicate}
               {provider_clause}
-              {account_clause}"#,
+              {account_clause}{scope_and}"#,
         );
         // Provider breakdown — only meaningful when the schema maps
         // `cloud_provider`. When unmapped we hand the executor a no-result query
@@ -421,7 +445,7 @@ impl SearchService {
             PREWHERE timestamp BETWEEN ? AND ?
               AND {col} != ''
               {provider_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             GROUP BY provider
             ORDER BY cnt DESC
             LIMIT 5"#,
@@ -431,7 +455,7 @@ impl SearchService {
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
               {provider_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             GROUP BY provider
             LIMIT 0"#,
             ),
@@ -479,7 +503,7 @@ impl SearchService {
                 PREWHERE timestamp BETWEEN ? AND ?
                   AND {acct} != ''
                   {provider_clause}
-                  {account_clause}
+                  {account_clause}{scope_and}
                 GROUP BY account_id, provider_raw, region_v, principal_v
             )
             GROUP BY account_id, provider
@@ -493,7 +517,7 @@ impl SearchService {
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
               {provider_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             GROUP BY account_id, provider
             LIMIT 0"#,
             ),
@@ -529,7 +553,7 @@ impl SearchService {
               AND {user} != ''
               {principal_provider_gate}
               {provider_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             GROUP BY principal{group_account}
             ORDER BY events DESC
             LIMIT {TOP_PRINCIPALS_LIMIT}"#,
@@ -541,7 +565,7 @@ impl SearchService {
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
               {provider_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             GROUP BY principal, account_id
             LIMIT 0"#,
             ),
@@ -563,7 +587,7 @@ impl SearchService {
             PREWHERE timestamp BETWEEN ? AND ?
               AND {acct} != ''
               {provider_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             GROUP BY account_id, bucket
             HAVING bucket < {TIMELINE_BUCKETS}
             ORDER BY events DESC"#,
@@ -573,7 +597,7 @@ impl SearchService {
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
               {provider_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             GROUP BY account_id, bucket
             LIMIT 0"#,
             ),
@@ -627,7 +651,7 @@ impl SearchService {
             PREWHERE timestamp BETWEEN ? AND ?
               AND {svc} != ''
               {provider_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             GROUP BY service
             ORDER BY events DESC
             LIMIT {TOP_SERVICES_LIMIT}"#,
@@ -637,7 +661,7 @@ impl SearchService {
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
               {provider_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             GROUP BY service
             LIMIT 0"#,
             ),
@@ -653,7 +677,7 @@ impl SearchService {
             PREWHERE timestamp BETWEEN ? AND ?
               AND {svc} != ''
               {provider_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             GROUP BY service, bucket
             HAVING bucket < {SERVICE_TREND_BUCKETS}"#,
             ),
@@ -662,7 +686,7 @@ impl SearchService {
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
               {provider_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             GROUP BY service, bucket
             LIMIT 0"#,
             ),
@@ -766,7 +790,7 @@ impl SearchService {
             PREWHERE timestamp BETWEEN ? AND ?{change_kind_filter}
               AND {svc} != ''
               {provider_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             {resource_filter}
             ORDER BY timestamp DESC
             LIMIT {TOP_CHANGES_LIMIT}"#,
@@ -778,7 +802,7 @@ impl SearchService {
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
               {provider_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             ORDER BY timestamp DESC
             LIMIT 0"#,
             ),
@@ -839,7 +863,7 @@ impl SearchService {
             INNER JOIN {signals_table} AS s ON s.matched_log_id = l.id
             WHERE l.timestamp BETWEEN ? AND ?
               AND s.timestamp BETWEEN ? AND ?
-              AND {anomaly_cloud_predicate}
+              AND {anomaly_cloud_predicate}{anomaly_scope_and}
             ORDER BY s.timestamp DESC
             LIMIT {ANOMALIES_LIMIT}"#,
         );
@@ -1209,8 +1233,11 @@ async fn build_accounts(
         })
         .collect();
 
-    // Fan out to entity_risk_scores — one per account id. The store keys risk
-    // by `cloud_account_id` for account-scoped findings.
+    // Fan out to the risk provider — one per account id. Account-scoped
+    // findings (risk_entity_field = cloud_account_id / cloud.account.uid) are
+    // stamped `risk_entity_type = cloud_account` at write since NAN-1806, and
+    // the CH-backed reader honors the stamp — before that, NOTHING produced
+    // this type and the filter matched zero rows.
     let ids: Vec<String> = accounts.iter().map(|a| a.id.clone()).collect();
     if ids.is_empty() {
         return accounts;
@@ -1219,7 +1246,9 @@ async fn build_accounts(
         .risky_entities(
             risk_window,
             &RiskFilter {
-                entity_type: Some("cloud_account".to_string()),
+                entity_type: Some(
+                    crate::risk::clickhouse_sql::CLOUD_ACCOUNT_ENTITY_TYPE.to_string(),
+                ),
                 min_score: None,
                 risk_level: None,
                 limit: Some(200),

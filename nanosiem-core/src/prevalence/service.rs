@@ -1174,12 +1174,17 @@ impl PrevalenceService {
     }
 
     /// Get detailed context for a single artifact from the logs table
-    #[instrument(skip(self))]
+    ///
+    /// `scope` is the caller's source-scope (NAN-1801) — the handler composes
+    /// it from `effective_source_deny_set()` (per-source RBAC ∪ audit unless
+    /// `audit:view`) and the repository ANDs it into every raw-logs sub-query.
+    #[instrument(skip(self, scope))]
     pub async fn get_artifact_detail(
         &self,
         artifact: &str,
         artifact_type: &ArtifactType,
         logs_table: &str,
+        scope: &crate::auth::ScopeSet,
         time_window: TimeWindow,
     ) -> Result<ArtifactDetailResponse, PrevalenceError> {
         // Resolve the active schema profile so the repository's raw-SQL detail
@@ -1194,6 +1199,7 @@ impl PrevalenceService {
                 artifact_type,
                 logs_table,
                 profile.as_ref(),
+                scope,
                 time_window,
             )
             .await
@@ -1206,10 +1212,14 @@ impl PrevalenceService {
     ///
     /// Single-batch design: one CH pass per artifact-type bucket, so cost
     /// is bounded regardless of page size. Empty input is a no-op.
+    ///
+    /// `scope` is the caller's source-scope (NAN-1801) — AND-ed into every
+    /// bucket query so `top_source_type` / counts never reflect denied sources.
     pub async fn enrich_explorer_items(
         &self,
         items: &mut [ArtifactExplorerItem],
         logs_table: &str,
+        scope: &crate::auth::ScopeSet,
         time_window: TimeWindow,
     ) {
         if items.is_empty() {
@@ -1245,6 +1255,7 @@ impl PrevalenceService {
                 &domain_artifacts,
                 logs_table,
                 profile.as_ref(),
+                scope,
                 time_window,
             )
             .await;

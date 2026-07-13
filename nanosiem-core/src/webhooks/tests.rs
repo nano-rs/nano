@@ -4,6 +4,7 @@
 //! payload shape (NAN-1546). Delivery/HTTP paths are validated live against a
 //! local receiver; these cover the pure logic that gates and shapes delivery.
 
+use super::channels::ChannelType;
 use super::models::*;
 use super::service::parse_egress_allowlist;
 use chrono::TimeZone;
@@ -18,10 +19,20 @@ fn webhook_with(event_types: Vec<String>) -> Webhook {
         secret_encrypted: None,
         severity_filter: None,
         event_types,
+        channel_type: "generic".to_string(),
+        channel_config: serde_json::json!({}),
+        rule_filter: None,
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
+}
+
+/// A generic webhook with an explicit rule filter, for routing tests.
+fn webhook_with_rule_filter(rule_ids: Option<Vec<Uuid>>) -> Webhook {
+    let mut w = webhook_with(default_event_types());
+    w.rule_filter = rule_ids;
+    w
 }
 
 // ---------------------------------------------------------------------------
@@ -67,6 +78,12 @@ fn obs_only_webhook_rejects_detection_and_vice_versa() {
 #[test]
 fn alert_kind_maps_to_correct_category() {
     assert_eq!(alert_kind_to_event_type("detection"), EVENT_TYPE_SIEM_ALERT);
+    // Risk notables are a security-analyst stream (NAN-1792): they aggregate
+    // detection-rule risk, so they gate on the SIEM subscription, not obs.
+    assert_eq!(
+        alert_kind_to_event_type("risk_notable"),
+        EVENT_TYPE_SIEM_ALERT
+    );
     assert_eq!(
         alert_kind_to_event_type("metric_monitor"),
         EVENT_TYPE_OBS_ALERT
@@ -100,6 +117,9 @@ fn create_req(event_types: Option<Vec<String>>) -> CreateWebhookRequest {
         secret: None,
         severity_filter: None,
         event_types,
+        channel_type: None,
+        channel_config: None,
+        rule_filter: None,
         enabled: None,
     }
 }
@@ -112,6 +132,9 @@ fn update_req(event_types: Option<Vec<String>>) -> UpdateWebhookRequest {
         secret: None,
         severity_filter: None,
         event_types,
+        channel_type: None,
+        channel_config: None,
+        rule_filter: None,
         enabled: None,
     }
 }
@@ -244,6 +267,129 @@ async fn validate_url_honors_egress_allowlist() {
         .is_err());
 
     std::env::remove_var("NANOSIEM_WEBHOOK_EGRESS_ALLOWLIST");
+}
+
+// ---------------------------------------------------------------------------
+// Rule-filter routing (NAN-1790)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rule_filter_none_or_empty_admits_all() {
+    let none = webhook_with_rule_filter(None);
+    let empty = webhook_with_rule_filter(Some(vec![]));
+    let rid = Uuid::now_v7();
+    assert!(none.passes_rule_filter(Some(rid)));
+    assert!(none.passes_rule_filter(None));
+    assert!(empty.passes_rule_filter(Some(rid)));
+    assert!(empty.passes_rule_filter(None));
+}
+
+#[test]
+fn rule_filter_set_admits_only_members() {
+    let wanted = Uuid::now_v7();
+    let other = Uuid::now_v7();
+    let w = webhook_with_rule_filter(Some(vec![wanted]));
+    assert!(w.passes_rule_filter(Some(wanted)));
+    assert!(!w.passes_rule_filter(Some(other)));
+    // A rule filter is detection-scoped; a rule-less alert/case is not admitted.
+    assert!(!w.passes_rule_filter(None));
+}
+
+// ---------------------------------------------------------------------------
+// Strict channel-type resolution at delivery (NAN-1790)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn resolve_channel_type_defaults_empty_to_generic() {
+    // Legacy row / column default: an empty value is the generic channel.
+    let mut w = webhook_with(default_event_types());
+    w.channel_type = String::new();
+    assert_eq!(w.resolve_channel_type().unwrap(), ChannelType::Generic);
+
+    w.channel_type = "slack".to_string();
+    assert_eq!(w.resolve_channel_type().unwrap(), ChannelType::Slack);
+}
+
+#[test]
+fn resolve_channel_type_fails_closed_on_unknown() {
+    // An unknown stored type must NOT fall back to generic: doing so would
+    // HMAC-sign this row's secret (which for a provider channel is a provider
+    // token) and POST it to the row's URL.
+    let mut w = webhook_with(default_event_types());
+    w.channel_type = "discord".to_string();
+    let err = w.resolve_channel_type().unwrap_err();
+    assert!(err.contains("discord"), "names the unknown type: {err}");
+    assert!(err.contains("refusing to deliver"), "fails closed: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// Channel type + config validation (NAN-1790)
+// ---------------------------------------------------------------------------
+
+fn channel_create_req(channel_type: Option<&str>, url: &str) -> CreateWebhookRequest {
+    CreateWebhookRequest {
+        name: "n".to_string(),
+        url: url.to_string(),
+        headers: None,
+        secret: None,
+        severity_filter: None,
+        event_types: None,
+        channel_type: channel_type.map(str::to_string),
+        channel_config: None,
+        rule_filter: None,
+        enabled: None,
+    }
+}
+
+#[test]
+fn validate_channel_accepts_generic_and_providers() {
+    assert!(channel_create_req(None, "https://x").validate_channel().is_ok());
+    assert!(channel_create_req(Some("generic"), "https://x").validate_channel().is_ok());
+    assert!(channel_create_req(Some("slack"), "https://hooks.slack.com/x").validate_channel().is_ok());
+    assert!(channel_create_req(Some("teams"), "https://outlook.office.com/x").validate_channel().is_ok());
+    // PagerDuty doesn't require a user URL (server sets the Events endpoint).
+    assert!(channel_create_req(Some("pagerduty"), "").validate_channel().is_ok());
+}
+
+#[test]
+fn validate_channel_rejects_unknown_type() {
+    let err = channel_create_req(Some("carrier_pigeon"), "https://x")
+        .validate_channel()
+        .unwrap_err();
+    assert!(err.contains("carrier_pigeon"), "names the bad type: {err}");
+}
+
+#[test]
+fn validate_channel_rejects_email_until_transport_lands() {
+    let err = channel_create_req(Some("email"), "")
+        .validate_channel()
+        .unwrap_err();
+    assert!(err.contains("not yet available"), "email deferred: {err}");
+}
+
+#[test]
+fn validate_channel_requires_url_for_url_types() {
+    for ct in ["generic", "slack", "teams"] {
+        let err = channel_create_req(Some(ct), "  ")
+            .validate_channel()
+            .unwrap_err();
+        assert!(err.contains("requires a destination URL"), "{ct}: {err}");
+    }
+}
+
+#[test]
+fn decoded_rule_filter_roundtrips_typeids_and_uuids() {
+    let a = Uuid::now_v7();
+    let b = Uuid::now_v7();
+    let mut req = channel_create_req(Some("generic"), "https://x");
+    // Mix a rule_… typeid with a bare UUID string — both must decode.
+    req.rule_filter = Some(vec![encode_rule_id(&a), b.to_string()]);
+    let decoded = req.decoded_rule_filter().unwrap().unwrap();
+    assert_eq!(decoded, vec![a, b]);
+
+    // A malformed id is a hard error naming the value.
+    req.rule_filter = Some(vec!["not-an-id".to_string()]);
+    assert!(req.decoded_rule_filter().unwrap_err().contains("not-an-id"));
 }
 
 #[test]

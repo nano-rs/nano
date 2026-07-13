@@ -65,7 +65,11 @@ pub fn create_router(state: AppState) -> Router {
         Some(state.api_key_service.clone()),
         state.auth_enabled,
     )
-    .with_permission_resolver(permission_resolver);
+    .with_permission_resolver(permission_resolver)
+    // Per-source RBAC (NAN-1799): the middleware resolves each caller's
+    // source-scope deny set into AuthContext::denied_sources, failing closed
+    // (503) if the registry is unavailable.
+    .with_source_scope_resolver(state.source_scope_resolver.clone());
 
     // Rate-limited login route
     let login_route = Router::new()
@@ -442,6 +446,20 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/rules", post(handlers::create_detection))
         .route("/api/rules/import", post(handlers::import_detections))
         .route("/api/rules/export", get(handlers::export_detections))
+        // Auto retro-hunt rules (NAN-1791). Static paths BEFORE `/api/rules/{id}`.
+        .route("/api/rules/retro-hunt", post(handlers::create_retro_hunt))
+        .route(
+            "/api/rules/retro-hunt/feeds",
+            get(handlers::list_retro_hunt_feeds),
+        )
+        .route(
+            "/api/rules/{id}/retro-hunt",
+            get(handlers::get_retro_hunt).put(handlers::update_retro_hunt),
+        )
+        .route(
+            "/api/rules/{id}/retro-hunt/runs",
+            get(handlers::list_retro_hunt_runs),
+        )
         .route("/api/rules/test", post(handlers::test_query))
         .route("/api/rules/format", post(handlers::format_query))
         .route("/api/rules/validate", post(handlers::validate_detection))
@@ -1164,7 +1182,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/settings/risk", get(handlers::get_risk_config))
         .route("/api/settings/risk", put(handlers::update_risk_config));
 
-    // Risk decay TTL config — enterprise only (RiskAnalyticsService).
+    // Risk decay TTL + risk-notable config — enterprise only
+    // (RiskAnalyticsService, NAN-1792; since NAN-1805 the notable config is a
+    // thin editor over the seeded default dataset=risk detection rule).
     #[cfg(feature = "enterprise")]
     {
         app = app
@@ -1175,6 +1195,14 @@ pub fn create_router(state: AppState) -> Router {
             .route(
                 "/api/settings/risk-decay",
                 put(handlers::update_risk_decay_config),
+            )
+            .route(
+                "/api/settings/risk-notables",
+                get(handlers::get_risk_notable_config),
+            )
+            .route(
+                "/api/settings/risk-notables",
+                put(handlers::update_risk_notable_config),
             );
     }
 
@@ -1603,6 +1631,15 @@ pub fn create_router(state: AppState) -> Router {
             "/api/settings/webhooks/{id}/deliveries",
             get(handlers::list_webhook_deliveries),
         )
+        // Notification config (deep-link base URL) — NAN-1790
+        .route(
+            "/api/settings/notifications/config",
+            get(handlers::get_notification_config),
+        )
+        .route(
+            "/api/settings/notifications/config",
+            put(handlers::update_notification_config),
+        )
         // Onboarding wizard
         .route(
             "/api/onboarding/progress",
@@ -1728,10 +1765,8 @@ pub fn create_router(state: AppState) -> Router {
                 "/api/risk/time-windowed",
                 get(handlers::risk::get_time_windowed_risk_scores::<AppState>),
             )
-            .route(
-                "/api/risk/thresholds",
-                get(handlers::risk::get_entities_exceeding_thresholds::<AppState>),
-            )
+            // NAN-1806: /api/risk/thresholds retired with the notable scheduler
+            // (NAN-1805) — risk alerting is a `dataset=risk` detection rule.
             .route(
                 "/api/risk/entity-activity",
                 get(handlers::risk::get_entity_activity::<AppState>),
@@ -2264,6 +2299,28 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/dashboards/{id}/share",
             post(handlers::share_dashboard),
+        )
+        // Scheduled report endpoints (NAN-1793). Static segments (`runs`,
+        // `artifacts`) are declared before `{id}` so matchit prefers them.
+        // Referenced via the qualified module path because `reports` is not
+        // glob-re-exported (its list_reports/get_report collide with siem_health).
+        .route("/api/reports", get(handlers::reports::list_reports))
+        .route("/api/reports", post(handlers::reports::create_report))
+        .route(
+            "/api/reports/runs/{run_id}",
+            get(handlers::reports::get_report_run),
+        )
+        .route(
+            "/api/reports/artifacts/{artifact_id}/download",
+            get(handlers::reports::download_report_artifact),
+        )
+        .route("/api/reports/{id}", get(handlers::reports::get_report))
+        .route("/api/reports/{id}", put(handlers::reports::update_report))
+        .route("/api/reports/{id}", delete(handlers::reports::delete_report))
+        .route("/api/reports/{id}/run", post(handlers::reports::trigger_report))
+        .route(
+            "/api/reports/{id}/runs",
+            get(handlers::reports::list_report_runs),
         );
 
     // Notebook endpoints — enterprise only (cases-coupled).
@@ -2536,6 +2593,12 @@ pub fn create_router(state: AppState) -> Router {
     {
         app = app.merge(airgap_import_routes);
     }
+    // Per-source RBAC scope administration (NAN-1799) — restricted source_type
+    // registry + per-group grants. Core surface (not enterprise-gated); the
+    // handlers gate on the source_scopes:view / source_scopes:manage
+    // permissions. Merged here so it shares AppState and sits inside the
+    // authenticated router group (behind the auth middleware layer below).
+    app = app.merge(handlers::source_scopes::source_scopes_routes());
     #[cfg_attr(not(feature = "enterprise"), allow(unused_mut))]
     let mut app = app
         // Add state

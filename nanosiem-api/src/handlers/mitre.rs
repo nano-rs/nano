@@ -290,11 +290,23 @@ pub async fn get_mitre_coverage(
         )
     } else {
         let requested_sources: Vec<String> = configured_source_types.iter().cloned().collect();
+        // NAN-1801 (P3 side-doors): the readiness probe reads the
+        // per-source `logs_per_source_5m` rollup, so scope it by the
+        // viewer's effective deny set — a viewer denied a source (or
+        // lacking `audit:view`) must not recover that source's last-seen
+        // timestamp here. Denied sources fall out of the stats map and
+        // render as "unknown" readiness; an empty deny set (unrestricted
+        // viewer) emits byte-identical SQL.
+        let deny_set = auth.effective_source_deny_set();
         let stats = match tokio::time::timeout(
             TELEMETRY_READINESS_QUERY_TIMEOUT,
             state
                 .log_telemetry_service
-                .stats_by_source_type(&requested_sources, TELEMETRY_READINESS_LOOKBACK_HOURS),
+                .stats_by_source_type(
+                    &requested_sources,
+                    TELEMETRY_READINESS_LOOKBACK_HOURS,
+                    &deny_set,
+                ),
         )
         .await
         {

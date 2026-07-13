@@ -89,7 +89,7 @@ async fn rollup_matches_raw_logs_for_inserted_rows() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let row = loop {
         let stats = svc
-            .stats_by_source_type(&[unique.clone()], 1)
+            .stats_by_source_type(&[unique.clone()], 1, &std::collections::BTreeSet::new())
             .await
             .expect("rollup read should succeed");
         if let Some(row) = stats.get(&unique).cloned() {

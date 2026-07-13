@@ -1,15 +1,35 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use super::*;
+use crate::auth::ScopeSet;
 use crate::search::execution::clickhouse_executor::{
     wrap_query_for_count, wrap_query_with_pagination, BoundedCountInput,
 };
+use crate::search::query_processing::enforce_source_scope;
 
 impl SearchService {
     /// Execute a raw SQL query (SELECT only)
-    #[instrument(skip(self))]
-    pub async fn search_sql(&self, request: RawSqlRequest) -> Result<SearchResponse, SearchError> {
+    ///
+    /// NAN-1799 FAIL-CLOSED: raw SQL cannot be AST-injected with a per-source
+    /// exclusion, so a caller with ANY restricted source is refused outright
+    /// (deny-when-scoped) — unscoped raw SQL over the logs table would leak
+    /// every denied source. Unrestricted callers behave exactly as before
+    /// (the handler-level `inject_audit_filter` still covers the audit gate).
+    #[instrument(skip(self, scope))]
+    pub async fn search_sql(
+        &self,
+        request: RawSqlRequest,
+        scope: &ScopeSet,
+    ) -> Result<SearchResponse, SearchError> {
         let start_time = Instant::now();
+
+        if scope.is_restricted() {
+            return Err(SearchError::SqlValidationError(
+                "Raw SQL search is not available for accounts with per-source access \
+                 restrictions. Use the piped query language instead."
+                    .to_string(),
+            ));
+        }
 
         // Validate time range
         request.time_range.validate()?;
@@ -67,13 +87,19 @@ impl SearchService {
     }
 
     /// Explain a piped query by returning the generated SQL without executing
-    #[instrument(skip(self), fields(query = %query))]
+    ///
+    /// `scope` (NAN-1799): the caller's source-scope deny-set is injected into
+    /// the query text exactly as the executed path does, so "Inspect SQL"
+    /// renders the SQL that would actually run for this caller (including the
+    /// scope exclusion) and the two can never diverge.
+    #[instrument(skip(self, scope), fields(query = %query))]
     pub async fn explain(
         &self,
         query: &str,
         time_range: &TimeRangeInput,
         table_view: bool,
         dataset: Option<&str>,
+        scope: &ScopeSet,
     ) -> Result<String, SearchError> {
         // Validate time range
         time_range.validate()?;
@@ -85,6 +111,11 @@ impl SearchService {
 
         // Extract time modifiers and clean the query
         let (cleaned_query, _, _) = extract_time_modifiers(query);
+
+        // NAN-1799: same injection point as `search()` — before the parse, so
+        // every explain branch below (prevalence pushdown included) renders
+        // the gated query. Empty deny-set → text unchanged.
+        let cleaned_query = enforce_source_scope(&cleaned_query, scope.deny_set())?;
 
         // Parse the cleaned query
         let parsed = parse_query(&cleaned_query).map_err(|e| convert_parse_error(e))?;
@@ -118,7 +149,11 @@ impl SearchService {
             &post_prevalence.commands,
             /* is_clickhouse = */ true,
             /* has_prevalence_svc = */ self.prevalence_service.is_some(),
-        ) {
+        )
+            // NAN-1798 P2: mirror the execute path — risk-touching queries do
+            // not take the prevalence pushdown (see core_search).
+            && !super::touches_risk_dataset(dataset, query)
+        {
             let rarity_threshold = if let Some(ref s) = self.prevalence_service {
                 s.rarity_threshold().await
             } else {
@@ -212,7 +247,8 @@ impl SearchService {
             ..Default::default()
         };
         let mut sql = self
-            .dataset_generator(dataset)
+            .dataset_generator(dataset, query)
+            .await
             .generate_with_options(&query_for_sql, &tr, &options)
             .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
 

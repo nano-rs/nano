@@ -111,6 +111,11 @@ pub enum AuditSource {
     Gdpr,
     /// Audit subsystem events (export/read of the audit trail itself)
     Audit,
+    /// Scheduled report events (definition CRUD, manual run trigger)
+    Report,
+    /// Per-source RBAC scope events (restrict/un-restrict a source_type,
+    /// grant/revoke a group's visibility of it) — NAN-1799.
+    SourceScope,
 }
 
 impl std::fmt::Display for AuditSource {
@@ -150,6 +155,8 @@ impl std::fmt::Display for AuditSource {
             Self::Lookup => write!(f, "lookup"),
             Self::Gdpr => write!(f, "gdpr"),
             Self::Audit => write!(f, "audit"),
+            Self::Report => write!(f, "report"),
+            Self::SourceScope => write!(f, "source_scope"),
         }
     }
 }

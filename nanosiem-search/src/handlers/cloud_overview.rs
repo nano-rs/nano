@@ -9,6 +9,7 @@
 //! loading / empty state, so partial failures degrade gracefully.
 
 use axum::{extract::State, Json};
+use nanosiem_core::auth::permissions;
 use nanosiem_core::search::CloudOverview;
 use nanosiem_core::TimeRangeInput;
 use serde::Deserialize;
@@ -40,17 +41,33 @@ pub struct CloudOverviewRequest {
         (status = 200, description = "Cloud overview aggregates", body = CloudOverview),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Missing search:execute permission"),
     )
 )]
 pub async fn get_cloud_overview(
     State(state): State<SearchState>,
+    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<CloudOverviewRequest>,
 ) -> Result<(axum::http::HeaderMap, Json<CloudOverview>), SearchError> {
+    // NAN-1801: this endpoint was bearer-only — it runs many hand-built
+    // ClickHouse aggregates over logs/signals, so gate it like every other
+    // search surface (mirrors /api/search/retro).
+    if !auth.claims.has_permission(permissions::SEARCH_EXECUTE) {
+        return Err(SearchError::Forbidden(
+            "Cloud overview queries require the search:execute permission".to_string(),
+        ));
+    }
+
+    // NAN-1801: compose the effective deny-set (per-user source scope ∪ audit
+    // gate) ONCE, before the cache lookup — it changes the executed SQL, so it
+    // is part of result identity and MUST be folded into the cache key.
+    let scope = super::search::effective_scope(&auth);
+
     // NAN-1593: the cloud overview landing aggregate fires on every load /
     // shared-link follow and runs many parallel ClickHouse aggregates — cache
     // it through the same Dragonfly layer. Keyed on the provider / account
-    // scope and the time range.
+    // scope, the time range, and the caller's effective source scope.
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "coverview",
         &[
@@ -59,6 +76,7 @@ pub async fn get_cloud_overview(
             request.time_range.start.timestamp_micros().to_string().as_bytes(),
             request.time_range.end.timestamp_micros().to_string().as_bytes(),
         ],
+        &scope,
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -81,6 +99,7 @@ pub async fn get_cloud_overview(
             request.provider.as_deref(),
             request.account.as_deref(),
             &time_range,
+            &scope,
         )
         .await;
 

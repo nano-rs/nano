@@ -300,7 +300,8 @@ impl MaterializedViewGenerator {
             crate::schema::SchemaId::Ocsf => "ocsf_logs",
             crate::schema::SchemaId::Udm
             | crate::schema::SchemaId::Spans
-            | crate::schema::SchemaId::Metrics => "logs",
+            | crate::schema::SchemaId::Metrics
+            | crate::schema::SchemaId::Risk => "logs",
         }
     }
 
@@ -458,7 +459,7 @@ impl MaterializedViewGenerator {
             if crate::query::Dataset::from_selector(ds) != crate::query::Dataset::Logs {
                 return Err(MaterializedViewError::InvalidRule(format!(
                     "Real-time rules cannot target dataset '{ds}' \
-                     (spans/metrics are scheduled-only). Use scheduled detection mode."
+                     (non-logs datasets are scheduled-only). Use scheduled detection mode."
                 )));
             }
         }
@@ -562,6 +563,16 @@ impl MaterializedViewGenerator {
         // carry the LOG timestamp, not ingest time, so a 1h floor dropped
         // normal batch-forwarded / outage-replayed events; 24h keeps a bound so
         // the MV doesn't rescan unbounded history per insert.
+        //
+        // NAN-1809 C5: `source_type` in the projection is the REAL base column
+        // (both `logs` and `ocsf_logs` expose it; the inner `SELECT *` carries
+        // it through) — NOT a constant — so each signal records the provenance
+        // of the matched log for per-source RBAC scoping of signal reads. The
+        // bare reference keeps the output name exactly `source_type`, which the
+        // `TO signals` target matches by NAME (migration 164 adds the column;
+        // pre-164/old-projection MVs fall back to its DEFAULT 'unknown').
+        // Existing deployed MVs keep their old projection until a separate,
+        // supervised regeneration rollout — nothing here triggers one.
         let on_cluster = Self::on_cluster_clause();
         let ddl = format!(
             r#"CREATE MATERIALIZED VIEW {}{} TO signals AS
@@ -574,6 +585,7 @@ SELECT
     {} AS risk_score,
     {} AS risk_entity,
     matched_log_id,
+    source_type,
     toJSONString(map()) AS metadata,
     now64(6) AS _inserted_at
 FROM (
@@ -869,6 +881,8 @@ mod tests {
             playbook_id: None,
             source_path: None,
             source_repo_url: None,
+            kind: "standard".to_string(),
+            alert_cooldown_minutes: None,
         }
     }
 
@@ -998,6 +1012,35 @@ mod tests {
         assert!(!ddl.contains("ON CLUSTER"));
     }
 
+    /// NAN-1809 C5: the outer projection must carry the matched log's REAL
+    /// `source_type` base column (provenance for per-source RBAC scoping of
+    /// signal reads) — a bare reference named exactly `source_type` so the
+    /// `TO signals` target matches it by name, and NOT a quoted constant.
+    #[test]
+    fn test_projection_carries_source_type_provenance() {
+        let rule = create_test_rule();
+        let generator = MaterializedViewGenerator::new(clickhouse::Client::default());
+        let ddl = generator.generate_view_ddl(&rule).unwrap();
+
+        // The column is listed in the OUTER projection (before the source
+        // subquery opens), where the `TO signals` name-matching happens.
+        let sub_open = ddl.find("FROM (").expect("DDL must open a source subquery");
+        let st_pos = ddl
+            .find("    source_type,")
+            .expect("outer projection must list source_type");
+        assert!(
+            st_pos < sub_open,
+            "source_type must be projected in the OUTER select\n  ddl:\n{ddl}"
+        );
+
+        // It is the real base column, not a constant: no `'...' AS source_type`
+        // alias anywhere in the DDL.
+        assert!(
+            !ddl.contains("AS source_type"),
+            "source_type must be a bare base-column reference, not an alias\n  ddl:\n{ddl}"
+        );
+    }
+
     /// NAN-1142: the real-time WHERE clause must be byte-for-byte identical to the
     /// canonical scheduled-path WHERE across a representative spread of rule shapes.
     /// Before the fix the MV path emitted case-sensitive / wildcard-literal /
@@ -1123,7 +1166,9 @@ mod tests {
     fn test_rejects_spans_metrics_dataset() {
         // NAN-1561: spans/metrics rules are scheduled-only; the MV path must
         // reject them before any DDL is built, even with a logs-shaped query.
-        for ds in ["spans", "metrics", "traces", "metric"] {
+        // NAN-1805: 'risk' inherits the same rejection — risk rules are
+        // scheduled-only too.
+        for ds in ["spans", "metrics", "traces", "metric", "risk"] {
             let mut rule = create_test_rule();
             rule.dataset = Some(ds.to_string());
             let generator = MaterializedViewGenerator::new(clickhouse::Client::default());

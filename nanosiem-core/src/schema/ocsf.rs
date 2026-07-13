@@ -740,6 +740,26 @@ impl SchemaProfile for OcsfProfile {
         OCSF_TAIL_COLUMN
     }
 
+    /// NAN-1828: a bare keyword must ALSO tokenize against `raw_data`, because on
+    /// OCSF the raw log lands in a different column depending on the producer.
+    ///
+    /// Our Vector OCSF parsers put the raw log in `message` and emit no
+    /// `raw_data`. A direct producer (Tenzir) puts the untouched original —
+    /// syslog header and all — in `raw_data` and a human summary in `message`.
+    /// Searching `message` alone therefore made a Tenzir tenant's original log
+    /// invisible to the primary hunt path: NAN-1827 persisted it, but the only
+    /// nPL form that reached it (`raw_data=*kw*`) emits `iLike`, which extracts
+    /// no index tokens and degrades to a dictionary scan.
+    ///
+    /// OR-folding the two is cheap because the body lives in exactly ONE of them:
+    /// the other column's text index prunes to (near) zero granules rather than
+    /// doubling the read. `keyword_search_column()` deliberately stays `message`
+    /// — it is consumed in identifier position (the `transaction` capture), where
+    /// `raw_data` would be the wrong display field.
+    fn keyword_search_secondary_columns(&self) -> &'static [&'static str] {
+        &["raw_data"]
+    }
+
     fn fields(&self) -> &[FieldDef] {
         &registry().fields
     }
@@ -1680,5 +1700,32 @@ mod tests {
         // is_search_col stems get a `.search` companion; the DDL realizes them.
         assert!(registry().search_stems.contains("message"));
         assert!(registry().search_stems.contains("actor.process.cmd_line"));
+    }
+
+    /// NAN-1827: `raw_data` must resolve to the real promoted column, NOT fall
+    /// through to `unmapped.raw_data`.
+    ///
+    /// This is the silent half of the bug the column fixes. `raw_data` is a
+    /// standard OCSF attribute, so a conformant producer never writes it into
+    /// `unmapped` — but before it was promoted, `resolve()` had no entry for it
+    /// and hit the json-tail fallthrough. A hunt for `raw_data` therefore
+    /// returned EMPTY RESULTS WITH NO ERROR: the producer's original had been
+    /// dropped at ingest, and the query said "no matches" rather than "no such
+    /// field". Promoting the column without this assertion would fix the storage
+    /// and leave the query layer reading the wrong place.
+    #[test]
+    fn raw_data_resolves_to_the_promoted_column_not_the_json_tail() {
+        let p = OcsfProfile::new();
+        assert_eq!(
+            p.resolve("raw_data"),
+            FieldResolution::ExplicitColumn("raw_data".to_string()),
+            "raw_data must resolve to the promoted column; a JsonPath into `{OCSF_TAIL_COLUMN}` \
+             means nPL reads the tail while the data sits in the column — empty results, no error"
+        );
+        // The bare-keyword hunt column is deliberately NOT widened to raw_data:
+        // OR-ing a second text index unions the granule sets and roughly doubles
+        // the read. Explicit `raw_data` hunts get the idx_raw_data_words index;
+        // bare keywords stay on `message` alone.
+        assert_eq!(p.keyword_search_column(), "message");
     }
 }

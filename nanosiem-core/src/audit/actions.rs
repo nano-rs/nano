@@ -149,6 +149,19 @@ pub const GROUP_MEMBER_ADDED: &str = "group_member_added";
 pub const GROUP_MEMBER_REMOVED: &str = "group_member_removed";
 
 // =============================================================================
+// Source Scope Actions (per-source RBAC visibility control — NAN-1799)
+// =============================================================================
+
+/// A `source_type` value was registered as restricted (invisible-by-default)
+pub const SOURCE_SCOPE_RESTRICTED: &str = "source_scope_restricted";
+/// A `source_type` value was un-restricted (removed from the registry)
+pub const SOURCE_SCOPE_UNRESTRICTED: &str = "source_scope_unrestricted";
+/// A group was granted visibility of a restricted `source_type`
+pub const SOURCE_SCOPE_GRANTED: &str = "source_scope_granted";
+/// A group's grant on a restricted `source_type` was revoked
+pub const SOURCE_SCOPE_REVOKED: &str = "source_scope_revoked";
+
+// =============================================================================
 // Credential Actions
 // =============================================================================
 
@@ -281,6 +294,19 @@ pub const ALERT_BULK_CLOSED: &str = "alert_bulk_closed";
 pub const QUERY_CREATED: &str = "query_created";
 /// Saved query was deleted
 pub const QUERY_DELETED: &str = "query_deleted";
+
+// =============================================================================
+// Scheduled Report Actions (NAN-1793)
+// =============================================================================
+
+/// Scheduled report definition was created
+pub const REPORT_CREATED: &str = "report_created";
+/// Scheduled report definition was updated
+pub const REPORT_UPDATED: &str = "report_updated";
+/// Scheduled report definition was deleted
+pub const REPORT_DELETED: &str = "report_deleted";
+/// Scheduled report was manually triggered
+pub const REPORT_RUN_TRIGGERED: &str = "report_run_triggered";
 
 // =============================================================================
 // Log Source Actions
@@ -531,6 +557,8 @@ pub const CH_RETENTION_RUN_TRIGGERED: &str = "ch_retention_run_triggered";
 pub const RISK_CONFIG_UPDATED: &str = "risk_config_updated";
 /// Risk decay configuration was updated
 pub const RISK_DECAY_CONFIG_UPDATED: &str = "risk_decay_config_updated";
+/// Risk notable configuration was updated
+pub const RISK_NOTABLE_CONFIG_UPDATED: &str = "risk_notable_config_updated";
 /// Tiering configuration was updated
 pub const TIERING_CONFIG_UPDATED: &str = "tiering_config_updated";
 /// Tiering credentials were set
@@ -790,6 +818,14 @@ pub const SECURITY_CRITICAL_ACTIONS: &[&str] = &[
     // Session termination — administrative, low-volume.
     SESSION_TERMINATED,
     USER_SESSIONS_TERMINATED,
+    // Per-source RBAC visibility control (NAN-1799) — admin-gated
+    // (`source_scopes:manage`), low-volume, non-floodable data-access-control
+    // changes. Durable so a lost write can never silently widen or narrow what
+    // an analyst can see without a recoverable audit trail.
+    SOURCE_SCOPE_RESTRICTED,
+    SOURCE_SCOPE_UNRESTRICTED,
+    SOURCE_SCOPE_GRANTED,
+    SOURCE_SCOPE_REVOKED,
 ];
 
 /// Returns `true` when `action` must be emitted durably (synchronous insert,
@@ -830,6 +866,10 @@ mod durable_classifier_tests {
             "oidc_user_provisioned",
             "session_terminated",
             "user_sessions_terminated",
+            "source_scope_restricted",
+            "source_scope_unrestricted",
+            "source_scope_granted",
+            "source_scope_revoked",
         ];
         let mut actual: Vec<&str> = SECURITY_CRITICAL_ACTIONS.to_vec();
         expected.sort_unstable();
@@ -856,6 +896,9 @@ mod durable_classifier_tests {
         assert!(is_security_critical(OIDC_USER_PROVISIONED));
         assert!(is_security_critical(USER_SESSIONS_TERMINATED));
         assert!(is_security_critical(PASSWORD_RESET_COMPLETE));
+        assert!(is_security_critical(SOURCE_SCOPE_RESTRICTED));
+        assert!(is_security_critical(SOURCE_SCOPE_GRANTED));
+        assert!(is_security_critical(SOURCE_SCOPE_REVOKED));
 
         // Deliberately EXCLUDED: floodable / high-volume security events stay
         // fire-and-forget so awaiting them can't amplify a flood into a DoS,

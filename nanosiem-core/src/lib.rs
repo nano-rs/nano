@@ -65,6 +65,7 @@ pub mod playbooks;
 pub mod prevalence;
 pub mod query;
 pub mod query_library;
+pub mod reports;
 pub mod risk;
 pub mod rule_repository;
 pub mod scheduler;
@@ -306,6 +307,11 @@ pub use rule_repository::{
     RuleRepositoryRepository, RuleRepositoryService, RuleRepositoryServiceConfig, SigmaDetection,
     SigmaLogsource, SigmaParseError, SigmaRule, SyncResult, SyncStatus, UpdateRuleRepository,
     UpdatedRule,
+};
+pub use reports::{
+    NewReportDefinition, ReportArtifactContent, ReportArtifactMeta, ReportDefinition, ReportError,
+    ReportRepository, ReportRepositoryError, ReportRun, ReportRunStatus, ReportService,
+    ReportSourceType, UpdateReportDefinition,
 };
 pub use scheduler::{
     calculate_next_run, calculate_next_runs, describe_cron, merge_auth_headers,

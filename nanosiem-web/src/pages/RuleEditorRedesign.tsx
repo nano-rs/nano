@@ -493,6 +493,16 @@ export function RuleEditorRedesign() {
     if (!metadata.mitre_tactics?.trim()) missing.push('mitre_tactics');
     if (!metadata.mitre_techniques?.trim()) missing.push('mitre_techniques');
     if (missing.length) return `Missing required fields: ${missing.join(', ')}`;
+    // NAN-1825: pre-save mirror of the backend feedback-loop guard (NAN-1805).
+    // A dataset=risk rule queries accumulated risk — a `| risk` command in its
+    // body would feed the rule's own input, and the server rejects it. Catch
+    // it here so the analyst gets the message before a failed save round-trip.
+    // The regex matches the `| risk` COMMAND only: `risk\b` does not match
+    // field references like `| where risk_score > 10` (word boundary fails
+    // before the underscore).
+    if (metadata.dataset === 'risk' && /\|\s*risk\b/.test(actualQuery)) {
+      return 'Risk rules query accumulated risk — they cannot contain a `| risk` command (it would feed the rule\'s own input). Remove the `| risk` pipe.';
+    }
     if (metadata.lookback) {
       const m = parseLookbackToMinutes(metadata.lookback);
       if (m !== null && m > MAX_LOOKBACK_MINUTES) {
@@ -524,10 +534,19 @@ export function RuleEditorRedesign() {
       detection_mode: detectionMode as 'scheduled' | 'real-time',
       schedule_cron: schedule || undefined,
       lookback_minutes: lookbackMinutes || undefined,
-      // NAN-1561: only send a dataset when it's a non-logs OTLP dataset; logs
-      // rules stay byte-identical (server treats undefined/'logs' the same).
-      dataset:
-        metadata.dataset && metadata.dataset !== 'logs' ? metadata.dataset : undefined,
+      // NAN-1561/NAN-1825: send the dataset explicitly whenever the YAML sets
+      // one — including 'logs'. Updates are patch-based server-side
+      // (COALESCE keeps the stored value when omitted), so omitting 'logs'
+      // made it impossible to flip a spans/metrics/risk rule back to logs.
+      // Rules whose YAML has no dataset key keep omitting it (unchanged).
+      dataset: metadata.dataset || undefined,
+      // NAN-1825: mirror the backend feedback-loop guard (NAN-1805). A
+      // dataset=risk rule's findings feed the risk dataset itself, so it must
+      // not contribute risk: the server requires risk_score EXPLICITLY 0
+      // (omitted falls back to a severity-derived nonzero default) and empty
+      // risk_modifiers on the effective post-patch rule. Non-risk rules keep
+      // omitting both so existing rule-level values are untouched.
+      ...(metadata.dataset === 'risk' ? { risk_score: 0, risk_modifiers: [] } : {}),
       narrative: metadata.narrative || undefined,
       author: metadata.author || undefined,
       tags,

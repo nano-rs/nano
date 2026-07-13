@@ -47,6 +47,9 @@ async fn loopback_target_blocked_without_opt_in() {
             secret: None,
             severity_filter: None,
             event_types: Some(vec!["siem_alert".to_string()]),
+            channel_type: None,
+            channel_config: None,
+            rule_filter: None,
             enabled: Some(true),
         })
         .await

@@ -43,6 +43,13 @@ impl WebhookRepository {
         Self { pool, encryption }
     }
 
+    /// The PG pool backing this repository. Lets `WebhookService::new` self-build
+    /// a `SourceScopeResolver` so restricted-source redaction is active at every
+    /// construction site without per-site wiring (NAN-1800).
+    pub fn pool(&self) -> PgPool {
+        self.pool.clone()
+    }
+
     // ========================================================================
     // Webhook CRUD
     // ========================================================================
@@ -52,7 +59,8 @@ impl WebhookRepository {
         let webhooks = sqlx::query_as::<_, Webhook>(
             r#"
             SELECT id, name, url, headers_encrypted, secret_encrypted,
-                   severity_filter, event_types, enabled, created_at, updated_at
+                   severity_filter, event_types, channel_type, channel_config,
+                   rule_filter, enabled, created_at, updated_at
             FROM webhooks
             ORDER BY name
             "#,
@@ -68,7 +76,8 @@ impl WebhookRepository {
         let webhooks = sqlx::query_as::<_, Webhook>(
             r#"
             SELECT id, name, url, headers_encrypted, secret_encrypted,
-                   severity_filter, event_types, enabled, created_at, updated_at
+                   severity_filter, event_types, channel_type, channel_config,
+                   rule_filter, enabled, created_at, updated_at
             FROM webhooks
             WHERE enabled = true
             ORDER BY name
@@ -85,7 +94,8 @@ impl WebhookRepository {
         sqlx::query_as::<_, Webhook>(
             r#"
             SELECT id, name, url, headers_encrypted, secret_encrypted,
-                   severity_filter, event_types, enabled, created_at, updated_at
+                   severity_filter, event_types, channel_type, channel_config,
+                   rule_filter, enabled, created_at, updated_at
             FROM webhooks
             WHERE id = $1
             "#,
@@ -129,12 +139,26 @@ impl WebhookRepository {
             .clone()
             .unwrap_or_else(default_event_types);
 
+        // Channel type / config / rule filter (NAN-1790). Omitted → generic / {}.
+        let channel_type = request
+            .channel_type
+            .clone()
+            .unwrap_or_else(|| "generic".to_string());
+        let channel_config = request
+            .channel_config
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let rule_filter = request
+            .decoded_rule_filter()
+            .map_err(WebhookRepositoryError::SerializationError)?;
+
         let webhook = sqlx::query_as::<_, Webhook>(
             r#"
-            INSERT INTO webhooks (name, url, headers_encrypted, secret_encrypted, severity_filter, event_types, enabled)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO webhooks (name, url, headers_encrypted, secret_encrypted, severity_filter, event_types, channel_type, channel_config, rule_filter, enabled)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING id, name, url, headers_encrypted, secret_encrypted,
-                      severity_filter, event_types, enabled, created_at, updated_at
+                      severity_filter, event_types, channel_type, channel_config,
+                      rule_filter, enabled, created_at, updated_at
             "#
         )
         .bind(&request.name)
@@ -143,6 +167,9 @@ impl WebhookRepository {
         .bind(secret_encrypted.as_deref())
         .bind(&request.severity_filter)
         .bind(&event_types)
+        .bind(&channel_type)
+        .bind(&channel_config)
+        .bind(rule_filter.as_deref())
         .bind(enabled)
         .fetch_one(&self.pool)
         .await?;
@@ -179,6 +206,17 @@ impl WebhookRepository {
             None // Don't update
         };
 
+        // Rule filter (NAN-1790): None = no change; Some([]) = clear to NULL;
+        // Some([ids]) = replace. Modeled with a should-update flag like secrets.
+        let rule_filter_decoded = request
+            .decoded_rule_filter()
+            .map_err(WebhookRepositoryError::SerializationError)?;
+        let rule_filter_should_update = rule_filter_decoded.is_some();
+        let rule_filter_value: Option<Vec<Uuid>> = match rule_filter_decoded {
+            Some(v) if v.is_empty() => None, // explicit clear
+            other => other,
+        };
+
         // Build dynamic update - use raw SQL to handle optional fields
         let webhook = sqlx::query_as::<_, Webhook>(
             r#"
@@ -190,10 +228,16 @@ impl WebhookRepository {
                 severity_filter = COALESCE($8, severity_filter),
                 enabled = COALESCE($9, enabled),
                 event_types = COALESCE($10, event_types),
+                -- Explicit casts: these params appear only inside COALESCE/CASE,
+                -- so pin their types rather than leaning on PG inference.
+                channel_type = COALESCE($11::text, channel_type),
+                channel_config = COALESCE($12::jsonb, channel_config),
+                rule_filter = CASE WHEN $13 THEN $14::uuid[] ELSE rule_filter END,
                 updated_at = NOW()
             WHERE id = $1
             RETURNING id, name, url, headers_encrypted, secret_encrypted,
-                      severity_filter, event_types, enabled, created_at, updated_at
+                      severity_filter, event_types, channel_type, channel_config,
+                      rule_filter, enabled, created_at, updated_at
             "#,
         )
         .bind(id)
@@ -206,6 +250,10 @@ impl WebhookRepository {
         .bind(&request.severity_filter)
         .bind(request.enabled)
         .bind(&request.event_types) // $10: replace subscription set (None = no change)
+        .bind(&request.channel_type) // $11: channel type (None = no change)
+        .bind(&request.channel_config) // $12: provider config (None = no change)
+        .bind(rule_filter_should_update) // $13: should update rule filter?
+        .bind(rule_filter_value.as_deref()) // $14: new rule filter (NULL = clear)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(WebhookRepositoryError::NotFound(id))?;
@@ -224,6 +272,44 @@ impl WebhookRepository {
             return Err(WebhookRepositoryError::NotFound(id));
         }
 
+        Ok(())
+    }
+
+    // ========================================================================
+    // Notification settings (deep-link base URL) — NAN-1790
+    // ========================================================================
+
+    /// The admin-configured external base URL used to build notification deep
+    /// links, or `None` when unset (callers then fall back to the
+    /// `NANOSIEM_HOSTNAME` env var). Blank values are normalized to `None`.
+    #[instrument(skip(self))]
+    pub async fn notification_base_url(&self) -> Result<Option<String>, WebhookRepositoryError> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT notification_base_url FROM system_settings WHERE id = 'default'")
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row
+            .and_then(|(v,)| v)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()))
+    }
+
+    /// Set (or clear, with `None`/blank) the notification deep-link base URL.
+    #[instrument(skip(self))]
+    pub async fn set_notification_base_url(
+        &self,
+        base_url: Option<&str>,
+    ) -> Result<(), WebhookRepositoryError> {
+        let normalized = base_url
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim_end_matches('/').to_string());
+        sqlx::query(
+            "UPDATE system_settings SET notification_base_url = $1, updated_at = NOW() WHERE id = 'default'",
+        )
+        .bind(normalized)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

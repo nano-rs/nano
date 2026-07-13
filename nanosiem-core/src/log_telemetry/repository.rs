@@ -9,8 +9,10 @@
 
 use chrono::{DateTime, Utc};
 use clickhouse::Client as ClickHouseClient;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use tracing::warn;
+
+use crate::search::service::source_scope_sql_predicate;
 
 use super::types::{BucketSize, HourlyPoint, SourceTypeStats};
 use crate::db::TableNames;
@@ -45,14 +47,22 @@ impl LogTelemetryRepository {
     ///
     /// The returned map may be partial — source_types with no rollup rows in
     /// the window simply don't appear (caller treats them as zero).
+    ///
+    /// NAN-1801 (P3 side-doors): `deny_set` is the caller's effective
+    /// per-source deny set ([`crate::auth::ScopeSet`] semantics — compose it
+    /// via `AuthContext::effective_source_deny_set()` in handlers). Denied
+    /// source_types are excluded at the SQL layer so a scoped viewer cannot
+    /// recover volume / last-seen for a source they cannot search. An empty
+    /// set emits byte-identical SQL to the pre-scoping form.
     pub async fn stats_by_source_type(
         &self,
         source_types: &[String],
         window_hours: i64,
+        deny_set: &BTreeSet<String>,
     ) -> Result<HashMap<String, SourceTypeStats>, RepoError> {
         let table = self.table_names.read(ROLLUP_TABLE);
         let safe = sanitize_source_types(source_types);
-        let Some(sql) = build_stats_sql(&table, &safe, window_hours) else {
+        let Some(sql) = build_stats_sql(&table, &safe, window_hours, deny_set) else {
             // Empty input or every entry rejected — nothing to ask about.
             return Ok(HashMap::new());
         };
@@ -77,15 +87,19 @@ impl LogTelemetryRepository {
     /// Returns per-(source_type, bucket) event counts for the ingestion
     /// history area chart. `bucket` is rounded server-side; the rollup's
     /// native 5-minute granularity is the smallest available bucket.
+    ///
+    /// NAN-1801: `deny_set` — see [`Self::stats_by_source_type`]. Empty set
+    /// emits byte-identical SQL.
     pub async fn buckets(
         &self,
         source_types: &[String],
         window_hours: i64,
         bucket: BucketSize,
+        deny_set: &BTreeSet<String>,
     ) -> Result<Vec<HourlyPoint>, RepoError> {
         let table = self.table_names.read(ROLLUP_TABLE);
         let safe = sanitize_source_types(source_types);
-        let Some(sql) = build_buckets_sql(&table, &safe, window_hours, bucket) else {
+        let Some(sql) = build_buckets_sql(&table, &safe, window_hours, bucket, deny_set) else {
             return Ok(Vec::new());
         };
         let rows = run_jsoneachrow(&self.client, &sql).await?;
@@ -157,10 +171,15 @@ pub fn sanitize_source_types(source_types: &[String]) -> Vec<String> {
 
 /// SQL for `stats_by_source_type`. Returns `None` when the safe input is
 /// empty so the caller can skip the round-trip.
+///
+/// NAN-1801: per-source builder — `deny_set` appends the shared
+/// `lower(source_type) NOT IN (...)` scope predicate (see
+/// [`source_scope_sql_predicate`]). Empty deny set = byte-identical SQL.
 pub fn build_stats_sql(
     table: &str,
     safe_source_types: &[String],
     window_hours: i64,
+    deny_set: &BTreeSet<String>,
 ) -> Option<String> {
     if safe_source_types.is_empty() {
         return None;
@@ -170,6 +189,9 @@ pub fn build_stats_sql(
         .map(|s| format!("'{}'", s))
         .collect::<Vec<_>>()
         .join(", ");
+    let scope_and = source_scope_sql_predicate("source_type", deny_set)
+        .map(|pred| format!(" AND {pred}"))
+        .unwrap_or_default();
     Some(format!(
         "SELECT \
             source_type, \
@@ -179,7 +201,7 @@ pub fn build_stats_sql(
             min(first_event_at) AS first_event_at \
          FROM {table} \
          WHERE bucket_start >= now() - INTERVAL {window_hours} HOUR \
-           AND source_type IN ({in_clause}) \
+           AND source_type IN ({in_clause}){scope_and} \
          GROUP BY source_type"
     ))
 }
@@ -201,11 +223,15 @@ pub fn build_stats_all_sql(table: &str, window_hours: i64) -> String {
 }
 
 /// SQL for `buckets`. Server-side rebucketing via `bucket.group_expr()`.
+///
+/// NAN-1801: per-source builder — `deny_set` appends the shared scope
+/// predicate; empty deny set = byte-identical SQL.
 pub fn build_buckets_sql(
     table: &str,
     safe_source_types: &[String],
     window_hours: i64,
     bucket: BucketSize,
+    deny_set: &BTreeSet<String>,
 ) -> Option<String> {
     if safe_source_types.is_empty() {
         return None;
@@ -216,6 +242,9 @@ pub fn build_buckets_sql(
         .collect::<Vec<_>>()
         .join(", ");
     let group_expr = bucket.group_expr();
+    let scope_and = source_scope_sql_predicate("source_type", deny_set)
+        .map(|pred| format!(" AND {pred}"))
+        .unwrap_or_default();
     Some(format!(
         "SELECT \
             source_type, \
@@ -223,7 +252,7 @@ pub fn build_buckets_sql(
             sum(events) AS events \
          FROM {table} \
          WHERE bucket_start >= now() - INTERVAL {window_hours} HOUR \
-           AND source_type IN ({in_clause}) \
+           AND source_type IN ({in_clause}){scope_and} \
          GROUP BY source_type, bucket \
          ORDER BY bucket ASC"
     ))
@@ -427,15 +456,19 @@ mod tests {
         assert!(safe.contains(&"aws-cloudtrail".to_string()));
     }
 
+    fn no_deny() -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
     #[test]
     fn build_stats_sql_returns_none_for_empty_input() {
-        assert!(build_stats_sql("nanosiem.logs_per_source_5m", &[], 24).is_none());
+        assert!(build_stats_sql("nanosiem.logs_per_source_5m", &[], 24, &no_deny()).is_none());
     }
 
     #[test]
     fn build_stats_sql_partition_prunes_and_scopes_in_clause() {
         let safe = vec!["limacharlie_edr".to_string(), "aws-cloudtrail".to_string()];
-        let sql = build_stats_sql("nanosiem.logs_per_source_5m", &safe, 24).unwrap();
+        let sql = build_stats_sql("nanosiem.logs_per_source_5m", &safe, 24, &no_deny()).unwrap();
         assert!(
             sql.contains("WHERE bucket_start >= now() - INTERVAL 24 HOUR"),
             "must keep the 24h bound, got: {sql}"
@@ -453,7 +486,9 @@ mod tests {
     #[test]
     fn build_stats_sql_uses_provided_table_name() {
         let safe = vec!["foo".to_string()];
-        let sql = build_stats_sql("nanosiem.logs_per_source_5m_distributed", &safe, 1).unwrap();
+        let sql =
+            build_stats_sql("nanosiem.logs_per_source_5m_distributed", &safe, 1, &no_deny())
+                .unwrap();
         assert!(
             sql.contains("FROM nanosiem.logs_per_source_5m_distributed"),
             "got: {sql}"
@@ -471,8 +506,14 @@ mod tests {
     #[test]
     fn build_buckets_sql_groups_by_hour_when_requested() {
         let safe = vec!["limacharlie_edr".to_string()];
-        let sql =
-            build_buckets_sql("nanosiem.logs_per_source_5m", &safe, 24, BucketSize::Hour).unwrap();
+        let sql = build_buckets_sql(
+            "nanosiem.logs_per_source_5m",
+            &safe,
+            24,
+            BucketSize::Hour,
+            &no_deny(),
+        )
+        .unwrap();
         assert!(sql.contains("toStartOfHour(bucket_start) AS bucket"));
         assert!(sql.contains("ORDER BY bucket ASC"));
     }
@@ -485,6 +526,7 @@ mod tests {
             &safe,
             1,
             BucketSize::FiveMin,
+            &no_deny(),
         )
         .unwrap();
         // FiveMin selects the column directly — no re-bucket function.
@@ -494,9 +536,96 @@ mod tests {
 
     #[test]
     fn build_buckets_sql_returns_none_for_empty_input() {
+        assert!(build_buckets_sql(
+            "nanosiem.logs_per_source_5m",
+            &[],
+            1,
+            BucketSize::Hour,
+            &no_deny()
+        )
+        .is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // NAN-1801: per-source scope predicate threading
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn build_stats_sql_empty_deny_set_is_byte_identical() {
+        let safe = vec!["foo".to_string()];
+        let sql = build_stats_sql("nanosiem.logs_per_source_5m", &safe, 24, &no_deny()).unwrap();
+        assert!(!sql.contains("NOT IN"), "got: {sql}");
+        assert!(!sql.contains("!="), "got: {sql}");
+    }
+
+    #[test]
+    fn build_stats_sql_appends_scope_predicate_before_group_by() {
+        let safe = vec!["foo".to_string(), "audit".to_string()];
+        let deny: BTreeSet<String> = ["audit".to_string(), "LimaCharlie_EDR".to_string()]
+            .into_iter()
+            .collect();
+        let sql = build_stats_sql("nanosiem.logs_per_source_5m", &safe, 24, &deny).unwrap();
+        // BTreeSet order is lexicographic; predicate lowercases values.
         assert!(
-            build_buckets_sql("nanosiem.logs_per_source_5m", &[], 1, BucketSize::Hour).is_none()
+            sql.contains(
+                "AND lower(source_type) NOT IN ('limacharlie_edr', 'audit')"
+            ) || sql.contains("AND lower(source_type) NOT IN ('audit', 'limacharlie_edr')"),
+            "expected scope predicate, got: {sql}"
         );
+        let pred_pos = sql.find("NOT IN").unwrap();
+        let group_pos = sql.find("GROUP BY").unwrap();
+        assert!(pred_pos < group_pos, "predicate must precede GROUP BY: {sql}");
+    }
+
+    #[test]
+    fn build_stats_sql_single_denied_source_uses_inequality_form() {
+        let safe = vec!["foo".to_string()];
+        let deny: BTreeSet<String> = ["audit".to_string()].into_iter().collect();
+        let sql = build_stats_sql("nanosiem.logs_per_source_5m", &safe, 24, &deny).unwrap();
+        assert!(
+            sql.contains("AND lower(source_type) != 'audit'"),
+            "expected single-value inequality form, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn build_buckets_sql_appends_scope_predicate() {
+        let safe = vec!["foo".to_string()];
+        let deny: BTreeSet<String> = ["audit".to_string()].into_iter().collect();
+        let sql = build_buckets_sql(
+            "nanosiem.logs_per_source_5m",
+            &safe,
+            24,
+            BucketSize::Hour,
+            &deny,
+        )
+        .unwrap();
+        assert!(
+            sql.contains("AND lower(source_type) != 'audit'"),
+            "expected scope predicate, got: {sql}"
+        );
+        let empty = build_buckets_sql(
+            "nanosiem.logs_per_source_5m",
+            &safe,
+            24,
+            BucketSize::Hour,
+            &no_deny(),
+        )
+        .unwrap();
+        assert!(!empty.contains("!= 'audit'"), "got: {empty}");
+    }
+
+    #[test]
+    fn cluster_wide_builders_are_never_scope_predicated() {
+        // NAN-1801 guard: buckets_all / total_events / stats_all have no
+        // per-viewer deny parameter BY DESIGN — buckets_all and total_events
+        // have no source_type dimension (predicating them would silently
+        // shrink cluster-wide headline numbers per viewer), and stats_all's
+        // consumers are covered by their own scoping seams.
+        let a = build_buckets_all_sql("nanosiem.logs_per_source_5m", 24, BucketSize::Hour);
+        let b = build_total_events_sql("nanosiem.logs_per_source_5m", 24);
+        assert!(!a.contains("NOT IN") && !a.contains("lower(source_type)"), "got: {a}");
+        assert!(!b.contains("NOT IN") && !b.contains("lower(source_type)"), "got: {b}");
     }
 
     #[test]

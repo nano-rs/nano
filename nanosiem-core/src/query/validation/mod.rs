@@ -43,5 +43,6 @@ pub use field_validation::{
     validate_query_fields_with_profile, FieldValidationError,
 };
 pub use query_checks::{
-    contains_aggregation, contains_join, is_aggregation_command, pre_aggregation_subquery,
+    contains_aggregation, contains_join, contains_risk_command, is_aggregation_command,
+    pre_aggregation_subquery,
 };

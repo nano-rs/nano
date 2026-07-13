@@ -122,6 +122,11 @@ async fn select1(client: &reqwest::Client, db: &str, expr: &str, where_clause: &
     exec(client, &sql).await.expect("select failed").trim().to_string()
 }
 
+/// Uppercase hex of the raw bytes — matches ClickHouse's `hex()` output.
+fn hex_upper(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
+}
+
 /// SHA-256 value from an OCSF `fingerprint[]` array (algorithm_id == 3), lowercased.
 fn sha256_of(hashes: &Value) -> String {
     hashes
@@ -256,6 +261,46 @@ async fn run_assertions(client: &reqwest::Client, db: &str) -> Result<(), String
                 ));
             }
         }
+    }
+
+    // --- raw_data: byte-exact round-trip of the producer's original (NAN-1827) ---
+    // Before NAN-1827 there was no `raw_data` column, so a spec-conformant producer's
+    // original event was silently dropped at ingest — `raw_data` is a standard OCSF
+    // attribute, so a well-behaved producer does not put it in `unmapped` either, and
+    // NAN-1443 removed the `event` blob it was once assumed to fall back to. Nothing
+    // in this suite would have caught that: every assertion above proves a promoted
+    // column POPULATES, none prove nothing was LOST.
+    //
+    // Compared as hex, not text: the auth fixture's raw_data is a syslog-framed
+    // Windows 4624 carrying tabs and CRLFs, which FORMAT TSV escapes on the way out
+    // — a text compare would happily pass on a mangled value. hex() proves the bytes
+    // survive JSON -> JSONExtractString -> String column intact, which is the whole
+    // point of a compliance-grade original.
+    for (name, raw) in fixtures {
+        let ev: Value = serde_json::from_str(raw).unwrap();
+        let type_uid = ev["type_uid"].as_u64().unwrap();
+        // Absent in 5 of 6 fixtures — JSONExtractString on a missing key yields ''.
+        // That empty case is load-bearing too: it is what a Vector-lane tenant stores.
+        let want_hex = hex_upper(ev["raw_data"].as_str().unwrap_or("").as_bytes());
+        let got_hex = select1(client, db, "hex(`raw_data`)", &format!("type_uid = {type_uid}")).await;
+        if got_hex != want_hex {
+            return Err(format!(
+                "{name}: raw_data did not round-trip byte-exactly.\n  got: {got_hex}\n want: {want_hex}"
+            ));
+        }
+    }
+    // Pin the positive case. Without this, emptying raw_data from the auth fixture
+    // would silently turn the loop above into a vacuous ''=='' check on all six.
+    let auth_raw = serde_json::from_str::<Value>(FIX_AUTH).unwrap()["raw_data"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    if !auth_raw.contains("4624") || !auth_raw.contains('\t') || !auth_raw.contains("\r\n") {
+        return Err(
+            "the auth fixture must carry a raw_data original containing tabs and CRLFs, \
+             or the round-trip assertion above proves nothing"
+                .into(),
+        );
     }
 
     // --- Deep checks on the file fixture (arrays, dual-user, lowercasing, time) ---

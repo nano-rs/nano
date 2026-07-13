@@ -14,6 +14,7 @@
   "status_detail": "LOGON_SUCCESS",
   "time": 1749081600123,
   "message": "Successful interactive Kerberos logon for ACME\\\\jsmith on DC01 from 10.20.30.40",
+  "raw_data": "<13>1 2026-06-05T00:00:00.123Z dc01.acme.local Microsoft-Windows-Security-Auditing 4624 - - An account was successfully logged on.\r\n\r\nSubject:\r\n\tSecurity ID:\t\tS-1-5-18\r\n\tAccount Name:\t\tDC01$\r\n\tAccount Domain:\t\tACME\r\n\tLogon ID:\t\t0x3E7\r\n\r\nLogon Type:\t\t\t2\r\n\r\nNew Logon:\r\n\tSecurity ID:\t\tS-1-5-21-1004336348-1177238915-682003330-1052\r\n\tAccount Name:\t\tjsmith\r\n\tAccount Domain:\t\tACME\r\n\tLogon ID:\t\t0x3E7A91C4\r\n\r\nNetwork Information:\r\n\tWorkstation Name:\tws-jsmith-01\r\n\tSource Network Address:\t10.20.30.40\r\n\tSource Port:\t\t49213\r\n\r\nDetailed Authentication Information:\r\n\tLogon Process:\t\tKerberos\r\n\tAuthentication Package:\tKerberos\r\n\tPackage Name (NTLM only):\t-",
   "metadata": {
     "version": "1.8.0",
     "product": {

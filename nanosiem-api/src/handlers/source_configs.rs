@@ -38,7 +38,7 @@ use nanosiem_core::source_configs::{
 };
 use nanosiem_core::typeid::TypeIdParam;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
@@ -124,7 +124,13 @@ pub async fn list_source_configs(
     //
     // Best-effort: ClickHouse unavailable or any underlying error leaves the
     // telemetry fields as `None` (graceful degradation per CLAUDE.md).
-    if let Err(e) = enrich_list_with_rollup(&state, &mut configs, want_telemetry).await {
+    //
+    // NAN-1801 (P3 side-doors): the rollup read is scoped by the viewer's
+    // effective per-source deny set — a viewer denied a source (or lacking
+    // `audit:view`) sees that source's contribution as 0 instead of its true
+    // volume/last-seen. Unrestricted viewers get byte-identical SQL.
+    let deny_set = auth.effective_source_deny_set();
+    if let Err(e) = enrich_list_with_rollup(&state, &mut configs, want_telemetry, &deny_set).await {
         tracing::warn!(
             error = %e,
             "Failed to enrich source configurations from rollup; returning without telemetry"
@@ -182,6 +188,7 @@ async fn enrich_list_with_rollup(
     state: &AppState,
     configs: &mut [SourceConfiguration],
     include_bytes_and_last_event: bool,
+    deny_set: &BTreeSet<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if configs.is_empty() {
         return Ok(());
@@ -200,7 +207,7 @@ async fn enrich_list_with_rollup(
 
     let stats = state
         .log_telemetry_service
-        .stats_by_source_type(&union, 24)
+        .stats_by_source_type(&union, 24, deny_set)
         .await?;
 
     for cfg in configs.iter_mut() {
@@ -261,6 +268,7 @@ async fn enrich_list_with_rollup(
 async fn enrich_full_with_rollup(
     state: &AppState,
     full: &mut SourceConfigurationWithRules,
+    deny_set: &BTreeSet<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let source_types = collect_target_source_types(&full.routing_rules);
     if source_types.is_empty() {
@@ -269,7 +277,7 @@ async fn enrich_full_with_rollup(
 
     let stats = state
         .log_telemetry_service
-        .stats_by_source_type(&source_types, 24)
+        .stats_by_source_type(&source_types, 24, deny_set)
         .await?;
 
     // Config-level: events + bytes + last_event_at across distinct
@@ -387,7 +395,11 @@ pub async fn get_source_config_with_rules(
     // bytes_per_day_24h / last_event_at on the config + fires_24h /
     // last_fired_at on each routing rule. Single rollup read populates
     // everything (NAN-733). Best-effort: failure leaves the fields as None.
-    if let Err(e) = enrich_full_with_rollup(&state, &mut config).await {
+    //
+    // NAN-1801: rollup read scoped by the viewer's effective per-source deny
+    // set (see list_source_configs). Denied sources contribute 0 / None.
+    let deny_set = auth.effective_source_deny_set();
+    if let Err(e) = enrich_full_with_rollup(&state, &mut config, &deny_set).await {
         tracing::warn!(
             source_config_id = %config.config.id,
             error = %e,

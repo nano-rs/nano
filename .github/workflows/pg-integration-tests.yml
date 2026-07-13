@@ -110,6 +110,7 @@ jobs:
             "$RUST_IMAGE" \
             bash -euo pipefail -c '
               cargo test -p nanosiem-core --test api_key_rate_limit_integration -- --ignored
+              cargo test -p nanosiem-core --test source_scope_integration -- --ignored
               cargo test -p nanosiem-enterprise --test settings_integration -- --ignored
               cargo test -p nanosiem-enterprise --test case_stats_visibility_integration -- --ignored --test-threads=1
             '

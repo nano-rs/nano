@@ -10,6 +10,7 @@ import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
 import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { ScheduleReportDialog } from '@/components/reports/ScheduleReportDialog';
 import { DateTimeRangePicker } from '@/components/ui/date-time-range-picker';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { GridLayout, Panel, VisualizationRenderer, DashboardEditor, buildSearchUrl, VariableControls, DashboardShareDialog, ObsMetricWidget, metricSeriesToRows } from '@/components/dashboard';
@@ -159,6 +160,8 @@ export function DashboardView() {
 
   // Share dialog state
   const [shareDialogOpen, setShareDialogOpen] = useState(false);
+  // NAN-1793: schedule this dashboard as a recurring HTML report.
+  const [scheduleOpen, setScheduleOpen] = useState(false);
 
   const autoRefreshRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -905,6 +908,13 @@ export function DashboardView() {
               <Download className="w-[12px] h-[12px] mr-2" />
               Export as JSON
             </DropdownMenuItem>
+            <DropdownMenuItem
+              onClick={() => setScheduleOpen(true)}
+              className="text-[12px] cursor-pointer"
+            >
+              <Clock className="w-[12px] h-[12px] mr-2" />
+              Schedule report
+            </DropdownMenuItem>
             <DropdownMenuSeparator />
             <DropdownMenuItem
               onClick={handleEnterEditMode}
@@ -1072,6 +1082,18 @@ export function DashboardView() {
             title: 'Permissions updated',
             description: `Dashboard visibility set to ${result.dashboard.visibility}`,
           });
+        }}
+      />
+
+      {/* Schedule report (NAN-1793) — cron this dashboard into an HTML artifact */}
+      <ScheduleReportDialog
+        open={scheduleOpen}
+        onOpenChange={setScheduleOpen}
+        preset={{
+          source_type: 'dashboard',
+          source_dashboard_id: dashboard.id,
+          dashboard_name: dashboard.name,
+          defaultName: `${dashboard.name} report`,
         }}
       />
     </div>

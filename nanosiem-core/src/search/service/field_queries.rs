@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use super::lateral::source_scope_sql_predicate;
 use super::*;
+use crate::auth::ScopeSet;
 use crate::query::escape_identifier;
+use crate::search::query_processing::enforce_source_scope;
 use crate::sql_hygiene::escape_sql_string;
+use std::collections::BTreeSet;
 // `MATERIALIZED_COLUMNS` is only referenced by the unit tests below (the UDM
 // materialized set passed to `build_fetch_log_sql`); production callers pass the
 // active profile's columns. Scoped to test builds to avoid an unused-import warning.
@@ -33,6 +37,7 @@ impl SearchService {
         user_id: uuid::Uuid,
         priority: super::admission::QueryPriority,
         dataset: Option<&str>,
+        scope: &ScopeSet,
     ) -> Result<Vec<FieldInfo>, SearchError> {
         let derived_qid = request_id.map(|r| format!("{r}-fstats"));
 
@@ -46,6 +51,7 @@ impl SearchService {
                     requested_columns,
                     derived_qid.as_deref(),
                     dataset,
+                    scope,
                 )
                 .await;
         };
@@ -66,6 +72,7 @@ impl SearchService {
                 requested_columns,
                 derived_qid.as_deref(),
                 dataset,
+                scope,
             )
             .await
     }
@@ -91,6 +98,7 @@ impl SearchService {
         requested_columns: Option<&[String]>,
         query_id: Option<&str>,
         dataset: Option<&str>,
+        scope: &ScopeSet,
     ) -> Result<Vec<FieldInfo>, SearchError> {
         // Only supported for ClickHouse backend
         if self.backend != SearchBackend::ClickHouse {
@@ -103,8 +111,14 @@ impl SearchService {
             ))
         })?;
 
+        // NAN-1799: inject the caller's source-scope exclusion before the
+        // parse — the companion aggregates over the base search's WHERE, so
+        // an ungated text here would leak denied sources' values into the
+        // field panel. Empty deny-set → text unchanged.
+        let query = enforce_source_scope(query, scope.deny_set())?;
+
         // Parse and validate the query
-        let parsed_query = parse_query(query).map_err(|e| convert_parse_error(e))?;
+        let parsed_query = parse_query(&query).map_err(|e| convert_parse_error(e))?;
 
         // Extract just the base search expression (strip pipeline commands)
         let base_query = extract_base_search(&parsed_query);
@@ -117,7 +131,8 @@ impl SearchService {
         // generated against `logs` and the companion enumerated UDM columns,
         // producing ClickHouse 47 `Unknown expression identifier`. Logs unchanged.
         let base_sql = self
-            .dataset_generator(dataset)
+            .dataset_generator(dataset, &query)
+            .await
             .generate(&base_query, &tr)
             .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
 
@@ -127,23 +142,36 @@ impl SearchService {
         // `otel_spans` / `otel_metrics`) — never the `_distributed` read alias
         // (NAN-1241/NAN-1559).
         let profile = self.dataset_profile(dataset);
-        let logs_table = crate::schema::logs_table_for(profile.id());
-        // Get column list dynamically. The profile's materialized re-add list
-        // scopes the inventory to columns resolvable inside a CTE wrap and
-        // keeps internal bookkeeping (e.g. OCSF `event_bytes`) out of the
-        // analyst-facing field panel (NAN-1397).
-        let columns = ch_executor
-            .get_table_columns(logs_table, profile.materialized_columns())
-            .await
-            .unwrap_or_else(|e| {
-            // NAN-1559: dataset-correct fallback — a UDM list here over an
-            // `otel_spans`/`otel_metrics` base would re-trigger CH 47.
-            warn!(
-                "Failed to get table columns for field stats, using dataset defaults: {}",
-                e
-            );
+        // NAN-1798 P2: the risk dataset's base is a DERIVED subquery — there is
+        // no physical table to introspect, and enumerating the underlying
+        // `logs` inventory would wrap UDM columns around the 15-column entity
+        // grain (guaranteed CH 47 per column). Its column universe IS the
+        // derived projection.
+        let columns = if profile.id() == crate::schema::SchemaId::Risk {
             Self::field_stats_fallback_columns(dataset)
-        });
+        } else {
+            // Enumerate the columns of the per-query DATASET's table, not a
+            // hardcoded `logs`. `system.columns` reflects the underlying local
+            // MergeTree, so pass the bare local table name (UDM `logs` / OCSF
+            // `ocsf_logs` / `otel_spans` / `otel_metrics`) — never the
+            // `_distributed` read alias (NAN-1241/NAN-1559). The profile's
+            // materialized re-add list scopes the inventory to columns
+            // resolvable inside a CTE wrap and keeps internal bookkeeping
+            // (e.g. OCSF `event_bytes`) out of the field panel (NAN-1397).
+            let logs_table = crate::schema::logs_table_for(profile.id());
+            ch_executor
+                .get_table_columns(logs_table, profile.materialized_columns())
+                .await
+                .unwrap_or_else(|e| {
+                    // NAN-1559: dataset-correct fallback — a UDM list here over an
+                    // `otel_spans`/`otel_metrics` base would re-trigger CH 47.
+                    warn!(
+                        "Failed to get table columns for field stats, using dataset defaults: {}",
+                        e
+                    );
+                    Self::field_stats_fallback_columns(dataset)
+                })
+        };
 
         // NAN-1427: reduce the column set to what the caller requested
         // (intersected with the live inventory). Falls back to the full
@@ -217,7 +245,7 @@ impl SearchService {
 
     /// Get top values for a single field (on-demand, Kibana-style).
     /// This is much more efficient than querying all fields at once.
-    #[instrument(skip(self), fields(field = %field, query = %query))]
+    #[instrument(skip(self, scope), fields(field = %field, query = %query))]
     pub async fn get_field_values(
         &self,
         field: &str,
@@ -225,6 +253,7 @@ impl SearchService {
         time_range: &TimeRangeInput,
         limit: usize,
         dataset: Option<&str>,
+        scope: &ScopeSet,
     ) -> Result<Vec<FieldValueInfo>, SearchError> {
         // Only supported for ClickHouse backend
         if self.backend != SearchBackend::ClickHouse {
@@ -237,8 +266,12 @@ impl SearchService {
             ))
         })?;
 
+        // NAN-1799: gate the drill-in the same way as the search it belongs
+        // to — inject the scope exclusion into the text before the parse.
+        let query = enforce_source_scope(query, scope.deny_set())?;
+
         // Parse and validate the query
-        let parsed_query = parse_query(query).map_err(|e| convert_parse_error(e))?;
+        let parsed_query = parse_query(&query).map_err(|e| convert_parse_error(e))?;
 
         // Extract just the base search expression, stripping ALL pipeline commands.
         // Stats/table/fields/eval all restrict or reshape columns, making field-values
@@ -253,7 +286,7 @@ impl SearchService {
         // against the dataset profile (e.g. spans `attributes['k']` MapKey), so a
         // sidebar field drill-in on a spans/metrics search reads the right table
         // and column. Logs unchanged.
-        let generator = self.dataset_generator(dataset);
+        let generator = self.dataset_generator(dataset, &query).await;
 
         // Generate base SQL for the query
         let base_sql = generator
@@ -290,8 +323,12 @@ impl SearchService {
     /// Used for table_view mode where initial results are fetched with minimal columns,
     /// and full row data is fetched on demand when user expands a row.
     ///
-    /// When `exclude_audit` is true, audit-source rows are filtered at the SQL layer so
-    /// callers without `audit:view` cannot retrieve them by direct id lookup (NAN-694).
+    /// `scope` (NAN-1799, replaces the old `exclude_audit: bool`): every
+    /// source_type in the caller's deny-set is filtered at the SQL layer so a
+    /// scoped caller cannot retrieve a denied row by direct id lookup. The
+    /// handler unions `audit` into the deny-set for callers without
+    /// `audit:view`, preserving the NAN-694 behavior byte-identically
+    /// (`lower(source_type) != 'audit'`).
     ///
     /// NAN-1032: callers should pass `source_type` whenever known so the query can
     /// use the `(source_type, timestamp, ...)` PK index for a tight range read.
@@ -300,13 +337,13 @@ impl SearchService {
     /// Skips the parallel `count(*)` companion that `execute_clickhouse_sql` adds:
     /// the response carries no count, the count is bounded to {0,1} by `id` + LIMIT 1,
     /// and on S3 it doubles the I/O.
-    #[instrument(skip(self))]
+    #[instrument(skip(self, scope))]
     pub async fn fetch_log_by_id(
         &self,
         id: &str,
         time_range: Option<&TimeRangeInput>,
         source_type: Option<&str>,
-        exclude_audit: bool,
+        scope: &ScopeSet,
     ) -> Result<Option<serde_json::Value>, SearchError> {
         // Profile-aware (NAN-1241): resolve the active schema's logs table
         // (`ocsf_logs` under OCSF) and re-add that profile's materialized columns,
@@ -331,7 +368,7 @@ impl SearchService {
             id,
             time_range,
             source_type,
-            exclude_audit,
+            scope.deny_set(),
             &mat_cols,
         );
 
@@ -352,10 +389,14 @@ impl SearchService {
 
     /// Query logs by a specific UDM field value
     /// This searches across all log sources that have the field mapped
-    #[instrument(skip(self))]
+    ///
+    /// NAN-1799: the hand-built SQL ANDs the caller's source-scope deny-set
+    /// into the WHERE (see `build_udm_field_query`).
+    #[instrument(skip(self, scope))]
     pub async fn query_udm_field(
         &self,
         request: UdmFieldQueryRequest,
+        scope: &ScopeSet,
     ) -> Result<SearchResponse, SearchError> {
         let start_time = Instant::now();
 
@@ -363,7 +404,7 @@ impl SearchService {
         request.time_range.validate()?;
 
         // Build the SQL query for the UDM field
-        let sql = self.build_udm_field_query(&request)?;
+        let sql = self.build_udm_field_query(&request, scope.deny_set())?;
 
         debug!("Generated UDM field query SQL: {}", sql);
 
@@ -387,14 +428,23 @@ impl SearchService {
         // Generate histogram for UDM field query.
         // NAN-1429: degrade to histogram:null on failure instead of failing
         // the whole query (matches the piped-query path's behavior).
-        let histogram = match self
-            .generate_histogram_for_time_range(&request.time_range)
-            .await
-        {
-            Ok(h) => Some(h),
-            Err(e) => {
-                tracing::warn!("UDM field query histogram failed: {}", e);
-                None
+        //
+        // NAN-1799: `generate_histogram_for_time_range` counts EVERY source in
+        // the window (no per-source filter), so for a scoped caller it would
+        // leak denied sources' event volumes into the timeline. Fail closed to
+        // no histogram for restricted callers; unrestricted behavior unchanged.
+        let histogram = if scope.is_restricted() {
+            None
+        } else {
+            match self
+                .generate_histogram_for_time_range(&request.time_range)
+                .await
+            {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    tracing::warn!("UDM field query histogram failed: {}", e);
+                    None
+                }
             }
         };
 
@@ -430,10 +480,15 @@ impl SearchService {
     /// that then expanded empty ("Values loaded on demand", no entries).
     /// Fallbacks: time-only when no query (historical window), `now()-3h` when
     /// neither (the context-free syntax-highlighter path).
+    /// `scope` (NAN-1799): the deny-set exclusion is ANDed into EVERY branch of
+    /// the scan predicate below — including the time-only and `now()-3h`
+    /// fallbacks, which previously applied NO source gate at all, leaking
+    /// audit/denied sources' ext keys to any caller.
     pub async fn get_ext_field_names(
         &self,
         query: Option<&str>,
         time_range: Option<&TimeRangeInput>,
+        scope: &ScopeSet,
     ) -> Result<Vec<String>, SearchError> {
         if self.backend != SearchBackend::ClickHouse {
             return Ok(Vec::new());
@@ -495,23 +550,50 @@ impl SearchService {
             _ => "timestamp >= now() - INTERVAL 3 HOUR".to_string(),
         };
 
+        // NAN-1799: append the caller's source-scope exclusion to whichever
+        // branch built the predicate (query-scoped, time-only, or the 3h
+        // fallback). Empty deny-set → predicate unchanged (byte-identical).
+        let where_predicate =
+            match source_scope_sql_predicate("source_type", scope.deny_set()) {
+                Some(pred) => format!("{where_predicate} AND {pred}"),
+                None => where_predicate,
+            };
+
         ch_executor
             .get_ext_field_names(&table, json_col, is_ocsf, &where_predicate)
             .await
     }
 
     /// Get top values for a specific UDM field
-    #[instrument(skip(self))]
+    ///
+    /// NAN-1799: previously applied NO source gate. The caller's deny-set is
+    /// now bound as a `text[]` parameter (`<> ALL($4)`) — parameterized, so no
+    /// literal-escaping concerns on the PostgreSQL path.
+    #[instrument(skip(self, scope))]
     pub async fn get_udm_field_values(
         &self,
         field: UdmField,
         time_range: &TimeRangeInput,
         limit: Option<usize>,
+        scope: &ScopeSet,
     ) -> Result<Vec<(String, u64)>, SearchError> {
         time_range.validate()?;
 
         let column = field.column_name();
         let limit = limit.unwrap_or(self.config.top_values_count);
+
+        // Values are lowercased once here; the predicate compares
+        // lower(source_type) so the gate is case-safe.
+        let denied: Vec<String> = scope
+            .deny_set()
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
+        let scope_clause = if denied.is_empty() {
+            ""
+        } else {
+            "AND lower(source_type) <> ALL($4)"
+        };
 
         // Use PostgreSQL for this query
         let sql = format!(
@@ -520,19 +602,22 @@ impl SearchService {
             FROM logs
             WHERE timestamp BETWEEN $1 AND $2
               AND "{}" IS NOT NULL
+              {}
             GROUP BY "{}"
             ORDER BY count DESC
             LIMIT $3
             "#,
-            column, column, column
+            column, column, scope_clause, column
         );
 
-        let rows = sqlx::query(&sql)
+        let mut query = sqlx::query(&sql)
             .bind(time_range.start)
             .bind(time_range.end)
-            .bind(limit as i64)
-            .fetch_all(&self.pg_pool)
-            .await?;
+            .bind(limit as i64);
+        if !denied.is_empty() {
+            query = query.bind(denied);
+        }
+        let rows = query.fetch_all(&self.pg_pool).await?;
 
         let values: Vec<(String, u64)> = rows
             .iter()
@@ -572,7 +657,14 @@ impl SearchService {
     }
 
     /// Build SQL query for UDM field search
-    fn build_udm_field_query(&self, request: &UdmFieldQueryRequest) -> Result<String, SearchError> {
+    ///
+    /// `deny_set` (NAN-1799): the caller's source-scope deny-set, ANDed into
+    /// the WHERE. Empty set emits nothing (byte-identical to the old SQL).
+    fn build_udm_field_query(
+        &self,
+        request: &UdmFieldQueryRequest,
+        deny_set: &BTreeSet<String>,
+    ) -> Result<String, SearchError> {
         let column = request.field.column_name();
 
         // Build the WHERE clause based on the operator
@@ -626,16 +718,23 @@ impl SearchService {
             }
         };
 
+        // NAN-1799: the caller's source-scope exclusion. Empty → "" (SQL
+        // byte-identical to the pre-scoping form).
+        let scope_clause = source_scope_sql_predicate("source_type", deny_set)
+            .map(|pred| format!("\n              AND {pred}"))
+            .unwrap_or_default();
+
         let sql = format!(
             r#"
             SELECT * FROM logs
             WHERE timestamp BETWEEN '{}' AND '{}'
-              AND {}
+              AND {}{}
             ORDER BY timestamp DESC
             "#,
             crate::sql_hygiene::format_ch_bound_micros(&request.time_range.start),
             crate::sql_hygiene::format_ch_bound_micros(&request.time_range.end),
-            value_clause
+            value_clause,
+            scope_clause
         );
 
         Ok(sql)
@@ -683,6 +782,11 @@ fn select_field_stats_columns(
 /// Extracted into a free function so the audit-exclusion behavior is unit-testable
 /// without a live ClickHouse/Postgres backend (NAN-694).
 ///
+/// `deny_set` (NAN-1799, replaces the old `exclude_audit: bool`): the caller's
+/// full source-scope deny-set, rendered via [`source_scope_sql_predicate`].
+/// A `{"audit"}` set emits the legacy ` AND lower(source_type) != 'audit'`
+/// byte-identically; an empty set emits nothing.
+///
 /// When `source_type` is provided it is added to the WHERE clause so the
 /// `(source_type, timestamp, ...)` PK index can do a tight range read instead
 /// of scanning every source_type's marks within the timestamp window (NAN-1032).
@@ -691,15 +795,13 @@ fn build_fetch_log_sql(
     id: &str,
     time_range: Option<&TimeRangeInput>,
     source_type: Option<&str>,
-    exclude_audit: bool,
+    deny_set: &BTreeSet<String>,
     materialized_cols: &[&str],
 ) -> String {
     let escaped_id = escape_sql_string(id);
-    let audit_filter = if exclude_audit {
-        " AND lower(source_type) != 'audit'"
-    } else {
-        ""
-    };
+    let audit_filter = source_scope_sql_predicate("source_type", deny_set)
+        .map(|pred| format!(" AND {pred}"))
+        .unwrap_or_default();
     let source_type_filter = source_type
         .map(|st| format!(" AND source_type = '{}'", escape_sql_string(st)))
         .unwrap_or_default();
@@ -751,6 +853,17 @@ mod tests {
         cols.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Unrestricted caller — no source gate (the old `exclude_audit: false`).
+    fn no_scope() -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
+    /// The handler-composed deny-set for a caller without `audit:view`
+    /// (the old `exclude_audit: true`).
+    fn audit_scope() -> BTreeSet<String> {
+        std::iter::once("audit".to_string()).collect()
+    }
+
     /// NAN-1427: requested-columns reduction — exact-match intersection with
     /// the live inventory, inventory order preserved.
     #[test]
@@ -798,7 +911,7 @@ mod tests {
 
     #[test]
     fn fetch_log_sql_without_audit_exclusion_omits_source_type_filter() {
-        let sql = build_fetch_log_sql("logs", "abc-123", None, None, false, MATERIALIZED_COLUMNS);
+        let sql = build_fetch_log_sql("logs", "abc-123", None, None, &no_scope(), MATERIALIZED_COLUMNS);
         assert!(sql.starts_with("SELECT *, "), "must re-add materialized cols: {sql}");
         assert!(
             sql.ends_with("FROM logs WHERE id = 'abc-123' LIMIT 1"),
@@ -816,7 +929,7 @@ mod tests {
             r"C:\Users\admin",
             None,
             Some(r"win\evtx"),
-            false,
+            &no_scope(),
             MATERIALIZED_COLUMNS,
         );
         assert!(
@@ -833,7 +946,7 @@ mod tests {
     fn fetch_log_sql_reads_materialized_enrichment_columns() {
         // NAN-1147 regression: `SELECT *` excludes MATERIALIZED columns, so the
         // row-expand inspector showed no enrichment. The fetch must name them.
-        let sql = build_fetch_log_sql("logs", "abc-123", None, None, false, MATERIALIZED_COLUMNS);
+        let sql = build_fetch_log_sql("logs", "abc-123", None, None, &no_scope(), MATERIALIZED_COLUMNS);
         for col in [
             "user_identity_department",
             "enriched_src_country",
@@ -846,11 +959,30 @@ mod tests {
 
     #[test]
     fn fetch_log_sql_with_audit_exclusion_filters_audit_rows() {
-        let sql = build_fetch_log_sql("logs", "abc-123", None, None, true, MATERIALIZED_COLUMNS);
+        let sql = build_fetch_log_sql("logs", "abc-123", None, None, &audit_scope(), MATERIALIZED_COLUMNS);
         assert!(sql.starts_with("SELECT *, "), "must re-add materialized cols: {sql}");
         assert!(
             sql.ends_with(
                 "FROM logs WHERE id = 'abc-123' AND lower(source_type) != 'audit' LIMIT 1"
+            ),
+            "{sql}"
+        );
+    }
+
+    /// NAN-1799: a multi-source deny-set renders the negated IN form — a
+    /// scoped caller cannot retrieve a denied row by direct id lookup.
+    #[test]
+    fn fetch_log_sql_with_multi_source_deny_set_renders_not_in() {
+        let deny: BTreeSet<String> = ["audit", "windows_sysmon"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let sql =
+            build_fetch_log_sql("logs", "abc-123", None, None, &deny, MATERIALIZED_COLUMNS);
+        assert!(
+            sql.ends_with(
+                "FROM logs WHERE id = 'abc-123' AND lower(source_type) NOT IN \
+                 ('audit', 'windows_sysmon') LIMIT 1"
             ),
             "{sql}"
         );
@@ -862,7 +994,7 @@ mod tests {
             start: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
             end: Utc.with_ymd_and_hms(2026, 1, 2, 4, 5, 6).unwrap(),
         };
-        let sql = build_fetch_log_sql("logs", "abc-123", Some(&tr), None, true, MATERIALIZED_COLUMNS);
+        let sql = build_fetch_log_sql("logs", "abc-123", Some(&tr), None, &audit_scope(), MATERIALIZED_COLUMNS);
         assert!(
             sql.contains("AND lower(source_type) != 'audit'"),
             "audit exclusion missing: {sql}"
@@ -875,7 +1007,7 @@ mod tests {
 
     #[test]
     fn fetch_log_sql_escapes_single_quotes_in_id() {
-        let sql = build_fetch_log_sql("logs", "abc'; DROP--", None, None, true, MATERIALIZED_COLUMNS);
+        let sql = build_fetch_log_sql("logs", "abc'; DROP--", None, None, &audit_scope(), MATERIALIZED_COLUMNS);
         assert!(
             sql.contains("WHERE id = 'abc''; DROP--'"),
             "id quotes not escaped: {sql}"
@@ -890,7 +1022,7 @@ mod tests {
         // as tuple sub-column access. `WHERE id =` is unchanged — OCSF now has a
         // real `id` UUID column too.
         let ocsf_cols: &[&str] = &["src_endpoint.ip", "http_response.code", "class_uid"];
-        let sql = build_fetch_log_sql("ocsf_logs", "abc-123", None, None, false, ocsf_cols);
+        let sql = build_fetch_log_sql("ocsf_logs", "abc-123", None, None, &no_scope(), ocsf_cols);
         assert!(
             sql.contains("\"src_endpoint.ip\""),
             "dotted col must be quoted: {sql}"
@@ -911,7 +1043,7 @@ mod tests {
     fn fetch_log_sql_with_empty_materialized_cols_emits_bare_star() {
         // Defensive: a profile with no materialized columns must not produce the
         // dangling `SELECT *, ` (trailing comma → syntax error).
-        let sql = build_fetch_log_sql("logs", "abc-123", None, None, false, &[]);
+        let sql = build_fetch_log_sql("logs", "abc-123", None, None, &no_scope(), &[]);
         assert!(
             sql.starts_with("SELECT * FROM logs WHERE id = 'abc-123'"),
             "{sql}"
@@ -929,7 +1061,7 @@ mod tests {
             "abc-123",
             Some(&tr),
             Some("windows_sysmon"),
-            false,
+            &no_scope(),
             MATERIALIZED_COLUMNS,
         );
         // source_type goes immediately after the id predicate so the PK
@@ -947,7 +1079,7 @@ mod tests {
     #[test]
     fn fetch_log_sql_escapes_single_quotes_in_source_type() {
         let sql =
-            build_fetch_log_sql("logs", "abc-123", None, Some("evil'; DROP--"), false, MATERIALIZED_COLUMNS);
+            build_fetch_log_sql("logs", "abc-123", None, Some("evil'; DROP--"), &no_scope(), MATERIALIZED_COLUMNS);
         assert!(
             sql.contains("source_type = 'evil''; DROP--'"),
             "source_type quotes not escaped: {sql}"

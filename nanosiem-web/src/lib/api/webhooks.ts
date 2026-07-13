@@ -6,6 +6,8 @@ import type {
   UpdateWebhookRequest,
   WebhookDeliveryLog,
   WebhookTestResult,
+  NotificationConfig,
+  UpdateNotificationConfigRequest,
 } from './types';
 
 export class WebhooksApi {
@@ -52,5 +54,19 @@ export class WebhooksApi {
     if (limit) params.set('limit', String(limit));
     const query = params.toString();
     return this.request(`/api/settings/webhooks/${id}/deliveries${query ? `?${query}` : ''}`);
+  }
+
+  // Notification deep-link base URL config (NAN-1790).
+  async getNotificationConfig(): Promise<NotificationConfig> {
+    return this.request('/api/settings/notifications/config');
+  }
+
+  async updateNotificationConfig(
+    request: UpdateNotificationConfigRequest
+  ): Promise<NotificationConfig> {
+    return this.request('/api/settings/notifications/config', {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
   }
 }

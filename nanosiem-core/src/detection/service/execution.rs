@@ -10,7 +10,7 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::detection::query_enrichment::inject_timestamp_bounds;
 use crate::models::{Alert, AlertMode, DetectionRule, RuleMode};
-use crate::query::{parse_query, PrettyPrint};
+use crate::query::{parse_query, PrettyPrint, Query};
 use crate::search::{SearchExecutionLimits, SearchRequest, TimeRangeInput};
 
 use super::DetectionError;
@@ -129,10 +129,150 @@ impl DetectionService {
             |limits| self.search_service.clone().with_execution_limits(limits),
         );
         search_service
-            .search(request)
+            // SYSTEM caller: detection rules must match across ALL sources
+            // (including audit + per-source-restricted), so run unrestricted.
+            .search(request, &crate::auth::ScopeSet::unrestricted())
             .await
             .map(|r| r.results)
             .map_err(|e| DetectionError::SearchError(e.to_string()))
+    }
+
+    /// NAN-1800: derive the companion query that lists the DISTINCT
+    /// `source_type` values feeding a rule's BASE search over a window.
+    ///
+    /// Aggregate commands (stats/timechart/top/rare) collapse the raw stream,
+    /// so their output rows carry no per-event `source_type` and the alert
+    /// `source_types` stamp would come out empty — which the read side treats
+    /// as visible-to-everyone (fail-OPEN for scoped viewers). This companion
+    /// re-runs only the rule's innermost search expression piped into
+    /// `stats count by source_type`, yielding the window's distinct source
+    /// types. Dropping the intermediate commands is deliberately
+    /// OVER-inclusive (pre-aggregation filters could only narrow the set):
+    /// over-stamping hides the alert from more scoped viewers, never fewer —
+    /// the fail-closed direction.
+    fn source_type_companion_query(rule_query: &str) -> Option<String> {
+        let parsed = parse_query(rule_query).ok()?;
+        let mut node: &Query = &parsed;
+        loop {
+            match node {
+                Query::Piped { source, .. } => node = source,
+                Query::Search(expr) => {
+                    return Some(format!(
+                        "{} | stats count by source_type",
+                        expr.pretty_print()
+                    ));
+                }
+            }
+        }
+    }
+
+    /// NAN-1800: stamp aggregate result rows with the window's distinct
+    /// `source_type` values (`_nano_source_types`) so
+    /// `AlertRepository::create_alert` can derive a non-empty
+    /// `alerts.source_types` for aggregate rules.
+    ///
+    /// No-op when every row already carries a per-event `source_type`
+    /// (raw/grouped-raw and vendor pass-through rules — the common case, no
+    /// extra query). The `_nano_` prefix keeps the stamp out of every dedup
+    /// hash (both `compute_event_hash` and the matched-event overlap hash
+    /// strip `_nano_*`). Best-effort: a companion failure logs a warning and
+    /// leaves the stamp empty (back-compat visible) rather than dropping the
+    /// alert — losing a detection is worse than losing its scoping stamp.
+    async fn annotate_source_types_for_scoping(
+        &self,
+        rule: &DetectionRule,
+        results: &mut [serde_json::Value],
+        time_range: &TimeRangeInput,
+    ) {
+        let lacks_source_type = |event: &serde_json::Value| {
+            event
+                .get("source_type")
+                .and_then(|v| v.as_str())
+                .map_or(true, |s| s.trim().is_empty())
+        };
+        if !results.iter().any(lacks_source_type) {
+            return;
+        }
+
+        // Restricted registry = the fail-closed authority. If nothing is
+        // restricted, any/empty stamp is harmless (scoping is a no-op). Shares
+        // the alert-write PG, so an error here would also fail the alert insert.
+        let restricted: std::collections::BTreeSet<String> = match sqlx::query_scalar::<_, String>(
+            "SELECT source_type FROM restricted_source_types",
+        )
+        .fetch_all(&self.pg_pool)
+        .await
+        {
+            Ok(rows) => rows.into_iter().map(|s| s.trim().to_lowercase()).collect(),
+            Err(e) => {
+                warn!(rule_id = %rule.id, error = %e,
+                    "NAN-1800: could not load restricted registry for aggregate stamping; skipping");
+                return;
+            }
+        };
+        if restricted.is_empty() {
+            return;
+        }
+        // Fail-CLOSED stamp: the full restricted set, so an unresolved-origin
+        // aggregate alert overlaps ANY scoped viewer's deny set and defaults to
+        // HIDDEN — used whenever the companion can't produce a trustworthy
+        // per-window source_type list (NAN-1800 review).
+        let restricted_stamp = || {
+            serde_json::Value::Array(
+                restricted
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            )
+        };
+        let apply = |results: &mut [serde_json::Value], stamp: &serde_json::Value| {
+            for event in results.iter_mut() {
+                if lacks_source_type(event) {
+                    if let Some(obj) = event.as_object_mut() {
+                        obj.insert("_nano_source_types".to_string(), stamp.clone());
+                    }
+                }
+            }
+        };
+
+        let Some(companion) = Self::source_type_companion_query(&rule.query) else {
+            warn!(rule_id = %rule.id,
+                "NAN-1800: could not derive source_type companion query; failing closed with the full restricted set");
+            apply(results, &restricted_stamp());
+            return;
+        };
+
+        match self
+            .evaluate_window(&companion, time_range.clone(), rule.dataset.clone())
+            .await
+        {
+            Ok(rows) => {
+                let mut types: Vec<String> = rows
+                    .iter()
+                    .filter_map(|r| r.get("source_type").and_then(|v| v.as_str()))
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                types.sort();
+                types.dedup();
+                let stamp = if types.is_empty() {
+                    warn!(rule_id = %rule.id,
+                        "NAN-1800: source_type companion returned no source types; failing closed with the full restricted set");
+                    restricted_stamp()
+                } else {
+                    serde_json::Value::Array(
+                        types.into_iter().map(serde_json::Value::String).collect(),
+                    )
+                };
+                apply(results, &stamp);
+            }
+            Err(e) => {
+                warn!(rule_id = %rule.id, error = %e,
+                    "NAN-1800: source_type companion query failed; failing closed with the full restricted set");
+                apply(results, &restricted_stamp());
+            }
+        }
     }
 
     /// Execute a detection rule and generate alerts for matches (if in alerting mode)
@@ -156,6 +296,13 @@ impl DetectionService {
         rule: &DetectionRule,
         time_range: Option<TimeRangeInput>,
     ) -> Result<Option<Alert>, DetectionError> {
+        // NAN-1791: auto retro-hunt rules ignore the scheduler's sliding window
+        // and rule.query — they compute their own indicator delta and hunt it
+        // over the configured lookback. Dispatch before any query parsing.
+        if rule.is_retro_hunt() {
+            return self.execute_retro_hunt_rule(rule).await;
+        }
+
         // Don't execute paused rules
         if rule.mode == RuleMode::Paused {
             warn!("Attempted to execute paused rule: {}", rule.id);
@@ -166,6 +313,33 @@ impl DetectionService {
         if rule.mode == RuleMode::Staging {
             debug!("Skipping execution of staging rule: {}", rule.name);
             return Ok(None);
+        }
+
+        // NAN-1805: execution-side feedback-loop guard for dataset=risk rules
+        // (belt-and-suspenders — save-time validation already rejects these,
+        // but a rule persisted through any other path must not run). A `| risk`
+        // body would emit query-derived scores into the findings stream, which
+        // is the risk dataset's own input. Refusing loudly every cycle keeps
+        // the misconfiguration visible instead of silently neutralized.
+        if Self::is_risk_dataset_rule(rule) {
+            if let Ok(parsed) = parse_query(&rule.query) {
+                if crate::query::contains_risk_command(&parsed) {
+                    return Err(DetectionError::InvalidQuery(format!(
+                        "rule '{}' targets dataset=risk but its query contains `| risk` — refusing to execute (feedback-loop guard); remove the `| risk` command",
+                        rule.name
+                    )));
+                }
+            }
+            if rule.risk_score != Some(0) {
+                // Scoring is zeroed at risk_result_for_group regardless; warn so
+                // the drift from the save-time invariant is visible.
+                warn!(
+                    rule_id = %rule.id,
+                    "Rule '{}' targets dataset=risk with risk_score {:?} — findings will be forced to score 0 (feedback-loop guard)",
+                    rule.name,
+                    rule.risk_score
+                );
+            }
         }
 
         // Determine time range
@@ -181,9 +355,10 @@ impl DetectionService {
         );
 
         // Run the rule's query against this window. Shared with the historical
-        // tester so test ≡ prod by construction.
+        // tester so test ≡ prod by construction. (`time_range` is kept for the
+        // NAN-1800 source_type companion in the alerting branch below.)
         let mut results = self
-            .evaluate_window(&rule.query, time_range, rule.dataset.clone())
+            .evaluate_window(&rule.query, time_range.clone(), rule.dataset.clone())
             .await?;
 
         // Audit D19: if a single window hit the 1M safety cap the rule is far too
@@ -290,6 +465,20 @@ impl DetectionService {
                         .record_daily_stats(rule.id, today, match_count, 0)
                         .await?;
 
+                    // NAN-1808: detection_matches rows are scope-stamped from
+                    // their events, so aggregate rows (no per-event
+                    // source_type) must be annotated BEFORE the Live write —
+                    // exactly like the alerting branch below. Without this, a
+                    // Live-mode aggregate rule would store '{}' and its
+                    // matched events would be visible to per-source-restricted
+                    // viewers. No-op for raw/grouped-raw rules; fails CLOSED
+                    // (full restricted set) when the window's source types
+                    // can't be resolved. `_nano_source_types` is stripped from
+                    // both dedup hashes, so match/matched-event dedup is
+                    // unaffected.
+                    self.annotate_source_types_for_scoping(rule, &mut results, &time_range)
+                        .await;
+
                     // Store detection match for review
                     // Per-event rules store one match per event for consistent display
                     match rule.alert_mode {
@@ -335,6 +524,13 @@ impl DetectionService {
 
                 // Generate alert if there are matches
                 if !results.is_empty() {
+                    // NAN-1800: aggregate rows carry no per-event source_type;
+                    // stamp the window's distinct source types so the alert's
+                    // `source_types` scope column is non-empty (else the alert
+                    // would be visible to per-source-restricted viewers).
+                    self.annotate_source_types_for_scoping(rule, &mut results, &time_range)
+                        .await;
+
                     let alert = match rule.alert_mode {
                         AlertMode::Grouped => {
                             self.handle_grouped_alert(

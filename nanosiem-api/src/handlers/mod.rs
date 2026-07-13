@@ -101,6 +101,7 @@ pub mod playbooks;
 pub mod prevalence;
 pub mod query_library;
 pub mod recent_activity;
+pub mod reports;
 // Risk analytics handlers — lifted to nanosiem-enterprise in NAN-752 (Phase
 // 2 of the open-core split). Re-exported here so route registrations
 // (`handlers::risk::get_risky_entities`, etc.) continue to resolve.
@@ -116,6 +117,7 @@ pub mod setup;
 pub mod siem_health;
 pub mod siem_health_suppressions;
 pub mod source_configs;
+pub mod source_scopes;
 pub mod system;
 pub mod tuning;
 pub mod upload;
@@ -145,6 +147,9 @@ pub use notifications::*;
 pub use prevalence::*;
 pub use query_library::*;
 pub use recent_activity::*;
+// NOTE: `reports` is intentionally NOT glob-re-exported — its `list_reports` /
+// `get_report` would collide with `siem_health`'s same-named handlers. Route
+// bindings reference these as `handlers::reports::*` (NAN-1793).
 // `risk` re-exported above as a module via `pub use nanosiem_enterprise::...`;
 // route bindings reference items as `handlers::risk::*` so a wildcard
 // re-export here is unnecessary.

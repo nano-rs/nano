@@ -96,6 +96,31 @@ impl AppState {
             );
         }
 
+        // --- Distributed scheduled reports (NAN-1793) ---
+        // Runs on ALL nodes via SKIP LOCKED (same pattern as scheduled jobs).
+        // Report execution is internal (ClickHouse + PostgreSQL only); the
+        // completion `report_ready` webhook is best-effort and SSRF-guarded, so
+        // unlike the feed-fetch jobs loop this is NOT egress-gated — reports
+        // still generate (and notify in-app) in air-gap mode.
+        {
+            let report_service = nanosiem_core::ReportService::with_node_id(
+                self.pool.clone(),
+                self.search_service.clone(),
+                self.node_id.clone(),
+            );
+            let poll_interval: u64 = std::env::var("REPORT_SCHEDULER_POLL_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30);
+            handles.push(
+                report_service.start_scheduler_with_shutdown(poll_interval, self.shutdown_token()),
+            );
+            tracing::info!(
+                "Distributed report scheduler started ({}s poll)",
+                poll_interval
+            );
+        }
+
         handles
     }
 
@@ -542,17 +567,19 @@ impl AppState {
         })
     }
 
-    /// Start the risk-decay sweep scheduler (NAN-1675).
-    ///
-    /// Periodically recomputes every entity's decayed score and persists it onto
-    /// `entity_risk_scores.decayed_score`, so scores age down between reads and
-    /// core/lateral surfaces can read a decayed band. Interval via
-    /// RISK_DECAY_SWEEP_INTERVAL_SECS (default 15 min). Leader-only (started from
-    /// start_leader_schedulers).
-    #[cfg(feature = "enterprise")]
-    pub fn start_risk_decay_scheduler(&self) -> tokio::task::JoinHandle<()> {
-        nanosiem_enterprise::risk::RiskDecayScheduler::from_env(self.risk_service.clone()).start()
-    }
+    // NAN-1810: the RiskDecayScheduler (NAN-1675) is retired along with the
+    // `entity_risk_scores` rollup it maintained — every risk read computes the
+    // decayed score live from the ClickHouse findings stream (NAN-1806), so
+    // there is no persisted snapshot left to sweep.
+
+    // NAN-1805: the RiskNotableScheduler (NAN-1792) is retired. Risk notables
+    // are now an ordinary detection rule over `dataset=risk` (the seeded
+    // "Accumulated risk threshold exceeded" rule, enterprise migration
+    // 9000033) — grouping/cases/webhooks/cooldown ride the standard detection
+    // engine, with the per-(rule, entity) alert_cooldown_minutes throttle
+    // carrying the scheduler's durable hysteresis. Historical
+    // kind="risk_notable" alerts remain valid (migration 237's CHECK is
+    // append-only).
 
     /// Start the tuning scheduler
     ///

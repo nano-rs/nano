@@ -219,6 +219,9 @@ const navigation: NavItem[] = [
   { name: 'Getting Started', href: '/getting-started', icon: NavPlusCross }, // Onboarding wizard
   { name: 'Search', href: '/search', icon: NavSearch, permissions: 'search:view' },
   { name: 'Dashboards', href: '/dashboards', icon: NavGrid, permissions: 'dashboards:view' },
+  // NAN-1793: scheduled reports — cron a saved search / dashboard into
+  // downloadable CSV/HTML artifacts. Gated on search:view (same as Search).
+  { name: 'Reports', href: '/reports', icon: NavList, permissions: 'search:view' },
   // NAN-746: Alerts is the open-core triage surface — core, no capability gate.
   // The /alerts/:id detail page is also core; Cases (when on) keeps its own
   // /inbox + /cases entries below.

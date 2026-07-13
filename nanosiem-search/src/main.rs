@@ -6,7 +6,8 @@
 
 use anyhow::Result;
 use nanosiem_core::auth::{
-    repository::ApiKeyRepository, ApiKeyService, PermissionResolver, TokenConfig, TokenService,
+    repository::ApiKeyRepository, ApiKeyService, PermissionResolver, SourceScopeResolver,
+    TokenConfig, TokenService,
 };
 use nanosiem_core::db::repository::RateLimitRepository;
 use nanosiem_core::db::ClickHouseMigrator;
@@ -100,8 +101,13 @@ async fn main() -> Result<()> {
         let api_key_service = ApiKeyService::new(api_key_repo, rate_limit_repo);
 
         let permission_resolver = PermissionResolver::new(dual_pool.postgres().clone());
+        // NAN-1797: fail-closed per-user source-scope resolver. Shares the same
+        // PG pool as the permission resolver; the search AuthContext carries the
+        // resolved deny set so every logs-touching handler can scope its query.
+        let source_scope_resolver = SourceScopeResolver::new(dual_pool.postgres().clone());
         AuthState::new(token_service, Some(api_key_service), true)
             .with_permission_resolver(permission_resolver)
+            .with_source_scope_resolver(source_scope_resolver)
     } else {
         tracing::warn!("Authentication DISABLED - all requests will be allowed");
         AuthState::disabled()

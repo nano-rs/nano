@@ -514,9 +514,11 @@ impl ClickHouseSqlGenerator {
                 // keeps its iLike form in its own arm. See
                 // `bare_keyword_predicate`. NAN-1555: the indexed text column is
                 // profile-driven (`message` for logs, `span_name` for spans).
+                // NAN-1828: OR-folded across every body column (OCSF adds
+                // `raw_data`; single-column profiles are byte-identical).
                 Ok(bare_keyword_predicate(
                     kw,
-                    self.profile.keyword_search_column(),
+                    &self.profile.keyword_search_columns(),
                 ))
             }
             SearchExpr::FieldFilter { field, op, value } => {
@@ -1932,9 +1934,11 @@ impl ClickHouseSqlGenerator {
                 // clear "column not found" error — correct, since bare keyword searches
                 // don't make sense after aggregation. NAN-1555: the indexed text
                 // column is profile-driven (`span_name` for spans).
+                // NAN-1828: OR-folded across every body column (OCSF adds
+                // `raw_data`; single-column profiles are byte-identical).
                 Ok(bare_keyword_predicate(
                     kw,
-                    self.profile.keyword_search_column(),
+                    &self.profile.keyword_search_columns(),
                 ))
             }
             SearchExpr::FieldFilter { field, op, value } => {
@@ -2458,13 +2462,12 @@ impl ClickHouseSqlGenerator {
         // Build a single WHERE with the time range and the subsearch's search
         // expression — `optimize_move_to_prewhere` does placement (NAN-1412).
         // The time column is the SUBSEARCH dataset's (NAN-1562 fixes the
-        // pre-existing hardcoded `timestamp` that was wrong for spans `start_time`).
-        let mut where_clause = format!(
-            "{} BETWEEN '{}' AND '{}'",
-            sub_gen.time_column(),
-            crate::sql_hygiene::format_ch_bound_micros(&time_range.start),
-            crate::sql_hygiene::format_ch_bound_micros(&time_range.end),
-        );
+        // pre-existing hardcoded `timestamp` that was wrong for spans
+        // `start_time`); a `dataset=risk` subsearch neutralizes the bound
+        // entirely (fixed trailing windows baked into its derived base source,
+        // NAN-1798 P2).
+        let mut where_clause =
+            sub_gen.time_bound_predicate(sub_gen.time_column(), time_range);
         if let Some(expr) = search_expr {
             let where_sql = sub_gen.generate_search_expr(expr)?;
             where_clause = format!("{} AND ({})", where_clause, where_sql);

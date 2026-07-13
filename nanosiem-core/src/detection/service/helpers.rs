@@ -248,6 +248,29 @@ pub(crate) async fn record_finding_emissions_with_pool(
     }
 }
 
+/// Hysteresis gate for the per-rule alert cooldown (NAN-1805): is `now` still
+/// inside the window that opened at the entity's last alert? `None` (no prior
+/// alert) always fires.
+///
+/// TIME-based, not edge-triggered — ported verbatim from the retired
+/// `RiskNotableScheduler` (NAN-1792, itself mirroring the SLO / metric-monitor
+/// evaluators, NAN-1563): the window is anchored to the persisted last-alert
+/// time, so a value dipping below a threshold and re-crossing within the
+/// window does NOT reset or re-open it. Anti-flap by construction.
+pub(super) fn within_alert_cooldown(
+    last_alert_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    cooldown_minutes: i32,
+) -> bool {
+    match last_alert_at {
+        None => false,
+        Some(last) => {
+            let elapsed = now.signed_duration_since(last);
+            elapsed < chrono::Duration::minutes(cooldown_minutes.max(0) as i64)
+        }
+    }
+}
+
 impl DetectionService {
     // ========================================================================
     // Entity Grouping Helpers
@@ -374,7 +397,21 @@ impl DetectionService {
         let severity_str = format!("{:?}", rule.severity).to_lowercase();
         let matched_events = serde_json::Value::Array(events.to_vec());
 
-        // Compute event hash for deduplication
+        // NAN-1808: stamp the match with the distinct normalized source_type
+        // values of its events (per-event `source_type` plus the aggregate
+        // `_nano_source_types` annotation) so the read side can enforce
+        // per-source RBAC — detection_matches is a sibling of alerts and is
+        // NOT covered by alerts.source_types. Callers on the aggregate path
+        // run `annotate_source_types_for_scoping` BEFORE this, so aggregate
+        // rows never land here as '{}' while the restricted registry is
+        // non-empty. An empty stamp means non-source-derived events
+        // (retro-hunt indicator summaries) = visible to everyone.
+        let source_types =
+            crate::db::repository::alerts::distinct_source_types(&matched_events);
+
+        // Compute event hash for deduplication (`compute_event_hash` strips
+        // `_nano_*` keys, so annotated and pre-annotation payloads dedup
+        // against each other).
         let event_hash = crate::db::repository::compute_event_hash(&matched_events);
 
         // Try to insert, but ignore if duplicate (same rule_id + event_hash)
@@ -382,8 +419,8 @@ impl DetectionService {
         // frequently with a long lookback window
         let result = sqlx::query(
             r#"
-            INSERT INTO detection_matches (rule_id, rule_name, severity, matched_events, event_count, event_hash)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO detection_matches (rule_id, rule_name, severity, matched_events, event_count, event_hash, source_types)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (rule_id, event_hash) DO NOTHING
             "#
         )
@@ -393,6 +430,7 @@ impl DetectionService {
         .bind(matched_events)
         .bind(event_count)
         .bind(&event_hash)
+        .bind(&source_types)
         .execute(&self.pg_pool)
         .await?;
 
@@ -460,6 +498,113 @@ impl DetectionService {
         findings: &[ClaimedFinding],
     ) {
         record_finding_emissions_with_pool(&self.pg_pool, rule_id, findings).await
+    }
+
+    // ========================================================================
+    // Per-(rule, entity) alert cooldown (NAN-1805)
+    // ========================================================================
+
+    /// Which of `entities` are still inside this rule's alert-cooldown window?
+    ///
+    /// Reads the durable `detection_alert_entity_cooldowns` anchors (migration
+    /// 248) — the persisted per-(rule, entity) last-alert times — and applies
+    /// the same TIME-based hysteresis the retired `RiskNotableScheduler` used
+    /// (NAN-1792 / NAN-1563): the window is anchored to the last alert, so a
+    /// value dipping below a threshold and re-crossing within the window does
+    /// NOT re-fire, and a jobs restart / leader failover cannot reset it.
+    ///
+    /// Errors PROPAGATE (no fail-open, no fail-closed): on a lookup failure the
+    /// whole execution errors, so neither an alert nor a terminal suppression
+    /// happens and the next cycle re-evaluates the window from scratch.
+    ///
+    /// CONCURRENCY (deliberate): this is a read-then-act sequence — the anchor
+    /// is only advanced AFTER the alert row exists
+    /// ([`Self::record_alert_cooldown_anchors`]), mirroring the D5/D20 ordering
+    /// of the emissions dedup store (suppression state is never persisted
+    /// before the alert it stands for). Two OVERLAPPING executions of the same
+    /// rule (a manual `POST /api/rules/{id}/trigger` racing the claimed
+    /// scheduled run — scheduled runs themselves are serialized per rule by
+    /// SKIP-LOCKED claiming) can therefore both pass this gate and produce one
+    /// duplicate alert; that same overlap already double-alerts today through
+    /// the emissions-store race, so the cooldown does not widen it. The
+    /// alternative — atomically claiming the anchor BEFORE the insert — would
+    /// convert that rare duplicate into a silent LOST alert whenever the
+    /// insert fails after the claim, which is the worse failure for a SIEM.
+    pub(super) async fn entities_in_alert_cooldown(
+        &self,
+        rule_id: Uuid,
+        cooldown_minutes: i32,
+        entities: &[String],
+    ) -> Result<std::collections::HashSet<String>, DetectionError> {
+        if cooldown_minutes <= 0 || entities.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
+            r#"
+            SELECT entity, last_alert_at
+            FROM detection_alert_entity_cooldowns
+            WHERE rule_id = $1 AND entity = ANY($2)
+            "#,
+        )
+        .bind(rule_id)
+        .bind(entities)
+        .fetch_all(&self.pg_pool)
+        .await?;
+
+        let now = Utc::now();
+        Ok(rows
+            .into_iter()
+            .filter(|(_, last)| within_alert_cooldown(Some(*last), now, cooldown_minutes))
+            .map(|(entity, _)| entity)
+            .collect())
+    }
+
+    /// Upsert the durable last-alert anchors for `entities` after an alert
+    /// fired for them. Best-effort like [`Self::record_finding_emissions`]: a
+    /// failure is logged, not propagated (the alert already exists). Under a
+    /// PERSISTENT anchor-write failure (schema/permission damage narrow enough
+    /// to spare the alert insert itself) the throttle degrades to the
+    /// pre-cooldown window-dedup behavior — noisy and WARN-logged every cycle,
+    /// never silently lossy.
+    ///
+    /// Also opportunistically prunes this rule's anchors that have been stale
+    /// for > 30 days (well past the 7-day `MAX_ALERT_COOLDOWN_MINUTES`), so the
+    /// table stays bounded without a dedicated sweeper.
+    pub(super) async fn record_alert_cooldown_anchors(&self, rule_id: Uuid, entities: &[String]) {
+        if entities.is_empty() {
+            return;
+        }
+        // DISTINCT: the same entity may appear twice in a batch; a duplicate
+        // inside one INSERT would trip "ON CONFLICT cannot affect row twice".
+        let result = sqlx::query(
+            r#"
+            INSERT INTO detection_alert_entity_cooldowns (rule_id, entity, last_alert_at)
+            SELECT DISTINCT $1, unnest($2::text[]), now()
+            ON CONFLICT (rule_id, entity) DO UPDATE SET last_alert_at = EXCLUDED.last_alert_at
+            "#,
+        )
+        .bind(rule_id)
+        .bind(entities)
+        .execute(&self.pg_pool)
+        .await;
+        if let Err(e) = result {
+            warn!(
+                rule_id = %rule_id,
+                error = %e,
+                "Failed to record alert-cooldown anchors; affected entities may re-alert once before the next successful write"
+            );
+            return;
+        }
+
+        let _ = sqlx::query(
+            r#"
+            DELETE FROM detection_alert_entity_cooldowns
+            WHERE rule_id = $1 AND last_alert_at < now() - interval '30 days'
+            "#,
+        )
+        .bind(rule_id)
+        .execute(&self.pg_pool)
+        .await;
     }
 
     /// Derive the stable cross-execution identity of a finding:

@@ -18,6 +18,7 @@ const OPTIONS: { value: SearchDataset; label: string; description: string }[] = 
   { value: 'logs', label: 'Logs', description: 'UDM / OCSF events' },
   { value: 'spans', label: 'Traces', description: 'OTLP spans' },
   { value: 'metrics', label: 'Metrics', description: 'OTLP metrics' },
+  { value: 'risk', label: 'Risk', description: 'Accumulated entity risk' },
 ];
 
 /**
@@ -130,6 +131,11 @@ export function DatasetSelector({ value, onChange, disabled }: DatasetSelectorPr
                   </RouterLink>{' '}
                   for waterfalls.
                 </>
+              ) : value === 'risk' ? (
+                <>
+                  One row per scored entity — score_24h / score_7d, findings, distinct
+                  rules and tactics over fixed 24h / 7d windows.
+                </>
               ) : (
                 <>Normalized logs (UDM/OCSF) — the default search plane.</>
               )}
@@ -137,7 +143,7 @@ export function DatasetSelector({ value, onChange, disabled }: DatasetSelectorPr
           </PopoverContent>
           <TooltipContent side="bottom">
             <p>Query dataset</p>
-            <p className="text-xs text-primary-foreground/70">Logs, OTLP traces, or metrics</p>
+            <p className="text-xs text-primary-foreground/70">Logs, OTLP traces, metrics, or accumulated risk</p>
           </TooltipContent>
         </Popover>
       </Tooltip>

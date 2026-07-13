@@ -828,7 +828,54 @@ pub(crate) fn anchored_guard_token(literal_lower: &str) -> Option<&str> {
 /// an ASCII split would yield `caf` → false negatives). `escape_string` (not
 /// `escape_like_pattern`) is correct: `hasAllTokens` takes a literal string where
 /// `%`/`_` are ordinary characters, not LIKE metacharacters.
-pub(crate) fn bare_keyword_predicate(kw: &str, col: &str) -> String {
+/// NAN-1828: OR-fold the predicate across every column that can carry the event
+/// body for the active profile (`keyword_search_columns()`).
+///
+/// Single-column profiles (UDM `message`, spans `span_name`, metrics, risk) fold
+/// to exactly one term, so their SQL is byte-identical to the pre-NAN-1828 form.
+///
+/// OCSF has TWO body columns, because the raw log lands in a different one
+/// depending on the producer: our Vector parsers put it in `message` and leave
+/// `raw_data` empty, while a direct producer (Tenzir) puts the original in
+/// `raw_data` and a human summary in `message`. Searching only `message` made a
+/// Tenzir tenant's original log unfindable by the primary hunt path (NAN-1827
+/// persisted it; nothing could reach it — the explicit `raw_data=*kw*` form emits
+/// `iLike`, which extracts NO index tokens, so it degrades to the 77-250x
+/// dictionary scan documented above).
+///
+/// The union is TIGHT, not doubled — the body lives in exactly ONE of the two, so
+/// the other index contributes almost nothing: on a Vector tenant `raw_data` is
+/// empty and its index prunes to zero granules; on a Tenzir tenant `message` is a
+/// short summary. Measured (120k rows / 16 granules, half of each shape): a
+/// needle in either column prunes to 1/15 granules via `<Combined skip indexes>`,
+/// and a nonexistent token to 0/15.
+///
+/// Rejected alternative: a single text index on the coalesce expression
+/// `lower(if(raw_data != '', raw_data, message))`. ClickHouse builds the index but
+/// the planner NEVER considers it (EXPLAIN shows no `Skip` entry at all) — text
+/// indexes do not match a non-trivial expression. Do not retry it.
+pub(crate) fn bare_keyword_predicate(kw: &str, cols: &[&str]) -> String {
+    debug_assert!(!cols.is_empty(), "keyword_search_columns() must never be empty");
+    match cols {
+        [col] => bare_keyword_predicate_for_column(kw, col),
+        _ => {
+            let folded = cols
+                .iter()
+                .map(|col| bare_keyword_predicate_for_column(kw, col))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            // Parenthesized: the caller splices this into a larger AND-chain, and
+            // a bare `a OR b` there would bind as `x AND a OR b` = `(x AND a) OR b`
+            // — silently widening every keyword search to match on `b` alone.
+            format!("({folded})")
+        }
+    }
+}
+
+/// The single-column predicate. Every arm below must stay index-compatible: the
+/// emitted expression is matched by ClickHouse against the text index BY
+/// EXPRESSION, so `lower(<col>)` here must mirror the DDL exactly.
+fn bare_keyword_predicate_for_column(kw: &str, col: &str) -> String {
     let lowered = kw.to_lowercase();
 
     // Explicit wildcards (`cmd*`, `*cmd`, `c?d`, `**`) are partial-match intent →

@@ -191,6 +191,7 @@ mod tests {
             is_api_key: true,
             api_key_id: Some(key_id),
             api_key_name: Some("ci-bot".to_string()),
+            denied_sources: Default::default(),
         }
     }
 

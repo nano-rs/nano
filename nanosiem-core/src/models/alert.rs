@@ -90,17 +90,29 @@ pub struct Alert {
     #[schema(value_type = Option<String>)]
     pub case_id: Option<Uuid>,
     /// NAN-1541: alert-spine discriminator — what produced this alert.
-    /// One of `detection`, `metric_monitor`, `slo`, `synthetic`. Defaults to
-    /// `detection` for every pre-spine row (migration 212).
+    /// One of `detection`, `metric_monitor`, `slo`, `synthetic`, or
+    /// `risk_notable` (NAN-1792). Defaults to `detection` for every pre-spine
+    /// row (migration 212).
     #[sqlx(default)]
     #[serde(default = "default_alert_kind")]
     pub kind: String,
     /// NAN-1541: the producer's identifier as text — the detection rule UUID
-    /// for `detection` alerts, or the monitor/check typeid for observability
-    /// alerts. NULL for legacy rows whose rule was deleted.
+    /// for `detection` alerts, the monitor/check typeid for observability
+    /// alerts, or `<entity_type>:<entity>` for risk notables (NAN-1792).
+    /// NULL for legacy rows whose rule was deleted.
     #[sqlx(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
+    /// NAN-1800: distinct normalized (trimmed + lowercased) `source_type`
+    /// values of the matched events, stamped at insert by
+    /// `AlertRepository::create_alert` (migration 246). Empty = pre-feature
+    /// row or a producer whose events carry no source_type (observability /
+    /// risk-notable alerts) = visible to everyone. The read side enforces
+    /// per-source RBAC by rejecting rows whose `source_types` overlap the
+    /// viewer's deny set.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub source_types: Vec<String>,
 }
 
 /// Default discriminator for alerts deserialized without an explicit `kind`

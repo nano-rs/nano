@@ -247,6 +247,42 @@ pub struct DetectionRule {
     #[sqlx(default)]
     #[serde(default)]
     pub source_repo_url: Option<String>,
+    /// Rule kind discriminator (NAN-1791): `"standard"` (default nPL detection)
+    /// or `"retro_hunt"` (auto retro-hunt of newly-landed threat-intel indicators
+    /// against historical logs — see `retro_hunt_rule_config`). A retro-hunt rule
+    /// ignores `query` at execution time and instead computes an indicator delta,
+    /// runs the retro engine over it, and emits hits through the standard signal
+    /// processor. Empty string from an old row is treated as `"standard"` by
+    /// [`DetectionRule::is_retro_hunt`].
+    #[sqlx(default)]
+    #[serde(default = "default_rule_kind")]
+    pub kind: String,
+    /// Per-(rule, entity) alert cooldown in minutes (NAN-1805). None/0 = off.
+    /// When set, an entity that alerted within the window is suppressed from
+    /// re-alerting — TIME-based and anchored on the durable
+    /// `detection_alert_entity_cooldowns` table, so it survives restart /
+    /// leader failover and a value flapping across a threshold cannot storm.
+    /// Enforced on the scheduled alert paths (grouped + per-event); the
+    /// real-time MV path is not covered (its per-event `event_hash` dedup
+    /// applies instead).
+    #[sqlx(default)]
+    #[serde(default)]
+    pub alert_cooldown_minutes: Option<i32>,
+}
+
+/// Serde default for [`DetectionRule::kind`]: a rule with no explicit kind is a
+/// standard nPL detection.
+fn default_rule_kind() -> String {
+    "standard".to_string()
+}
+
+impl DetectionRule {
+    /// Whether this is an auto retro-hunt rule (NAN-1791). Execution and the
+    /// scheduler branch on this to run the delta-hunt path instead of the nPL
+    /// query path.
+    pub fn is_retro_hunt(&self) -> bool {
+        self.kind == "retro_hunt"
+    }
 }
 
 /// Input for creating a new detection rule
@@ -317,6 +353,11 @@ pub struct NewDetectionRule {
     /// Detection-as-Code provenance: repo URL this rule was imported from (NAN-1764).
     #[serde(default)]
     pub source_repo_url: Option<String>,
+    /// Per-(rule, entity) alert cooldown in minutes (NAN-1805). None/0 = off.
+    /// Time-based re-fire throttle anchored on a durable table (see
+    /// [`DetectionRule::alert_cooldown_minutes`]). 0-10080 (7 days).
+    #[serde(default)]
+    pub alert_cooldown_minutes: Option<i32>,
 }
 
 /// Input for updating a detection rule
@@ -391,6 +432,11 @@ pub struct UpdateDetectionRule {
     /// Detection-as-Code provenance: repo URL this rule was imported from (NAN-1764).
     #[serde(default)]
     pub source_repo_url: Option<String>,
+    /// Per-(rule, entity) alert cooldown in minutes (NAN-1805). Set 0 to
+    /// disable (COALESCE update semantics — None leaves the stored value).
+    /// 0-10080 (7 days).
+    #[serde(default)]
+    pub alert_cooldown_minutes: Option<i32>,
 }
 
 /// Validation error for detection rule risk fields
@@ -428,8 +474,10 @@ pub enum FieldValidationError {
     SpecificPlaybookWithoutId,
     /// playbook_id provided but playbook_selector_mode is not 'specific'
     PlaybookIdWithoutSpecificMode,
-    /// dataset has an invalid value (must be 'logs', 'spans', or 'metrics')
+    /// dataset has an invalid value (must be 'logs', 'spans', 'metrics', or 'risk')
     InvalidDataset(String),
+    /// alert_cooldown_minutes is out of valid range (0 = off, max 10080 = 7 days)
+    AlertCooldownOutOfBounds(i32),
 }
 
 impl std::fmt::Display for RiskValidationError {
@@ -506,7 +554,14 @@ impl std::fmt::Display for FieldValidationError {
                 write!(f, "playbook_id provided but playbook_selector_mode is not 'specific'")
             }
             FieldValidationError::InvalidDataset(value) => {
-                write!(f, "Invalid dataset '{}' (must be 'logs', 'spans', or 'metrics')", value)
+                write!(f, "Invalid dataset '{}' (must be 'logs', 'spans', 'metrics', or 'risk')", value)
+            }
+            FieldValidationError::AlertCooldownOutOfBounds(minutes) => {
+                write!(
+                    f,
+                    "alert_cooldown_minutes {} is out of bounds (must be 0-{}; 0 disables the cooldown)",
+                    minutes, MAX_ALERT_COOLDOWN_MINUTES
+                )
             }
         }
     }
@@ -526,9 +581,16 @@ pub const MAX_LOOKBACK_MINUTES: i32 = 10080;
 /// Valid playbook selector modes (rule → playbook assignment at firing time)
 pub const VALID_PLAYBOOK_SELECTOR_MODES: &[&str] = &["none", "specific", "adaptive"];
 
-/// Valid dataset values for a detection rule (NAN-1561). NULL/"logs" = default
-/// UDM/OCSF logs; "spans"/"metrics" = OTLP datasets (scheduled-only).
-pub const VALID_DATASETS: &[&str] = &["logs", "spans", "metrics"];
+/// Valid dataset values for a detection rule (NAN-1561, NAN-1805).
+/// NULL/"logs" = default UDM/OCSF logs; "spans"/"metrics" = OTLP datasets;
+/// "risk" = derived accumulated-entity-risk grain. Non-logs datasets are
+/// scheduled-only.
+pub const VALID_DATASETS: &[&str] = &["logs", "spans", "metrics", "risk"];
+
+/// Maximum per-(rule, entity) alert cooldown: 7 days (NAN-1805) — matches
+/// [`MAX_LOOKBACK_MINUTES`] and stays well inside the 30-day opportunistic
+/// prune of the durable anchor table.
+pub const MAX_ALERT_COOLDOWN_MINUTES: i32 = 10080;
 
 impl NewDetectionRule {
     /// Validate risk-related fields
@@ -639,6 +701,13 @@ impl NewDetectionRule {
         if let Some(ref ds) = self.dataset {
             if !VALID_DATASETS.contains(&ds.as_str()) {
                 return Err(FieldValidationError::InvalidDataset(ds.clone()));
+            }
+        }
+
+        // Validate alert_cooldown_minutes bounds (NAN-1805): 0 = off, max 7 days.
+        if let Some(minutes) = self.alert_cooldown_minutes {
+            if !(0..=MAX_ALERT_COOLDOWN_MINUTES).contains(&minutes) {
+                return Err(FieldValidationError::AlertCooldownOutOfBounds(minutes));
             }
         }
 
@@ -762,6 +831,13 @@ impl UpdateDetectionRule {
             }
         }
 
+        // Validate alert_cooldown_minutes bounds (NAN-1805) if set in this patch.
+        if let Some(minutes) = self.alert_cooldown_minutes {
+            if !(0..=MAX_ALERT_COOLDOWN_MINUTES).contains(&minutes) {
+                return Err(FieldValidationError::AlertCooldownOutOfBounds(minutes));
+            }
+        }
+
         Ok(())
     }
 }
@@ -831,6 +907,7 @@ mod tests {
             playbook_id: None,
             source_path: None,
             source_repo_url: None,
+            alert_cooldown_minutes: None,
         }
     }
 
@@ -917,5 +994,55 @@ mod tests {
             ..Default::default()
         };
         assert!(update.validate_auto_tuning_fields().is_ok());
+    }
+
+    #[test]
+    fn risk_dataset_accepted_by_field_validation() {
+        // NAN-1805: 'risk' joined the valid dataset set (migration 249).
+        let mut rule = new_rule_with_confidence(None);
+        rule.dataset = Some("risk".to_string());
+        assert!(rule.validate_fields().is_ok());
+
+        let update = UpdateDetectionRule {
+            dataset: Some("risk".to_string()),
+            ..Default::default()
+        };
+        assert!(update.validate_fields().is_ok());
+
+        // Unknown values still rejected.
+        rule.dataset = Some("riskier".to_string());
+        assert!(matches!(
+            rule.validate_fields(),
+            Err(FieldValidationError::InvalidDataset(_))
+        ));
+    }
+
+    #[test]
+    fn alert_cooldown_bounds_enforced() {
+        // NAN-1805: 0 (off) through 10080 (7 days) accepted; out of range rejected.
+        for minutes in [0, 1, 240, MAX_ALERT_COOLDOWN_MINUTES] {
+            let mut rule = new_rule_with_confidence(None);
+            rule.alert_cooldown_minutes = Some(minutes);
+            assert!(rule.validate_fields().is_ok(), "cooldown {minutes} accepted");
+        }
+        for minutes in [-1, MAX_ALERT_COOLDOWN_MINUTES + 1] {
+            let mut rule = new_rule_with_confidence(None);
+            rule.alert_cooldown_minutes = Some(minutes);
+            assert!(
+                matches!(
+                    rule.validate_fields(),
+                    Err(FieldValidationError::AlertCooldownOutOfBounds(_))
+                ),
+                "cooldown {minutes} rejected"
+            );
+            let update = UpdateDetectionRule {
+                alert_cooldown_minutes: Some(minutes),
+                ..Default::default()
+            };
+            assert!(matches!(
+                update.validate_fields(),
+                Err(FieldValidationError::AlertCooldownOutOfBounds(_))
+            ));
+        }
     }
 }

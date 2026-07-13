@@ -26,8 +26,8 @@ impl DetectionRuleRepository {
         .map_err(|error| DetectionRuleRepositoryError::InvalidMitreMapping(error.to_string()))?;
         let result = sqlx::query_as::<_, DetectionRule>(
             r#"
-            INSERT INTO detection_rules (name, description, query, severity, mitre_tactics, mitre_techniques, schedule_cron, mode, narrative, reference_url, author, tags, ai_generated, realtime_enabled, risk_score, risk_entity_field, risk_modifiers, detection_mode, lookback_minutes, auto_tuning_enabled, auto_tuning_min_confidence, auto_tuning_critical, ai_triage_hints, folder, case_visibility, alert_mode, case_assigned_group, playbook_selector_mode, playbook_id, dataset, source_path, source_repo_url)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)
+            INSERT INTO detection_rules (name, description, query, severity, mitre_tactics, mitre_techniques, schedule_cron, mode, narrative, reference_url, author, tags, ai_generated, realtime_enabled, risk_score, risk_entity_field, risk_modifiers, detection_mode, lookback_minutes, auto_tuning_enabled, auto_tuning_min_confidence, auto_tuning_critical, ai_triage_hints, folder, case_visibility, alert_mode, case_assigned_group, playbook_selector_mode, playbook_id, dataset, source_path, source_repo_url, alert_cooldown_minutes)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)
             RETURNING *
             "#,
         )
@@ -68,6 +68,8 @@ impl DetectionRuleRepository {
         // pipeline on import so tuning PRs can target the real file.
         .bind(&rule.source_path)
         .bind(&rule.source_repo_url)
+        // NAN-1805: per-(rule, entity) alert cooldown; NULL/0 = off.
+        .bind(&rule.alert_cooldown_minutes)
         .fetch_one(&self.pool)
         .await
         .map_err(map_rule_write_error)?;
@@ -181,6 +183,9 @@ impl DetectionRuleRepository {
                 -- a deliberate re-import that supplies a new value updates it.
                 source_path = COALESCE($35, source_path),
                 source_repo_url = COALESCE($36, source_repo_url),
+                -- NAN-1805: COALESCE patch semantics — send 0 to disable the
+                -- cooldown; None leaves the stored value unchanged.
+                alert_cooldown_minutes = COALESCE($37, alert_cooldown_minutes),
                 updated_at = NOW()
             WHERE id = $1 AND updated_at = $31
             RETURNING *
@@ -227,6 +232,7 @@ impl DetectionRuleRepository {
         .bind(&update.dataset) // $34
         .bind(&update.source_path) // $35
         .bind(&update.source_repo_url) // $36
+        .bind(&update.alert_cooldown_minutes) // $37
         .fetch_optional(&self.pool)
         .await
         .map_err(map_rule_write_error)?

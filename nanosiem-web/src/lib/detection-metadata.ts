@@ -25,10 +25,11 @@ export interface DetectionMetadata {
   severity?: 'critical' | 'high' | 'medium' | 'low';
   mode?: 'staging' | 'live' | 'alerting' | 'paused';
   detection_mode?: 'realtime' | 'scheduled';
-  // NAN-1561: dataset this rule queries. 'logs' (default UDM/OCSF), 'spans', or
-  // 'metrics'. Spans/metrics are scheduled-only — the editor forces scheduled
-  // mode when this is set to a non-logs value.
-  dataset?: 'logs' | 'spans' | 'metrics';
+  // NAN-1561: dataset this rule queries. 'logs' (default UDM/OCSF), 'spans',
+  // 'metrics', or 'risk' (NAN-1805: derived accumulated-entity-risk grain).
+  // Non-logs datasets are scheduled-only, risk included — the editor forces
+  // scheduled mode when this is set to a non-logs value.
+  dataset?: 'logs' | 'spans' | 'metrics' | 'risk';
   schedule?: string;
   lookback?: string; // e.g., "24h", "1h", "30m"
   folder?: string; // organization folder: network, identity, endpoint, cloud, stash
@@ -284,13 +285,14 @@ export function validateMetadata(metadata: DetectionMetadata): string[] {
     errors.push('schedule is required when detection_mode is scheduled');
   }
 
-  // NAN-1561: dataset validation. Spans/metrics are scheduled-only.
-  if (metadata.dataset && !['logs', 'spans', 'metrics'].includes(metadata.dataset)) {
-    errors.push('dataset must be one of: logs, spans, metrics');
+  // NAN-1561: dataset validation. Non-logs datasets (spans/metrics/risk) are
+  // scheduled-only — risk included (NAN-1805).
+  if (metadata.dataset && !['logs', 'spans', 'metrics', 'risk'].includes(metadata.dataset)) {
+    errors.push('dataset must be one of: logs, spans, metrics, risk');
   }
 
   if (metadata.dataset && metadata.dataset !== 'logs' && metadata.detection_mode !== 'scheduled') {
-    errors.push('spans/metrics datasets require detection_mode: scheduled');
+    errors.push('non-logs datasets (spans, metrics, risk) require detection_mode: scheduled');
   }
 
   if (metadata.lookback) {

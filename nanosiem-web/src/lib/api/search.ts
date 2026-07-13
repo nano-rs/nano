@@ -84,10 +84,23 @@ export class SearchApi {
     });
   }
 
-  async explainQuery(query: string, timeRange: TimeRange, tableView = true): Promise<{ sql: string }> {
+  async explainQuery(
+    query: string,
+    timeRange: TimeRange,
+    tableView = true,
+    dataset?: import('./types').SearchDataset,
+  ): Promise<{ sql: string }> {
     return this.request('/api/search/explain', {
       method: 'POST',
-      body: JSON.stringify({ query, time_range: timeRange, table_view: tableView }),
+      // NAN-1825: send a non-logs dataset so the inspected SQL matches the
+      // executed query (risk / spans / metrics). Logs stays byte-identical
+      // (dataset omitted), matching the search execution path's convention.
+      body: JSON.stringify({
+        query,
+        time_range: timeRange,
+        table_view: tableView,
+        ...(dataset && dataset !== 'logs' ? { dataset } : {}),
+      }),
     });
   }
 

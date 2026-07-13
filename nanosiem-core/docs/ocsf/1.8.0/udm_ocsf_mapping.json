@@ -704,7 +704,20 @@
     "array_key": null,
     "entity_type": null,
     "category": "Core",
-    "notes": "Human-readable summary. UDM message has text(splitByNonAlpha) index + `message.search` companion (the primary full-text hunt field). `raw_data` (unparsed) stays in the event tail / maps to a secondary column if needed. `message` is a real top-level OCSF field (no dot)."
+    "notes": "Human-readable summary, and the bare-keyword hunt field (keyword_search_column() -> `message`, text(splitByNonAlpha) index on lower(message)). `message` is a real top-level OCSF field (no dot). NAN-1827: the unparsed original now has its own promoted `raw_data` column — it is NOT in the event tail (NAN-1443 deleted `event`). Note our Vector parsers still put the raw log in `message` and leave `raw_data` empty, so on a Vector tenant `message` IS the original; on a Tenzir tenant `message` is a summary and `raw_data` is the original."
+  },
+  {
+    "udm_field": "raw_data",
+    "ocsf_path": "raw_data",
+    "ch_column_name": "raw_data",
+    "ch_type": "String",
+    "index": "tokenbf",
+    "prewhere": false,
+    "is_search_col": true,
+    "array_key": null,
+    "entity_type": null,
+    "category": "Core",
+    "notes": "The original event as received by the producer (OCSF string_t since 1.5, NOT json_t). The compliance-grade original: an OCSF feed re-materializes from it by re-running the mapping pipeline, so no parallel raw archive is needed (NAN-1827). Promoted so nPL resolves it to a real column — before NAN-1827 there was no column and `raw_data` fell through json_tail_column() to `unmapped.raw_data`, returning EMPTY with no error while the producer's data was dropped at ingest. EMPTY unless the producer emits it: our Vector OCSF parsers do not (they set `message` = raw log), and making them would re-create the duplication NAN-1443 deleted. is_search_col only gates the text index (search_stems has no runtime consumer) — bare keyword still targets `message` alone. Companions raw_data_hash (a fingerprint OBJECT) and raw_data_size are deliberately NOT promoted: nothing emits them yet."
   },
   {
     "udm_field": null,

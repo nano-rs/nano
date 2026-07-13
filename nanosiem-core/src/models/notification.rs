@@ -38,6 +38,8 @@ pub enum NotificationType {
     DiskPressurePartitionDropped,
     ModelDeprecated,
     CaseEscalated,
+    /// A scheduled report finished and its artifacts are ready to download.
+    ReportReady,
 }
 
 impl std::fmt::Display for NotificationType {
@@ -67,6 +69,7 @@ impl std::fmt::Display for NotificationType {
             }
             NotificationType::ModelDeprecated => write!(f, "model_deprecated"),
             NotificationType::CaseEscalated => write!(f, "case_escalated"),
+            NotificationType::ReportReady => write!(f, "report_ready"),
         }
     }
 }

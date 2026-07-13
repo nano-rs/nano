@@ -47,6 +47,19 @@ pub struct AuthContext {
     pub api_key_id: Option<Uuid>,
     /// API key display name if authenticated via API key
     pub api_key_name: Option<String>,
+    /// SOURCE-scope deny set for this caller (NAN-1799 / per-source RBAC).
+    ///
+    /// Populated by the auth middleware via `SourceScopeResolver::resolve`
+    /// after authentication succeeds. Carries SOURCE scope ONLY — the `audit`
+    /// source gate is NOT baked in here; handlers union it in from the
+    /// `audit:view` permission when composing the effective deny set they pass
+    /// to the search/detection services.
+    ///
+    /// Defaults to unrestricted (empty deny set) in the constructors below; the
+    /// middleware overwrites it with the resolved scope. An unrestricted scope
+    /// means "sees everything", so callers built outside the middleware (tests,
+    /// internal SYSTEM paths) stay back-compatible.
+    pub denied_sources: nanosiem_core::auth::ScopeSet,
 }
 
 impl AuthContext {
@@ -57,6 +70,7 @@ impl AuthContext {
             is_api_key: false,
             api_key_id: None,
             api_key_name: None,
+            denied_sources: nanosiem_core::auth::ScopeSet::default(),
         }
     }
 
@@ -83,12 +97,30 @@ impl AuthContext {
             is_api_key: true,
             api_key_id: Some(info.id),
             api_key_name: Some(info.name.clone()),
+            denied_sources: nanosiem_core::auth::ScopeSet::default(),
         }
     }
 
     /// Check if the context has a specific permission
     pub fn has_permission(&self, permission: &str) -> bool {
         self.claims.has_permission(permission)
+    }
+
+    /// NAN-1801: compose the caller's EFFECTIVE per-source deny set — the
+    /// per-source RBAC deny set (NAN-1799, `denied_sources`) unioned with the
+    /// `audit` source unless the caller holds `audit:view`. This is the same
+    /// composition the gated handlers perform inline (alerts, fields,
+    /// dashboard panel queries, detection stats, dry-resolve); side-door
+    /// callers use this method so the audit gate cannot be forgotten.
+    ///
+    /// An unrestricted caller with `audit:view` yields an EMPTY deny set,
+    /// keeping downstream SQL byte-identical to the pre-scoping form.
+    pub fn effective_source_deny_set(&self) -> std::collections::BTreeSet<String> {
+        let mut deny = self.denied_sources.deny_set().clone();
+        if !self.has_permission(nanosiem_core::auth::permissions::AUDIT_VIEW) {
+            deny.insert("audit".to_string());
+        }
+        deny
     }
 
     /// Check if the context has any of the specified permissions

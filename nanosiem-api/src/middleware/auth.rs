@@ -23,7 +23,8 @@ use std::sync::Arc;
 
 use nanosiem_core::audit::ClientContext;
 use nanosiem_core::auth::{
-    ApiKeyService, ApiKeyServiceError, PermissionResolver, TokenConfig, TokenService,
+    ApiKeyService, ApiKeyServiceError, PermissionResolver, SourceScopeResolver, TokenConfig,
+    TokenService,
 };
 
 // AuthContext, AuthErrorResponse, and the check_*/require_* permission helpers
@@ -173,6 +174,12 @@ pub struct AuthState {
     /// Resolves user permissions from PostgreSQL with caching.
     /// Populated after JWT validation to keep permissions out of the token.
     pub permission_resolver: Option<Arc<PermissionResolver>>,
+    /// Resolves the caller's SOURCE-scope deny set (per-source RBAC, NAN-1799)
+    /// from PostgreSQL with caching. FAIL-CLOSED on PG unavailability. Populated
+    /// into `AuthContext::denied_sources` after authentication succeeds. `None`
+    /// in minimal setups (e.g. tests) — callers then resolve to unrestricted.
+    /// Cheap to clone (Arc-backed internally), so it is stored by value.
+    pub source_scope_resolver: Option<SourceScopeResolver>,
 }
 
 impl AuthState {
@@ -187,6 +194,7 @@ impl AuthState {
             api_key_service: api_key_service.map(Arc::new),
             auth_enabled,
             permission_resolver: None,
+            source_scope_resolver: None,
         }
     }
 
@@ -201,6 +209,7 @@ impl AuthState {
             api_key_service,
             auth_enabled,
             permission_resolver: None,
+            source_scope_resolver: None,
         }
     }
 
@@ -214,6 +223,7 @@ impl AuthState {
             api_key_service: None,
             auth_enabled: true,
             permission_resolver: None,
+            source_scope_resolver: None,
         }
     }
 
@@ -221,6 +231,49 @@ impl AuthState {
     pub fn with_permission_resolver(mut self, resolver: PermissionResolver) -> Self {
         self.permission_resolver = Some(Arc::new(resolver));
         self
+    }
+
+    /// Set the source-scope resolver so the middleware populates each request's
+    /// `AuthContext::denied_sources` (per-source RBAC, NAN-1799).
+    pub fn with_source_scope_resolver(mut self, resolver: SourceScopeResolver) -> Self {
+        self.source_scope_resolver = Some(resolver);
+        self
+    }
+}
+
+/// Resolve the caller's SOURCE-scope deny set to stamp onto `AuthContext`.
+///
+/// FAIL-CLOSED (NAN-1799): when a resolver is configured but cannot produce a
+/// scope — PostgreSQL unreachable with no known restricted registry — the
+/// request is rejected with 503 rather than proceeding with an empty
+/// (fail-open) deny set. When no resolver is configured (minimal `AuthState`,
+/// e.g. tests) the caller resolves to unrestricted for back-compat.
+async fn resolve_source_scope(
+    auth_state: &AuthState,
+    user_id: uuid::Uuid,
+    roles: &[String],
+) -> Result<nanosiem_core::auth::ScopeSet, Response> {
+    let Some(ref resolver) = auth_state.source_scope_resolver else {
+        return Ok(nanosiem_core::auth::ScopeSet::default());
+    };
+    match resolver.resolve(user_id, roles).await {
+        Ok(scope) => Ok(scope),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                user_id = %user_id,
+                "source-scope resolution failed — failing closed (503)"
+            );
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(AuthErrorResponse {
+                    error: "source_scope_unavailable".to_string(),
+                    message: "Source access scope is temporarily unavailable. Please retry shortly."
+                        .to_string(),
+                }),
+            )
+                .into_response())
+        }
     }
 }
 
@@ -283,7 +336,14 @@ pub async fn auth_middleware(
                 if let Some(ref resolver) = auth_state.permission_resolver {
                     claims.permissions = resolver.resolve_with_roles(claims.sub, &claims.roles).await;
                 }
-                let auth_context = AuthContext::from_jwt(claims.clone());
+                // Resolve the caller's source-scope deny set (fail-closed 503).
+                let scope =
+                    match resolve_source_scope(&auth_state, claims.sub, &claims.roles).await {
+                        Ok(scope) => scope,
+                        Err(response) => return Err(response),
+                    };
+                let mut auth_context = AuthContext::from_jwt(claims.clone());
+                auth_context.denied_sources = scope;
                 request.extensions_mut().insert(auth_context);
                 request.extensions_mut().insert(claims);
                 return Ok(next.run(request).await);
@@ -303,8 +363,16 @@ pub async fn auth_middleware(
                 .await
             {
                 Ok(info) => {
-                    let auth_context = AuthContext::from_api_key(&info);
+                    let mut auth_context = AuthContext::from_api_key(&info);
                     let claims = auth_context.claims.clone();
+                    // The api-key subject is the key OWNER's user_id, so grants
+                    // resolve the owner's group memberships here (correct).
+                    let scope =
+                        match resolve_source_scope(&auth_state, claims.sub, &claims.roles).await {
+                            Ok(scope) => scope,
+                            Err(response) => return Err(response),
+                        };
+                    auth_context.denied_sources = scope;
                     request.extensions_mut().insert(auth_context);
                     request.extensions_mut().insert(claims);
                     return Ok(next.run(request).await);
@@ -375,7 +443,14 @@ pub async fn auth_middleware(
                 if let Some(ref resolver) = auth_state.permission_resolver {
                     claims.permissions = resolver.resolve_with_roles(claims.sub, &claims.roles).await;
                 }
-                let auth_context = AuthContext::from_jwt(claims.clone());
+                // Resolve the caller's source-scope deny set (fail-closed 503).
+                let scope =
+                    match resolve_source_scope(&auth_state, claims.sub, &claims.roles).await {
+                        Ok(scope) => scope,
+                        Err(response) => return Err(response),
+                    };
+                let mut auth_context = AuthContext::from_jwt(claims.clone());
+                auth_context.denied_sources = scope;
                 request.extensions_mut().insert(auth_context);
                 request.extensions_mut().insert(claims);
                 return Ok(next.run(request).await);

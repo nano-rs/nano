@@ -66,7 +66,10 @@ async fn first_page_runs_companions() {
     let svc = SearchService::with_dual_pool(&pool);
 
     let resp = svc
-        .search(request(NO_MATCH_SENTINEL, 0))
+        .search(
+            request(NO_MATCH_SENTINEL, 0),
+            &nanosiem_core::auth::ScopeSet::unrestricted(),
+        )
         .await
         .expect("offset=0 search should succeed");
 
@@ -89,7 +92,10 @@ async fn page_flips_skip_companions() {
 
     let offset = 200usize;
     let resp = svc
-        .search(request(NO_MATCH_SENTINEL, offset))
+        .search(
+            request(NO_MATCH_SENTINEL, offset),
+            &nanosiem_core::auth::ScopeSet::unrestricted(),
+        )
         .await
         .expect("offset>0 search should succeed");
 

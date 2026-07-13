@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Risk weight and decay configuration handlers
+//! Risk weight, decay, and notable configuration handlers
 //!
 //! - Risk **weight** (`/api/settings/risk`) stays open: it's a single PG
 //!   column on `system_settings` consumed by the detection scoring path
@@ -8,11 +8,21 @@
 //! - Risk **decay TTL** (`/api/settings/risk-decay`) is enterprise-only —
 //!   the decay factors are read by `RiskAnalyticsService` time-windowed
 //!   queries, which live in `nanosiem-enterprise::risk`.
+//! - Risk **notables** (`/api/settings/risk-notables`, NAN-1792) are
+//!   enterprise-only. Since NAN-1805 the bespoke `RiskNotableScheduler` is
+//!   retired and notables run as the seeded DEFAULT DETECTION RULE over
+//!   `dataset=risk` (`DEFAULT_RISK_NOTABLE_RULE_ID`, enterprise migration
+//!   9000033). This endpoint is a thin editor over that rule: thresholds and
+//!   per-type overrides regenerate the rule's WHERE, cooldown maps to
+//!   `alert_cooldown_minutes`, and `enabled` maps to Live vs Alerting mode.
+//!   The `system_settings.risk_notable_*` columns remain the storage for the
+//!   threshold numbers (the rule query is generated FROM them), so the card's
+//!   contract (`RiskNotableConfig`) is unchanged.
 
 use axum::{extract::State, Extension, Json};
 use nanosiem_core::audit::{AuditEvent, AuditSource, ClientContext, RISK_CONFIG_UPDATED};
 #[cfg(feature = "enterprise")]
-use nanosiem_core::audit::RISK_DECAY_CONFIG_UPDATED;
+use nanosiem_core::audit::{RISK_DECAY_CONFIG_UPDATED, RISK_NOTABLE_CONFIG_UPDATED};
 use nanosiem_core::auth::permissions;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -281,4 +291,184 @@ pub async fn update_risk_decay_config(
         decay_3_5d: config.decay_3_5d,
         decay_5_7d: config.decay_5_7d,
     }))
+}
+
+/// Get risk-notable configuration
+///
+/// GET /api/settings/risk-notables
+///
+/// Returns the risk-notable settings (NAN-1792/NAN-1805): the 24h/7d
+/// decayed-score thresholds and per-entity-type overrides (stored on
+/// `system_settings`, from which the default rule's query is generated), plus
+/// the live state of the seeded default `dataset=risk` detection rule —
+/// `enabled` reflects whether the rule is in Alerting mode and
+/// `cooldown_minutes` reflects its `alert_cooldown_minutes`. When the default
+/// rule has been deleted, `enabled` reads false (nothing evaluates).
+#[cfg(feature = "enterprise")]
+#[utoipa::path(
+    get,
+    path = "/api/settings/risk-notables",
+    tag = "settings",
+    responses(
+        (status = 200, description = "Risk notable configuration", body = nanosiem_core::risk::RiskNotableConfig),
+        (status = 403, description = "Missing permission", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
+pub async fn get_risk_notable_config(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<nanosiem_core::risk::RiskNotableConfig>, ApiError> {
+    ensure_permission(&auth, permissions::SETTINGS_RISK)?;
+
+    let mut config = state
+        .risk_service
+        .get_notable_config()
+        .await
+        .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+
+    // NAN-1805: the default dataset=risk rule is the execution surface —
+    // overlay its live state so the card reflects reality even after the rule
+    // was edited directly (rule editor / DaC).
+    use nanosiem_core::models::RuleMode;
+    use nanosiem_core::risk::DEFAULT_RISK_NOTABLE_RULE_ID;
+    match state
+        .detection_service
+        .get_rule(DEFAULT_RISK_NOTABLE_RULE_ID)
+        .await
+    {
+        Ok(rule) => {
+            config.enabled = rule.mode == RuleMode::Alerting;
+            if let Some(cooldown) = rule.alert_cooldown_minutes.filter(|m| *m > 0) {
+                config.cooldown_minutes = cooldown;
+            }
+        }
+        Err(nanosiem_core::DetectionError::RuleNotFound(_)) => {
+            // Deleted by the operator: nothing evaluates, so notables are off.
+            config.enabled = false;
+        }
+        Err(e) => {
+            // Degrade to the persisted settings rather than failing the card.
+            tracing::warn!(error = %e, "risk-notables: failed to read the default rule; returning persisted settings");
+        }
+    }
+
+    Ok(Json(config))
+}
+
+/// Update risk-notable configuration
+///
+/// PUT /api/settings/risk-notables
+///
+/// Updates the risk-notable settings AND syncs the seeded default
+/// `dataset=risk` detection rule (NAN-1805): thresholds + per-type overrides
+/// regenerate the rule's query, `cooldown_minutes` writes its
+/// `alert_cooldown_minutes`, and `enabled` maps to Alerting (true) vs Live
+/// (false) mode — the same explicit operator action that previously flipped
+/// the scheduler switch. Thresholds and cooldown must be positive; the
+/// cooldown may not exceed 10080 (7 days). If the default rule was deleted,
+/// the settings are still persisted and a warning is logged (nothing
+/// evaluates until a risk rule exists again).
+#[cfg(feature = "enterprise")]
+#[utoipa::path(
+    put,
+    path = "/api/settings/risk-notables",
+    tag = "settings",
+    request_body = nanosiem_core::risk::RiskNotableConfig,
+    responses(
+        (status = 200, description = "Risk notable config updated", body = nanosiem_core::risk::RiskNotableConfig),
+        (status = 400, description = "Invalid config", body = ErrorResponse),
+        (status = 403, description = "Missing permission", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
+pub async fn update_risk_notable_config(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(client): Extension<ClientContext>,
+    Json(config): Json<nanosiem_core::risk::RiskNotableConfig>,
+) -> Result<Json<nanosiem_core::risk::RiskNotableConfig>, ApiError> {
+    ensure_permission(&auth, permissions::SETTINGS_RISK)?;
+
+    // The rule's alert_cooldown_minutes is CHECK-bounded at 7 days
+    // (migration 248); reject up front instead of 500ing on the constraint.
+    if config.cooldown_minutes > nanosiem_core::models::detection_rule::MAX_ALERT_COOLDOWN_MINUTES
+    {
+        return Err(ApiError::ValidationError(format!(
+            "cooldown_minutes must be at most {} (7 days)",
+            nanosiem_core::models::detection_rule::MAX_ALERT_COOLDOWN_MINUTES
+        )));
+    }
+
+    state
+        .risk_service
+        .update_notable_config(&config)
+        .await
+        .map_err(|e| ApiError::ValidationError(e.to_string()))?;
+
+    // NAN-1805: sync the default dataset=risk rule — it is the execution
+    // surface for these settings now that the scheduler is retired. Mapping
+    // `enabled` to Alerting mode via this SETTINGS_RISK-gated endpoint is
+    // behavior parity with NAN-1792 (enabling the scheduler needed the same
+    // permission). enabled=false only demotes Alerting → Live; a rule the
+    // operator parked in Staging/Paused is left alone.
+    {
+        use nanosiem_core::models::{RuleMode, UpdateDetectionRule};
+        use nanosiem_core::risk::DEFAULT_RISK_NOTABLE_RULE_ID;
+
+        match state
+            .detection_service
+            .get_rule(DEFAULT_RISK_NOTABLE_RULE_ID)
+            .await
+        {
+            Ok(rule) => {
+                let mode = if config.enabled {
+                    (rule.mode != RuleMode::Alerting).then_some(RuleMode::Alerting)
+                } else {
+                    (rule.mode == RuleMode::Alerting).then_some(RuleMode::Live)
+                };
+                let update = UpdateDetectionRule {
+                    query: Some(config.default_rule_query()),
+                    alert_cooldown_minutes: Some(config.cooldown_minutes),
+                    mode,
+                    ..Default::default()
+                };
+                let updated = state
+                    .detection_service
+                    .update_rule(DEFAULT_RISK_NOTABLE_RULE_ID, update)
+                    .await?;
+                // Keep distributed scheduling in step with a mode change
+                // (Live/Alerting both schedule; this is a no-op otherwise).
+                state.detection_service.sync_next_run_at(&updated).await;
+            }
+            Err(nanosiem_core::DetectionError::RuleNotFound(_)) => {
+                tracing::warn!(
+                    "risk-notables: default rule {} not found — settings persisted but nothing evaluates them (the rule was deleted; re-create a dataset=risk rule to resume notables)",
+                    DEFAULT_RISK_NOTABLE_RULE_ID
+                );
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    tracing::info!(
+        enabled = config.enabled,
+        threshold_24h = config.threshold_24h,
+        threshold_7d = config.threshold_7d,
+        cooldown_minutes = config.cooldown_minutes,
+        "Risk notable config updated (default rule synced)"
+    );
+
+    state.emit_audit(
+        AuditEvent::builder(AuditSource::Settings, RISK_NOTABLE_CONFIG_UPDATED)
+            .actor(Some(auth.user_id()), None)
+            .api_key(auth.api_key_id, auth.api_key_name.clone())
+            .resource("settings", None, Some("risk_notables".to_string()))
+            .client_context(&client)
+            .build(),
+    );
+
+    Ok(Json(config))
 }

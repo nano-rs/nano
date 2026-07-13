@@ -761,57 +761,190 @@ pub(super) fn has_selective_indexed_eq(expr: &SearchExpr, profile: &dyn SchemaPr
     check(expr, profile)
 }
 
-/// True when `expr` is exactly the audit-gate conjunct that
-/// `enforce_source_type_exclusion` (NAN-704) appends for users lacking
-/// `audit:view`: `source_type != "audit"` (case-insensitive on both sides).
+/// True when `expr` is exactly the source-scope gate conjunct that
+/// `query_processing::mandatory_exclusion` appends at every scan. Two shapes
+/// exist (see that function for the authoritative emitted AST):
+///
+///  * NAN-704 legacy audit gate — a deny set of exactly `{"audit"}` emits
+///    `source_type != "audit"` (case-insensitive on both sides).
+///  * NAN-1799 per-source RBAC scoping — any other non-empty deny set emits
+///    ONE negated IN-list, `source_type NOT IN ("a", "b", …)`
+///    (`SearchExpr::InList { negated: true, .. }`).
+///
+/// Both must be recognized here: a scoped user's spans/metrics query carries
+/// the NOT-IN form, and missing it would leave a per-row `attributes` Map
+/// probe on a column class that doesn't exist there AND silently drop any
+/// span a tenant tagged with a denied `source_type` value (perf + correctness
+/// on spans; the logs dataset never strips, so there is no leak either way).
+///
+/// The field-name check is the same relaxed normalization for both arms
+/// (`eq_ignore_ascii_case("source_type")`); values are NOT inspected for the
+/// IN-list arm — the injector is the only producer of the
+/// `And(Group(inner), <gate>)` wrap this matcher is applied under, and its
+/// value set is exactly the caller's deny set.
 fn is_injected_audit_gate_filter(expr: &SearchExpr) -> bool {
-    matches!(
-        expr,
+    match expr {
         SearchExpr::FieldFilter {
             field,
             op: Comparator::Ne,
             value: Value::String(s),
-        } if field.eq_ignore_ascii_case("source_type") && s.eq_ignore_ascii_case("audit")
-    )
+        } => field.eq_ignore_ascii_case("source_type") && s.eq_ignore_ascii_case("audit"),
+        SearchExpr::InList {
+            field,
+            negated: true,
+            values: _,
+        } => field.eq_ignore_ascii_case("source_type"),
+        _ => false,
+    }
 }
 
-/// Strip the injected non-audit gate from a query so it is NOT emitted on the
-/// spans/metrics datasets (O45 / NAN-1733).
+/// Strip the injected source-scope gate from a query so it is NOT emitted on
+/// the spans/metrics datasets (O45 / NAN-1733; generalized for NAN-1799).
 ///
-/// `enforce_source_type_exclusion` wraps the base search as
-/// `(<expr>) AND source_type != "audit"` for users without `audit:view`. On
+/// `enforce_source_scope` (and its `enforce_non_audit_query` /
+/// `enforce_source_type_exclusion` wrappers) wraps EVERY scan as
+/// `(<expr>) AND <gate>`, where `<gate>` is `source_type != "audit"` for the
+/// legacy `{"audit"}` deny set or `source_type NOT IN (…)` for any other
+/// deny set (NAN-1799 per-source RBAC scoping — see
+/// `is_injected_audit_gate_filter` for both recognized shapes). On
 /// `Dataset::Logs` that resolves to a cheap `source_type` column compare and is
 /// correct — audit rows live only in the `logs` table (`source_type = 'audit'`).
 /// On the OTLP spans/metrics datasets there IS no `source_type` column: the
 /// spans/metrics profile resolves it to a per-row `attributes` / `resource_attributes`
 /// Map lookup, so the gate (a) costs a double Map probe for a row class that can
 /// never exist there and (b) silently drops any span/metric a tenant legitimately
-/// tagged `source_type=audit`. This is the exact structural inverse of the
-/// injection in `query_processing::inject_source_type_exclusion_recursive`:
-/// unwrap `And(Group(inner), <audit filter>)` back to `inner`, recursing through
-/// piped sources exactly as the injection does. Only the auto-injected wrap
-/// (`Group` on the left) is matched, so a user's own top-level
-/// `source_type!="audit"` term is left untouched. Callers gate this to
-/// non-`Logs` datasets, so the logs path stays byte-identical.
-fn strip_injected_audit_gate(query: &Query) -> Query {
+/// tagged with a denied `source_type` value. This is the exact structural
+/// inverse of the injection in
+/// `query_processing::inject_source_type_exclusion_recursive`:
+/// unwrap `And(Group(inner), <gate>)` back to `inner`. Only the
+/// auto-injected wrap (`Group` on the left) is matched, so a user's own top-level
+/// `source_type!="audit"` term is left untouched.
+///
+/// NAN-1794: the injection now also gates every SUBSEARCH (`join` / `append` /
+/// `IN [ … ]`), so the strip must walk them too — and it must decide PER SCAN,
+/// because a subsearch can target a different dataset than the outer query
+/// (NAN-1562 cross-dataset correlation). The rule is simply "does THIS scan read
+/// the logs table?":
+///
+///  * spans query + inherited subsearch → subsearch reads spans → strip.
+///  * spans query + `[dataset=logs …]`  → subsearch reads LOGS → KEEP the gate.
+///    (Dropping it there would be the audit leak this gate exists to prevent.)
+///  * logs query  + `[dataset=spans …]` → subsearch reads spans → strip.
+///
+/// Fail-closed by construction: anything this walker does not recognize keeps
+/// its gate. A missed variant costs a redundant Map probe on spans — never a
+/// leaked audit row.
+fn strip_injected_audit_gate(query: &Query, dataset: otel::Dataset) -> Query {
     match query {
-        Query::Search(expr) => Query::Search(strip_injected_audit_gate_expr(expr)),
+        Query::Search(expr) => Query::Search(strip_injected_audit_gate_expr(expr, dataset)),
         Query::Piped { source, command } => Query::Piped {
-            source: Box::new(strip_injected_audit_gate(source)),
-            command: command.clone(),
+            source: Box::new(strip_injected_audit_gate(source, dataset)),
+            command: strip_injected_audit_gate_command(command, dataset),
         },
     }
 }
 
-fn strip_injected_audit_gate_expr(expr: &SearchExpr) -> SearchExpr {
-    if let SearchExpr::And(left, right) = expr {
-        if is_injected_audit_gate_filter(right) {
-            if let SearchExpr::Group(inner) = left.as_ref() {
-                return (**inner).clone();
+/// Unwrap the gate from one scan (only when that scan does NOT read `logs`),
+/// then recurse into any subsearches the expression carries.
+fn strip_injected_audit_gate_expr(expr: &SearchExpr, dataset: otel::Dataset) -> SearchExpr {
+    if !matches!(dataset, otel::Dataset::Logs) {
+        if let SearchExpr::And(left, right) = expr {
+            if is_injected_audit_gate_filter(right) {
+                if let SearchExpr::Group(inner) = left.as_ref() {
+                    return strip_injected_audit_gate_subsearches(inner, dataset);
+                }
             }
         }
     }
-    expr.clone()
+    strip_injected_audit_gate_subsearches(expr, dataset)
+}
+
+/// Walk an expression and strip the gate inside every `IN [ <subsearch> ]`,
+/// each resolved against ITS OWN dataset (inheriting the outer one when unset).
+fn strip_injected_audit_gate_subsearches(
+    expr: &SearchExpr,
+    dataset: otel::Dataset,
+) -> SearchExpr {
+    match expr {
+        SearchExpr::InSubsearch {
+            field,
+            subsearch,
+            negated,
+            subsearch_dataset,
+        } => SearchExpr::InSubsearch {
+            field: field.clone(),
+            subsearch: Box::new(strip_injected_audit_gate(
+                subsearch,
+                subsearch_dataset.unwrap_or(dataset),
+            )),
+            negated: *negated,
+            subsearch_dataset: *subsearch_dataset,
+        },
+        SearchExpr::And(left, right) => SearchExpr::And(
+            Box::new(strip_injected_audit_gate_subsearches(left, dataset)),
+            Box::new(strip_injected_audit_gate_subsearches(right, dataset)),
+        ),
+        SearchExpr::Or(left, right) => SearchExpr::Or(
+            Box::new(strip_injected_audit_gate_subsearches(left, dataset)),
+            Box::new(strip_injected_audit_gate_subsearches(right, dataset)),
+        ),
+        SearchExpr::Not(inner) => SearchExpr::Not(Box::new(
+            strip_injected_audit_gate_subsearches(inner, dataset),
+        )),
+        SearchExpr::Group(inner) => SearchExpr::Group(Box::new(
+            strip_injected_audit_gate_subsearches(inner, dataset),
+        )),
+        other => other.clone(),
+    }
+}
+
+/// Mirror of `query_processing::gate_command`: reach the subsearch of every
+/// command that carries one.
+fn strip_injected_audit_gate_command(command: &Command, dataset: otel::Dataset) -> Command {
+    let mut stripped = command.clone();
+    match &mut stripped {
+        Command::Join {
+            subsearch,
+            subsearch_dataset,
+            ..
+        } => {
+            let sub_dataset = subsearch_dataset.unwrap_or(dataset);
+            **subsearch = strip_injected_audit_gate(subsearch, sub_dataset);
+        }
+        // `append` has no dataset selector — its subsearch inherits the outer one.
+        Command::Append { subsearch, .. } => {
+            **subsearch = strip_injected_audit_gate(subsearch, dataset);
+        }
+        Command::Where { condition } => {
+            *condition = strip_injected_audit_gate_subsearches(condition, dataset);
+        }
+        Command::Transaction {
+            startswith,
+            endswith,
+            ..
+        } => {
+            if let Some(expr) = startswith {
+                *expr = strip_injected_audit_gate_subsearches(expr, dataset);
+            }
+            if let Some(expr) = endswith {
+                *expr = strip_injected_audit_gate_subsearches(expr, dataset);
+            }
+        }
+        Command::Sequence { conditions, .. } => {
+            for condition in conditions.iter_mut() {
+                *condition = strip_injected_audit_gate_subsearches(condition, dataset);
+            }
+        }
+        Command::Funnel { steps, .. } => {
+            for (_, condition) in steps.iter_mut() {
+                *condition = strip_injected_audit_gate_subsearches(condition, dataset);
+            }
+        }
+        // Everything else carries no subsearch. A wildcard is safe HERE (unlike
+        // on the injection side): an unrecognized variant simply keeps its gate.
+        _ => {}
+    }
+    stripped
 }
 
 /// Default max elements for groupArray/groupUniqArray to prevent OOM from unbounded array aggregation.
@@ -924,6 +1057,16 @@ pub struct ClickHouseSqlGenerator {
     /// OCSF/tenant-prefixed logs table (`ocsf_logs` != `"logs"`) as cross-dataset
     /// and re-points the sub at the wrong table.
     dataset: otel::Dataset,
+    /// Per-request configuration for the derived `risk` dataset (NAN-1798 P2):
+    /// the decay factors + cleared-entity boundaries the shared risk builder
+    /// inlines into the `FROM (<risk aggregation>)` base source, resolved by
+    /// `core_search`'s cached provider and injected via
+    /// [`with_risk_config`](Self::with_risk_config) BEFORE any
+    /// [`with_dataset`](Self::with_dataset)`(Risk)` swap (including the scoped
+    /// clones a `[dataset=risk …]` subsearch takes — the field is carried by
+    /// `Clone`). `None` (every non-risk path, and tests that never touch risk)
+    /// falls back to [`RiskQueryConfig::default`] at swap time.
+    risk_config: Option<crate::risk::clickhouse_sql::RiskQueryConfig>,
     /// Whether this deployment is a multi-shard ClickHouse cluster (NAN-1728 / C5).
     /// Set from `DualPool::TableNames::is_clustered()` at construction via
     /// [`with_cluster_routing`](Self::with_cluster_routing). When `true`, a
@@ -936,6 +1079,19 @@ pub struct ClickHouseSqlGenerator {
     /// literal-local output. The `Dataset::Logs` restore arm is unaffected: its
     /// table comes from `base_table`, already routed by `read_bare`.
     is_clustered: bool,
+    /// Caller-scope deny set for gating the `| identity` ASOF-join build-side
+    /// (NAN-1801). The P1 main-scan enforcement is a text rewrite of the outer
+    /// query and does NOT reach joined datasets; when set via
+    /// [`with_source_scope_deny`](Self::with_source_scope_deny), the identity
+    /// build-side subquery filters denied `source` values.
+    /// Config-like (mirrors `is_clustered`): carried across clone, not reset.
+    ///
+    /// NOTE: the direct `/api/identity/resolve` endpoints (the primary leak) are
+    /// gated separately in the handlers. This field is NOT yet populated by the
+    /// interactive search pipeline (`ch_generator_for_pool` doesn't carry scope),
+    /// so the `| identity` enrich-side gate is inert until that threading lands —
+    /// tracked as a NAN-1801 follow-up. Empty default = no behavior change.
+    source_scope_deny: std::collections::BTreeSet<String>,
 }
 
 impl Clone for ClickHouseSqlGenerator {
@@ -956,7 +1112,9 @@ impl Clone for ClickHouseSqlGenerator {
             base_profile: self.base_profile.clone(),
             base_table: self.base_table.clone(),
             dataset: self.dataset,
+            risk_config: self.risk_config.clone(),
             is_clustered: self.is_clustered,
+            source_scope_deny: self.source_scope_deny.clone(),
         }
     }
 }
@@ -987,7 +1145,9 @@ impl ClickHouseSqlGenerator {
             base_profile: None,
             base_table: None,
             dataset: otel::Dataset::Logs,
+            risk_config: None,
             is_clustered: false,
+            source_scope_deny: std::collections::BTreeSet::new(),
         }
     }
 
@@ -1010,7 +1170,9 @@ impl ClickHouseSqlGenerator {
             base_profile: None,
             base_table: None,
             dataset: otel::Dataset::Logs,
+            risk_config: None,
             is_clustered: false,
+            source_scope_deny: std::collections::BTreeSet::new(),
         }
     }
 
@@ -1054,6 +1216,57 @@ impl ClickHouseSqlGenerator {
         }
     }
 
+    /// Inject the per-request risk-dataset configuration (NAN-1798 P2): the
+    /// decay factors + cleared-entity boundaries + evaluation anchor the shared
+    /// risk builder inlines into the derived `FROM (<risk aggregation>)` base
+    /// source. Builder-style; MUST be applied before a
+    /// [`with_dataset`](Self::with_dataset)`(Risk)` swap (or before generating
+    /// a query whose subsearch selects `dataset=risk` — the scoped clone
+    /// carries the field). `core_search` resolves it from the cached
+    /// [`RiskQueryConfigProvider`](crate::risk::config_provider::RiskQueryConfigProvider)
+    /// so `dataset=risk` scores are computed with the SAME values the
+    /// enterprise repository binds — never a divergent computation. Non-risk
+    /// generation never consults it, so attaching it is output-neutral for
+    /// `dataset=logs/spans/metrics`.
+    pub fn with_risk_config(
+        mut self,
+        config: crate::risk::clickhouse_sql::RiskQueryConfig,
+    ) -> Self {
+        self.risk_config = Some(config);
+        self
+    }
+
+    /// The derived base source for the `risk` dataset (NAN-1798 P2): the shared
+    /// risk builder's entity-grain aggregation, rendered inline and
+    /// parenthesized for a `FROM (…)` position. Built from the CAPTURED tenant
+    /// logs binding (`base_table`/`base_profile` — already cluster-routed via
+    /// `read_bare` and OCSF-aware), so the findings scan targets the same table
+    /// the enterprise repository reads, whichever dataset the generator was on
+    /// when the swap happened.
+    fn risk_base_source(&self) -> String {
+        let cfg = self
+            .risk_config
+            .clone()
+            .unwrap_or_else(crate::risk::clickhouse_sql::RiskQueryConfig::default);
+        let logs_table = self
+            .base_table
+            .clone()
+            .expect("base_table captured at top of with_dataset");
+        let ocsf = self
+            .base_profile
+            .as_ref()
+            .map(|p| p.id() == crate::schema::SchemaId::Ocsf)
+            .unwrap_or(false);
+        let source = crate::risk::clickhouse_sql::RiskFindingsSource::new(ocsf, logs_table);
+        let query = crate::risk::clickhouse_sql::risk_dataset_base_query(
+            &source,
+            cfg.now,
+            &cfg.decay,
+            &cfg.cleared,
+        );
+        format!("({})", query.to_inline_sql())
+    }
+
     /// Point the generator at an OTLP [`Dataset`] (NAN-1534). Builder-style; sets
     /// the storage table AND the primary time column in lock-step so the
     /// time-bound WHERE, default ORDER BY, and the `rate()` window all reference
@@ -1064,6 +1277,10 @@ impl ClickHouseSqlGenerator {
     /// byte-for-byte identical to the pre-dataset generator. The whole nPL
     /// pipeline (search terms, stats/where/sort/timechart/eval) then runs against
     /// the selected table unchanged.
+    ///
+    /// `Dataset::Risk` (NAN-1798 P2) swaps in a DERIVED subquery instead of a
+    /// storage table ([`risk_base_source`](Self::risk_base_source)) — the first
+    /// dataset whose base source is not a table string.
     ///
     /// [`Dataset`]: otel::Dataset
     pub fn with_dataset(mut self, dataset: otel::Dataset) -> Self {
@@ -1090,6 +1307,10 @@ impl ClickHouseSqlGenerator {
                 .base_table
                 .clone()
                 .unwrap_or_else(|| dataset.table_name().to_string()),
+            // NAN-1798 P2: the risk dataset's base source is a DERIVED subquery
+            // over the captured tenant logs table (cluster routing + OCSF
+            // sentinels inherited from the shared builder), not a storage table.
+            otel::Dataset::Risk => self.risk_base_source(),
             // NAN-1728 (C5): route the spans/metrics storage table to its
             // `_distributed` wrapper when clustered so the search reads all
             // shards; single-shard (default) keeps the bare literal.
@@ -1109,6 +1330,9 @@ impl ClickHouseSqlGenerator {
             otel::Dataset::Metrics => {
                 self.profile = Arc::new(crate::schema::MetricsProfile::new())
             }
+            // NAN-1798 P2: the derived risk grain resolves fields through its
+            // own 15-column profile (no ext/Map spill on a subquery source).
+            otel::Dataset::Risk => self.profile = Arc::new(crate::schema::RiskProfile::new()),
             // NAN-1567: restore the captured tenant logs profile. For a logs-only
             // query `with_dataset` is never called, so this arm is only reached for
             // a cross-dataset subsearch INTO logs — where `base_profile` was
@@ -1172,6 +1396,34 @@ impl ClickHouseSqlGenerator {
     /// default ORDER BY, and the `rate()` counter window (NAN-1534).
     pub(crate) fn time_column(&self) -> &str {
         &self.time_column
+    }
+
+    /// The base-scan time-bound predicate for the ACTIVE dataset (NAN-1798 P2).
+    ///
+    /// Every non-risk dataset emits the exact historical
+    /// `{time_column} BETWEEN '{start}' AND '{end}'` form — byte-identical to
+    /// the previously inlined format strings. The derived `risk` dataset emits
+    /// a constant-true predicate instead: its 24h/7d score windows are FIXED
+    /// trailing windows anchored at evaluation time and baked into the derived
+    /// base source (design §4 — "the search time-picker does not reshape
+    /// them"), so bounding the entity grain by the picker window would
+    /// silently drop entities whose last finding predates it and diverge from
+    /// the Risk page / leaderboard numbers.
+    pub(crate) fn time_bound_predicate(
+        &self,
+        time_column: &str,
+        time_range: &TimeRange,
+    ) -> String {
+        if matches!(self.dataset, otel::Dataset::Risk) {
+            "1 = 1".to_string()
+        } else {
+            format!(
+                "{} BETWEEN '{}' AND '{}'",
+                time_column,
+                crate::sql_hygiene::format_ch_bound_micros(&time_range.start),
+                crate::sql_hygiene::format_ch_bound_micros(&time_range.end),
+            )
+        }
     }
 
     /// The physical per-row identity column for the active dataset (NAN-1721 /
@@ -1613,21 +1865,24 @@ impl ClickHouseSqlGenerator {
         time_range: &TimeRange,
         options: &QueryOptions,
     ) -> Result<String, SqlGenError> {
-        // O45 (NAN-1733): the audit-view gate (`… AND source_type != "audit"`,
-        // injected by `enforce_source_type_exclusion` for users without
-        // `audit:view`) is a logs-domain concern — audit rows live only in the
-        // `logs` table. On the OTLP spans/metrics datasets `source_type` has no
-        // column and resolves to a per-row Map lookup, so the gate is pure cost
-        // and can hide rows a tenant tagged `source_type=audit`. Drop it here for
-        // every non-`Logs` dataset; the logs path keeps `query` untouched and
-        // stays byte-identical.
-        let stripped_query;
-        let query = if matches!(self.dataset, otel::Dataset::Logs) {
-            query
-        } else {
-            stripped_query = strip_injected_audit_gate(query);
-            &stripped_query
-        };
+        // O45 (NAN-1733): the source-scope gate (`… AND source_type != "audit"`
+        // for the legacy audit gate, `… AND source_type NOT IN (…)` for
+        // NAN-1799 per-source RBAC deny sets — both injected by
+        // `enforce_source_scope`/`enforce_source_type_exclusion`) is a
+        // logs-domain concern — audit rows live only in the `logs` table and
+        // per-source scoping is a logs-table access control. On the OTLP
+        // spans/metrics datasets `source_type` has no column and resolves to a
+        // per-row Map lookup, so the gate is pure cost and can hide rows a
+        // tenant tagged with a denied `source_type` value.
+        //
+        // NAN-1794: run the strip for EVERY dataset, not just non-`Logs`. The
+        // gate is now injected into subsearches too, and a subsearch can target
+        // a different dataset than the outer query (`[dataset=spans …]` from a
+        // logs query, `[dataset=logs …]` from a spans query), so the keep/strip
+        // decision is per-scan — see `strip_injected_audit_gate`. On a pure-logs
+        // query the walk is a structural no-op and the SQL stays byte-identical.
+        let stripped_query = strip_injected_audit_gate(query, self.dataset);
+        let query = &stripped_query;
 
         // Store time range for subsearch IN subquery generation
         // Use write_or_default to avoid panic on poisoned lock
@@ -1680,6 +1935,13 @@ impl ClickHouseSqlGenerator {
         // `timestamp`, which the rollup lacks. `SELECT *` so every state column
         // flows from the base read into the aggregation stage. Rollup-only.
         if self.is_metrics_rollup() {
+            ctx.required_fields = None;
+        }
+        // NAN-1798 P2: the risk dataset's base source is a derived 15-column
+        // entity grain — the slim/table-view projections enumerate logs-shaped
+        // columns that don't exist on it. `SELECT *` is both correct and cheap
+        // at this grain (entity cardinality, not event volume).
+        if matches!(self.dataset, otel::Dataset::Risk) {
             ctx.required_fields = None;
         }
 
@@ -1779,16 +2041,14 @@ impl ClickHouseSqlGenerator {
             format!("ORDER BY {} DESC ", ctx.time_column)
         };
         Ok(format!(
-            "SELECT {} FROM {} WHERE {tc} BETWEEN '{}' AND '{}' AND ({}) {}LIMIT {} {}",
+            "SELECT {} FROM {} WHERE {} AND ({}) {}LIMIT {} {}",
             select_clause,
             ctx.table_name,
-            crate::sql_hygiene::format_ch_bound_micros(&ctx.time_range.start),
-            crate::sql_hygiene::format_ch_bound_micros(&ctx.time_range.end),
+            self.time_bound_predicate(&ctx.time_column, &ctx.time_range),
             where_clause,
             order_clause,
             limit,
             generate_settings(ctx.use_cache, selective, false),
-            tc = ctx.time_column,
         ))
     }
 
@@ -1847,16 +2107,14 @@ impl ClickHouseSqlGenerator {
                     format!("ORDER BY {} DESC ", ctx.time_column)
                 };
                 Ok(format!(
-                    "SELECT {} FROM {} WHERE {tc} BETWEEN '{}' AND '{}' AND ({}) {}{}{}",
+                    "SELECT {} FROM {} WHERE {} AND ({}) {}{}{}",
                     select_clause,
                     ctx.table_name,
-                    crate::sql_hygiene::format_ch_bound_micros(&ctx.time_range.start),
-                    crate::sql_hygiene::format_ch_bound_micros(&ctx.time_range.end),
+                    self.time_bound_predicate(&ctx.time_column, &ctx.time_range),
                     where_clause,
                     order_clause,
                     limit_clause,
                     generate_settings(ctx.use_cache, selective, false),
-                    tc = ctx.time_column,
                 ))
             }
             QueryStage::Command(_) => Err(SqlGenError::UnsupportedOperation(
@@ -1991,15 +2249,13 @@ impl ClickHouseSqlGenerator {
                         String::new()
                     };
                     format!(
-                        "{} AS (\n  SELECT {} FROM {}\n  WHERE {tc} BETWEEN '{}' AND '{}'\n  AND ({}){}\n)",
+                        "{} AS (\n  SELECT {} FROM {}\n  WHERE {}\n  AND ({}){}\n)",
                         cte_name,
                         select_clause,
                         ctx.table_name,
-                        crate::sql_hygiene::format_ch_bound_micros(&ctx.time_range.start),
-                        crate::sql_hygiene::format_ch_bound_micros(&ctx.time_range.end),
+                        self.time_bound_predicate(&ctx.time_column, &ctx.time_range),
                         where_clause,
                         limit_clause,
-                        tc = ctx.time_column,
                     )
                 }
                 QueryStage::Command(cmd) => {
@@ -2880,12 +3136,10 @@ impl ClickHouseSqlGenerator {
                 // Time column is the (sub)dataset's `ctx.time_column` — `start_time`
                 // for a spans subsearch, not the literal `timestamp` (NAN-1562).
                 return Ok(format!(
-                    "    SELECT {} FROM {}\n    WHERE {} BETWEEN '{}' AND '{}'\n    AND ({})\n    LIMIT {}",
+                    "    SELECT {} FROM {}\n    WHERE {}\n    AND ({})\n    LIMIT {}",
                     base_select,
                     ctx.table_name,
-                    ctx.time_column,
-                    crate::sql_hygiene::format_ch_bound_micros(&ctx.time_range.start),
-                    crate::sql_hygiene::format_ch_bound_micros(&ctx.time_range.end),
+                    self.time_bound_predicate(&ctx.time_column, &ctx.time_range),
                     where_clause,
                     limit
                 ));
@@ -2902,12 +3156,10 @@ impl ClickHouseSqlGenerator {
                     // Single WHERE — `optimize_move_to_prewhere` does placement (NAN-1412).
                     // Time column is the (sub)dataset's `ctx.time_column` (NAN-1562).
                     current_sql = format!(
-                        "SELECT {} FROM {} WHERE {} BETWEEN '{}' AND '{}' AND ({})",
+                        "SELECT {} FROM {} WHERE {} AND ({})",
                         base_select,
                         ctx.table_name,
-                        ctx.time_column,
-                        crate::sql_hygiene::format_ch_bound_micros(&ctx.time_range.start),
-                        crate::sql_hygiene::format_ch_bound_micros(&ctx.time_range.end),
+                        self.time_bound_predicate(&ctx.time_column, &ctx.time_range),
                         where_clause
                     );
                 }
@@ -3473,3 +3725,222 @@ impl<'a> GeneratorContext<'a> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod risk_dataset_tests;
+
+/// NAN-1799 (per-source RBAC scoping) — OTLP strip coverage for the
+/// generalized deny-set gate.
+///
+/// The legacy `{"audit"}` gate (`source_type != "audit"`) is pinned
+/// end-to-end in `tests/spans_codegen.rs` (O45 / NAN-1733 / NAN-1794) and is
+/// byte-identical after NAN-1799, so those tests keep guarding it. This
+/// module exercises the SECOND recognized conjunct shape — the
+/// `SearchExpr::InList { field: "source_type", negated: true, .. }` gate that
+/// `enforce_source_scope` injects for every deny set other than exactly
+/// `{"audit"}` — against `is_injected_audit_gate_filter` /
+/// `strip_injected_audit_gate`, which are private to this module (hence the
+/// inline `#[cfg(test)]` module rather than the sibling `tests.rs`).
+#[cfg(test)]
+mod source_scope_otel_strip_tests {
+    use super::*;
+    use crate::query::parse_query;
+    use chrono::{TimeZone, Utc};
+    use std::collections::BTreeSet;
+
+    fn time_range() -> TimeRange {
+        TimeRange {
+            start: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap(),
+        }
+    }
+
+    /// Reproduce the real scoped search path: `enforce_source_scope` rewrites
+    /// the nPL text (injecting the deny-set gate at every scan), the service
+    /// re-parses the rewritten text, and the generator runs over `dataset` —
+    /// exactly the production flow, so the gate arrives through the parser's
+    /// `in_list_filter` round-trip and not as a hand-built AST.
+    fn scoped_sql(q: &str, deny: &[&str], dataset: otel::Dataset) -> String {
+        let deny_set: BTreeSet<String> = deny.iter().map(|s| s.to_string()).collect();
+        let enforced = crate::search::query_processing::enforce_source_scope(q, &deny_set)
+            .unwrap_or_else(|e| panic!("enforce {q}: {e}"));
+        ClickHouseSqlGenerator::new()
+            .with_dataset(dataset)
+            .generate(
+                &parse_query(&enforced).unwrap_or_else(|e| panic!("parse {enforced}: {e}")),
+                &time_range(),
+            )
+            .unwrap_or_else(|e| panic!("generate {enforced}: {e}"))
+    }
+
+    /// The multi-member gate renders on logs as
+    /// `lower(source_type) NOT IN ('audit', 'insider')` (negated membership
+    /// keeps the `lower(...)` form — no skip index prunes a negation).
+    fn multi_gate_count(sql: &str) -> usize {
+        sql.matches("NOT IN ('audit', 'insider')").count()
+    }
+
+    /// AST-level: the matcher recognizes BOTH injected conjunct shapes and
+    /// nothing else.
+    #[test]
+    fn matcher_recognizes_both_gate_shapes() {
+        // Legacy audit FieldFilter (NAN-704) — unchanged.
+        assert!(is_injected_audit_gate_filter(&SearchExpr::FieldFilter {
+            field: "source_type".to_string(),
+            op: Comparator::Ne,
+            value: Value::String("audit".to_string()),
+        }));
+        // NAN-1799 deny-set gate — negated IN-list on source_type.
+        assert!(is_injected_audit_gate_filter(&SearchExpr::InList {
+            field: "source_type".to_string(),
+            values: vec![
+                Value::String("audit".to_string()),
+                Value::String("insider".to_string()),
+            ],
+            negated: true,
+        }));
+        // A POSITIVE in-list on source_type is a user filter, never the gate.
+        assert!(!is_injected_audit_gate_filter(&SearchExpr::InList {
+            field: "source_type".to_string(),
+            values: vec![Value::String("audit".to_string())],
+            negated: false,
+        }));
+        // Negated in-list on any other field is untouched.
+        assert!(!is_injected_audit_gate_filter(&SearchExpr::InList {
+            field: "user".to_string(),
+            values: vec![Value::String("audit".to_string())],
+            negated: true,
+        }));
+    }
+
+    /// On spans there is no `source_type` column — a scoped user's NOT-IN gate
+    /// would resolve to a per-row attributes-Map probe that hides any span a
+    /// tenant tagged with a denied value. It must not survive into the SQL.
+    #[test]
+    fn spans_strip_the_multi_member_deny_gate() {
+        for q in ["error", "* | stats count by span_kind"] {
+            let sql = scoped_sql(q, &["audit", "insider"], otel::Dataset::Spans);
+            assert!(
+                !sql.contains("source_type"),
+                "spans must not carry the deny-set gate for `{q}`: {sql}"
+            );
+            assert!(
+                !sql.contains("'insider'"),
+                "spans must not reference denied source_type values for `{q}`: {sql}"
+            );
+        }
+    }
+
+    /// A single-member NON-audit deny set also takes the NOT-IN form (only
+    /// exactly `{"audit"}` keeps the legacy FieldFilter) — the strip must
+    /// recognize it too.
+    #[test]
+    fn spans_strip_the_single_member_non_audit_gate() {
+        let sql = scoped_sql("error", &["insider"], otel::Dataset::Spans);
+        assert!(
+            !sql.contains("source_type") && !sql.contains("'insider'"),
+            "spans must strip the single-member NOT-IN gate: {sql}"
+        );
+    }
+
+    /// The same gate MUST remain on the logs dataset — per-source scoping is
+    /// enforced there, and stripping it would be the access-control bypass.
+    #[test]
+    fn logs_keep_the_multi_member_deny_gate() {
+        for q in ["error", "* | stats count by src_ip"] {
+            let sql = scoped_sql(q, &["audit", "insider"], otel::Dataset::Logs);
+            assert_eq!(
+                multi_gate_count(&sql),
+                1,
+                "logs must keep the deny-set gate for `{q}`: {sql}"
+            );
+            assert!(
+                sql.contains("lower(source_type) NOT IN ('audit', 'insider')"),
+                "logs gate must render as the lower() NOT-IN membership: {sql}"
+            );
+        }
+    }
+
+    /// A subsearch with no `dataset=` selector inherits the outer spans
+    /// dataset, so it reads SPANS and its gate is stripped too (NAN-1794
+    /// per-scan walk, NOT-IN shape).
+    #[test]
+    fn spans_subsearch_drops_the_multi_member_gate() {
+        let sql = scoped_sql(
+            r#"service_name="checkout" | append [search span_kind="server"]"#,
+            &["audit", "insider"],
+            otel::Dataset::Spans,
+        );
+        assert!(
+            !sql.contains("source_type"),
+            "inherited spans subsearch must not carry the deny-set gate: {sql}"
+        );
+    }
+
+    /// `Dataset::Risk` (NAN-1798 P2) joins spans/metrics in the strip set:
+    /// the risk dataset is a DERIVED aggregate over the findings stream — per
+    /// the RBAC design (§3.4), entity/prevalence-style aggregates are a
+    /// documented accepted-leak in v1, and the derived projection has no
+    /// per-row `source_type` for the gate to bind to (it would resolve
+    /// against the aggregate output, hiding whole entities instead of
+    /// scoping rows). The gate must not survive into the risk SQL — while the
+    /// risk source's OWN `source_type = 'findings'` predicate (positive
+    /// equality, part of the derived subquery) stays intact.
+    #[test]
+    fn risk_dataset_strips_the_deny_gate() {
+        for q in ["*", "entity_type=\"user\" | sort -decayed_score_24h"] {
+            let sql = scoped_sql(q, &["audit", "insider"], otel::Dataset::Risk);
+            assert_eq!(
+                multi_gate_count(&sql),
+                0,
+                "risk dataset must strip the deny-set gate for `{q}`: {sql}"
+            );
+            assert!(
+                !sql.contains("'insider'"),
+                "risk dataset must not reference denied source_type values for `{q}`: {sql}"
+            );
+            assert!(
+                sql.contains("source_type = 'findings'"),
+                "the risk derived source must survive the strip intact for `{q}`: {sql}"
+            );
+        }
+    }
+
+    /// SECURITY, cross-dataset (NAN-1562): a spans query pulling a
+    /// `[dataset=logs …]` subsearch reads the scoped table THERE — that scan
+    /// must keep exactly its own NOT-IN gate while the outer spans scan keeps
+    /// none. This is precisely the scan a "strip the gate on spans queries"
+    /// shortcut would wrongly expose to a scoped user.
+    #[test]
+    fn cross_dataset_logs_subsearch_from_spans_keeps_the_multi_member_gate() {
+        let sql = scoped_sql(
+            r#"service_name="checkout" | join trace_id [dataset=logs search status=500]"#,
+            &["audit", "insider"],
+            otel::Dataset::Spans,
+        );
+        assert_eq!(
+            multi_gate_count(&sql),
+            1,
+            "the logs subsearch of a spans query must keep exactly its own \
+             deny-set gate (outer spans scan keeps none): {sql}"
+        );
+    }
+
+    /// Same cross-dataset rule from the RISK side: a risk query joining a
+    /// `[dataset=logs …]` subsearch reads the scoped logs table THERE — that
+    /// scan keeps exactly its own gate while the outer risk scan keeps none.
+    #[test]
+    fn cross_dataset_logs_subsearch_from_risk_keeps_the_multi_member_gate() {
+        let sql = scoped_sql(
+            r#"entity_type="user" | join entity [dataset=logs search status=500 | eval entity=user]"#,
+            &["audit", "insider"],
+            otel::Dataset::Risk,
+        );
+        assert_eq!(
+            multi_gate_count(&sql),
+            1,
+            "the logs subsearch of a risk query must keep exactly its own \
+             deny-set gate (outer risk scan keeps none): {sql}"
+        );
+    }
+}

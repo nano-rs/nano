@@ -224,7 +224,9 @@ fn asn_present(profile: &dyn SchemaProfile, udm_field: &str) -> Option<String> {
     let c = col(profile, udm_field)?;
     Some(match profile.id() {
         SchemaId::Ocsf => format!("{c} != 0"),
-        SchemaId::Udm | SchemaId::Spans | SchemaId::Metrics => format!("{c} != ''"),
+        SchemaId::Udm | SchemaId::Spans | SchemaId::Metrics | SchemaId::Risk => {
+            format!("{c} != ''")
+        }
     })
 }
 

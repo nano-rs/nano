@@ -170,6 +170,10 @@ pub const RULE_REPOSITORIES_IMPORT: &str = "rule_repositories:import";
 pub const DETECTION_CODE_TARGETS_VIEW: &str = "detection_code_targets:view";
 pub const DETECTION_CODE_TARGETS_MANAGE: &str = "detection_code_targets:manage";
 
+// Per-source RBAC scoping permissions (NAN-1797)
+pub const SOURCE_SCOPES_VIEW: &str = "source_scopes:view";
+pub const SOURCE_SCOPES_MANAGE: &str = "source_scopes:manage";
+
 // Parser Repository permissions
 pub const PARSER_REPOSITORIES_VIEW: &str = "parser_repositories:view";
 pub const PARSER_REPOSITORIES_MANAGE: &str = "parser_repositories:manage";
@@ -331,6 +335,9 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     // Detection-as-Code push targets
     DETECTION_CODE_TARGETS_VIEW,
     DETECTION_CODE_TARGETS_MANAGE,
+    // Per-source RBAC scoping
+    SOURCE_SCOPES_VIEW,
+    SOURCE_SCOPES_MANAGE,
     // Parser Repositories
     PARSER_REPOSITORIES_VIEW,
     PARSER_REPOSITORIES_MANAGE,

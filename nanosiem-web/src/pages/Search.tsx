@@ -34,6 +34,7 @@ import {
   CircleCheck,
   FileSearch,
   Zap,
+  CalendarClock,
   LayoutDashboard,
   AlertTriangle,
   Info,
@@ -81,6 +82,7 @@ import { Sheet, SheetContent, SheetTitle } from '@/components/ui/sheet';
 import { useNotebookCapture } from '@/enterprise/contexts/NotebookContext';
 import { TimelineVisualization, FieldsPanel, FIELD_STATS_PINNED_COLUMNS, SearchResults, SearchQueryInput, SavedQueriesPalette, SearchJobsModal, PrevalenceSlider, DatasetSelector, type FieldStat } from '@/components/search';
 import { AnalyzeView } from '@/enterprise/components/search/AnalyzeView';
+import { ScheduleReportDialog, type ScheduleReportPreset } from '@/components/reports/ScheduleReportDialog';
 import { useHereCardOverride } from '@/contexts/PageContext';
 import type { SearchJobSummary } from '@/lib/api';
 import { registerDynamicFields } from '@/components/editor';
@@ -269,11 +271,19 @@ interface CachedSearchResult {
 const searchResultCache = new Map<string, CachedSearchResult>();
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
-function buildCacheKey(query: string, timeRange: TimeRangeValue, mode: string): string {
+function buildCacheKey(
+  query: string,
+  timeRange: TimeRangeValue,
+  mode: string,
+  // NAN-1825: identical query text against different datasets (logs vs
+  // spans/metrics/risk) must not share a cache entry, or switching datasets
+  // silently serves results from the wrong table.
+  dataset: import('@/lib/api/types').SearchDataset = 'logs',
+): string {
   const timeKey = timeRange.type === 'custom' && timeRange.start && timeRange.end
     ? `${timeRange.start.toISOString()}_${timeRange.end.toISOString()}`
     : timeRange.preset;
-  return `${mode}:${query}:${timeKey}`;
+  return `${mode}:${dataset}:${query}:${timeKey}`;
 }
 
 // Helper function to flatten nested objects (like metadata) into underscore-notation fields
@@ -397,9 +407,10 @@ export function Search() {
   // UDM lane) is the default; "spans"/"metrics" target the OTLP tables. The
   // dedicated /observability explorers are the primary span/metric surfaces —
   // this toggle lets analysts run ad-hoc nPL against those tables in-place.
+  // "risk" (NAN-1805) targets the derived accumulated-entity-risk grain.
   const [dataset, setDataset] = useState<import('@/lib/api/types').SearchDataset>(() => {
     const d = searchParams.get('dataset');
-    return d === 'spans' || d === 'metrics' ? d : 'logs';
+    return d === 'spans' || d === 'metrics' || d === 'risk' ? d : 'logs';
   });
   const [query, setQuery] = useState(urlQuery || '');
   const [executedQuery, setExecutedQuery] = useState(''); // Query that was actually executed (for highlighting)
@@ -479,6 +490,8 @@ export function Search() {
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
   const [savedQueriesOpen, setSavedQueriesOpen] = useState(false);
   const [jobsModalOpen, setJobsModalOpen] = useState(false);
+  // NAN-1793: schedule a saved query as a recurring report.
+  const [schedulePreset, setSchedulePreset] = useState<ScheduleReportPreset | null>(null);
 
   // Active search jobs indicator — drives the badge on the More (...) chip.
   const { data: activeJobs } = useQuery({
@@ -997,7 +1010,7 @@ export function Search() {
   }, [query, melodStatus?.connected, looksLikeNaturalLanguage]);
 
   // URL management - pushHistory=true creates a new browser history entry (for back button)
-  const updateUrl = useCallback((q: string, mode: 'piped' | 'sql', time: TimeRangeValue, shortId?: string, pushHistory: boolean = false, prevalence?: number) => {
+  const updateUrl = useCallback((q: string, mode: 'piped' | 'sql', time: TimeRangeValue, shortId?: string, pushHistory: boolean = false, prevalence?: number, ds?: import('@/lib/api/types').SearchDataset) => {
     const params = new URLSearchParams();
     if (shortId) {
       params.set('s', shortId);
@@ -1015,6 +1028,12 @@ export function Search() {
     if (prevalence !== undefined && prevalence < 100) {
       params.set('prevalence', prevalence.toString());
     }
+    // NAN-1825: keep the dataset in the URL for non-logs searches so refresh /
+    // back-nav / copied links reproduce the spans/metrics/risk search instead
+    // of silently falling back to logs.
+    if (ds && ds !== 'logs') {
+      params.set('dataset', ds);
+    }
     setSearchParams(params, { replace: !pushHistory });
   }, [setSearchParams]);
 
@@ -1029,9 +1048,14 @@ export function Search() {
     if (prevalenceMax < 100) {
       params.set('prevalence', prevalenceMax.toString());
     }
+    // NAN-1825: shared links must carry the dataset, or a copied risk/spans/
+    // metrics search runs against logs for the recipient.
+    if (dataset !== 'logs') {
+      params.set('dataset', dataset);
+    }
     const baseUrl = window.location.origin + window.location.pathname;
     return params.toString() ? `${baseUrl}?${params.toString()}` : baseUrl;
-  }, [query, queryMode, timeRange, prevalenceMax]);
+  }, [query, queryMode, timeRange, prevalenceMax, dataset]);
 
   const copyShareableUrl = useCallback(async () => {
     const url = getShareableUrl();
@@ -1169,8 +1193,12 @@ export function Search() {
     currentQuery: string,
     currentTimeRange: TimeRangeValue,
     currentMode: 'piped' | 'sql',
-    isAggregate: boolean
+    isAggregate: boolean,
+    // NAN-1825: dataset the job's search actually targeted. Falls back to the
+    // live selector state for callers that don't know it (URL job loads).
+    jobDataset?: import('@/lib/api/types').SearchDataset
   ) => {
+    const effectiveDataset = jobDataset ?? dataset;
     const results: SearchResult[] = (response.results || [])
       .filter((r: unknown) => r != null && typeof r === 'object')
       .map((r: Record<string, unknown>, i: number) => ({
@@ -1199,7 +1227,7 @@ export function Search() {
     setHistogramData(histData);
 
     // Cache async results for back-navigation
-    const cacheKey = buildCacheKey(currentQuery, currentTimeRange, currentMode);
+    const cacheKey = buildCacheKey(currentQuery, currentTimeRange, currentMode, effectiveDataset);
     const cacheEntry: CachedSearchResult = {
       results,
       histogramData: histData,
@@ -1263,7 +1291,7 @@ export function Search() {
         start: apiTime.start,
         end: apiTime.end,
         request_id: currentRequestIdRef.current ?? undefined,
-        dataset, // NAN-1559: stats must enumerate the same dataset the search targeted
+        dataset: effectiveDataset, // NAN-1559: stats must enumerate the same dataset the search targeted
       };
       lastFieldStatsRequestRef.current = fsRequest;
       // Small, specific result set → fetch the FULL inventory directly (no
@@ -1324,7 +1352,7 @@ export function Search() {
         return updated;
       });
     }
-  }, [fetchFieldStats, captureSearch, toApiTimeRange, requestQueryReview]);
+  }, [fetchFieldStats, captureSearch, toApiTimeRange, requestQueryReview, dataset]);
 
   // Start polling for async job results
   const startAsyncJobPolling = useCallback((
@@ -1332,7 +1360,10 @@ export function Search() {
     currentQuery: string,
     currentTimeRange: TimeRangeValue,
     currentMode: 'piped' | 'sql',
-    isAggregate: boolean
+    isAggregate: boolean,
+    // NAN-1825: dataset the job's search targeted — forwarded to
+    // processAsyncJobResult so results cache under the right dataset.
+    jobDataset?: import('@/lib/api/types').SearchDataset
   ) => {
     // Clear any existing polling interval to prevent leaks
     if (asyncJobPollingRef.current) {
@@ -1375,7 +1406,7 @@ export function Search() {
           setEstimatedWait(null);
         } else if (status.status === 'completed' && status.result) {
           clearAsyncJob();
-          processAsyncJobResult(status.result, currentQuery, currentTimeRange, currentMode, isAggregate);
+          processAsyncJobResult(status.result, currentQuery, currentTimeRange, currentMode, isAggregate, jobDataset);
           setIsSearching(false);
           setHasSearched(true);
           queryClient.invalidateQueries({ queryKey: ['search-jobs'] });
@@ -1546,8 +1577,9 @@ export function Search() {
         sseControllerRef.current = null;
         queryClient.invalidateQueries({ queryKey: ['search-jobs'] });
 
-        // Cache results
-        const cacheKey = buildCacheKey(currentQuery, currentTimeRange, currentMode);
+        // Cache results — keyed on the dataset the REQUEST ran against (not
+        // the live selector state, which the user may have flipped mid-stream).
+        const cacheKey = buildCacheKey(currentQuery, currentTimeRange, currentMode, request.dataset);
         // We need to read the final searchResults via a callback since state may not have flushed yet
         setSearchResults(finalResults => {
           const cacheEntry: CachedSearchResult = {
@@ -1582,7 +1614,10 @@ export function Search() {
             start: apiTime.start,
             end: apiTime.end,
             request_id: currentRequestIdRef.current ?? undefined,
-            dataset, // NAN-1559: stats must enumerate the same dataset the search targeted
+            // NAN-1559: stats must enumerate the same dataset the search
+            // targeted. Read it off the REQUEST — the `dataset` state was a
+            // stale closure here (not in this callback's dep list).
+            dataset: request.dataset,
           };
           lastFieldStatsRequestRef.current = fsRequest;
           // NAN-1508/1509: the streaming path is the default piped-search path —
@@ -1628,10 +1663,10 @@ export function Search() {
             if (asyncResponse.job_id) {
               setAsyncJobId(asyncResponse.job_id);
               queryClient.invalidateQueries({ queryKey: ['search-jobs'] });
-              startAsyncJobPolling(asyncResponse.job_id, currentQuery, currentTimeRange, currentMode, isAggregate);
+              startAsyncJobPolling(asyncResponse.job_id, currentQuery, currentTimeRange, currentMode, isAggregate, request.dataset);
             } else {
               // Sync response
-              processAsyncJobResult(asyncResponse as unknown as import('@/lib/api/types').SearchResponse, currentQuery, currentTimeRange, currentMode, isAggregate);
+              processAsyncJobResult(asyncResponse as unknown as import('@/lib/api/types').SearchResponse, currentQuery, currentTimeRange, currentMode, isAggregate, request.dataset);
               setIsSearching(false);
               setHasSearched(true);
             }
@@ -1667,11 +1702,15 @@ export function Search() {
   }, [clearAsyncJob, processAsyncJobResult, startAsyncJobPolling, queryClient, fetchFieldStats, toApiTimeRange, captureSearch, requestQueryCorrection]);
 
   // Main search function
-  const handleSearch = useCallback(async (page: number = 1, append: boolean = false, searchQuery?: string, searchMode?: 'piped' | 'sql', searchTimeRange?: TimeRangeValue, useCache?: boolean) => {
+  const handleSearch = useCallback(async (page: number = 1, append: boolean = false, searchQuery?: string, searchMode?: 'piped' | 'sql', searchTimeRange?: TimeRangeValue, useCache?: boolean, searchDataset?: import('@/lib/api/types').SearchDataset) => {
     // Use provided parameters or fall back to current state
     const currentQuery = searchQuery ?? query;
     const currentMode = searchMode ?? queryMode;
     const currentTimeRange = searchTimeRange ?? timeRange;
+    // NAN-1825: explicit dataset override for callers that can't rely on this
+    // closure's state (e.g. the history-restore effect, whose setDataset
+    // hasn't re-rendered into this callback yet when the deferred call fires).
+    const currentDataset = searchDataset ?? dataset;
     
     // Check for empty query
     if (!currentQuery?.trim()) {
@@ -1730,7 +1769,7 @@ export function Search() {
       setCurrentPage(1);
       // Only push to history if not restoring from back/forward navigation
       if (!isRestoringFromHistory.current) {
-        updateUrl(currentQuery, currentMode, currentTimeRange, undefined, true, prevalenceMax);
+        updateUrl(currentQuery, currentMode, currentTimeRange, undefined, true, prevalenceMax, currentDataset);
       }
       isRestoringFromHistory.current = false; // Reset the flag
       addToSearchHistory({ query: currentQuery, queryMode: currentMode, timeRange: currentTimeRange });
@@ -1780,13 +1819,13 @@ export function Search() {
       } else if (shouldUseStreaming) {
         // Use SSE streaming for live result delivery
         startStreamingSearch(
-          { query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset, skip_field_stats: true, table_view: true, dataset },
+          { query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset, skip_field_stats: true, table_view: true, dataset: currentDataset },
           currentQuery, currentTimeRange, currentMode, isAggregate,
           useCache !== true // NAN-1602: user runs are live (bypass); only the shared-search load (useCache=true) reads cache
         );
         // Refresh SQL panel if visible (SSE returns early, so do it before exit)
         if (showSql) {
-          explainQuery({ query: cleanQuery, timeRange: apiTimeRange }).then(
+          explainQuery({ query: cleanQuery, timeRange: apiTimeRange, dataset }).then(
             (result) => setGeneratedSql(result.sql),
             () => {} // Silently fail - SQL display is not critical
           );
@@ -1799,7 +1838,7 @@ export function Search() {
         // NAN-1645: page flips (offset > 0) skip the histogram companion — the
         // timeline is page-invariant and frozen from page 1 (mirrors the
         // existing skip_field_stats behavior; the backend offset-gates too).
-        response = await search({ query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset, use_cache: useCache, skip_field_stats: true, skip_histogram: offset > 0, table_view: true, request_id: requestId, dataset });
+        response = await search({ query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset, use_cache: useCache, skip_field_stats: true, skip_histogram: offset > 0, table_view: true, request_id: requestId, dataset: currentDataset });
       }
 
       if (abortControllerRef.current?.signal.aborted) return;
@@ -1935,7 +1974,7 @@ export function Search() {
       }
 
       // Cache results for back-navigation (use local vars, not state which is async)
-      const cacheKey = !append ? buildCacheKey(currentQuery, currentTimeRange, currentMode) : null;
+      const cacheKey = !append ? buildCacheKey(currentQuery, currentTimeRange, currentMode, currentDataset) : null;
       if (cacheKey) {
         const cacheEntry: CachedSearchResult = {
           results,
@@ -1973,7 +2012,7 @@ export function Search() {
           start: apiTimeRange.start,
           end: apiTimeRange.end,
           request_id: requestId,
-          dataset, // NAN-1559: stats must enumerate the same dataset the search targeted
+          dataset: currentDataset, // NAN-1559: stats must enumerate the same dataset the search targeted
         };
         lastFieldStatsRequestRef.current = fsRequest;
         // Small, specific result set → full inventory directly; broad → reduced.
@@ -2021,7 +2060,7 @@ export function Search() {
       // If SQL panel is visible, refresh the generated SQL for the new query
       if (showSql && currentMode === 'piped' && !append) {
         try {
-          const result = await explainQuery({ query: cleanQuery, timeRange: apiTimeRange });
+          const result = await explainQuery({ query: cleanQuery, timeRange: apiTimeRange, dataset });
           setGeneratedSql(result.sql);
         } catch {
           // Silently fail - SQL display is not critical
@@ -2557,7 +2596,7 @@ export function Search() {
         const effectiveTimeRange = overrideTimeRange ?? timeRange;
 
         // Update URL and add to search history
-        updateUrl(newQuery, 'piped', effectiveTimeRange, undefined, true);
+        updateUrl(newQuery, 'piped', effectiveTimeRange, undefined, true, undefined, dataset);
         addToSearchHistory({ query: newQuery, queryMode: 'piped', timeRange: effectiveTimeRange });
         refreshHistory();
 
@@ -2565,7 +2604,9 @@ export function Search() {
           const apiTimeRange = toApiTimeRange(effectiveTimeRange);
           // Strip comments from query before sending to API
           const cleanQuery = stripComments(newQuery);
-          const response = await search({ query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset: 0 });
+          // NAN-1825: drilldowns must stay on the dataset the source search ran
+          // against — dropping it silently re-queried logs for spans/metrics/risk.
+          const response = await search({ query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset: 0, dataset });
           
           const results: SearchResult[] = (response.results || [])
             .filter((r: unknown) => r != null && typeof r === 'object')
@@ -2620,7 +2661,7 @@ export function Search() {
       
       runDrilldownSearch();
     }, 0);
-  }, [query, timeRange, search, pageSize, updateUrl, addToSearchHistory, refreshHistory, captureSearch]);
+  }, [query, timeRange, search, pageSize, updateUrl, addToSearchHistory, refreshHistory, captureSearch, dataset]);
 
   // Toggle functions
   const toggleField = useCallback((field: string) => {
@@ -3129,6 +3170,12 @@ export function Search() {
     const currentUrlTimePreset = searchParams.get('time') || '';
     const currentUrlTimeStart = searchParams.get('start') || '';
     const currentUrlTimeEnd = searchParams.get('end') || '';
+    // NAN-1825: restore the dataset from the URL too — back-nav across a
+    // dataset boundary (logs ↔ spans/metrics/risk) must re-run against the
+    // dataset that search actually targeted.
+    const rawUrlDataset = searchParams.get('dataset');
+    const urlDataset: import('@/lib/api/types').SearchDataset =
+      rawUrlDataset === 'spans' || rawUrlDataset === 'metrics' || rawUrlDataset === 'risk' ? rawUrlDataset : 'logs';
     
     // Build time range from URL
     const urlTimeRange: TimeRangeValue = currentUrlTimeStart && currentUrlTimeEnd
@@ -3144,17 +3191,19 @@ export function Search() {
     const queryChanged = currentUrlQuery !== query;
     const modeChanged = normalizedMode !== queryMode;
     const timeChanged = JSON.stringify(urlTimeRange) !== JSON.stringify(timeRange);
-    
+    const datasetChanged = urlDataset !== dataset;
+
     // Always restore state from URL if there's a meaningful change, regardless of hasSearched
-    if (queryChanged || modeChanged || timeChanged) {
+    if (queryChanged || modeChanged || timeChanged || datasetChanged) {
       // URL changed from back/forward - restore state and re-search
       // Set flag BEFORE updating state to prevent timeRange effect from also triggering
       isRestoringFromHistory.current = true;
-      
+
       // Update state
       setQuery(currentUrlQuery);
       setQueryMode(normalizedMode);
       setTimeRange(urlTimeRange);
+      setDataset(urlDataset);
       
       // Show fields panel if there's a query
       if (currentUrlQuery.trim()) {
@@ -3172,7 +3221,7 @@ export function Search() {
       
       // If there's a query in the URL, check cache first, then fall back to search
       if (currentUrlQuery.trim() && currentUrlMode !== 'natural') {
-        const cacheKey = buildCacheKey(currentUrlQuery, urlTimeRange, normalizedMode);
+        const cacheKey = buildCacheKey(currentUrlQuery, urlTimeRange, normalizedMode, urlDataset);
         const cached = searchResultCache.get(cacheKey);
         if (cached && (Date.now() - cached.cachedAt) < CACHE_TTL_MS) {
           // Restore from cache — instant back-navigation
@@ -3203,10 +3252,12 @@ export function Search() {
             isRestoringFromHistory.current = false;
           }, 50);
         } else {
-          // Cache miss or expired — re-fetch
+          // Cache miss or expired — re-fetch. Pass the URL dataset explicitly:
+          // the setDataset above hasn't re-rendered into the handleSearch
+          // closure this timeout captured (NAN-1825).
           if (cached) searchResultCache.delete(cacheKey);
           setTimeout(() => {
-            handleSearch(1, false, currentUrlQuery, normalizedMode, urlTimeRange, true); // NAN-1602: URL-restore miss (passive) → use cache + badge
+            handleSearch(1, false, currentUrlQuery, normalizedMode, urlTimeRange, true, urlDataset); // NAN-1602: URL-restore miss (passive) → use cache + badge
           }, 50);
         }
       } else {
@@ -3236,7 +3287,7 @@ export function Search() {
         }, 50);
       }
     }
-  }, [searchParams, query, queryMode, timeRange, handleSearch]);
+  }, [searchParams, query, queryMode, timeRange, dataset, handleSearch]);
 
   useEffect(() => {
     // Trigger search when time range changes (both custom and preset)
@@ -3866,6 +3917,17 @@ export function Search() {
                     <span>Pin to Dashboard</span>
                   </DropdownMenuItem>
                 )}
+                {hasSearched && query?.trim() && (
+                  <DropdownMenuItem
+                    onClick={() =>
+                      setSchedulePreset({ source_type: 'search', source_query: query, defaultName: '' })
+                    }
+                    className="gap-1.5 px-2 py-1 text-[12px]"
+                  >
+                    <CalendarClock className="w-[13px] h-[13px]" />
+                    <span>Schedule report</span>
+                  </DropdownMenuItem>
+                )}
               </DropdownMenuContent>
             </DropdownMenu>
           </div>
@@ -3883,7 +3945,27 @@ export function Search() {
               if (mode) setQueryMode(mode);
               handleSearch(1, false, q, mode ?? queryMode, timeRange);
             }}
+            onScheduleQuery={(q) => {
+              setSavedQueriesOpen(false);
+              setSchedulePreset({
+                source_type: 'search',
+                source_query: q.query,
+                saved_query_id: typeof q.id === 'number' ? q.id : undefined,
+                defaultName: q.name,
+              });
+            }}
           />
+
+          {/* Schedule report (NAN-1793) — cron a saved query into CSV/HTML artifacts */}
+          {schedulePreset && (
+            <ScheduleReportDialog
+              open={!!schedulePreset}
+              onOpenChange={(o) => {
+                if (!o) setSchedulePreset(null);
+              }}
+              preset={schedulePreset}
+            />
+          )}
 
           {/* Search jobs modal — opened from the More (...) menu */}
           <SearchJobsModal

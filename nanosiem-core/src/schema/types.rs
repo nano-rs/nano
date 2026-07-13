@@ -36,6 +36,13 @@ pub enum SchemaId {
     /// aggregation, with gap-fill, counter-reset-aware rates, and resolution
     /// routing to the `otel_metrics_1m/_1h` rollups handled in the SQL generator.
     Metrics,
+    /// Accumulated (decayed) entity risk — a per-QUERY dataset profile like
+    /// [`Spans`](SchemaId::Spans)/[`Metrics`](SchemaId::Metrics), NOT a tenant
+    /// log schema (NAN-1798 P2; `from_env_str` rejects it). A DERIVED grain:
+    /// one row per entity, aggregated at query time from the findings stream in
+    /// the logs table by the shared risk builder — injected by the SQL
+    /// generator's `with_dataset(Risk)`, never by `NANO_SCHEMA_PROFILE`.
+    Risk,
 }
 
 impl SchemaId {

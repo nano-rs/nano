@@ -315,15 +315,15 @@ impl AppState {
             tracing::info!("Synthetic-check runner started (leader-only, 15s tick)");
         }
 
-        // Risk-decay sweep (NAN-1675): persist always-current decayed scores so
-        // they age down between reads. Internal (PG + CH only) — runs regardless
-        // of egress/air-gap mode. Leader-only by virtue of being in
-        // start_leader_schedulers (only the elected node runs this).
-        #[cfg(feature = "enterprise")]
-        {
-            handles.push(self.start_risk_decay_scheduler());
-            tracing::info!("Risk-decay sweep scheduler started (leader-only, 15m default)");
-        }
+        // NAN-1810: the risk-decay sweep (NAN-1675) is retired — the
+        // `entity_risk_scores` snapshot it maintained is dropped, and every
+        // risk read computes decayed scores live from ClickHouse (NAN-1806).
+
+        // NAN-1805: the risk-notable evaluator (NAN-1792) is retired — risk
+        // notables now run as an ordinary scheduled detection rule over
+        // `dataset=risk` (seeded by enterprise migration 9000033) with the
+        // per-(rule, entity) alert_cooldown_minutes throttle carrying the
+        // scheduler's durable hysteresis, so no dedicated scheduler starts here.
 
         // Tuning scheduler (low-frequency singleton)
         handles.extend(self.start_tuning_scheduler());

@@ -54,14 +54,21 @@ pub async fn panel_query(
     // (the piped nPL arm and the SQL arm have different quoting/escaping rules).
     let query = substitute_variables(&request.query, &request.variables, is_sql);
 
-    // NAN-704: gate audit-log access for users without `audit:view`.
-    // `panel_query` is the only authenticated search surface that lacked
-    // this gate (see `nanosiem-search/src/handlers/search.rs:62` for the
-    // canonical pattern). The enforcement is applied INSIDE each query
-    // mode arm because piped vs SQL use different rewrite functions and
-    // different parsers — running the piped rewrite on raw SQL would
-    // fail with a parse error.
-    let has_audit_view = auth.claims.has_permission(permissions::AUDIT_VIEW);
+    // NAN-1799: compose the effective deny-set once and let the search service
+    // enforce it (per-source RBAC + the audit-log gate). The service injects the
+    // deny-set into the piped nPL query itself and fails raw SQL closed when the
+    // scope is restricted, so the handler no longer runs its own audit rewrite
+    // (`enforce_non_audit_query` / `inject_audit_filter`, NAN-704 — now superseded).
+    // Union the `audit` source into the caller's per-source deny set unless they
+    // hold `audit:view`; an unrestricted caller with `audit:view` yields a
+    // byte-identical query (empty deny set => unrestricted scope).
+    let scope = {
+        let mut deny = auth.denied_sources.deny_set().clone();
+        if !auth.has_permission(permissions::AUDIT_VIEW) {
+            deny.insert("audit".to_string());
+        }
+        nanosiem_core::auth::ScopeSet::from_denied(deny)
+    };
 
     // Execute based on query mode. Each arm yields
     // `(response, cached, cache_age_secs)` so the caller can report cache
@@ -79,9 +86,9 @@ pub async fn panel_query(
         // DSH60: bind SQL panels to the dashboard time picker via opt-in
         // Grafana-style macros — `$__timeFilter(col)`, `$__timeFrom`,
         // `$__timeTo` — expanded against the dashboard window. This must run
-        // BEFORE `inject_audit_filter` (below), which parses the SQL and cannot
-        // tolerate an un-expanded macro. SQL with no macro is unchanged (and
-        // still scans all time, as before); authors opt in with e.g.
+        // BEFORE the SQL reaches the service, whose `validate_sql` parses it and
+        // cannot tolerate an un-expanded macro. SQL with no macro is unchanged
+        // (and still scans all time, as before); authors opt in with e.g.
         // `... WHERE $__timeFilter(timestamp) ...`. The injected literals come
         // from the dashboard window, not user input — no injection surface.
         let query = nanosiem_core::sql_hygiene::expand_sql_time_macros(
@@ -92,26 +99,20 @@ pub async fn panel_query(
 
         // Execute raw SQL query.
         //
-        // NAN-704: audit gate applied at the SQL level via
-        // `inject_audit_filter`. Mirrors the /api/search/sql
-        // handler's enforcement (`nanosiem-search/src/handlers/search.rs:232`).
-        // Trailing `;` is stripped because the filter injection
-        // parses the SQL and wouldn't tolerate it.
-        let sql = if has_audit_view {
-            query
-        } else {
-            nanosiem_core::search::inject_audit_filter(query.trim_end_matches(';'))
-                .map_err(ApiError::from)?
-        };
+        // NAN-1799: the audit + per-source gate is enforced by the service, which
+        // fails raw SQL closed when `scope.is_restricted()` — i.e. the caller
+        // lacks `audit:view` or has any per-source deny — since raw SQL can't be
+        // safely scope-rewritten. The handler no longer pre-rewrites the SQL (the
+        // old `inject_audit_filter` path is gone); it just forwards `&scope`.
         let sql_request = nanosiem_core::RawSqlRequest {
-            sql,
+            sql: query,
             time_range: request.time_range,
             limit: Some(PANEL_ROW_LIMIT),
             offset: None,
         };
         // Raw SQL is neither cached nor routed through admission control here.
         (
-            state.search_service.search_sql(sql_request).await?,
+            state.search_service.search_sql(sql_request, &scope).await?,
             false,
             None,
         )
@@ -121,14 +122,10 @@ pub async fn panel_query(
         // addition, matching the retro/search paths.
         ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
 
-        // NAN-704: piped audit gate, AST-level rewrite. Wraps any
-        // `OR`-based attempt to bypass with `(<orig>) AND source_type != "audit"`.
-        let query = if has_audit_view {
-            query
-        } else {
-            nanosiem_core::search::query_processing::enforce_non_audit_query(&query)
-                .map_err(ApiError::from)?
-        };
+        // NAN-1799: the piped audit + per-source gate is applied by the service,
+        // which injects the composed deny-set (`&scope`) into the query AST. The
+        // handler no longer runs its own `enforce_non_audit_query` rewrite — the
+        // deny-set threaded through `search_with_admission` below covers it.
 
         // Default to piped query mode.
         //
@@ -194,24 +191,28 @@ pub async fn panel_query(
         // through to a plain `search_with_admission` when REDIS_URL is unset.
         let user_id = auth.claims.sub;
         let search_service = state.search_service.clone();
+        // NAN-1799: move a clone of the effective scope into the admission
+        // closure so the original `scope` stays available for the scoped
+        // cache-key computation below.
+        let run_scope = scope.clone();
         let run = move |req: SearchRequest| async move {
             search_service
-                .search_with_admission(req, user_id, priority)
+                .search_with_admission(req, user_id, priority, &run_scope)
                 .await
         };
 
         let bypass = request.bypass_cache.unwrap_or(false);
         match state.search_result_cache.as_ref() {
-            Some(cache) if !bypass => match cache.get(&search_request).await {
+            Some(cache) if !bypass => match cache.get(&search_request, &scope).await {
                 Some(hit) => {
                     let age = cache
-                        .age_secs(&SearchResultCache::cache_key(&search_request))
+                        .age_secs(&SearchResultCache::cache_key(&search_request, &scope))
                         .await;
                     (hit, true, age)
                 }
                 None => {
                     let resp = run(search_request.clone()).await?;
-                    spawn_cache_set(cache, &search_request, &resp);
+                    spawn_cache_set(cache, &search_request, &resp, &scope);
                     (resp, false, None)
                 }
             },
@@ -219,7 +220,7 @@ pub async fn panel_query(
                 // Bypass: recompute live and repopulate the cache for the next
                 // caller (mirrors the search handler's cache-bypass refresh).
                 let resp = run(search_request.clone()).await?;
-                spawn_cache_set(cache, &search_request, &resp);
+                spawn_cache_set(cache, &search_request, &resp, &scope);
                 (resp, false, None)
             }
             None => (run(search_request).await?, false, None),
@@ -248,12 +249,18 @@ pub async fn panel_query(
 /// Populate the result cache in the background — mirrors
 /// `SearchResultCache::execute_or_cache`'s fire-and-forget SET so the caller
 /// isn't blocked on the Redis write (DSH8).
-fn spawn_cache_set(cache: &SearchResultCache, request: &SearchRequest, response: &SearchResponse) {
+fn spawn_cache_set(
+    cache: &SearchResultCache,
+    request: &SearchRequest,
+    response: &SearchResponse,
+    scope: &nanosiem_core::auth::ScopeSet,
+) {
     let cache = cache.clone();
     let req = request.clone();
     let resp = response.clone();
+    let scope = scope.clone();
     tokio::spawn(async move {
-        cache.set(&req, &resp).await;
+        cache.set(&req, &resp, &scope).await;
     });
 }
 

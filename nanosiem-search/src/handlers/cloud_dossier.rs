@@ -7,6 +7,7 @@
 //! `/api/search/asset-dossier`.
 
 use axum::{extract::State, Json};
+use nanosiem_core::auth::permissions;
 use nanosiem_core::search::CloudDossier;
 use nanosiem_core::TimeRangeInput;
 use serde::Deserialize;
@@ -51,18 +52,35 @@ pub struct CloudDossierRequest {
         (status = 200, description = "Cloud principal dossier aggregates", body = CloudDossier),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Missing search:execute permission"),
     )
 )]
 pub async fn get_cloud_dossier(
     State(state): State<SearchState>,
+    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<CloudDossierRequest>,
 ) -> Result<(axum::http::HeaderMap, Json<CloudDossier>), SearchError> {
+    // NAN-1801: this endpoint was bearer-only — it runs many hand-built
+    // ClickHouse aggregates over logs, so gate it like every other search
+    // surface (mirrors /api/search/retro).
+    if !auth.claims.has_permission(permissions::SEARCH_EXECUTE) {
+        return Err(SearchError::Forbidden(
+            "Cloud dossier queries require the search:execute permission".to_string(),
+        ));
+    }
+
+    // NAN-1801: compose the effective deny-set (per-user source scope ∪ audit
+    // gate) ONCE, before the cache lookup — it changes the executed SQL, so it
+    // is part of result identity and MUST be folded into the cache key.
+    let scope = super::search::effective_scope(&auth);
+
     // NAN-1593: the cloud principal dossier fires on every load / shared-link
     // follow and runs many parallel ClickHouse aggregates — cache it through
     // the same Dragonfly layer. Every narrowing facet vec is applied to each
     // subquery, so they all change the result and MUST be part of the key
-    // alongside the principal / account / provider scope and the time range.
+    // alongside the principal / account / provider scope, the time range, and
+    // the caller's effective source scope.
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "cdossier",
         &[
@@ -87,6 +105,7 @@ pub async fn get_cloud_dossier(
                 .unwrap_or_default()
                 .as_bytes(),
         ],
+        &scope,
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -117,6 +136,7 @@ pub async fn get_cloud_dossier(
                 change_types: request.change_types,
             },
             &time_range,
+            &scope,
         )
         .await;
 

@@ -5,6 +5,8 @@
 //! This module provides functions to transform and filter parsed query ASTs,
 //! particularly for handling prevalence commands and their interaction with other commands.
 
+use std::collections::BTreeSet;
+
 use super::command_extraction::extract_post_ai_commands;
 use crate::query::{Command, Comparator, Query, SearchExpr, TableField, Value};
 use crate::search::field_utils::{is_post_processing_field, normalize_field_alias};
@@ -160,12 +162,104 @@ pub fn strip_lateral_and_after(query: &Query) -> Query {
 
 /// Enforce a source_type exclusion at the AST level.
 ///
-/// This wraps the base search expression as:
-/// `(<existing search expr>) AND source_type != "<excluded_source_type>"`
+/// EVERY scan in the query tree — the main search AND every subsearch reachable
+/// through any command (`join`, `append`, `field IN [ … ]`, plus any subsearch
+/// nested inside `where` / `transaction` / `sequence` / `funnel` conditions) —
+/// is rewritten as:
 ///
-/// Doing this at AST level prevents textual bypasses such as leading `OR ...`.
+/// `(<the user's expression>) AND source_type != "<excluded_source_type>"`
+///
+/// (for `"audit"` — the only production input; any other single source takes
+/// the `source_type NOT IN (…)` form, see [`mandatory_exclusion`])
+///
+/// NAN-1794 (security): this conjunct is UNCONDITIONAL and MANDATORY. It is
+/// deliberately *not* skipped when the user's query already "mentions"
+/// `source_type`. The previous presence-check was semantically unsound — it
+/// reported "already excluded" whenever a `source_type != "audit"` node appeared
+/// ANYWHERE in the tree, including in positions that invert or weaken it, and
+/// two crafted forms defeated it:
+///
+///  * `NOT (source_type != "audit")` — the check walked into the `Not`, saw the
+///    exclusion term and suppressed injection; the predicate actually means
+///    `source_type == "audit"`.
+///  * `source_type!="audit" OR source_type="audit"` — the check was satisfied by
+///    the left `OR` arm while the right arm selected audit rows.
+///
+/// The sound model is structural, not textual: `X AND source_type != "audit"`
+/// cannot match an audit row for ANY `X`, however the user wrote `X`. So we
+/// always AND, and never detect-and-skip. Re-introducing a "the user already
+/// wrote it" optimization is a security regression unless it can PROVE the
+/// identical conjunct is already ANDed at the TOP level (a mention under a
+/// `Not`, or in an `Or` arm, must never satisfy it). The cost it would save is
+/// one column compare against a hot, bloom-indexed column — so the honest
+/// answer is: don't.
+///
+/// NAN-1799: this gate is now generalized to a denied-SET (per-source RBAC
+/// scoping). This function is kept as a thin single-source wrapper so every
+/// existing caller (and every NAN-1794 test) is untouched; the deny-set entry
+/// point is [`enforce_source_scope`].
 pub fn enforce_source_type_exclusion(query: &Query, excluded_source_type: &str) -> Query {
-    inject_source_type_exclusion_recursive(query, excluded_source_type)
+    let deny_set = BTreeSet::from([excluded_source_type.to_string()]);
+    inject_source_type_exclusion_recursive(query, &deny_set)
+}
+
+/// The mandatory conjunct ANDed onto every scan.
+///
+/// NAN-1799 — EXACT emitted AST shape (load-bearing for the OTLP strip matcher
+/// in `clickhouse_sql_gen::strip_injected_audit_gate`, which must structurally
+/// recognize the injected conjunct; see the wrap-shape note on
+/// [`inject_source_type_exclusion_recursive`]):
+///
+///  * `deny_set == {"audit"}` exactly (the legacy audit gate) — byte-identical
+///    to the pre-NAN-1799 output so every NAN-1794 test and the NAN-1733 OTLP
+///    strip keep matching:
+///
+///    ```ignore
+///    SearchExpr::FieldFilter {
+///        field: "source_type".to_string(),
+///        op: Comparator::Ne,
+///        value: Value::String("audit".to_string()),
+///    }
+///    ```
+///
+///  * any other non-empty deny set — ONE negated IN-list, values in `BTreeSet`
+///    iteration order (i.e. lexicographically sorted, deterministic):
+///
+///    ```ignore
+///    SearchExpr::InList {
+///        field: "source_type".to_string(),
+///        values: deny_set.iter().map(|s| Value::String(s.clone())).collect(),
+///        negated: true,
+///    }
+///    ```
+///
+/// Either conjunct is wrapped at each scan leaf as the RHS of
+/// `SearchExpr::And(Box::new(SearchExpr::Group(<gated user expr>)), Box::new(<conjunct>))`
+/// — only the conjunct builder changed for NAN-1799, never the wrap shape.
+///
+/// Callers guarantee `deny_set` is non-empty ([`enforce_source_scope`] returns
+/// the query unchanged for an empty set before any injection runs); an empty
+/// set here would emit an unparseable `source_type NOT IN ()`.
+fn mandatory_exclusion(deny_set: &BTreeSet<String>) -> SearchExpr {
+    debug_assert!(
+        !deny_set.is_empty(),
+        "mandatory_exclusion requires a non-empty deny set; empty sets must \
+         short-circuit in enforce_source_scope"
+    );
+    if deny_set.len() == 1 && deny_set.contains("audit") {
+        // Legacy audit-gate shape — kept byte-identical (NAN-704 / NAN-1794).
+        SearchExpr::FieldFilter {
+            field: "source_type".to_string(),
+            op: Comparator::Ne,
+            value: Value::String("audit".to_string()),
+        }
+    } else {
+        SearchExpr::InList {
+            field: "source_type".to_string(),
+            values: deny_set.iter().map(|s| Value::String(s.clone())).collect(),
+            negated: true,
+        }
+    }
 }
 
 /// Parse a piped-query string, inject `source_type != "audit"` at the AST
@@ -179,20 +273,58 @@ pub fn enforce_source_type_exclusion(query: &Query, excluded_source_type: &str) 
 /// shares one canonical implementation. Drift on one site now surfaces
 /// as a compile error instead of a silent permission bypass.
 pub fn enforce_non_audit_query(query: &str) -> Result<String, crate::SearchError> {
+    let deny_set = BTreeSet::from(["audit".to_string()]);
+    enforce_source_scope(query, &deny_set)
+}
+
+/// NAN-1799 (per-source RBAC scoping): parse a piped-query string, inject an
+/// exclusion of EVERY source_type in `deny_set` at every base-table scan —
+/// the main search and every subsearch at any depth (`join` / `append` /
+/// `IN [ … ]`, including subsearches nested inside `where` / `transaction` /
+/// `sequence` / `funnel` conditions) — and serialize back to a string.
+///
+/// Contract (shared across the NAN-1799 wave — do not deviate):
+///
+///  * `deny_set.is_empty()` → the query is returned UNCHANGED, byte-identical.
+///    This is the zero-restricted-sources back-compat guarantee: unrestricted
+///    callers pay nothing and their query text is not even reparsed.
+///  * `deny_set == {"audit"}` exactly → output is byte-identical to
+///    [`enforce_non_audit_query`] (the legacy `source_type != "audit"`
+///    conjunct), preserving every NAN-1794 test and the NAN-1733 OTLP strip.
+///  * otherwise → one `source_type NOT IN ("a", "b", …)` conjunct per scan,
+///    values sorted (BTreeSet order), rendered from
+///    `SearchExpr::InList { negated: true, .. }`. See [`mandatory_exclusion`]
+///    for the exact AST shape.
+///
+/// The injection is UNCONDITIONAL and structural — see
+/// [`enforce_source_type_exclusion`] for why detect-and-skip is a security
+/// regression.
+pub fn enforce_source_scope(
+    query: &str,
+    deny_set: &BTreeSet<String>,
+) -> Result<String, crate::SearchError> {
     use crate::query::{extract_time_modifier_tokens, parse_query, PrettyPrint};
+
+    // Zero restricted sources → nothing to enforce. Return the input verbatim
+    // (no parse/pretty-print round-trip, so formatting and time modifiers are
+    // untouched by construction).
+    if deny_set.is_empty() {
+        return Ok(query.to_string());
+    }
+
     let parsed = parse_query(query).map_err(|e| {
         crate::SearchError::ParseError(format!(
             "Query parsing failed for access control enforcement: {}",
             e
         ))
     })?;
-    let mut enforced = enforce_source_type_exclusion(&parsed, "audit").pretty_print();
+    let mut enforced = inject_source_type_exclusion_recursive(&parsed, deny_set).pretty_print();
 
     // NAN-1453: `parse_query` strips `earliest=`/`latest=` (they are TimeRange
     // controls, not AST nodes), so the pretty-printed rewrite above drops them.
     // Re-append the analyst's original tokens so the downstream search layer's
-    // `extract_time_modifiers` still applies them — otherwise a non-audit-view
-    // user's `earliest=` silently no-ops and their results/timeline come back
+    // `extract_time_modifiers` still applies them — otherwise a scoped user's
+    // `earliest=` silently no-ops and their results/timeline come back
     // empty. Append position is safe: that consumer strips modifiers by regex
     // anywhere in the string, regardless of pipe placement.
     for token in extract_time_modifier_tokens(query) {
@@ -202,50 +334,171 @@ pub fn enforce_non_audit_query(query: &str) -> Result<String, crate::SearchError
     Ok(enforced)
 }
 
-fn inject_source_type_exclusion_recursive(query: &Query, excluded_source_type: &str) -> Query {
+/// Apply the mandatory exclusion to every scan in `query`, recursing through
+/// piped sources AND into every subsearch-bearing command.
+///
+/// The wrap shape — `And(Group(<user expr>), <exclusion>)` — is load-bearing:
+/// `clickhouse_sql_gen::strip_injected_audit_gate` is its exact structural
+/// inverse (it unwraps this on the OTLP spans/metrics datasets, where
+/// `source_type` is not a column — NAN-1733). Change the shape here and you
+/// must change it there.
+///
+/// NAN-1799: `<exclusion>` is now one of TWO conjunct forms (see
+/// [`mandatory_exclusion`] for the exact AST): the legacy
+/// `FieldFilter { source_type, Ne, "audit" }` when the deny set is exactly
+/// `{"audit"}`, or `InList { field: "source_type", values: <sorted>, negated: true }`
+/// for any other deny set. The OTLP strip matcher must recognize both.
+fn inject_source_type_exclusion_recursive(query: &Query, deny_set: &BTreeSet<String>) -> Query {
     match query {
-        Query::Search(expr) => {
-            if search_expr_has_source_type_exclusion(expr, excluded_source_type) {
-                return Query::Search(expr.clone());
-            }
-
-            let exclusion = SearchExpr::FieldFilter {
-                field: "source_type".to_string(),
-                op: Comparator::Ne,
-                value: Value::String(excluded_source_type.to_string()),
-            };
-
-            Query::Search(SearchExpr::And(
-                Box::new(SearchExpr::Group(Box::new(expr.clone()))),
-                Box::new(exclusion),
-            ))
-        }
+        Query::Search(expr) => Query::Search(SearchExpr::And(
+            Box::new(SearchExpr::Group(Box::new(gate_search_expr(
+                expr, deny_set,
+            )))),
+            Box::new(mandatory_exclusion(deny_set)),
+        )),
         Query::Piped { source, command } => Query::Piped {
-            source: Box::new(inject_source_type_exclusion_recursive(
-                source,
-                excluded_source_type,
-            )),
-            command: command.clone(),
+            source: Box::new(inject_source_type_exclusion_recursive(source, deny_set)),
+            command: gate_command(command, deny_set),
         },
     }
 }
 
-fn search_expr_has_source_type_exclusion(expr: &SearchExpr, excluded_source_type: &str) -> bool {
+/// Rewrite a `SearchExpr`, gating every subsearch it carries.
+///
+/// The expression's own logical structure is preserved verbatim — the caller
+/// ANDs the mandatory exclusion on the outside, so nothing in here can weaken
+/// it. The only job is to reach nested `IN [ <subsearch> ]` scans.
+///
+/// FAIL-CLOSED: the match is exhaustive with NO wildcard arm. A new
+/// `SearchExpr` variant that carries a `Query` is a compile error here rather
+/// than a silent audit leak.
+fn gate_search_expr(expr: &SearchExpr, deny_set: &BTreeSet<String>) -> SearchExpr {
     match expr {
-        SearchExpr::FieldFilter { field, op, value } => {
-            field.eq_ignore_ascii_case("source_type")
-                && *op == Comparator::Ne
-                && matches!(value, Value::String(s) if s.eq_ignore_ascii_case(excluded_source_type))
-        }
-        SearchExpr::And(left, right) | SearchExpr::Or(left, right) => {
-            search_expr_has_source_type_exclusion(left, excluded_source_type)
-                || search_expr_has_source_type_exclusion(right, excluded_source_type)
-        }
-        SearchExpr::Not(inner) | SearchExpr::Group(inner) => {
-            search_expr_has_source_type_exclusion(inner, excluded_source_type)
-        }
-        _ => false,
+        SearchExpr::InSubsearch {
+            field,
+            subsearch,
+            negated,
+            subsearch_dataset,
+        } => SearchExpr::InSubsearch {
+            field: field.clone(),
+            subsearch: Box::new(inject_source_type_exclusion_recursive(subsearch, deny_set)),
+            negated: *negated,
+            subsearch_dataset: *subsearch_dataset,
+        },
+        SearchExpr::And(left, right) => SearchExpr::And(
+            Box::new(gate_search_expr(left, deny_set)),
+            Box::new(gate_search_expr(right, deny_set)),
+        ),
+        SearchExpr::Or(left, right) => SearchExpr::Or(
+            Box::new(gate_search_expr(left, deny_set)),
+            Box::new(gate_search_expr(right, deny_set)),
+        ),
+        SearchExpr::Not(inner) => SearchExpr::Not(Box::new(gate_search_expr(inner, deny_set))),
+        SearchExpr::Group(inner) => SearchExpr::Group(Box::new(gate_search_expr(inner, deny_set))),
+        // Leaves — carry no nested `Query`, nothing to walk. Listed explicitly
+        // (no `_` arm) so the fail-closed property above holds.
+        SearchExpr::Keyword(_)
+        | SearchExpr::FieldFilter { .. }
+        | SearchExpr::FunctionFilter { .. }
+        | SearchExpr::FieldFunctionFilter { .. }
+        | SearchExpr::InList { .. }
+        | SearchExpr::BooleanFunction(_)
+        | SearchExpr::LiteralComparison { .. }
+        | SearchExpr::IocMatch { .. } => expr.clone(),
     }
+}
+
+/// Rewrite a `Command`, gating every subsearch it carries.
+///
+/// Enumerated from the AST (`query::ast::commands::Command`), not assumed:
+///  * `Join` / `Append` hold a `Box<Query>` subsearch that reads the log table
+///    directly — these are the direct audit-exfiltration paths.
+///  * `Where` / `Transaction` / `Sequence` / `Funnel` hold `SearchExpr`s that
+///    can themselves contain an `IN [ <subsearch> ]`. These conditions run over
+///    rows the (already-gated) main scan produced, so they cannot resurrect
+///    audit rows on their own — but the subsearches inside them hit the table
+///    directly and must be gated.
+///
+/// FAIL-CLOSED: the match is exhaustive with NO wildcard arm. Adding a new
+/// subsearch-bearing `Command` variant is a compile error here rather than a
+/// silent audit leak.
+fn gate_command(command: &Command, deny_set: &BTreeSet<String>) -> Command {
+    let mut gated = command.clone();
+    match &mut gated {
+        Command::Join { subsearch, .. } | Command::Append { subsearch, .. } => {
+            **subsearch = inject_source_type_exclusion_recursive(subsearch, deny_set);
+        }
+        Command::Where { condition } => {
+            *condition = gate_search_expr(condition, deny_set);
+        }
+        Command::Transaction {
+            startswith,
+            endswith,
+            ..
+        } => {
+            if let Some(expr) = startswith {
+                *expr = gate_search_expr(expr, deny_set);
+            }
+            if let Some(expr) = endswith {
+                *expr = gate_search_expr(expr, deny_set);
+            }
+        }
+        Command::Sequence { conditions, .. } => {
+            for condition in conditions.iter_mut() {
+                *condition = gate_search_expr(condition, deny_set);
+            }
+        }
+        Command::Funnel { steps, .. } => {
+            for (_, condition) in steps.iter_mut() {
+                *condition = gate_search_expr(condition, deny_set);
+            }
+        }
+        // Commands carrying no nested `Query`/`SearchExpr` — pass through
+        // untouched. Listed explicitly (no `_` arm) to keep the fail-closed
+        // property above.
+        Command::Stats { .. }
+        | Command::Chart { .. }
+        | Command::StreamStats { .. }
+        | Command::Sort { .. }
+        | Command::Head { .. }
+        | Command::Tail { .. }
+        | Command::Timechart { .. }
+        | Command::Table { .. }
+        | Command::Rename { .. }
+        | Command::Lookup { .. }
+        | Command::Eval { .. }
+        | Command::Dedup { .. }
+        | Command::Bin { .. }
+        | Command::Rex { .. }
+        | Command::Fields { .. }
+        | Command::Top { .. }
+        | Command::Rare { .. }
+        | Command::Fillnull { .. }
+        | Command::Mvexpand { .. }
+        | Command::Spath { .. }
+        | Command::Format { .. }
+        | Command::Return { .. }
+        | Command::Risk { .. }
+        | Command::Prevalence { .. }
+        | Command::Sample { .. }
+        | Command::Reverse
+        | Command::EventStats { .. }
+        | Command::Anomaly { .. }
+        | Command::InputLookup { .. }
+        | Command::Tree { .. }
+        | Command::ResolveIdentity { .. }
+        | Command::Asset { .. }
+        | Command::Cloud { .. }
+        | Command::Lateral { .. }
+        | Command::Ai { .. }
+        | Command::Output { .. }
+        | Command::Services
+        | Command::Service { .. }
+        | Command::Trace { .. }
+        | Command::Metric { .. }
+        | Command::Retro { .. } => {}
+    }
+    gated
 }
 
 /// Recursively strip lateral and all commands after it
@@ -296,209 +549,4 @@ fn strip_ai_and_after_recursive(query: &Query, parent_found: bool) -> (Query, bo
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::query::parse_query;
-
-    // NAN-1453: non-audit-view users have their query rewritten by
-    // `enforce_non_audit_query`, which round-trips through parse + pretty-print.
-    // That path strips `earliest=`/`latest=`; these tests pin that the rewrite
-    // re-attaches the analyst's time window so it isn't silently lost.
-    #[test]
-    fn test_enforce_non_audit_query_preserves_earliest() {
-        let out = enforce_non_audit_query("actor.user.name=\"mmoore\" earliest=-12h").unwrap();
-        assert!(
-            out.contains("source_type!=\"audit\""),
-            "audit exclusion missing: {out}"
-        );
-        assert!(out.contains("earliest=-12h"), "earliest= dropped: {out}");
-    }
-
-    #[test]
-    fn test_enforce_non_audit_query_preserves_earliest_and_latest() {
-        let out = enforce_non_audit_query("error earliest=-1h latest=now").unwrap();
-        assert!(out.contains("source_type!=\"audit\""), "{out}");
-        assert!(out.contains("earliest=-1h"), "earliest= dropped: {out}");
-        assert!(out.contains("latest=now"), "latest= dropped: {out}");
-    }
-
-    #[test]
-    fn test_enforce_non_audit_query_preserves_modifiers_with_pipe() {
-        let out = enforce_non_audit_query("error earliest=-12h | stats count").unwrap();
-        assert!(out.contains("source_type!=\"audit\""), "{out}");
-        assert!(out.contains("earliest=-12h"), "earliest= dropped: {out}");
-        assert!(out.contains("stats count"), "pipe command dropped: {out}");
-    }
-
-    #[test]
-    fn test_enforce_non_audit_query_no_modifiers_unchanged() {
-        // No earliest=/latest= → exactly the bare exclusion, no trailing tokens.
-        let out = enforce_non_audit_query("error").unwrap();
-        assert!(out.contains("source_type!=\"audit\""), "{out}");
-        assert!(!out.contains("earliest"), "spurious earliest=: {out}");
-        assert!(!out.contains("latest"), "spurious latest=: {out}");
-    }
-
-    #[test]
-    fn test_strip_post_prevalence_commands() {
-        // Query with commands after prevalence enrich should have them stripped
-        let query = parse_query("error | prevalence enrich=true | head 10").unwrap();
-        let stripped = strip_post_prevalence_commands(&query);
-
-        // The stripped query should only go up to prevalence
-        match stripped {
-            Query::Piped { source, command } => {
-                assert!(matches!(*source, Query::Search(_)));
-                assert!(matches!(command, Command::Prevalence { enrich: true, .. }));
-            }
-            _ => panic!("Expected Piped query"),
-        }
-    }
-
-    #[test]
-    fn test_strip_prevalence_and_after() {
-        // Query with prevalence should have it and everything after stripped
-        let query = parse_query("error | prevalence hash_prevalence < 5 | head 10").unwrap();
-        let stripped = strip_prevalence_and_after(&query);
-
-        // The stripped query should only be the base search
-        match stripped {
-            Query::Search(_) => {} // Success
-            _ => panic!("Expected Search query, got Piped"),
-        }
-    }
-
-    #[test]
-    fn test_strip_prevalence_keeps_commands_before() {
-        // Commands before prevalence should be kept
-        let query = parse_query("error | head 100 | prevalence enrich=true | tail 10").unwrap();
-        let stripped = strip_post_prevalence_commands(&query);
-
-        // Should keep head and prevalence, but not tail
-        let mut found_head = false;
-        let mut found_prevalence = false;
-
-        let mut current = &stripped;
-        loop {
-            match current {
-                Query::Search(_) => break,
-                Query::Piped { source, command } => {
-                    if matches!(command, Command::Head { count: _ }) {
-                        found_head = true;
-                    }
-                    if matches!(command, Command::Prevalence { enrich: true, .. }) {
-                        found_prevalence = true;
-                    }
-                    current = source;
-                }
-            }
-        }
-
-        assert!(found_head, "Should keep head command before prevalence");
-        assert!(found_prevalence, "Should keep prevalence command");
-    }
-
-    #[test]
-    fn test_strip_ai_and_after() {
-        let query =
-            parse_query(r#"error | head 10 | ai prompt="Classify" | where ai_verdict="TP""#)
-                .unwrap();
-        let stripped = strip_ai_and_after(&query);
-
-        // Should keep "error | head 10" — ai and where both stripped
-        match stripped {
-            Query::Piped { source, command } => {
-                assert!(matches!(command, Command::Head { count: 10 }));
-                assert!(matches!(*source, Query::Search(_)));
-            }
-            _ => panic!("Expected Piped query with Head"),
-        }
-    }
-
-    #[test]
-    fn test_strip_ai_reinjects_table_fields() {
-        // | table after | ai should be re-injected with only database fields
-        let query =
-            parse_query(r#"error | ai prompt="Classify" | table timestamp, url, ai_verdict"#)
-                .unwrap();
-        let stripped = strip_ai_and_after(&query);
-
-        // Should be: error | table timestamp, url  (ai_verdict filtered out)
-        match &stripped {
-            Query::Piped { command, source } => {
-                if let Command::Table { fields } = command {
-                    let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
-                    assert!(names.contains(&"timestamp"), "Should keep timestamp");
-                    assert!(names.contains(&"url"), "Should keep url");
-                    assert!(
-                        !names.contains(&"ai_verdict"),
-                        "Should filter out ai_verdict"
-                    );
-                } else {
-                    panic!("Expected Table command, got {:?}", command);
-                }
-                assert!(matches!(source.as_ref(), Query::Search(_)));
-            }
-            _ => panic!("Expected Piped query with Table"),
-        }
-    }
-
-    #[test]
-    fn test_strip_ai_keeps_commands_before() {
-        let query = parse_query(r#"error | stats count by src_ip | ai prompt="Classify""#).unwrap();
-        let stripped = strip_ai_and_after(&query);
-
-        match stripped {
-            Query::Piped { command, .. } => {
-                assert!(matches!(command, Command::Stats { .. }));
-            }
-            _ => panic!("Expected Piped query with Stats"),
-        }
-    }
-
-    #[test]
-    fn test_enforce_source_type_exclusion_wraps_or_queries() {
-        let parsed = parse_query(r#"source_type="audit" OR user="alice""#).unwrap();
-        let rewritten = enforce_source_type_exclusion(&parsed, "audit");
-
-        match rewritten {
-            Query::Search(SearchExpr::And(_, right)) => match right.as_ref() {
-                SearchExpr::FieldFilter { field, op, value } => {
-                    assert_eq!(field, "source_type");
-                    assert_eq!(*op, Comparator::Ne);
-                    assert_eq!(value, &Value::String("audit".to_string()));
-                }
-                other => panic!("Expected source_type exclusion filter, got {:?}", other),
-            },
-            other => panic!("Expected top-level AND after enforcement, got {:?}", other),
-        }
-    }
-
-    /// NAN-704: the public string-in / string-out wrapper is what every
-    /// authenticated search surface (search handler, streaming handler,
-    /// dashboard panel handler) calls. Confirms the rewrite injects the
-    /// `source_type != "audit"` clause and survives the round-trip
-    /// through `pretty_print` so the rewritten string can feed back into
-    /// the search service.
-    #[test]
-    fn test_enforce_non_audit_query_injects_exclusion() {
-        let original = r#"source_type="audit" OR user="alice""#;
-        let rewritten = enforce_non_audit_query(original).expect("rewrite should succeed");
-        assert!(
-            rewritten.contains("source_type") && rewritten.contains("audit"),
-            "rewritten query should still mention source_type/audit (as exclusion): {}",
-            rewritten
-        );
-        // Round-trip: the rewritten string must itself parse cleanly.
-        let _ = parse_query(&rewritten).expect("rewritten query must re-parse");
-    }
-
-    #[test]
-    fn test_enforce_non_audit_query_rejects_unparseable_input() {
-        let result = enforce_non_audit_query("| | invalid");
-        assert!(
-            result.is_err(),
-            "unparseable query should return Err, not silently pass through"
-        );
-    }
-}
+mod tests;

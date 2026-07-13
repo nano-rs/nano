@@ -1124,12 +1124,17 @@ CREATE TABLE IF NOT EXISTS nanosiem.signals
     `risk_score` Int32,
     `risk_entity` String,
     `matched_log_id` UUID,
+    -- NAN-1809 C5: provenance of the matched log for per-source RBAC scoping of
+    -- signal reads. Mirrors the `logs.source_type` sentinel: 'unknown' when the
+    -- writer predates the column (pre-164 real-time MVs, historical rows).
+    `source_type` LowCardinality(String) DEFAULT 'unknown',
     `metadata` String DEFAULT '{}',
     `_inserted_at` DateTime64(6, 'UTC') DEFAULT now64(6),
     INDEX idx_rule_id rule_id TYPE bloom_filter GRANULARITY 4,
     INDEX idx_risk_entity risk_entity TYPE bloom_filter GRANULARITY 4,
     INDEX idx_severity severity TYPE set(10) GRANULARITY 4,
-    INDEX idx_matched_log_id matched_log_id TYPE bloom_filter GRANULARITY 4
+    INDEX idx_matched_log_id matched_log_id TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_source_type source_type TYPE set(100) GRANULARITY 4
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(timestamp)

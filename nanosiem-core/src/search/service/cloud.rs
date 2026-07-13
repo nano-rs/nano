@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use super::*;
+use super::lateral::source_scope_sql_predicate;
+use crate::auth::ScopeSet;
 
 impl SearchService {
     /// Cloud event page size for paginated events
@@ -274,10 +276,20 @@ impl SearchService {
     /// CTE construction logic: parse the nPL query, generate SQL, wrap as a CTE.
     /// Returns `Ok(cte_string)` where cte_string is `"cloud_base AS (SELECT ...)"`,
     /// or `Err(SearchError)` if SQL generation fails.
+    ///
+    /// `scope` (NAN-1797/NAN-1799) gates ONLY the parse-failure fallback scan:
+    /// the generated path derives from the nPL text, which the scoped search
+    /// entry point has already run through `enforce_source_scope` — the
+    /// injected exclusion lands inside the generated SQL, and it is never
+    /// re-gated here (no double gating). The fallback is a hand-built
+    /// `SELECT * FROM logs` that bypasses the text injection entirely, so the
+    /// deny-set predicate is ANDed in directly. Empty deny set → byte-identical
+    /// SQL.
     fn build_cloud_base_cte(
         &self,
         query_str: &str,
         time_range: &TimeRange,
+        scope: &ScopeSet,
     ) -> Result<String, SearchError> {
         let base_sql = match parse_query(query_str) {
             Ok(query) => match self.ch_sql_generator.generate(&query, time_range) {
@@ -288,14 +300,17 @@ impl SearchService {
                 }
             },
             Err(_) => {
-                // Fallback: just use time range filter
+                // Fallback: just use time range filter (NAN-1797: with the
+                // caller's source-scope gate ANDed in — this scan does not go
+                // through the nPL text injection that covers the path above).
                 let logs_table = self
                     .table_names
                     .read(Self::logs_table_key(self.active_profile.as_ref()));
-                format!(
-                    "SELECT * FROM {logs_table} PREWHERE timestamp BETWEEN '{}' AND '{}' ORDER BY timestamp DESC",
-                    crate::sql_hygiene::format_ch_bound_micros(&time_range.start),
-                    crate::sql_hygiene::format_ch_bound_micros(&time_range.end),
+                build_cloud_fallback_scan_sql(
+                    &logs_table,
+                    &crate::sql_hygiene::format_ch_bound_micros(&time_range.start).to_string(),
+                    &crate::sql_hygiene::format_ch_bound_micros(&time_range.end).to_string(),
+                    source_scope_sql_predicate("source_type", scope.deny_set()).as_deref(),
                 )
             }
         };
@@ -337,12 +352,21 @@ impl SearchService {
     pub(crate) const MAX_CLOUD_VIEW_HOURS: i64 = 6;
 
     /// Build a cloud investigation view with faceted summaries, resource activity, and MFA analysis
+    ///
+    /// `scope` (NAN-1797/NAN-1799): every cloud sub-query selects from the
+    /// `cloud_base` CTE, whose generated SQL inherits the exclusion that the
+    /// scoped search entry point injected into `cleaned_query` via
+    /// `enforce_source_scope`. The one scan that BYPASSES that injection is
+    /// the CTE builder's parse-failure fallback (`SELECT * FROM logs`), so
+    /// the caller's `ScopeSet` is threaded down to gate it directly. Empty
+    /// deny set → byte-identical SQL.
     pub(crate) async fn build_cloud_view(
         &self,
         _results: Vec<serde_json::Value>,
         cloud_info: &CloudCommandInfo,
         time_range: &TimeRange,
         cleaned_query: &str,
+        scope: &ScopeSet,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
         use serde_json::json;
 
@@ -379,7 +403,7 @@ impl SearchService {
         };
 
         // Build base CTE using shared helper
-        let base_cte = match self.build_cloud_base_cte(cleaned_query, time_range) {
+        let base_cte = match self.build_cloud_base_cte(cleaned_query, time_range, scope) {
             Ok(cte) => cte,
             Err(e) => {
                 tracing::warn!("Cloud view CTE build failed: {}", e);
@@ -833,6 +857,7 @@ impl SearchService {
         offset: usize,
         limit: usize,
         filters: Option<&CloudEventFilters>,
+        scope: &ScopeSet,
     ) -> Result<
         (
             Vec<serde_json::Value>,
@@ -858,8 +883,19 @@ impl SearchService {
             None => return Ok((Vec::new(), 0, CloudFacets::default(), None, None)),
         };
 
-        // Build base CTE using shared helper
-        let base_cte = match self.build_cloud_base_cte(query_str, time_range) {
+        // Build base CTE using shared helper.
+        // NAN-1801: the nPL text is echoed back BY THE CLIENT, so the exclusion
+        // the scoped `| cloud` search injected cannot be trusted to still be
+        // present — a scoped caller could strip it. Re-run the injection here
+        // with the caller's real scope (idempotent for honest frontends: the
+        // duplicate predicate is semantically identical, and an empty deny set
+        // returns the text verbatim). If the text doesn't parse, pass it
+        // through unchanged: `build_cloud_base_cte`'s parse-failure fallback
+        // scan is gated by the same scope directly.
+        let enforced_query =
+            crate::search::query_processing::enforce_source_scope(query_str, scope.deny_set())
+                .unwrap_or_else(|_| query_str.to_string());
+        let base_cte = match self.build_cloud_base_cte(&enforced_query, time_range, scope) {
             Ok(cte) => cte,
             Err(e) => {
                 tracing::warn!("Cloud paginated CTE build failed: {}", e);
@@ -1091,6 +1127,12 @@ impl SearchService {
         // `user` is profile-mapped (OCSF -> `user.name`); the MV `ua` keeps a real
         // `user` column so only the cloud_base side is mapped. Skip the panel when
         // the schema has no user column.
+        //
+        // NAN-1801 RESIDUAL: `cloud_user_activity_agg` carries no source_type, so
+        // the per-user COUNTERS may include denied-source contributions. The user
+        // SET is scope-safe — it joins against the enforced cloud_base CTE, so
+        // users visible only in denied sources never appear. Same residual as
+        // `build_cloud_view`'s identical panel and `entity_time_range_agg`.
         let user_col = Self::cloud_principal_col(profile);
         let cloud_user_activity_table = self.table_names.read("cloud_user_activity_agg");
         let user_activity_sql = match (include_panels, &user_col) {
@@ -1353,6 +1395,7 @@ impl SearchService {
         query_str: &str,
         time_range: &TimeRange,
         user: &str,
+        scope: &ScopeSet,
     ) -> Result<(Vec<serde_json::Value>, CloudUserSessionSummary), SearchError> {
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
@@ -1374,7 +1417,13 @@ impl SearchService {
             }
         };
 
-        let base_cte = self.build_cloud_base_cte(query_str, time_range)?;
+        // NAN-1801: client-echoed nPL — re-run the scope injection with the
+        // caller's real scope (see query_cloud_events_paginated for rationale).
+        // Unparseable text falls through to the scope-gated fallback scan.
+        let enforced_query =
+            crate::search::query_processing::enforce_source_scope(query_str, scope.deny_set())
+                .unwrap_or_else(|_| query_str.to_string());
+        let base_cte = self.build_cloud_base_cte(&enforced_query, time_range, scope)?;
         let user_bind = user.to_string();
         let profile = self.active_profile.as_ref();
 
@@ -1577,6 +1626,7 @@ impl SearchService {
         time_range: &TimeRange,
         entity_type: &str,
         entity_value: &str,
+        scope: &ScopeSet,
     ) -> Result<
         (
             Vec<serde_json::Value>,
@@ -1600,7 +1650,13 @@ impl SearchService {
             )));
         }
 
-        let base_cte = self.build_cloud_base_cte(query_str, time_range)?;
+        // NAN-1801: client-echoed nPL — re-run the scope injection with the
+        // caller's real scope (see query_cloud_events_paginated for rationale).
+        // Unparseable text falls through to the scope-gated fallback scan.
+        let enforced_query =
+            crate::search::query_processing::enforce_source_scope(query_str, scope.deny_set())
+                .unwrap_or_else(|_| query_str.to_string());
+        let base_cte = self.build_cloud_base_cte(&enforced_query, time_range, scope)?;
         let entity_val = entity_value.to_string();
         let profile = self.active_profile.as_ref();
 
@@ -1844,5 +1900,65 @@ impl SearchService {
         );
 
         Ok((events, cross_references, entity_summary))
+    }
+}
+
+/// Build the parse-failure fallback scan for the cloud-view base CTE
+/// (NAN-1797). This is the one hand-built `FROM logs` scan on the cloud path —
+/// every other cloud sub-query selects from the `cloud_base` CTE, whose
+/// generated SQL inherits the scope gate injected into the nPL text by
+/// `enforce_source_scope`. Extracted into a free function so the gating is
+/// unit-testable without a live ClickHouse (mirrors `build_hop_sql` in
+/// `lateral.rs`). With `scope_predicate = None` the output is byte-identical
+/// to the pre-scoping inline `format!`.
+fn build_cloud_fallback_scan_sql(
+    logs_table: &str,
+    start: &str,
+    end: &str,
+    scope_predicate: Option<&str>,
+) -> String {
+    let scope_and = scope_predicate
+        .map(|pred| format!(" AND {pred}"))
+        .unwrap_or_default();
+    format!(
+        "SELECT * FROM {logs_table} PREWHERE timestamp BETWEEN '{start}' AND '{end}'{scope_and} ORDER BY timestamp DESC"
+    )
+}
+
+#[cfg(test)]
+mod source_scope_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// NAN-1797: a nonempty deny-set must gate the hand-built fallback scan —
+    /// the only cloud-view logs scan that does not inherit the nPL text
+    /// injection.
+    #[test]
+    fn nonempty_deny_set_gates_cloud_fallback_scan() {
+        let deny: BTreeSet<String> = ["audit".to_string(), "insider_threat".to_string()]
+            .into_iter()
+            .collect();
+        let pred = source_scope_sql_predicate("source_type", &deny)
+            .expect("nonempty deny set must render");
+        assert_eq!(
+            build_cloud_fallback_scan_sql("logs", "S", "E", Some(&pred)),
+            "SELECT * FROM logs PREWHERE timestamp BETWEEN 'S' AND 'E' \
+             AND lower(source_type) NOT IN ('audit', 'insider_threat') \
+             ORDER BY timestamp DESC"
+        );
+    }
+
+    /// Empty deny set (unrestricted caller) → byte-identical to the
+    /// pre-scoping fallback SQL.
+    #[test]
+    fn empty_deny_set_leaves_cloud_fallback_byte_identical() {
+        assert_eq!(
+            source_scope_sql_predicate("source_type", &BTreeSet::new()),
+            None
+        );
+        assert_eq!(
+            build_cloud_fallback_scan_sql("logs", "S", "E", None),
+            "SELECT * FROM logs PREWHERE timestamp BETWEEN 'S' AND 'E' ORDER BY timestamp DESC"
+        );
     }
 }

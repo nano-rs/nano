@@ -4,7 +4,7 @@
 //!
 //! Split into focused submodules by domain:
 //! - `retention` — PostgreSQL retention + ClickHouse storage
-//! - `risk` — risk weight + decay
+//! - `risk` — risk weight + decay + notable thresholds
 //! - `tiering` — S3 warm/cold storage tiering
 //! - `ai_providers` — multi-provider AI config, models, agents, catalog
 //! - `operational` — org context, health monitoring, developer settings, search admission
@@ -76,6 +76,8 @@ impl utoipa::OpenApi for SettingsApiDoc {
                 risk::update_risk_config,
                 risk::get_risk_decay_config,
                 risk::update_risk_decay_config,
+                risk::get_risk_notable_config,
+                risk::update_risk_notable_config,
                 retention::get_storage_overview,
                 retention::get_clickhouse_storage_stats,
                 retention::update_clickhouse_retention,
@@ -114,6 +116,8 @@ impl utoipa::OpenApi for SettingsApiDoc {
                 webhooks::delete_webhook,
                 webhooks::test_webhook,
                 webhooks::list_webhook_deliveries,
+                webhooks::get_notification_config,
+                webhooks::update_notification_config,
                 operational::get_search_admission_settings,
                 operational::update_search_admission_settings,
                 operational::get_search_query_limits,
@@ -133,6 +137,8 @@ impl utoipa::OpenApi for SettingsApiDoc {
                     risk::UpdateRiskConfigRequest,
                     risk::RiskDecayConfigResponse,
                     risk::UpdateRiskDecayConfigRequest,
+                    nanosiem_core::risk::RiskNotableConfig,
+                    nanosiem_core::risk::RiskNotableTypeThresholds,
                     retention::StorageOverviewResponse,
                     retention::ClickHouseStorageStatsResponse,
                     retention::UpdateClickHouseRetentionRequest,
@@ -163,6 +169,8 @@ impl utoipa::OpenApi for SettingsApiDoc {
                     nanosiem_core::webhooks::WebhookDeliveryLog,
                     nanosiem_core::webhooks::WebhookPayload,
                     nanosiem_core::webhooks::WebhookTestResult,
+                    webhooks::NotificationConfigResponse,
+                    webhooks::UpdateNotificationConfigRequest,
                     nanosiem_core::settings::SearchAdmissionConfig,
                     nanosiem_core::settings::SearchQueryLimitsConfig,
                     retention::DiskPressureStatusResponse,
@@ -240,6 +248,8 @@ impl utoipa::OpenApi for SettingsApiDoc {
                 webhooks::delete_webhook,
                 webhooks::test_webhook,
                 webhooks::list_webhook_deliveries,
+                webhooks::get_notification_config,
+                webhooks::update_notification_config,
                 operational::get_search_admission_settings,
                 operational::update_search_admission_settings,
                 operational::get_search_query_limits,
@@ -278,6 +288,8 @@ impl utoipa::OpenApi for SettingsApiDoc {
                     nanosiem_core::webhooks::WebhookDeliveryLog,
                     nanosiem_core::webhooks::WebhookPayload,
                     nanosiem_core::webhooks::WebhookTestResult,
+                    webhooks::NotificationConfigResponse,
+                    webhooks::UpdateNotificationConfigRequest,
                     nanosiem_core::settings::SearchAdmissionConfig,
                     nanosiem_core::settings::SearchQueryLimitsConfig,
                     retention::DiskPressureStatusResponse,

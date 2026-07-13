@@ -58,9 +58,21 @@ and `time` is **epoch milliseconds** (13 digits, `timestamp_t`) — convert with
   hashes (MD5 = 1 alongside SHA-256 = 3) confirm the `arrayFilter(algorithm_id=3)`
   selector picks the right one.
 
-`observables[]` is populated on every fixture; together with `raw_data` and the
-long tail it intentionally stays in the `event` JSON column (`JsonPath`
-resolution per scoping §5) and is **not** promoted to a hot column.
+`raw_data` — the producer's untouched original — IS promoted, to its own column
+(NAN-1827). The auth fixture carries a syslog-framed Windows 4624 there while its
+`message` stays a human summary, which is the split OCSF intends; the other five
+leave it absent, which is what our own Vector lanes produce (they put the raw log
+in `message` and emit no `raw_data`). `ocsf_materialization_integration` asserts
+both cases round-trip byte-exactly — as hex, because the original carries tabs and
+CRLFs that `FORMAT TSV` would escape.
+
+⚠️ `observables[]` is populated on every fixture and is currently **dropped on
+every ingest**. It is a standard OCSF attribute, so a conformant producer does not
+put it in `unmapped`; it is not promoted; and the `event` JSON column this file
+once said it "intentionally stays in" no longer exists — NAN-1443 deleted it. Same
+silent-drop class as the pre-NAN-1827 `raw_data` bug, and nothing in the test suite
+catches it (the assertions prove promoted columns POPULATE, never that nothing was
+LOST). Tracked separately; do not assume `observables[]` survives ingest.
 
 `enrichments[]`, by contrast, IS promoted (dual-mode): the Network/DNS/HTTP
 fixtures carry named entries (`ioc_*`, `custom_*`) that materialize into the

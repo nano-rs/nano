@@ -755,6 +755,8 @@ mod tests {
             playbook_id: None,
             source_path: None,
             source_repo_url: None,
+            kind: "standard".into(),
+            alert_cooldown_minutes: None,
         }
     }
 
@@ -953,6 +955,7 @@ mod tests {
             playbook_id: None,
             source_path: None,
             source_repo_url: None,
+            alert_cooldown_minutes: None,
         }
     }
 

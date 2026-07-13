@@ -18,8 +18,8 @@ import type { ComponentType, SVGProps } from 'react';
 import type { Capabilities } from '@/hooks/use-capabilities';
 import {
   Briefcase,
-  // Bell, — kept on hand for when Notifications ships
-  Webhook,
+  Bell,
+  // Webhook, — retired with the standalone webhooks rail item (folded into Notifications)
   Bot,
   Activity,
   TrendingUp,
@@ -28,6 +28,7 @@ import {
   Database,
   Shield,
   ShieldCheck,
+  EyeOff,
   KeyRound,
   Users as UsersIcon,
   UserCog,
@@ -162,31 +163,31 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
       },
     ],
   },
-  // Notifications hidden until the surface ships — flip back on when there's
-  // a real channels/routing config to manage. The /settings/notifications
-  // route still exists in App.tsx and renders SettingsComingSoon for any
-  // direct deeplink, but the rail no longer surfaces it.
-  // {
-  //   id: 'notifications',
-  //   label: 'Notifications',
-  //   group: 'workspace',
-  //   icon: Bell,
-  //   desc: 'Email, Slack, PagerDuty channels and routing.',
-  //   href: '/settings/notifications',
-  //   permissions: 'settings:system',
-  //   status: 'ok',
-  //   comingSoon: true,
-  // },
+  // Notification channels (NAN-1790): the unified outbound surface. Absorbs the
+  // legacy generic webhooks — Slack / Teams / PagerDuty / generic all live here.
   {
-    id: 'webhooks',
-    label: 'Webhooks',
+    id: 'notifications',
+    label: 'Notifications',
     group: 'workspace',
-    icon: Webhook,
-    desc: 'Outbound webhooks for cases, alerts, rule changes.',
-    href: '/settings/webhooks',
+    icon: Bell,
+    desc: 'Slack, Teams, PagerDuty, and webhook channels — plus routing.',
+    href: '/settings/notifications',
     permissions: 'settings:webhooks',
     status: 'ok',
   },
+  // The standalone Webhooks rail item is retired in favor of the unified
+  // Notifications surface (generic webhooks are a channel type there). The
+  // /settings/webhooks route stays live in App.tsx for existing deep links.
+  // {
+  //   id: 'webhooks',
+  //   label: 'Webhooks',
+  //   group: 'workspace',
+  //   icon: Webhook,
+  //   desc: 'Outbound webhooks for cases, alerts, rule changes.',
+  //   href: '/settings/webhooks',
+  //   permissions: 'settings:webhooks',
+  //   status: 'ok',
+  // },
 
   // ------- Detection & Search -------
   {
@@ -358,6 +359,17 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
         icon: MonitorSmartphone,
       },
     ],
+  },
+  {
+    id: 'source-scopes',
+    label: 'Source Visibility',
+    group: 'admin',
+    icon: EyeOff,
+    desc: 'Restrict which groups can see events from a source type.',
+    href: '/settings/source-scopes',
+    matchPrefixes: ['/settings/source-scopes'],
+    permissions: 'source_scopes:view',
+    status: 'ok',
   },
   {
     id: 'sso',

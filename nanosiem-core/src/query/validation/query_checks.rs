@@ -86,6 +86,22 @@ pub fn pre_aggregation_subquery(query: &Query) -> Option<&Query> {
     }
 }
 
+/// Check if a query contains a `| risk` command (NAN-1805).
+///
+/// Rules over `dataset=risk` must not carry `| risk`: a detection rule EMITS
+/// findings, and findings are the risk dataset's input — a risk-dataset rule
+/// stamping risk scores would feed its own input (feedback loop). Rule
+/// validation rejects such queries at save time; execution rejects them again
+/// as belt-and-suspenders.
+pub fn contains_risk_command(query: &Query) -> bool {
+    match query {
+        Query::Search(_) => false,
+        Query::Piped { source, command } => {
+            matches!(command, Command::Risk { .. }) || contains_risk_command(source)
+        }
+    }
+}
+
 /// Check if a query contains joins
 ///
 /// Real-time detection rules cannot use joins because they require
@@ -224,5 +240,27 @@ mod tests {
         let query = parse_query("error | stats count by src_ip | where count > 10").unwrap();
         let base = pre_aggregation_subquery(&query).expect("expected base filter");
         assert_eq!(crate::query::PrettyPrint::pretty_print(base), "error");
+    }
+
+    #[test]
+    fn test_contains_risk_command() {
+        // NAN-1805: the feedback-loop guard's `| risk` detector.
+        let with_risk = parse_query("error | risk score=50 entity=src_ip").unwrap();
+        assert!(contains_risk_command(&with_risk));
+
+        // Buried mid-pipeline still detected.
+        let buried =
+            parse_query("error | risk score=50 entity=src_ip | where status=500").unwrap();
+        assert!(contains_risk_command(&buried));
+
+        // The risk-notable rule shape carries no `| risk`.
+        let notable =
+            parse_query("* | where score_24h > 500 or score_7d > 1000 | table entity, score_24h")
+                .unwrap();
+        assert!(!contains_risk_command(&notable));
+
+        // A field merely NAMED risk_score is not the command.
+        let field_ref = parse_query("* | where risk_score > 10").unwrap();
+        assert!(!contains_risk_command(&field_ref));
     }
 }

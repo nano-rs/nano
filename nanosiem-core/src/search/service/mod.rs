@@ -90,6 +90,15 @@ mod sql_execution;
 mod streaming;
 mod tree_view;
 
+/// Crate-public re-export of the ONE source-scope SQL predicate builder
+/// (NAN-1801, P3). The hand-built "side-door" SQL paths in other crates
+/// (identity API, prevalence, telemetry, AI) render a caller's deny-set with
+/// THIS function so their gate stays byte-identical to the nPL injector's
+/// negated-`InList` shape — never a re-derived copy. Reachable as
+/// `nanosiem_core::search::service::source_scope_sql_predicate` (requires
+/// `search::service` to be a `pub mod`).
+pub use lateral::source_scope_sql_predicate;
+
 /// Determine the display type for a query based on its commands
 ///
 /// This inspects the AST to determine the appropriate display type:
@@ -194,6 +203,17 @@ pub(super) fn is_command_page_marker(display_type: DisplayType) -> bool {
             | DisplayType::Metric
             | DisplayType::Retro
     )
+}
+
+/// Whether a search request can touch the derived `risk` dataset (NAN-1798
+/// P2) — directly (`dataset=risk`) or through a `[dataset=risk …]` subsearch
+/// bracket. The bracket check is a cheap textual pre-filter (the parser only
+/// accepts the literal `dataset=` token form); a false positive — e.g. the
+/// text inside a quoted string — only costs an optimization (prevalence
+/// pushdown skip / an unused risk config attach), never correctness.
+pub(super) fn touches_risk_dataset(dataset: Option<&str>, raw_query: &str) -> bool {
+    crate::query::Dataset::from_selector(dataset.unwrap_or("logs")) == crate::query::Dataset::Risk
+        || raw_query.to_ascii_lowercase().contains("dataset=risk")
 }
 
 /// Input-side field-name validation for the nPL request path (NAN-1354).
@@ -651,6 +671,12 @@ pub struct SearchService {
     /// passed to the SQL generator at construction so default-view projection,
     /// field resolution, and the FROM table follow the active schema.
     active_profile: std::sync::Arc<dyn crate::schema::SchemaProfile>,
+    /// Cached decay-factor + cleared-boundary provider for the derived
+    /// `dataset=risk` base source (NAN-1798 P2). Resolves the SAME values the
+    /// enterprise `RiskRepository` binds (60s cache; open-core schema degrades
+    /// to the shipped defaults) so risk-dataset scores equal the Risk page /
+    /// leaderboard numbers.
+    risk_query_config: std::sync::Arc<crate::risk::config_provider::RiskQueryConfigProvider>,
 }
 
 impl SearchService {
@@ -666,7 +692,8 @@ impl SearchService {
             crate::schema::SchemaId::Ocsf => "ocsf_logs",
             crate::schema::SchemaId::Udm
             | crate::schema::SchemaId::Spans
-            | crate::schema::SchemaId::Metrics => "logs",
+            | crate::schema::SchemaId::Metrics
+            | crate::schema::SchemaId::Risk => "logs",
         }
     }
 
@@ -688,6 +715,10 @@ impl SearchService {
             crate::query::Dataset::Metrics => {
                 crate::schema::profile_for_id(crate::schema::SchemaId::Metrics)
             }
+            // NAN-1798 P2: the derived risk grain's 15-column profile.
+            crate::query::Dataset::Risk => {
+                crate::schema::profile_for_id(crate::schema::SchemaId::Risk)
+            }
             crate::query::Dataset::Logs => self.active_profile.clone(),
         }
     }
@@ -698,13 +729,24 @@ impl SearchService {
     /// `ocsf_logs` / tenant-prefixed) — mirrors the data-query path in
     /// `core_search`; applying `with_dataset(Logs)` would clobber it to the
     /// literal `"logs"`.
-    fn dataset_generator(&self, dataset: Option<&str>) -> ClickHouseSqlGenerator {
+    /// Async since NAN-1798 P2: when the request can touch the risk dataset —
+    /// `dataset=risk`, or a LOGS query carrying a `[dataset=risk …]` bracket
+    /// (judged from `raw_query`) — the cached decay/cleared config is resolved
+    /// and attached BEFORE any dataset swap, so the derived base source (and
+    /// therefore explain / field-values SQL) matches the executed data path.
+    async fn dataset_generator(
+        &self,
+        dataset: Option<&str>,
+        raw_query: &str,
+    ) -> ClickHouseSqlGenerator {
         let ds = crate::query::Dataset::from_selector(dataset.unwrap_or("logs"));
-        let generator = self.ch_sql_generator.clone();
-        if ds == crate::query::Dataset::Logs {
-            generator
-        } else {
-            generator.with_dataset(ds)
+        let mut generator = self.ch_sql_generator.clone();
+        if touches_risk_dataset(dataset, raw_query) {
+            generator = generator.with_risk_config(self.risk_query_config.resolve().await);
+        }
+        match ds {
+            crate::query::Dataset::Logs => generator,
+            _ => generator.with_dataset(ds),
         }
     }
 
@@ -718,7 +760,11 @@ impl SearchService {
     fn field_stats_fallback_columns(dataset: Option<&str>) -> Vec<String> {
         let ds = crate::query::Dataset::from_selector(dataset.unwrap_or("logs"));
         match ds {
-            crate::query::Dataset::Spans | crate::query::Dataset::Metrics => {
+            crate::query::Dataset::Spans
+            | crate::query::Dataset::Metrics
+            // NAN-1798 P2: the risk dataset's columns ARE its derived
+            // projection — the guaranteed-correct inventory.
+            | crate::query::Dataset::Risk => {
                 ds.columns().iter().map(|c| c.to_string()).collect()
             }
             crate::query::Dataset::Logs => [
@@ -806,6 +852,11 @@ impl SearchService {
                 crate::settings::SearchQueryLimitsConfig::default(),
             )),
             active_profile: profile,
+            risk_query_config: std::sync::Arc::new(
+                crate::risk::config_provider::RiskQueryConfigProvider::new(
+                    dual_pool.postgres().clone(),
+                ),
+            ),
         }
     }
     /// Create a new search service with DualPool, lookup, and prevalence support.
@@ -860,6 +911,11 @@ impl SearchService {
                 crate::settings::SearchQueryLimitsConfig::default(),
             )),
             active_profile: profile,
+            risk_query_config: std::sync::Arc::new(
+                crate::risk::config_provider::RiskQueryConfigProvider::new(
+                    dual_pool.postgres().clone(),
+                ),
+            ),
         }
     }
 

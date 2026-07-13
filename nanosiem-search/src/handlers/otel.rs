@@ -8,12 +8,24 @@
 //! the `nanosiem_core::query::otel` helpers (partition-pruned trace fetch,
 //! bucketed metric series) and executed via the SearchService's single-SELECT
 //! `query_otel_*` glue.
+//!
+//! Source scoping (NAN-1801): `otel_spans` / `otel_metrics` carry NO
+//! `source_type` column, so the per-source RBAC deny-set does not apply to the
+//! data these handlers return (out of scope by design — the scoping unit is
+//! the ingest `source_type` string). No handler in this module reads the
+//! source-scopeable `signals` table; the service-detail security-signals panel
+//! is served by the api crate's `/api/observability/services/{service}/
+//! security-signals`, which threads the viewer's scope into
+//! `observability_service_security_signals`. Cache keys here accordingly stay
+//! on the unrestricted `ScopeSet` — the cached bodies are identical for every
+//! authorized viewer.
 
 use axum::{
     Json,
     extract::{Path, Query, State},
 };
 use nanosiem_core::TimeRangeInput;
+use nanosiem_core::auth::permissions;
 use nanosiem_core::query::{
     InfraHostsFilters, MetricAgg, MetricQuery, MetricTagFilter, RumFilters, ServicesOverviewFilters,
     ServicesSort, TimeRange, TraceListFilters, valid_tag_key,
@@ -83,9 +95,13 @@ pub async fn get_trace(
 
     // NAN-1593: the trace waterfall re-fetches on every load / shared-link
     // follow — cache it through the same Dragonfly layer as the main search.
+    // NAN-1801 (resolved in P3): otel_spans has no source_type, so this read is
+    // out of the per-source scope's reach by design — the unrestricted key is
+    // correct, not a gap (see module doc).
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "trace",
         &[trace_id.to_ascii_lowercase().as_bytes()],
+        &nanosiem_core::auth::ScopeSet::unrestricted(),
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -311,6 +327,7 @@ pub async fn get_metric_timeseries(
             group_by.unwrap_or("").as_bytes(),
             filters_key.as_bytes(),
         ],
+        &nanosiem_core::auth::ScopeSet::unrestricted(),
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -434,6 +451,7 @@ pub async fn list_metric_tags(
             time_range.start.timestamp_micros().to_string().as_bytes(),
             time_range.end.timestamp_micros().to_string().as_bytes(),
         ],
+        &nanosiem_core::auth::ScopeSet::unrestricted(),
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -616,6 +634,7 @@ pub async fn list_traces(
                 .unwrap_or_default()
                 .as_bytes(),
         ],
+        &nanosiem_core::auth::ScopeSet::unrestricted(),
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -703,6 +722,7 @@ pub async fn list_metric_names(
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "mnames",
         &[service.unwrap_or("").as_bytes()],
+        &nanosiem_core::auth::ScopeSet::unrestricted(),
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -902,6 +922,7 @@ pub async fn list_services(
             params.offset.to_string().as_bytes(),
             params.limit.map(|v| v.to_string()).unwrap_or_default().as_bytes(),
         ],
+        &nanosiem_core::auth::ScopeSet::unrestricted(),
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -1004,14 +1025,26 @@ pub struct ServiceDetailResponse {
         (status = 200, description = "Service detail (red/endpoints/exemplars)", body = ServiceDetailResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Missing search:execute permission", body = ErrorResponse),
     )
 )]
 pub async fn get_service_detail(
     State(state): State<SearchState>,
+    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     Path(service): Path<String>,
     Query(params): Query<ServiceDetailParams>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
 ) -> Result<(axum::http::HeaderMap, Json<ServiceDetailResponse>), SearchError> {
+    // NAN-1801: this drill-in was BEARER-ONLY. Gate it like the other search
+    // reads (mirrors the retro handler). The detail body itself reads only
+    // `otel_spans` (no source_type — unscoped by design, see module doc); the
+    // security-signals panel lives on the api crate's scoped endpoint.
+    if !auth.claims.has_permission(permissions::SEARCH_EXECUTE) {
+        return Err(SearchError::Forbidden(
+            "Service detail requires the search:execute permission".to_string(),
+        ));
+    }
+
     let start = Instant::now();
 
     if service.trim().is_empty() {
@@ -1035,6 +1068,7 @@ pub async fn get_service_detail(
             step.to_string().as_bytes(),
             params.exemplar_limit.to_string().as_bytes(),
         ],
+        &nanosiem_core::auth::ScopeSet::unrestricted(),
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -1180,6 +1214,7 @@ pub async fn list_infra_hosts(
             params.offset.to_string().as_bytes(),
             params.limit.map(|v| v.to_string()).unwrap_or_default().as_bytes(),
         ],
+        &nanosiem_core::auth::ScopeSet::unrestricted(),
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -1304,6 +1339,7 @@ pub async fn get_rum_summary(
             filters.browser.unwrap_or("").as_bytes(),
             filters.env.unwrap_or("").as_bytes(),
         ],
+        &nanosiem_core::auth::ScopeSet::unrestricted(),
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {

@@ -17,6 +17,7 @@ mod dispositions;
 mod import_export;
 mod lifecycle;
 mod predicates;
+mod retro_hunt;
 mod reviews;
 mod stats;
 mod testing;
@@ -29,6 +30,7 @@ pub use dispositions::*;
 pub use import_export::*;
 pub use lifecycle::*;
 pub use predicates::*;
+pub use retro_hunt::*;
 pub use reviews::*;
 pub use stats::*;
 pub use testing::*;
@@ -153,6 +155,12 @@ impl utoipa::OpenApi for DetectionsApiDoc {
                 get_rule_disposition_stats,
                 set_match_disposition,
                 get_rule_predicates,
+                // NAN-1791: auto retro-hunt rules
+                create_retro_hunt,
+                get_retro_hunt,
+                update_retro_hunt,
+                list_retro_hunt_runs,
+                list_retro_hunt_feeds,
             ),
             components(schemas(
                 TestRuleRequest,
@@ -182,6 +190,13 @@ impl utoipa::OpenApi for DetectionsApiDoc {
                 Predicate,
                 PredicateKind,
                 PipeStage,
+                // NAN-1791: auto retro-hunt rules
+                nanosiem_core::models::retro_hunt::CreateRetroHuntRequest,
+                nanosiem_core::models::retro_hunt::UpdateRetroHuntConfigRequest,
+                nanosiem_core::models::retro_hunt::RetroHuntConfig,
+                nanosiem_core::models::retro_hunt::RetroHuntState,
+                nanosiem_core::models::retro_hunt::RetroHuntRuleView,
+                nanosiem_core::models::retro_hunt::RetroHuntRun,
             ))
         )]
         struct ApiDoc;

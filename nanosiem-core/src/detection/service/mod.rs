@@ -14,8 +14,11 @@
 
 mod alerts;
 mod analysis;
+#[cfg(test)]
+mod cooldown_tests;
 mod execution;
 pub(crate) mod helpers;
+mod retro_hunt;
 mod rules;
 #[cfg(test)]
 mod tests;

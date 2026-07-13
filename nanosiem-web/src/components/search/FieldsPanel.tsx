@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '@/lib/api';
+import { useAuth } from '@/contexts/AuthContext';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -12,7 +13,7 @@ import {
   DropdownMenuShortcut,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import { ChevronDown, Plus, Minus, Copy, Search, X, Loader2, Filter, ChevronLeft, BarChart2 } from 'lucide-react';
+import { ChevronDown, Plus, Minus, Copy, Search, X, Loader2, Filter, ChevronLeft, BarChart2, EyeOff } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 interface FieldValueInfo {
@@ -200,6 +201,21 @@ export function FieldsPanel({
   });
   const selectedFieldSet =
     schemaFields?.schema === 'ocsf' ? SELECTED_FIELDS_OCSF : SELECTED_FIELDS_UDM;
+  // Per-source RBAC scoping (NAN-1802): mark restricted source_type values in
+  // the field-value picker so analysts see which sources are visibility-scoped.
+  // Only fetched for admins with `source_scopes:view` — others get an empty set
+  // (and no 403). An empty restricted registry = allow-all.
+  const { hasPermission } = useAuth();
+  const { data: restrictedResp } = useQuery({
+    queryKey: ['source-scopes-restricted'],
+    queryFn: () => api.sourceScopes.listRestricted(),
+    enabled: hasPermission('source_scopes:view'),
+    staleTime: 5 * 60 * 1000,
+  });
+  const restrictedSourceTypes = useMemo(
+    () => new Set((restrictedResp?.restricted ?? []).map((r) => r.source_type)),
+    [restrictedResp],
+  );
   // Server-side field values (fetched on-demand when field is expanded)
   const [serverFieldValues, setServerFieldValues] = useState<Map<string, ServerFieldValues>>(new Map());
 
@@ -556,8 +572,20 @@ export function FieldsPanel({
                                       setLabelValueExpanded(false);
                                     }}
                                   >
-                                    <span className="text-str whitespace-nowrap overflow-hidden text-ellipsis" title={valueInfo.value}>
-                                      {valueInfo.value}
+                                    <span className="min-w-0 flex items-center gap-1.5">
+                                      <span className="text-str whitespace-nowrap overflow-hidden text-ellipsis" title={valueInfo.value}>
+                                        {valueInfo.value}
+                                      </span>
+                                      {(stat.field === 'source_type' || stat.field === 'sourcetype') &&
+                                        restrictedSourceTypes.has(valueInfo.value) && (
+                                          <span
+                                            title="Visibility-scoped source — only granted groups can see its events"
+                                            className="shrink-0 inline-flex items-center gap-0.5 h-[13px] px-1 rounded-[3px] bg-amber-500/12 text-amber-500 text-[8.5px] uppercase tracking-wider"
+                                          >
+                                            <EyeOff className="w-[8px] h-[8px]" />
+                                            Restricted
+                                          </span>
+                                        )}
                                     </span>
                                     <span className="text-muted-foreground text-right text-[10px] tabular-nums">
                                       {valueInfo.percentage.toFixed(1)}%

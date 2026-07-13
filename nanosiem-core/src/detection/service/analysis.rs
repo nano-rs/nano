@@ -138,7 +138,8 @@ impl DetectionService {
 
         let response = self
             .search_service
-            .search(request)
+            // SYSTEM caller: detection analysis must see ALL sources.
+            .search(request, &crate::auth::ScopeSet::unrestricted())
             .await
             .map_err(|e| DetectionError::SearchError(e.to_string()))?;
 
@@ -633,7 +634,8 @@ impl DetectionService {
 
         let response = self
             .search_service
-            .search(request)
+            // SYSTEM caller: detection analysis must see ALL sources.
+            .search(request, &crate::auth::ScopeSet::unrestricted())
             .await
             .map_err(|e| DetectionError::SearchError(e.to_string()))?;
 
@@ -754,7 +756,12 @@ impl DetectionService {
             dataset,
         };
 
-        match self.search_service.search(request).await {
+        // SYSTEM caller: detection analysis must see ALL sources.
+        match self
+            .search_service
+            .search(request, &crate::auth::ScopeSet::unrestricted())
+            .await
+        {
             Ok(response) => response
                 .results
                 .iter()

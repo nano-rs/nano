@@ -7,6 +7,7 @@ import type {
   UpdateRiskConfigRequest,
   RiskDecayConfig,
   UpdateRiskDecayConfigRequest,
+  RiskNotableConfig,
   RiskEntitiesQuery,
   RiskEntitiesResponse,
   RiskOverviewResponse,
@@ -38,6 +39,12 @@ export class RiskApi {
     return ENTERPRISE_ONLY();
   }
   updateRiskDecayConfig(_request: UpdateRiskDecayConfigRequest): Promise<RiskDecayConfig> {
+    return ENTERPRISE_ONLY();
+  }
+  getRiskNotableConfig(): Promise<RiskNotableConfig> {
+    return ENTERPRISE_ONLY();
+  }
+  updateRiskNotableConfig(_request: RiskNotableConfig): Promise<RiskNotableConfig> {
     return ENTERPRISE_ONLY();
   }
   getRiskyEntities(_params?: RiskEntitiesQuery): Promise<RiskEntitiesResponse> {

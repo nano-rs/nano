@@ -71,6 +71,7 @@ pub struct FieldValue {
 )]
 pub async fn get_field_values(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(field_name): Path<String>,
     Query(query): Query<FieldValuesQuery>,
 ) -> Result<Json<FieldValuesResponse>, ApiError> {
@@ -79,10 +80,21 @@ pub async fn get_field_values(
         .parse()
         .map_err(|_| ApiError::NotFound(format!("Unknown field: {}", field_name)))?;
 
+    // NAN-1799: compose the effective deny-set (per-source RBAC + audit gate) and
+    // let the service apply it. Union the `audit` source unless the caller holds
+    // `audit:view`; an unrestricted `audit:view` caller yields byte-identical SQL.
+    let scope = {
+        let mut deny = auth.denied_sources.deny_set().clone();
+        if !auth.has_permission(permissions::AUDIT_VIEW) {
+            deny.insert("audit".to_string());
+        }
+        nanosiem_core::auth::ScopeSet::from_denied(deny)
+    };
+
     let time_range = query.time_range();
     let values = state
         .search_service
-        .get_udm_field_values(field, &time_range, query.limit)
+        .get_udm_field_values(field, &time_range, query.limit, &scope)
         .await?;
 
     let values = values
@@ -225,6 +237,7 @@ pub struct ExtFieldsQuery {
 )]
 pub async fn get_ext_fields(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Query(params): Query<ExtFieldsQuery>,
 ) -> Result<Json<Vec<String>>, ApiError> {
     // Only scope when BOTH bounds are present; a half-specified range falls back
@@ -233,9 +246,21 @@ pub async fn get_ext_fields(
         (Some(start), Some(end)) => Some(TimeRangeInput::new(start, end)),
         _ => None,
     };
+
+    // NAN-1799: compose the effective deny-set (per-source RBAC + audit gate) so
+    // the enumerator never surfaces `ext`/`unmapped` leaf paths from source types
+    // the caller can't see. The service injects the deny-set into its predicate.
+    let scope = {
+        let mut deny = auth.denied_sources.deny_set().clone();
+        if !auth.has_permission(permissions::AUDIT_VIEW) {
+            deny.insert("audit".to_string());
+        }
+        nanosiem_core::auth::ScopeSet::from_denied(deny)
+    };
+
     let names = state
         .search_service
-        .get_ext_field_names(params.query.as_deref(), time_range.as_ref())
+        .get_ext_field_names(params.query.as_deref(), time_range.as_ref(), &scope)
         .await
         .map_err(|e| ApiError::InternalError(format!("Failed to get ext field names: {}", e)))?;
     Ok(Json(names))

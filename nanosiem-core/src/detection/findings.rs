@@ -16,7 +16,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::PgPool;
 use tracing::{debug, info, instrument};
 use uuid::Uuid;
 
@@ -78,8 +77,29 @@ pub struct FindingEvent {
     pub risk_entity: String,
     /// Field name that the risk entity was extracted from (e.g., "src_ip", "user", "dest_host")
     pub risk_entity_field: Option<String>,
+    /// Write-side entity type, inferred from the field name (falling back to
+    /// the value) at finding construction (NAN-1806). Stamped into the finding
+    /// row so the read side can honor types the value inference can never
+    /// produce — `cloud_account` first (the cloud-overview fan-out keyed on it
+    /// but nothing emitted it). Empty on findings without a risk entity.
+    #[serde(default)]
+    pub risk_entity_type: String,
     /// Risk factors explaining the score
     pub risk_factors: Vec<String>,
+    /// NAN-1800: distinct normalized (trim + lowercase) `source_type` values of
+    /// the matched origin events. Empty when the origin cannot be determined
+    /// (aggregate rules whose result rows drop `source_type`). Used by the
+    /// write-side redaction policy AND persisted as a marker so readers can
+    /// scope findings by origin.
+    #[serde(default)]
+    pub origin_source_types: Vec<String>,
+    /// NAN-1800: true when `matched_events_sample` was redacted at write time
+    /// because the finding originated (or may have originated) from a
+    /// restricted `source_type`. When set, `matched_events_sample` is empty and
+    /// `risk_entity` / `risk_entity_field` are neutralized; counts and rule
+    /// metadata are kept.
+    #[serde(default)]
+    pub matched_events_redacted: bool,
 }
 
 impl FindingEvent {
@@ -150,6 +170,58 @@ impl FindingEvent {
             .max()
     }
 
+    /// Distinct normalized `source_type` values carried by the matched events
+    /// (NAN-1800). Normalization is trim + lowercase — OCSF `source_type` is
+    /// NOT ingest-lowercased, and the restricted-source registry stores
+    /// normalized values. Events without a `source_type` string contribute
+    /// nothing; an all-empty result means "origin unknown" and the write-side
+    /// policy treats that conservatively (see `FindingLogger::origin_restricted`).
+    fn origin_source_types_from(events: &[serde_json::Value]) -> Vec<String> {
+        let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for event in events {
+            if let Some(st) = event.get("source_type").and_then(|v| v.as_str()) {
+                let normalized = st.trim().to_lowercase();
+                if !normalized.is_empty() {
+                    set.insert(normalized);
+                }
+            }
+        }
+        set.into_iter().collect()
+    }
+
+    /// Redact restricted-origin evidence from this finding (NAN-1800).
+    ///
+    /// MUST be applied on the `FindingEvent` itself, BEFORE `to_log_json()` —
+    /// that method is pure and cannot self-redact, and its JSON feeds BOTH
+    /// physical write branches (UDM `logs.metadata` and the OCSF
+    /// `build_ocsf_finding_event` path). Redacting here guarantees the empty
+    /// sample flows to both.
+    ///
+    /// Keeps counts + rule metadata (rule id/name/query, severity, MITRE,
+    /// risk scores, risk factors); removes the event sample and neutralizes
+    /// the risk entity so no restricted entity VALUE leaks via the
+    /// `risk_entity` column, the CH-derived risk aggregation, or the
+    /// `message()` entity summary (which derives from `risk_entity` + the
+    /// sample).
+    pub fn redact_matched_events(&mut self) {
+        self.matched_events_sample = Vec::new();
+        self.matched_events_redacted = true;
+        // Neutralize the entity VALUE. Emptying it also (a) makes
+        // `extract_entity_summary()` skip it, so `message()` falls back to the
+        // count-only form, and (b) excludes the finding from every CH risk
+        // aggregation (the shared risk builder filters `risk_entity != ''` —
+        // NAN-1798/NAN-1810 replaced the PG `entity_risk_scores` rollup with
+        // read-time aggregation over these rows), so a restricted entity value
+        // never surfaces on the risk page / `dataset=risk` either.
+        self.risk_entity = String::new();
+        self.risk_entity_field = None;
+        // risk_factors can carry `toString(<field>)` values for `factors=<field-expr>`
+        // rules (clickhouse_sql_gen commands) — a second event-value channel that
+        // egresses to both write branches. Clear it unconditionally on redaction;
+        // at this layer label-only factors can't be distinguished from value-bearing ones.
+        self.risk_factors = Vec::new();
+    }
+
     /// Create a finding event for a live mode detection match
     pub fn detection_match(
         rule: &DetectionRule,
@@ -183,9 +255,12 @@ impl FindingEvent {
             detected_at: Self::source_event_time(matched_events).unwrap_or_else(Utc::now),
             raw_risk_score: risk_result.raw_score,
             risk_score: risk_result.weighted_score,
+            risk_entity_type: Self::stamp_entity_type(&risk_result),
             risk_entity: risk_result.entity,
             risk_entity_field: risk_result.entity_field,
             risk_factors: risk_result.factors,
+            origin_source_types: Self::origin_source_types_from(matched_events),
+            matched_events_redacted: false,
         }
     }
 
@@ -225,10 +300,24 @@ impl FindingEvent {
             detected_at: Self::source_event_time(&matched_events).unwrap_or_else(Utc::now),
             raw_risk_score: risk_result.raw_score,
             risk_score: risk_result.weighted_score,
+            risk_entity_type: Self::stamp_entity_type(&risk_result),
             risk_entity: risk_result.entity,
             risk_entity_field: risk_result.entity_field,
             risk_factors: risk_result.factors,
+            origin_source_types: Self::origin_source_types_from(&matched_events),
+            matched_events_redacted: false,
         }
+    }
+
+    /// Write-side entity type for the finding row (NAN-1806): field-name
+    /// inference falling back to value inference, empty when the finding has
+    /// no real entity.
+    fn stamp_entity_type(risk_result: &RiskResult) -> String {
+        if risk_result.entity.is_empty() || risk_result.entity == "unknown" {
+            return String::new();
+        }
+        FindingLogger::infer_entity_type(&risk_result.entity, risk_result.entity_field.as_deref())
+            .to_string()
     }
 
     /// Convert to a log-compatible JSON structure
@@ -245,12 +334,19 @@ impl FindingEvent {
             "alert_id": self.alert_id.map(|id| id.to_string()),
             "matched_event_count": self.matched_event_count,
             "matched_events_sample": self.matched_events_sample,
+            // NAN-1800: redaction markers. `to_log_json` is PURE — it must not
+            // decide redaction itself; `FindingLogger::log_finding` applies
+            // `redact_matched_events()` on the event BEFORE this is called so
+            // both write branches (UDM metadata + OCSF event) agree.
+            "origin_source_types": self.origin_source_types,
+            "matched_events_redacted": self.matched_events_redacted,
             "realtime": self.realtime,
             "detected_at": self.detected_at.to_rfc3339(),
             "raw_risk_score": self.raw_risk_score,
             "risk_score": self.risk_score,
             "risk_entity": self.risk_entity,
             "risk_entity_field": self.risk_entity_field,
+            "risk_entity_type": self.risk_entity_type,
             "risk_factors": self.risk_factors,
         })
     }
@@ -351,160 +447,90 @@ impl FindingEvent {
 /// Service for logging findings to the log store
 #[derive(Clone)]
 pub struct FindingLogger {
-    pg_pool: PgPool,
     dual_pool: DualPool,
-    /// Latch for the enterprise-only `entity_risk_scores` rollup table. On
-    /// open-core that table is stripped, so the per-finding accumulator write
-    /// would fail (42P01) and log an error every finding — gate it on a cached
-    /// existence check instead (NAN-1676). Mirrors `RiskRepository::table_exists`:
-    /// fast-path once present; re-check while absent so a later open→enterprise
-    /// upgrade is picked up.
-    entity_risk_table_verified: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// NAN-1800: restricted-source registry used to redact
+    /// `matched_events_sample` at WRITE time for findings whose origin events
+    /// come from a restricted `source_type`. Self-built from the PG pool (no
+    /// external wiring); the resolver is Arc-backed and cheap to clone. The
+    /// fail-closed policy itself lives in
+    /// `SourceScopeResolver::any_restricted` — registry unavailable ⇒ treat as
+    /// restricted ⇒ redact (safe: findings are best-effort analytics).
+    source_scopes: crate::auth::source_scope_resolver::SourceScopeResolver,
 }
 
 impl FindingLogger {
-    /// Defensive upper bound on the accumulated `entity_risk_scores.risk_score`
-    /// (R3). Well above the reader's 0–100 banding range so it never silently
-    /// re-bands a normal entity, but far below `i32::MAX` so the monotonic
-    /// `+= weighted` accumulator can never overflow/wrap. See the FIXME in
-    /// `update_entity_risk_score`: the durable fix is a decay job (deferred).
-    const ENTITY_RISK_SCORE_CAP: i32 = 1_000_000;
-
     /// Create a new finding logger backed by a DualPool. ClickHouse is the
-    /// findings log store; PostgreSQL is used for the entity-risk-score
-    /// rollup table.
+    /// findings log store — the append-only contribution stream every risk
+    /// score is computed from. (The per-finding Postgres accumulator on
+    /// `entity_risk_scores` was removed in NAN-1810 along with the table;
+    /// accumulated/decayed scores are derived from these finding rows at
+    /// read time.)
     pub fn with_dual_pool(dual_pool: &DualPool) -> Self {
         Self {
-            pg_pool: dual_pool.postgres().clone(),
+            source_scopes: crate::auth::source_scope_resolver::SourceScopeResolver::new(
+                dual_pool.postgres().clone(),
+            ),
             dual_pool: dual_pool.clone(),
-            entity_risk_table_verified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                false,
-            )),
         }
     }
 
-    /// Whether the enterprise `entity_risk_scores` rollup table exists (NAN-1676).
-    /// Fast-paths once verified present; while absent (open-core) re-queries the
-    /// catalog — cheap, and far better than a failing INSERT + error per finding.
-    async fn entity_risk_table_exists(&self) -> bool {
-        use std::sync::atomic::Ordering;
-        if self.entity_risk_table_verified.load(Ordering::Relaxed) {
-            return true;
+    /// NAN-1800: should this finding's matched-event evidence be redacted?
+    ///
+    /// - Known origin (`origin_source_types` non-empty): delegate to
+    ///   `SourceScopeResolver::any_restricted` — THE home of the fail-closed
+    ///   policy (restricted match ⇒ true; registry unavailable ⇒ true).
+    /// - Unknown origin (empty — aggregate rules whose result rows drop
+    ///   `source_type`): `any_restricted(&[])` would return false, which is
+    ///   fail-OPEN for evidence we cannot attribute. Be conservative instead:
+    ///   redact whenever ANY restriction exists at all, and redact when the
+    ///   registry is unavailable. An empty registry (no restrictions
+    ///   configured — the pre-feature default) stays visible, so deployments
+    ///   without source scoping are byte-identical to before.
+    async fn origin_restricted(&self, finding: &FindingEvent) -> bool {
+        if finding.origin_source_types.is_empty() {
+            match self.source_scopes.restricted_snapshot().await {
+                Ok(restricted) => !restricted.is_empty(),
+                // FAIL-CLOSED: registry never loaded + PG down ⇒ redact.
+                Err(_) => true,
+            }
+        } else {
+            self.source_scopes
+                .any_restricted(&finding.origin_source_types)
+                .await
         }
-        let exists = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'entity_risk_scores')",
-        )
-        .fetch_one(&self.pg_pool)
-        .await
-        .unwrap_or(false);
-        if exists {
-            self.entity_risk_table_verified.store(true, Ordering::Relaxed);
-        }
-        exists
     }
 
     /// Log a finding event
     #[instrument(skip(self, finding), fields(finding_type = %finding.finding_type, rule_id = %finding.rule_id))]
     pub async fn log_finding(&self, finding: &FindingEvent) -> Result<(), FindingLogError> {
+        // NAN-1800: redact restricted-origin evidence BEFORE serialization.
+        // `to_log_json()` is pure and feeds BOTH physical write branches (UDM
+        // `logs.metadata` below and the OCSF `build_ocsf_finding_event` path
+        // inside `log_to_clickhouse`), so the redaction must happen here on
+        // the event itself — a downstream no-op "redaction" would still write
+        // the sample.
+        let redacted_finding;
+        let finding = if !finding.matched_events_redacted && self.origin_restricted(finding).await
+        {
+            let mut event = finding.clone();
+            event.redact_matched_events();
+            debug!(
+                rule_id = %event.rule_id,
+                origin_source_types = ?event.origin_source_types,
+                "redacting matched_events_sample: restricted (or undeterminable) origin"
+            );
+            redacted_finding = event;
+            &redacted_finding
+        } else {
+            finding
+        };
+
         let metadata = finding.to_log_json();
         let message = finding.message();
         let timestamp = finding.detected_at;
 
         self.log_to_clickhouse(&self.dual_pool, &message, &metadata, timestamp)
-            .await?;
-
-        // Update entity risk score if we have a valid entity and risk score
-        if finding.risk_score > 0
-            && !finding.risk_entity.is_empty()
-            && finding.risk_entity != "unknown"
-        {
-            if let Err(e) = self.update_entity_risk_score(finding).await {
-                tracing::error!(
-                    "Failed to update entity risk score for {}: {}",
-                    finding.risk_entity,
-                    e
-                );
-            }
-        } else {
-            debug!(
-                "Skipping entity risk update: score={}, entity='{}' (empty={}, unknown={})",
-                finding.risk_score,
-                finding.risk_entity,
-                finding.risk_entity.is_empty(),
-                finding.risk_entity == "unknown"
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Update entity risk score in the database
-    async fn update_entity_risk_score(
-        &self,
-        finding: &FindingEvent,
-    ) -> Result<(), FindingLogError> {
-        // Skip on open-core, where `entity_risk_scores` is stripped (enterprise
-        // feature). Otherwise the INSERT below fails 42P01 and the caller logs an
-        // error on every finding (NAN-1676). No-op = no entity risk rollup, which
-        // is exactly the open-core contract.
-        if !self.entity_risk_table_exists().await {
-            return Ok(());
-        }
-
-        let now = Utc::now();
-        let severity = format!("{:?}", finding.severity).to_lowercase();
-
-        // Determine entity type from the risk_entity_field if available, otherwise infer from value
-        let entity_type =
-            Self::infer_entity_type(&finding.risk_entity, finding.risk_entity_field.as_deref());
-
-        // R3 (prevalence/risk audit): `risk_score` is a monotonically increasing
-        // accumulator — every finding does `risk_score += weighted` and there is
-        // NO decay job that ever brings it back down. Left unbounded it (a) grows
-        // without limit so any long-lived entity is pinned "critical" forever once
-        // the reader bands it, and (b) will eventually overflow the i32 column and
-        // wrap negative, corrupting the banding entirely.
-        //
-        // FIXME(prevalence/risk-audit R3): the real fix is a time-decay job +
-        // making the read-side banding not assume a fixed 0–100 ceiling on this
-        // unbounded accumulator (tracked in the Lane L7b design note — decay job
-        // is a deliberate deferral, NOT to be added as an overnight background
-        // task). Until then, defensively clamp the stored accumulator to
-        // `ENTITY_RISK_SCORE_CAP` so it can neither overflow nor wrap. This is a
-        // safety bound only — it does not by itself un-pin a chronically-critical
-        // entity; that requires the decay work.
-        sqlx::query(
-            r#"
-            INSERT INTO entity_risk_scores (
-                entity, entity_type, risk_score, signal_count,
-                last_signal_at, first_signal_at, last_rule_name, last_severity,
-                created_at, updated_at
-            ) VALUES ($1, $2, LEAST($3, $7), 1, $4, $4, $5, $6, $4, $4)
-            ON CONFLICT (entity, entity_type) DO UPDATE SET
-                risk_score = LEAST(entity_risk_scores.risk_score + $3, $7),
-                signal_count = entity_risk_scores.signal_count + 1,
-                last_signal_at = $4,
-                last_rule_name = $5,
-                last_severity = $6,
-                updated_at = $4
-            "#,
-        )
-        .bind(&finding.risk_entity)
-        .bind(entity_type)
-        .bind(finding.risk_score)
-        .bind(now)
-        .bind(&finding.rule_name)
-        .bind(&severity)
-        .bind(Self::ENTITY_RISK_SCORE_CAP)
-        .execute(&self.pg_pool)
-        .await
-        .map_err(FindingLogError::DatabaseError)?;
-
-        debug!(
-            "Updated entity risk score: entity={}, type={}, score=+{}",
-            finding.risk_entity, entity_type, finding.risk_score
-        );
-        Ok(())
+            .await
     }
 
     /// Infer entity type from the entity value and optional field name
@@ -558,6 +584,15 @@ impl FindingLogger {
     fn infer_entity_type(entity: &str, field_name: Option<&str>) -> &'static str {
         // If we have the field name, use it for accurate classification.
         if let Some(field) = field_name {
+            // Cloud account fields (UDM `cloud_account_id`, OCSF
+            // `cloud.account.uid`) — checked FIRST because an account id's
+            // VALUE is an opaque string that would otherwise infer as "user".
+            // This is the type the cloud-overview risk fan-out filters on
+            // (NAN-1806); requires BOTH tokens so a bare `account_name` (a
+            // user-ish field) is not swallowed.
+            if Self::field_has_token(field, "cloud") && Self::field_has_token(field, "account") {
+                return crate::risk::clickhouse_sql::CLOUD_ACCOUNT_ENTITY_TYPE;
+            }
             // IP address fields. `dvc` (device) is intentionally NOT forced to
             // "ip" — a device identifier may be an IP or a hostname, so it falls
             // through to value-based inference which types it by its actual value.
@@ -874,6 +909,7 @@ impl FindingLogger {
                 "risk_score": risk_score,
                 "risk_entity": get_str("risk_entity"),
                 "risk_entity_field": cloned("risk_entity_field", serde_json::Value::Null),
+                "risk_entity_type": get_str("risk_entity_type"),
                 "rule_mode": get_str("rule_mode"),
                 "realtime": cloned("realtime", json!(false)),
                 "raw_risk_score": cloned("raw_risk_score", json!(0)),
@@ -881,6 +917,11 @@ impl FindingLogger {
                 "mitre_techniques": cloned("mitre_techniques", json!([])),
                 "risk_factors": cloned("risk_factors", json!([])),
                 "matched_events_sample": cloned("matched_events_sample", json!([])),
+                // NAN-1800: redaction markers — mirrored from `to_log_json`
+                // so the OCSF surface carries the same origin/redaction
+                // signal as the UDM `metadata` column.
+                "origin_source_types": cloned("origin_source_types", json!([])),
+                "matched_events_redacted": cloned("matched_events_redacted", json!(false)),
             },
         })
     }
@@ -889,9 +930,6 @@ impl FindingLogger {
 /// Errors that can occur during finding logging
 #[derive(Debug, thiserror::Error)]
 pub enum FindingLogError {
-    #[error("Database error: {0}")]
-    DatabaseError(#[from] sqlx::Error),
-
     #[error("ClickHouse error: {0}")]
     ClickHouseError(String),
 }
@@ -923,6 +961,7 @@ mod ocsf_finding_tests {
             "risk_score": 75,
             "risk_entity": "10.0.0.5",
             "risk_entity_field": "src_ip",
+            "risk_entity_type": "ip",
             "risk_factors": ["off-hours"]
         })
     }
@@ -956,6 +995,9 @@ mod ocsf_finding_tests {
         // nano vendor extension under `unmapped` — read back by risk/repository.rs
         assert_eq!(event["unmapped"]["risk_entity"], "10.0.0.5");
         assert_eq!(event["unmapped"]["risk_entity_field"], "src_ip");
+        // NAN-1806: the write-side type stamp rides the same spill so the
+        // shared risk builder's cloud_account branch can read it under OCSF.
+        assert_eq!(event["unmapped"]["risk_entity_type"], "ip");
         assert_eq!(event["unmapped"]["rule_id"], "rule-abc-123");
         assert_eq!(event["unmapped"]["signal_type"], "detection_match");
         assert_eq!(event["unmapped"]["risk_score"], 75);
@@ -980,6 +1022,124 @@ mod ocsf_finding_tests {
             assert_eq!(ev["severity_id"], expect_id, "severity_id for {nano}");
             assert_eq!(ev["severity"], expect_title, "severity title for {nano}");
         }
+    }
+}
+
+/// NAN-1800: write-side redaction of restricted-origin finding evidence.
+/// These tests pin the PURE seams: origin derivation from matched events and
+/// `redact_matched_events()` flowing through BOTH physical write shapes
+/// (`to_log_json` → UDM `logs.metadata`, and `build_ocsf_finding_event` →
+/// `ocsf_logs_raw`). The async fail-closed policy itself lives in — and is
+/// tested with — `SourceScopeResolver::any_restricted`.
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    #[test]
+    fn origin_source_types_normalized_and_deduped() {
+        let events = vec![
+            json!({ "source_type": "  Windows Event Log ", "user": "a" }),
+            json!({ "source_type": "windows event log", "user": "b" }),
+            json!({ "source_type": "syslog", "user": "c" }),
+            json!({ "user": "no-source-type" }),
+            json!({ "source_type": "   " }), // whitespace-only → contributes nothing
+        ];
+        assert_eq!(
+            FindingEvent::origin_source_types_from(&events),
+            vec!["syslog".to_string(), "windows event log".to_string()],
+        );
+        // Aggregate-shaped rows (no source_type at all) ⇒ unknown origin.
+        assert!(FindingEvent::origin_source_types_from(&[json!({ "count": 7 })]).is_empty());
+    }
+
+    #[test]
+    fn redaction_flows_to_both_write_branches() {
+        let mut finding = FindingEvent {
+            finding_type: FindingType::Alert,
+            rule_id: Uuid::now_v7(),
+            rule_name: "Restricted Origin Rule".to_string(),
+            rule_query: "source_type=hr_system secret".to_string(),
+            severity: Severity::High,
+            rule_mode: crate::models::RuleMode::Alerting,
+            mitre_tactics: vec!["TA0006".to_string()],
+            mitre_techniques: vec![],
+            alert_id: Some(Uuid::now_v7()),
+            matched_event_count: 3,
+            matched_events_sample: vec![json!({ "user": "ceo", "source_type": "hr_system" })],
+            realtime: false,
+            detected_at: Utc::now(),
+            raw_risk_score: 50,
+            risk_score: 75,
+            risk_entity: "ceo".to_string(),
+            risk_entity_field: Some("user".to_string()),
+            risk_entity_type: "user".to_string(),
+            risk_factors: vec!["severity_default:High".to_string()],
+            origin_source_types: vec!["hr_system".to_string()],
+            matched_events_redacted: false,
+        };
+
+        finding.redact_matched_events();
+
+        // Struct-level: sample gone, entity neutralized, counts/metadata kept.
+        assert!(finding.matched_events_sample.is_empty());
+        assert!(finding.matched_events_redacted);
+        assert_eq!(finding.risk_entity, "");
+        assert_eq!(finding.risk_entity_field, None);
+        assert_eq!(finding.matched_event_count, 3);
+        assert_eq!(finding.risk_score, 75);
+
+        // Branch 1: UDM `logs.metadata` (to_log_json).
+        let metadata = finding.to_log_json();
+        assert_eq!(metadata["matched_events_sample"], json!([]));
+        assert_eq!(metadata["matched_events_redacted"], json!(true));
+        assert_eq!(metadata["origin_source_types"], json!(["hr_system"]));
+        assert_eq!(metadata["risk_entity"], json!(""));
+        assert_eq!(metadata["matched_event_count"], 3);
+        assert!(!metadata.to_string().contains("ceo"), "entity leaked into UDM metadata");
+
+        // Branch 2: OCSF `ocsf_logs_raw` (build_ocsf_finding_event) — built
+        // from the SAME metadata JSON, so a no-op redaction upstream would
+        // still write the sample here. Both must be empty.
+        let message = finding.message();
+        let ocsf = FindingLogger::build_ocsf_finding_event(&metadata, &message, finding.detected_at);
+        assert_eq!(ocsf["unmapped"]["matched_events_sample"], json!([]));
+        assert_eq!(ocsf["unmapped"]["matched_events_redacted"], json!(true));
+        assert_eq!(ocsf["unmapped"]["origin_source_types"], json!(["hr_system"]));
+        assert_eq!(ocsf["unmapped"]["risk_entity"], json!(""));
+        assert!(!ocsf.to_string().contains("ceo"), "entity leaked into OCSF event");
+
+        // The human-readable message falls back to the count-only form — the
+        // entity summary (seeded from risk_entity + sample) is neutralized.
+        assert_eq!(message, "Restricted Origin Rule - 3 event(s)");
+    }
+
+    #[test]
+    fn constructors_stamp_origin_and_unredacted() {
+        // Deserialization back-compat: rows written before NAN-1800 lack the
+        // marker fields entirely — serde defaults must fill them.
+        let legacy = json!({
+            "finding_type": "alert",
+            "rule_id": Uuid::now_v7(),
+            "rule_name": "r",
+            "rule_query": "q",
+            "severity": "high",
+            "rule_mode": "alerting",
+            "mitre_tactics": [],
+            "mitre_techniques": [],
+            "alert_id": null,
+            "matched_event_count": 1,
+            "matched_events_sample": [{"user": "a"}],
+            "realtime": false,
+            "detected_at": Utc::now().to_rfc3339(),
+            "raw_risk_score": 1,
+            "risk_score": 1,
+            "risk_entity": "a",
+            "risk_entity_field": "user",
+            "risk_factors": [],
+        });
+        let event: FindingEvent = serde_json::from_value(legacy).expect("legacy deserializes");
+        assert!(event.origin_source_types.is_empty());
+        assert!(!event.matched_events_redacted);
     }
 }
 
@@ -1052,6 +1212,30 @@ mod timestamp_basis_tests {
         // A principal/description value that is plainly a username infers "user".
         assert_eq!(F::infer_entity_type("bob", Some("principal")), "user");
     }
+
+    /// NAN-1806: cloud-account fields stamp `cloud_account` — the one type
+    /// value inference can never produce (an account id is an opaque string
+    /// that would otherwise infer "user"), which left the cloud-overview
+    /// `entity_type = 'cloud_account'` risk fan-out permanently empty.
+    #[test]
+    fn infer_entity_type_stamps_cloud_account_from_field() {
+        use FindingLogger as F;
+        // UDM + OCSF cloud-account field spellings.
+        assert_eq!(
+            F::infer_entity_type("123456789012", Some("cloud_account_id")),
+            "cloud_account"
+        );
+        assert_eq!(
+            F::infer_entity_type("123456789012", Some("cloud.account.uid")),
+            "cloud_account"
+        );
+        // Requires BOTH tokens: `account_name` is a user-ish field, and a
+        // bare `cloud` field says nothing about accounts.
+        assert_eq!(F::infer_entity_type("bob", Some("account_name")), "user");
+        assert_ne!(F::infer_entity_type("bob", Some("cloud_provider")), "cloud_account");
+        // Value-only inference still can't produce it (write-side stamp only).
+        assert_ne!(F::infer_entity_type("123456789012", None), "cloud_account");
+    }
 }
 
 #[cfg(test)]
@@ -1115,6 +1299,8 @@ mod tests {
             playbook_id: None,
             source_path: None,
             source_repo_url: None,
+            kind: "standard".to_string(),
+            alert_cooldown_minutes: None,
         }
     }
 
@@ -1183,7 +1369,39 @@ mod tests {
         assert_eq!(json["raw_risk_score"], 90);
         assert_eq!(json["risk_score"], 45);
         assert_eq!(json["risk_entity"], "admin");
+        // NAN-1806: the finding row carries the write-side type stamp.
+        assert_eq!(json["risk_entity_type"], "user");
         assert_eq!(json["risk_factors"][0], "severity_default:Critical");
+    }
+
+    /// NAN-1806: a cloud-account-attributed finding stamps
+    /// `risk_entity_type = "cloud_account"` into the log JSON — the seam the
+    /// shared risk builder's read-side branch and the PG accumulator both
+    /// consume, making the cloud-overview fan-out resolvable.
+    #[test]
+    fn test_finding_event_stamps_cloud_account_type() {
+        let rule = DetectionRule {
+            risk_score: Some(60),
+            risk_entity_field: Some("cloud_account_id".to_string()),
+            ..sample_rule()
+        };
+        let events = vec![serde_json::json!({"cloud_account_id": "123456789012"})];
+        let risk_result = RiskResult::new(
+            60,
+            60,
+            "123456789012".to_string(),
+            Some("cloud_account_id".to_string()),
+            vec![],
+        );
+        let finding = FindingEvent::detection_match(&rule, &events, false, risk_result);
+        assert_eq!(finding.risk_entity_type, "cloud_account");
+        let json = finding.to_log_json();
+        assert_eq!(json["risk_entity_type"], "cloud_account");
+
+        // Entityless findings stamp nothing.
+        let empty = RiskResult::new(0, 0, String::new(), None, vec![]);
+        let finding = FindingEvent::detection_match(&sample_rule(), &[], false, empty);
+        assert_eq!(finding.risk_entity_type, "");
     }
 
     #[test]

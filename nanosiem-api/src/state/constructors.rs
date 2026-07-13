@@ -4,7 +4,9 @@ use super::get_vector_config_dir;
 use super::{AppState, TaskRegistry};
 
 use nanosiem_core::audit::{AuditEmitter, AuditQueryService};
+use nanosiem_core::auth::source_scope_resolver::SourceScopeResolver;
 use nanosiem_core::auth::{OidcRepository, OidcService};
+use nanosiem_core::db::repository::SourceScopeRepository;
 #[cfg(feature = "enterprise")]
 use nanosiem_enterprise::cases::ShadowInvestigationService;
 use nanosiem_core::db::{ClickHouseMigrator, DualPool, DualPoolConfig, DualPoolError};
@@ -340,6 +342,15 @@ impl AppState {
             node_id.clone(),
         ));
 
+        // Per-source RBAC scoping (NAN-1799). The repo backs the source-scopes
+        // admin handlers (restricted registry + group grants); the resolver
+        // computes a user's deny-set ScopeSet from that registry + their
+        // grants, FAIL-CLOSED on PG unavailability, and is called by the auth
+        // middleware. Both share the same PG pool as the other RBAC repos.
+        // Mutations through the repo must call `resolver.invalidate()`.
+        let source_scope_repo = SourceScopeRepository::new(pg_pool.clone());
+        let source_scope_resolver = SourceScopeResolver::new(pg_pool.clone());
+
         Self {
             // Services using DualPool for ClickHouse log queries
             search_service,
@@ -399,6 +410,8 @@ impl AppState {
             user_repo,
             group_repo,
             role_repo,
+            source_scope_repo,
+            source_scope_resolver,
             oidc_repo,
             oidc_service,
             auth_enabled,
@@ -587,7 +600,8 @@ impl AppState {
                 // (NAN-1555); UDM default keeps this unreachable arm total.
                 nanosiem_core::schema::SchemaId::Udm
                 | nanosiem_core::schema::SchemaId::Spans
-                | nanosiem_core::schema::SchemaId::Metrics => "logs",
+                | nanosiem_core::schema::SchemaId::Metrics
+                | nanosiem_core::schema::SchemaId::Risk => "logs",
             };
             let local_table = dual_pool.table_names().local(key);
             match nanosiem_core::schema::validate_active_schema_table(

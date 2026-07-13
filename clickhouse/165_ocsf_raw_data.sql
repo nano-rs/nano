@@ -1,0 +1,258 @@
+-- NAN-1827: persist OCSF `raw_data` — the compliance-grade original event.
+--
+-- A spec-conformant producer that populates `raw_data` had it SILENTLY DROPPED:
+-- there was no column, and since NAN-1443 removed the full `event` blob the MV
+-- promotes only the manifest columns + `message` + `event.^unmapped`. `raw_data`
+-- is a standard OCSF attribute, so a well-behaved producer does not put it in
+-- `unmapped` — it landed nowhere. Queries were silent too: with no column, nPL
+-- resolved `raw_data` through json_tail_column() to `unmapped.raw_data` and
+-- returned EMPTY with no error.
+--
+-- Additive and free where unused: the column is empty unless the producer emits
+-- `raw_data` (our Vector OCSF parsers do not — they set `message` = raw log, and
+-- making them fill both would re-create the duplication NAN-1443 deleted). No
+-- backfill: existing rows genuinely have no raw_data, and a backfill would be a
+-- table-sized mutation on the 8GiB migrator.
+--
+-- ocsf_logs is absent on UDM-only tenants -> every statement is skip-if-unknown-table.
+
+ALTER TABLE nanosiem.ocsf_logs /* nano:skip-if-unknown-table */ ADD COLUMN IF NOT EXISTS `raw_data` String CODEC(ZSTD(3)) AFTER `message`;
+
+-- Text index so an explicit raw_data hunt prunes instead of full-scanning. The
+-- expression must mirror what the query generator emits (`lower(<col>)`) exactly
+-- or ClickHouse never matches the index and it goes dead.
+ALTER TABLE nanosiem.ocsf_logs /* nano:skip-if-unknown-table */ ADD INDEX IF NOT EXISTS idx_raw_data_words lower(`raw_data`) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1;
+
+-- Repoint the ingest MV to populate the new column.
+--
+-- MODIFY QUERY, *not* DROP+CREATE (which is what clickhouse/135 did). The MV's
+-- source `ocsf_logs_raw` is ENGINE = Null: it accepts an INSERT and discards it,
+-- relying entirely on this MV to fan the row out to ocsf_logs. With the MV
+-- dropped, live ingest is accepted and PERMANENTLY LOST — and if the recreate
+-- failed, the loss would continue silently until someone noticed. MODIFY QUERY
+-- swaps the definition atomically, so there is no window with no MV. Same
+-- reasoning as clickhouse/157 (OTel). MODIFY QUERY takes the SELECT directly —
+-- no `AS` (NAN-1727).
+--
+-- Body is generated verbatim from clickhouse/ocsf/init.sql: init.sql's CREATE is
+-- IF NOT EXISTS and no-ops on an existing install, so fresh and upgraded tenants
+-- can only converge if this ALTER carries the identical SELECT (NAN-1755).
+ALTER TABLE nanosiem.ocsf_logs_raw_mv /* nano:skip-if-unknown-table */
+MODIFY QUERY SELECT
+    timestamp,
+    source_type,
+    id,
+    JSONExtractUInt(event, 'class_uid') AS `class_uid`,
+    JSONExtractUInt(event, 'category_uid') AS `category_uid`,
+    JSONExtractUInt(event, 'activity_id') AS `activity_id`,
+    JSONExtractString(event, 'activity_name') AS `activity`,
+    JSONExtractUInt(event, 'type_uid') AS `type_uid`,
+    JSONExtractUInt(event, 'severity_id') AS `severity_id`,
+    JSONExtractString(event, 'severity') AS `severity`,
+    JSONExtractUInt(event, 'status_id') AS `status_id`,
+    JSONExtractString(event, 'status') AS `status`,
+    JSONExtractString(event, 'message') AS `message`,
+    JSONExtractString(event, 'raw_data') AS `raw_data`,
+    event.^unmapped AS `unmapped`,
+    lower(JSONExtractString(event, 'src_endpoint', 'ip')) AS `src_endpoint.ip`,
+    lower(JSONExtractString(event, 'dst_endpoint', 'ip')) AS `dst_endpoint.ip`,
+    toUInt16(JSONExtractUInt(event, 'src_endpoint', 'port')) AS `src_endpoint.port`,
+    toUInt16(JSONExtractUInt(event, 'dst_endpoint', 'port')) AS `dst_endpoint.port`,
+    lower(JSONExtractString(event, 'src_endpoint', 'mac')) AS `src_endpoint.mac`,
+    lower(JSONExtractString(event, 'dst_endpoint', 'mac')) AS `dst_endpoint.mac`,
+    lower(JSONExtractString(event, 'src_endpoint', 'hostname')) AS `src_endpoint.hostname`,
+    lower(JSONExtractString(event, 'device', 'hostname')) AS `device.hostname`,
+    lower(JSONExtractString(event, 'dst_endpoint', 'hostname')) AS `dst_endpoint.hostname`,
+    JSONExtractInt(event, 'connection_info', 'protocol_num') AS `connection_info.protocol_num`,
+    JSONExtractUInt(event, 'traffic', 'bytes_in') AS `traffic.bytes_in`,
+    JSONExtractUInt(event, 'traffic', 'bytes_out') AS `traffic.bytes_out`,
+    JSONExtractUInt(event, 'traffic', 'packets_in') AS `traffic.packets_in`,
+    JSONExtractUInt(event, 'traffic', 'packets_out') AS `traffic.packets_out`,
+    lower(JSONExtractString(event, 'user', 'name')) AS `user.name`,
+    lower(JSONExtractString(event, 'actor', 'user', 'name')) AS `actor.user.name`,
+    lower(JSONExtractString(event, 'user', 'domain')) AS `user.domain`,
+    JSONExtractString(event, 'user', 'uid') AS `user.uid`,
+    JSONExtractString(event, 'process', 'name') AS `process.name`,
+    JSONExtractString(event, 'process', 'cmd_line') AS `process.cmd_line`,
+    JSONExtractUInt(event, 'process', 'pid') AS `process.pid`,
+    JSONExtractString(event, 'process', 'uid') AS `process.uid`,
+    lower(
+        JSONExtractString(
+            arrayFirst(
+                h -> JSONExtractInt(h, 'algorithm_id') = 3,
+                JSONExtractArrayRaw(JSONExtractRaw(event, 'process', 'file', 'hashes'))
+            ),
+            'value'
+        )
+    ) AS `process.file.hashes.sha256`,
+    JSONExtractString(event, 'process', 'file', 'path') AS `process.file.path`,
+    JSONExtractString(event, 'actor', 'process', 'name') AS `actor.process.name`,
+    JSONExtractString(event, 'actor', 'process', 'cmd_line') AS `actor.process.cmd_line`,
+    JSONExtractUInt(event, 'actor', 'process', 'pid') AS `actor.process.pid`,
+    JSONExtractString(event, 'actor', 'process', 'uid') AS `actor.process.uid`,
+    lower(
+        JSONExtractString(
+            arrayFirst(
+                h -> JSONExtractInt(h, 'algorithm_id') = 3,
+                JSONExtractArrayRaw(JSONExtractRaw(event, 'actor', 'process', 'file', 'hashes'))
+            ),
+            'value'
+        )
+    ) AS `actor.process.file.hashes.sha256`,
+    JSONExtractString(event, 'actor', 'process', 'file', 'path') AS `actor.process.file.path`,
+    JSONExtractString(event, 'file', 'name') AS `file.name`,
+    JSONExtractString(event, 'file', 'path') AS `file.path`,
+    JSONExtractString(event, 'module', 'file', 'path') AS `module.file.path`,
+    JSONExtractString(event, 'module', 'file', 'name') AS `module.file.name`,
+    lower(
+        JSONExtractString(
+            arrayFirst(
+                h -> JSONExtractInt(h, 'algorithm_id') = 3,
+                JSONExtractArrayRaw(JSONExtractRaw(event, 'file', 'hashes'))
+            ),
+            'value'
+        )
+    ) AS `file.hashes.sha256`,
+    JSONExtractUInt(event, 'auth_protocol_id') AS `auth_protocol_id`,
+    JSONExtractString(event, 'auth_protocol') AS `auth_protocol`,
+    JSONExtractString(event, 'session', 'uid') AS `session.uid`,
+    toUInt8(JSONExtractBool(event, 'is_mfa')) AS `is_mfa`,
+    JSONExtractString(event, 'url', 'hostname') AS `url.hostname`,
+    JSONExtractString(event, 'url', 'url_string') AS `url.url_string`,
+    JSONExtractString(event, 'http_request', 'http_method') AS `http_request.http_method`,
+    JSONExtractString(event, 'http_request', 'url', 'hostname') AS `http_request.url.hostname`,
+    JSONExtractString(event, 'http_request', 'url', 'url_string') AS `http_request.url.url_string`,
+    JSONExtractString(event, 'http_request', 'url', 'path') AS `http_request.url.path`,
+    JSONExtractString(event, 'http_request', 'user_agent') AS `http_request.user_agent`,
+    toUInt16(JSONExtractUInt(event, 'http_response', 'code')) AS `http_response.code`,
+    -- NAN-1465 promotions
+    JSONExtractString(event, 'reg_key', 'path') AS `reg_key.path`,
+    JSONExtractString(event, 'reg_value', 'name') AS `reg_value.name`,
+    JSONExtractString(event, 'reg_value', 'path') AS `reg_value.path`,
+    JSONExtractString(event, 'reg_value', 'data') AS `reg_value.data`,
+    JSONExtractString(event, 'http_request', 'referrer') AS `http_request.referrer`,
+    JSONExtract(toString(event), 'http_request', 'url', 'categories', 'Array(String)') AS `http_request.url.categories`,
+    JSONExtractString(event, 'actor', 'user', 'uid') AS `actor.user.uid`,
+    JSONExtractString(event, 'actor', 'user', 'type') AS `actor.user.type`,
+    toUInt32(JSONExtractUInt(event, 'duration')) AS `duration`,
+    JSONExtractString(event, 'query', 'hostname') AS `query.hostname`,
+    JSONExtractString(
+        arrayElement(
+            JSONExtractArrayRaw(JSONExtractRaw(event, 'answers')),
+            1
+        ),
+        'rdata'
+    ) AS `answers.rdata`,
+    lower(JSONExtractString(event, 'email', 'from')) AS `email.from`,
+    lower(
+        JSONExtractString(JSONExtractRaw(event, 'email', 'to'), 1)
+    ) AS `email.to`,
+    JSONExtractString(event, 'email', 'subject') AS `email.subject`,
+    JSONExtractString(event, 'email', 'message_uid') AS `email.message_uid`,
+    JSONExtractString(
+        arrayElement(
+            JSONExtractArrayRaw(JSONExtractRaw(event, 'vulnerabilities')),
+            1
+        ),
+        'cve', 'uid'
+    ) AS `vulnerabilities.cve.uid`,
+    JSONExtractString(event, 'cloud', 'provider') AS `cloud.provider`,
+    JSONExtractString(event, 'cloud', 'account', 'uid') AS `cloud.account.uid`,
+    JSONExtractString(event, 'cloud', 'account', 'name') AS `cloud.account.name`,
+    JSONExtractString(event, 'cloud', 'region') AS `cloud.region`,
+    JSONExtractString(event, 'api', 'service', 'name') AS `api.service.name`,
+    JSONExtractString(event, 'api', 'operation') AS `api.operation`,
+    JSONExtractString(
+        arrayElement(
+            JSONExtractArrayRaw(JSONExtractRaw(event, 'resources')),
+            1
+        ),
+        'type'
+    ) AS `resources.type`,
+    JSONExtractString(
+        arrayElement(
+            JSONExtractArrayRaw(JSONExtractRaw(event, 'resources')),
+            1
+        ),
+        'uid'
+    ) AS `resources.uid`,
+    JSONExtractString(
+        arrayElement(
+            JSONExtractArrayRaw(JSONExtractRaw(event, 'resources')),
+            1
+        ),
+        'name'
+    ) AS `resources.name`,
+    if(JSONExtractString(event, 'src_endpoint', 'location', 'country') != '', JSONExtractString(event, 'src_endpoint', 'location', 'country'), if(`src_endpoint.ip` != '', if(isIPv4String(`src_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'country_code', toIPv4OrDefault(`src_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'country_code', toIPv6OrDefault(`src_endpoint.ip`), '')), '')) AS `src_endpoint.location.country`,
+    if(JSONExtractString(event, 'src_endpoint', 'location', 'continent') != '', JSONExtractString(event, 'src_endpoint', 'location', 'continent'), if(`src_endpoint.ip` != '', if(isIPv4String(`src_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'continent', toIPv4OrDefault(`src_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'continent', toIPv6OrDefault(`src_endpoint.ip`), '')), '')) AS `src_endpoint.location.continent`,
+    if(JSONExtractUInt(event, 'src_endpoint', 'autonomous_system', 'number') != 0, JSONExtractUInt(event, 'src_endpoint', 'autonomous_system', 'number'), if(`src_endpoint.ip` != '', toUInt32OrZero(replaceRegexpAll(if(isIPv4String(`src_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'asn', toIPv4OrDefault(`src_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'asn', toIPv6OrDefault(`src_endpoint.ip`), '')), '[^0-9]', '')), 0)) AS `src_endpoint.autonomous_system.number`,
+    if(JSONExtractString(event, 'src_endpoint', 'autonomous_system', 'name') != '', JSONExtractString(event, 'src_endpoint', 'autonomous_system', 'name'), if(`src_endpoint.ip` != '', if(isIPv4String(`src_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'as_name', toIPv4OrDefault(`src_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'as_name', toIPv6OrDefault(`src_endpoint.ip`), '')), '')) AS `src_endpoint.autonomous_system.name`,
+    if(JSONExtractString(event, 'dst_endpoint', 'location', 'country') != '', JSONExtractString(event, 'dst_endpoint', 'location', 'country'), if(`dst_endpoint.ip` != '', if(isIPv4String(`dst_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'country_code', toIPv4OrDefault(`dst_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'country_code', toIPv6OrDefault(`dst_endpoint.ip`), '')), '')) AS `dst_endpoint.location.country`,
+    if(JSONExtractString(event, 'dst_endpoint', 'location', 'continent') != '', JSONExtractString(event, 'dst_endpoint', 'location', 'continent'), if(`dst_endpoint.ip` != '', if(isIPv4String(`dst_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'continent', toIPv4OrDefault(`dst_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'continent', toIPv6OrDefault(`dst_endpoint.ip`), '')), '')) AS `dst_endpoint.location.continent`,
+    if(JSONExtractUInt(event, 'dst_endpoint', 'autonomous_system', 'number') != 0, JSONExtractUInt(event, 'dst_endpoint', 'autonomous_system', 'number'), if(`dst_endpoint.ip` != '', toUInt32OrZero(replaceRegexpAll(if(isIPv4String(`dst_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'asn', toIPv4OrDefault(`dst_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'asn', toIPv6OrDefault(`dst_endpoint.ip`), '')), '[^0-9]', '')), 0)) AS `dst_endpoint.autonomous_system.number`,
+    if(JSONExtractString(event, 'dst_endpoint', 'autonomous_system', 'name') != '', JSONExtractString(event, 'dst_endpoint', 'autonomous_system', 'name'), if(`dst_endpoint.ip` != '', if(isIPv4String(`dst_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'as_name', toIPv4OrDefault(`dst_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'as_name', toIPv6OrDefault(`dst_endpoint.ip`), '')), '')) AS `dst_endpoint.autonomous_system.name`,
+    if(JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_src_ip_threat_type',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ) != '', JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_src_ip_threat_type',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ), if(`src_endpoint.ip` != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', `src_endpoint.ip`, ''), '')) AS `enrichments.ioc_src_ip_threat_type`,
+    if(JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_dest_ip_threat_type',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ) != '', JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_dest_ip_threat_type',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ), if(`dst_endpoint.ip` != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', `dst_endpoint.ip`, ''), '')) AS `enrichments.ioc_dest_ip_threat_type`,
+    if(JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_domain_threat_type',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ) != '', JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_domain_threat_type',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ), multiIf(`url.hostname` != '' AND dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`url.hostname`), '') != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`url.hostname`), ''), `http_request.url.hostname` != '' AND dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`http_request.url.hostname`), '') != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`http_request.url.hostname`), ''), `query.hostname` != '' AND dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`query.hostname`), '') != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`query.hostname`), ''), '')) AS `enrichments.ioc_domain_threat_type`,
+    if(JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_hash_threat_type',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ) != '', JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_hash_threat_type',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ), multiIf(`file.hashes.sha256` != '' AND dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`file.hashes.sha256`), '') != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`file.hashes.sha256`), ''), `process.file.hashes.sha256` != '' AND dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`process.file.hashes.sha256`), '') != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`process.file.hashes.sha256`), ''), '')) AS `enrichments.ioc_hash_threat_type`,
+    if(JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'custom_src_ip_tags',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ) != '', JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'custom_src_ip_tags',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ), if(`src_endpoint.ip` != '', arrayStringConcat(dictGetOrDefault('nanosiem.custom_enrichment_dict', 'tags', tuple('ip', `src_endpoint.ip`), []), ', '), '')) AS `enrichments.custom_src_ip_tags`,
+    if(JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'custom_dest_ip_tags',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ) != '', JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'custom_dest_ip_tags',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ), if(`dst_endpoint.ip` != '', arrayStringConcat(dictGetOrDefault('nanosiem.custom_enrichment_dict', 'tags', tuple('ip', `dst_endpoint.ip`), []), ', '), '')) AS `enrichments.custom_dest_ip_tags`,
+    JSONExtractString(event, 'metadata', 'product', 'name') AS `metadata.product.name`,
+    JSONExtractString(event, 'metadata', 'product', 'vendor_name') AS `metadata.product.vendor_name`,
+    JSONExtractString(event, 'metadata', 'product', 'feature', 'name') AS `metadata.product.feature.name`,
+    JSONExtractString(event, 'metadata', 'log_name') AS `metadata.log_name`,
+    JSONExtractString(event, 'metadata', 'log_provider') AS `metadata.log_provider`,
+    JSONExtractString(event, 'metadata', 'uid') AS `metadata.uid`,
+    JSONExtractString(event, 'metadata', 'version') AS `metadata.version`,
+    JSONExtractString(event, 'metadata', 'correlation_uid') AS `metadata.correlation_uid`,
+    length(toString(event)) AS `event_bytes`
+FROM nanosiem.ocsf_logs_raw
+;

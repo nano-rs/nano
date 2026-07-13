@@ -284,13 +284,16 @@ impl RuleRepositoryService {
             // target, so a tuning PR must not be steered at a curated-feed path.
             source_path: None,
             source_repo_url: None,
+            alert_cooldown_minutes: None,
         };
 
         // Check if a detection rule with this name already exists from this repo.
         // This catches duplicates that slip past the rule_imports check (e.g., race
         // conditions from concurrent batch imports, or re-imports after DB cleanup).
-        let existing_by_name: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM detection_rules WHERE name = $1 AND source_repository_id = $2 LIMIT 1",
+        // The existing rule's dataset/risk_score ride along for the NAN-1805
+        // feedback-loop guard below.
+        let existing_by_name: Option<(Uuid, Option<String>, Option<i32>)> = sqlx::query_as(
+            "SELECT id, dataset, risk_score FROM detection_rules WHERE name = $1 AND source_repository_id = $2 LIMIT 1",
         )
         .bind(&new_rule.name)
         .bind(repo_id)
@@ -298,11 +301,26 @@ impl RuleRepositoryService {
         .await
         .map_err(|e| RuleRepositoryError::Database(e))?;
 
-        if let Some(existing_id) = existing_by_name {
+        if let Some((existing_id, existing_dataset, existing_risk_score)) = existing_by_name {
             info!(
                 "Rule '{}' already exists from this repo (id={}), updating instead of creating",
                 new_rule.name, existing_id
             );
+
+            // NAN-1805 feedback-loop guard: this UPDATE writes the query
+            // directly (bypassing DetectionService::update_rule), so enforce
+            // the dataset=risk invariants here too — a re-import must not
+            // persist `| risk` (or ride a nonzero score) onto a rule the user
+            // has since moved to the risk dataset. (Execution refuses such
+            // rules as belt-and-suspenders, but save paths should never
+            // manufacture a permanently-failing rule.)
+            crate::detection::DetectionService::validate_risk_dataset_rule(
+                existing_dataset.as_deref(),
+                &new_rule.query,
+                existing_risk_score,
+                true, // imported updates never write risk_modifiers
+            )
+            .map_err(|e| RuleRepositoryError::ConversionFailed(e.to_string()))?;
 
             // Update the existing rule's query, severity, and metadata
             sqlx::query(

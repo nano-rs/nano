@@ -11,6 +11,7 @@ pub mod log;
 pub mod notebook;
 pub mod notification;
 pub mod queue;
+pub mod retro_hunt;
 pub mod saved_search;
 pub mod shared_search;
 
@@ -88,6 +89,12 @@ pub use detection_rule::{
 };
 pub use incident::{
     CreateIncidentRequest, Incident, IncidentSummary, IncidentWithCases, NewIncident,
+};
+pub use retro_hunt::{
+    CreateRetroHuntRequest, RetroHuntConfig, RetroHuntRun, RetroHuntRuleView, RetroHuntState,
+    UpdateRetroHuntConfigRequest, RetroHuntConfigValidationError, DEFAULT_RETRO_HUNT_CRON,
+    DEFAULT_RETRO_HUNT_LOOKBACK_DAYS, DEFAULT_RETRO_HUNT_MAX_INDICATORS, MAX_RETRO_HUNT_LOOKBACK_DAYS,
+    MAX_RETRO_HUNT_MAX_INDICATORS, VALID_RETRO_HUNT_ARTIFACT_TYPES,
 };
 pub use log::{Log, NewLog};
 pub use notebook::{

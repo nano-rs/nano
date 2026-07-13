@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use super::*;
+use crate::auth::ScopeSet;
+use crate::search::query_processing::enforce_source_scope;
 
 /// The asset view is a single synthetic row carrying the real event total in
 /// `_asset_pagination.total_count`. Lift it so `SearchResponse.total_count`
@@ -110,7 +112,15 @@ impl SearchService {
     ///
     /// The search runs in the background. Use get_job_status() to poll for
     /// completion and retrieve results.
-    pub async fn search_async(&self, request: SearchRequest) -> Result<String, SearchError> {
+    ///
+    /// `scope` (NAN-1799): the caller's source-scope deny-set, enforced inside
+    /// [`SearchService::search`]. REQUIRED — pass [`ScopeSet::unrestricted`]
+    /// only for SYSTEM callers.
+    pub async fn search_async(
+        &self,
+        request: SearchRequest,
+        scope: &ScopeSet,
+    ) -> Result<String, SearchError> {
         // Create job in store
         let job_id = self
             .job_store
@@ -129,6 +139,7 @@ impl SearchService {
         // Clone what we need for the spawned task
         let service = self.clone();
         let job_id_clone = job_id.clone();
+        let scope = scope.clone();
 
         // Modify request to use our query_id for progress tracking
         let mut request_with_id = request;
@@ -139,7 +150,7 @@ impl SearchService {
             tracing::info!("Async job {} starting search execution", job_id_clone);
 
             // Execute the search (reuse existing search logic)
-            let result = service.search(request_with_id).await;
+            let result = service.search(request_with_id, &scope).await;
 
             // Update job with result
             match result {
@@ -176,6 +187,7 @@ impl SearchService {
         request: SearchRequest,
         user_id: uuid::Uuid,
         priority: super::admission::QueryPriority,
+        scope: &ScopeSet,
     ) -> Result<String, SearchError> {
         // Create job in Queued state
         let job_id = self
@@ -196,6 +208,7 @@ impl SearchService {
         // Set per-query ClickHouse settings based on priority
         service.active_ch_settings = Some(priority.to_ch_settings());
         let job_id_clone = job_id.clone();
+        let scope = scope.clone();
 
         let mut request_with_id = request;
         request_with_id.request_id = Some(query_id);
@@ -224,7 +237,7 @@ impl SearchService {
             );
 
             // Step 3: Execute search
-            let result = service.search(request_with_id).await;
+            let result = service.search(request_with_id, &scope).await;
 
             // Step 4: Complete or fail
             match result {
@@ -270,6 +283,7 @@ impl SearchService {
         request: SearchRequest,
         user_id: uuid::Uuid,
         priority: super::admission::QueryPriority,
+        scope: &ScopeSet,
     ) -> Result<SearchResponse, SearchError> {
         // NAN-709: lower-priority requests yield briefly before claiming a
         // slot. Without this, the initial admit burst when a dashboard fires
@@ -286,7 +300,7 @@ impl SearchService {
         // No controller wired up → no gating, run directly. Preserves the
         // pre-NAN-701 behavior for code paths that haven't been migrated.
         let Some(controller) = self.admission_controller.clone() else {
-            return self.search(request).await;
+            return self.search(request, scope).await;
         };
 
         let job_id = uuid::Uuid::now_v7().to_string();
@@ -298,7 +312,7 @@ impl SearchService {
         let mut service = self.clone();
         service.active_ch_settings = Some(priority.to_ch_settings());
         // _permit drops at end of scope, freeing the slot.
-        service.search(request).await
+        service.search(request, scope).await
     }
 
     /// Get the status of an async search job
@@ -404,8 +418,19 @@ impl SearchService {
     }
 
     /// Execute a piped query and return structured results
-    #[instrument(skip(self), fields(query = %request.query))]
-    pub async fn search(&self, request: SearchRequest) -> Result<SearchResponse, SearchError> {
+    ///
+    /// `scope` (NAN-1799): the caller's source-scope deny-set (audit gate
+    /// already unioned in by the handler). Enforced structurally on the query
+    /// text BEFORE SQL generation and before any companion (histogram /
+    /// count / field-stats / view builder) sees the query, so every derived
+    /// scan carries the same exclusion. An empty deny-set leaves the query
+    /// byte-identical (zero-restricted-sources back-compat).
+    #[instrument(skip(self, scope), fields(query = %request.query))]
+    pub async fn search(
+        &self,
+        request: SearchRequest,
+        scope: &ScopeSet,
+    ) -> Result<SearchResponse, SearchError> {
         let start_time = Instant::now();
 
         // Read query safety limits (hot-reloadable from DB settings)
@@ -432,6 +457,14 @@ impl SearchService {
         // Extract time modifiers (earliest=-24h, latest=now, etc.) and clean the query
         let (cleaned_query, earliest_offset, latest_offset) =
             extract_time_modifiers(&request.query);
+
+        // NAN-1799: inject the caller's source-scope exclusion into the query
+        // TEXT before anything downstream touches it — the parse below, SQL
+        // generation, the histogram companion, the prevalence-join path and
+        // the cloud view builder all derive from `cleaned_query`, so a single
+        // injection here gates every scan this search fans out to. Empty
+        // deny-set returns the text unchanged (byte-identical).
+        let cleaned_query = enforce_source_scope(&cleaned_query, scope.deny_set())?;
 
         // Adjust time range based on modifiers
         let mut adjusted_time_range = request.time_range.clone();
@@ -657,7 +690,30 @@ impl SearchService {
             &post_prevalence.commands,
             is_clickhouse,
             has_prevalence_svc,
-        );
+        )
+            // NAN-1798 P2: the pushdown builds its base scan from the tenant
+            // LOGS generator, sync and without the per-request risk config —
+            // on a `dataset=risk` request it would scan raw logs instead of
+            // the derived grain, and a `[dataset=risk …]` bracket would render
+            // with default decay/cleared values. Any risk-touching query takes
+            // the post-processing prevalence path instead (correct results;
+            // only the pushdown optimization is skipped). The explain path
+            // applies the SAME condition so "Inspect SQL" matches execution.
+            && !super::touches_risk_dataset(request.dataset.as_deref(), &request.query);
+
+        // NAN-1798 P2: prevalence is a logs-artifact concept (hash/domain/ip
+        // host-counts). The derived risk grain has no artifact columns, so the
+        // post-processing fallback would silently pass every entity through
+        // the filter and decorate nothing — reject loudly instead.
+        if !prevalence_commands.is_empty()
+            && crate::query::Dataset::from_selector(request.dataset.as_deref().unwrap_or("logs"))
+                == crate::query::Dataset::Risk
+        {
+            return Err(SearchError::PrevalenceError(
+                "prevalence operates on log artifacts (hashes, domains, IPs) and is not                  supported on dataset=risk. Query the findings stream instead, e.g.                  `source_type=findings | prevalence ...`"
+                    .to_string(),
+            ));
+        }
 
         // Check if this is a tree visualization query BEFORE setting limit
         // Tree queries need ALL events to properly build parent-child relationships
@@ -768,7 +824,7 @@ impl SearchService {
                     pre_id.0, pre_id.1
                 );
                 let results = self
-                    .build_asset_view(Vec::new(), asset_info, &time_range, Some(pre_id))
+                    .build_asset_view(Vec::new(), asset_info, &time_range, Some(pre_id), scope)
                     .await?;
                 let execution_time_ms = start_time.elapsed().as_millis() as u64;
                 let column_order = get_column_order(&query);
@@ -854,6 +910,26 @@ impl SearchService {
             q
         };
 
+        // The dataset this request targets (NAN-1534). Shared by the SQL-gen
+        // block, the histogram spawn, and the field-stats gate below.
+        let request_dataset =
+            crate::query::Dataset::from_selector(request.dataset.as_deref().unwrap_or("logs"));
+
+        // NAN-1798 P2: resolve the cached decay-factor + cleared-boundary config
+        // whenever this request can reach the derived risk dataset — either
+        // directly (`dataset=risk`) or through a `[dataset=risk …]` subsearch
+        // bracket (cheap textual pre-filter; a false positive only attaches an
+        // unused, output-neutral config). Resolved OUTSIDE the sync SQL-gen
+        // block; served from the provider's 60s cache on the hot path. This is
+        // what makes `dataset=risk` scores equal the Risk page / leaderboard:
+        // the generator inlines the SAME values the enterprise repository binds.
+        let risk_config = if super::touches_risk_dataset(request.dataset.as_deref(), &request.query)
+        {
+            Some(self.risk_query_config.resolve().await)
+        } else {
+            None
+        };
+
         // Generate SQL
         let (sql, bounded_count_sql) = {
             use crate::query::QueryOptions;
@@ -875,14 +951,20 @@ impl SearchService {
                 .clone()
                 .with_max_group_array_size(query_limits.max_group_array_size as usize)
                 .with_max_mvexpand_rows(query_limits.max_mvexpand_rows as usize);
+            // NAN-1798 P2: attach the resolved risk config BEFORE any dataset
+            // swap so both a `dataset=risk` request and a `[dataset=risk …]`
+            // subsearch clone build the derived base source from the real
+            // per-request decay/cleared values. Output-neutral for every
+            // non-risk generation path.
+            if let Some(cfg) = risk_config.clone() {
+                ch_gen = ch_gen.with_risk_config(cfg);
+            }
             // NAN-1534: retarget to the spans/metrics OTLP table for this request.
             // `Dataset::Logs` is left UNTOUCHED so the generator keeps the
             // tenant-aware logs table resolved by `with_table` (UDM `logs` /
             // OCSF `ocsf_logs` / tenant-prefixed) — applying `with_dataset(Logs)`
             // would clobber that back to the literal `"logs"`.
-            let dataset = crate::query::Dataset::from_selector(
-                request.dataset.as_deref().unwrap_or("logs"),
-            );
+            let dataset = request_dataset;
             if dataset != crate::query::Dataset::Logs {
                 ch_gen = ch_gen.with_dataset(dataset);
             }
@@ -960,7 +1042,13 @@ impl SearchService {
         // every page was pure repeat work. The frontend freezes the page-1
         // timeline across flips; `histogram: None` in the response leaves it
         // untouched (same shape `skip_histogram` already produces).
+        // NAN-1798 P2: the risk dataset has no meaningful time axis at entity
+        // grain (fixed trailing 24h/7d windows; one row per entity), so the
+        // timeline companion is skipped entirely — mirroring the marker-page
+        // special-casing. `histogram: None` leaves the frontend timeline
+        // untouched, same shape `skip_histogram` produces.
         let histogram_handle = if !request.skip_histogram
+            && request_dataset != crate::query::Dataset::Risk
             && crate::search::execution::clickhouse_executor::is_first_page(offset)
             && !is_tree_query
             && !is_asset_query
@@ -1007,11 +1095,16 @@ impl SearchService {
         // back. Statically non-wide (or unmodeled → Unknown) output shapes go
         // straight to the client-side fallback, which computes exact stats
         // over the (small) transformed result set the response already carries.
+        // NAN-1798 P2: skip the server-side companion for the risk dataset —
+        // its base source is a derived subquery with no `system.columns`
+        // inventory to enumerate; the client-side fallback computes exact
+        // stats over the (entity-cardinality) result set instead.
         let should_run_server_field_stats = self.backend == SearchBackend::ClickHouse
             && !is_aggregation_query
             && !is_tree_query
             && !is_asset_query
             && !request.skip_field_stats
+            && request_dataset != crate::query::Dataset::Risk
             && self.ch_sql_generator.pipeline_output_is_wide(&query_for_sql);
 
         let (mut results, total_count, server_field_stats) = {
@@ -1262,7 +1355,7 @@ impl SearchService {
                 asset_info.sections
             );
             results = self
-                .build_asset_view(results, asset_info, &time_range, None)
+                .build_asset_view(results, asset_info, &time_range, None, scope)
                 .await?;
             tracing::debug!("After asset view building: {} results", results.len());
         }
@@ -1275,7 +1368,7 @@ impl SearchService {
                 cloud_info.show_mfa
             );
             results = self
-                .build_cloud_view(results, cloud_info, &time_range, &cleaned_query)
+                .build_cloud_view(results, cloud_info, &time_range, &cleaned_query, scope)
                 .await?;
             tracing::debug!("After cloud view building: {} results", results.len());
         }
@@ -1288,7 +1381,7 @@ impl SearchService {
                 lateral_info.max_hops
             );
             results = self
-                .build_lateral_view(results, lateral_info, &time_range)
+                .build_lateral_view(results, lateral_info, &time_range, scope)
                 .await?;
             tracing::debug!("After lateral view building: {} results", results.len());
 

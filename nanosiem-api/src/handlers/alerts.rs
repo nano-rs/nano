@@ -30,6 +30,20 @@ use crate::{
     state::AppState,
 };
 
+/// NAN-1800: compose the caller's EFFECTIVE per-source deny scope for
+/// detection-derived surfaces — the per-source RBAC deny set (NAN-1799)
+/// unioned with the `audit` source unless the caller holds `audit:view`.
+/// Mirrors the dashboards panel-query composition. An unrestricted caller
+/// with `audit:view` yields an empty deny set, and every repository query
+/// stays byte-identical to the pre-scoping SQL.
+fn effective_viewer_scope(auth: &AuthContext) -> nanosiem_core::auth::ScopeSet {
+    let mut deny = auth.denied_sources.deny_set().clone();
+    if !auth.has_permission(permissions::AUDIT_VIEW) {
+        deny.insert("audit".to_string());
+    }
+    nanosiem_core::auth::ScopeSet::from_denied(deny)
+}
+
 /// Resolve the authenticated user into a stable display string for the
 /// `acknowledged_by` / `closed_by` columns. Looks up the email from the
 /// users table (JWT no longer carries PII — see `handlers/auth.rs:734`
@@ -226,6 +240,8 @@ pub async fn list_alerts(
     let kinds = parse_kinds(&query.kinds);
     let limit = clamp_page_limit(query.limit);
     let offset = clamp_offset(query.offset);
+    // NAN-1800: per-source viewer scope, enforced inside the repository SQL.
+    let scope = effective_viewer_scope(&auth);
     // A4 (NAN-1747): route the `rule_id` filter through the same unified list as
     // every other filter, so status/severity/kinds + limit/offset all apply. The
     // old `list_alerts_by_rule` short-circuit hard-capped at 100 and silently
@@ -243,13 +259,21 @@ pub async fn list_alerts(
                 kinds.as_deref(),
                 limit,
                 offset,
+                scope.deny_set(),
             )
             .await
             .map_err(|e| ApiError::DatabaseError(e.to_string()))?
     } else {
         state
             .detection_service
-            .list_alerts(query.status, query.severity, kinds.as_deref(), limit, offset)
+            .list_alerts(
+                query.status,
+                query.severity,
+                kinds.as_deref(),
+                limit,
+                offset,
+                scope.deny_set(),
+            )
             .await?
     };
 
@@ -327,9 +351,12 @@ pub async fn stream_alerts(
     // page with `has_more=true`/`next_cursor=None` → an infinite SOAR poll loop;
     // a negative limit 500'd at the DB.
     let limit = clamp_page_limit(query.limit);
+    // NAN-1800: per-source viewer scope — the SOAR stream must not leak
+    // alerts derived from sources the caller can't see.
+    let scope = effective_viewer_scope(&auth);
     let alerts = state
         .detection_service
-        .list_alerts_after(after_timestamp, after_id, limit)
+        .list_alerts_after(after_timestamp, after_id, limit, scope.deny_set())
         .await?;
 
     let has_more = alerts.len() == limit as usize;
@@ -393,7 +420,13 @@ pub async fn get_alert(
 ) -> Result<Json<Alert>, ApiError> {
     ensure_permission(&auth, permissions::ALERTS_VIEW)?;
 
-    let alert = state.detection_service.get_alert(*id).await?;
+    // NAN-1800: a source-denied alert reads as 404, indistinguishable from
+    // nonexistent.
+    let scope = effective_viewer_scope(&auth);
+    let alert = state
+        .detection_service
+        .get_alert(*id, scope.deny_set())
+        .await?;
 
     // Demo isolation: block access to alerts from other demo users' rules
     if auth.claims.roles.contains(&"demo_analyst".to_string()) {
@@ -432,9 +465,16 @@ pub async fn acknowledge_alert(
 ) -> Result<Json<Alert>, ApiError> {
     ensure_permission(&auth, permissions::ALERTS_ACKNOWLEDGE)?;
 
+    // NAN-1800: mutations are deny-scoped too — a source-denied alert 404s
+    // BEFORE any state change.
+    let scope = effective_viewer_scope(&auth);
+
     // Demo isolation: block access to alerts from other demo users' rules
     if auth.claims.roles.contains(&"demo_analyst".to_string()) {
-        let alert = state.detection_service.get_alert(*id).await?;
+        let alert = state
+            .detection_service
+            .get_alert(*id, scope.deny_set())
+            .await?;
         let exclude_rule_ids = state
             .get_demo_exclude_ids(auth.user_id(), nanosiem_core::demo::DemoResourceType::Rule)
             .await;
@@ -446,7 +486,7 @@ pub async fn acknowledge_alert(
     let actor = resolve_actor_display(&state, auth.user_id()).await;
     let alert = state
         .detection_service
-        .acknowledge_alert(*id, &actor)
+        .acknowledge_alert(*id, &actor, scope.deny_set())
         .await?;
 
     state.emit_audit(
@@ -486,9 +526,15 @@ pub async fn close_alert(
 ) -> Result<Json<Alert>, ApiError> {
     ensure_permission(&auth, permissions::ALERTS_CLOSE)?;
 
+    // NAN-1800: deny-scoped mutation (see acknowledge_alert).
+    let scope = effective_viewer_scope(&auth);
+
     // Demo isolation: block access to alerts from other demo users' rules
     if auth.claims.roles.contains(&"demo_analyst".to_string()) {
-        let alert = state.detection_service.get_alert(*id).await?;
+        let alert = state
+            .detection_service
+            .get_alert(*id, scope.deny_set())
+            .await?;
         let exclude_rule_ids = state
             .get_demo_exclude_ids(auth.user_id(), nanosiem_core::demo::DemoResourceType::Rule)
             .await;
@@ -500,7 +546,7 @@ pub async fn close_alert(
     let actor = resolve_actor_display(&state, auth.user_id()).await;
     let alert = state
         .detection_service
-        .close_alert(*id, &actor, request.disposition)
+        .close_alert(*id, &actor, request.disposition, scope.deny_set())
         .await?;
 
     state.emit_audit(
@@ -544,9 +590,15 @@ pub async fn assign_alert(
 
     ensure_permission(&auth, permissions::ALERTS_ASSIGN)?;
 
+    // NAN-1800: deny-scoped mutation (see acknowledge_alert).
+    let scope = effective_viewer_scope(&auth);
+
     // Demo isolation: block access to alerts from other demo users' rules
     if auth.claims.roles.contains(&"demo_analyst".to_string()) {
-        let alert = state.detection_service.get_alert(*id).await?;
+        let alert = state
+            .detection_service
+            .get_alert(*id, scope.deny_set())
+            .await?;
         let exclude_rule_ids = state
             .get_demo_exclude_ids(auth.user_id(), nanosiem_core::demo::DemoResourceType::Rule)
             .await;
@@ -557,7 +609,7 @@ pub async fn assign_alert(
 
     let alert = state
         .detection_service
-        .assign_alert(*id, &request.assigned_to)
+        .assign_alert(*id, &request.assigned_to, scope.deny_set())
         .await?;
 
     // Send notification to assignee if assigned to someone other than self.
@@ -586,7 +638,7 @@ pub async fn assign_alert(
             // the joined fetch (only on the notify path) (NAN-1754).
             let rule_display = state
                 .detection_service
-                .get_alert(*id)
+                .get_alert(*id, scope.deny_set())
                 .await
                 .ok()
                 .and_then(|a| a.rule_name)
@@ -679,6 +731,10 @@ pub async fn bulk_alerts(
         }
     }
 
+    // NAN-1800: deny-scoped — the bulk UPDATE itself excludes source-denied
+    // rows, so a restricted viewer can't mutate alerts they can't see.
+    let scope = effective_viewer_scope(&auth);
+
     // Demo isolation: filter out alerts from other demo users' rules
     let ids = if auth.claims.roles.contains(&"demo_analyst".to_string()) {
         let exclude_rule_ids = state
@@ -693,7 +749,7 @@ pub async fn bulk_alerts(
                 // transient DB error (fail the whole bulk op). The old
                 // `if let Ok(..)` swallowed every error, silently shrinking the
                 // affected set with no signal to the caller.
-                match state.detection_service.get_alert(*id).await {
+                match state.detection_service.get_alert(*id, scope.deny_set()).await {
                     Ok(alert) => {
                         if alert.rule_id.map_or(true, |rid| !exclude_rule_ids.contains(&rid)) {
                             allowed.push(*id);
@@ -714,7 +770,7 @@ pub async fn bulk_alerts(
         BulkAction::Acknowledge => {
             state
                 .detection_service
-                .bulk_acknowledge_alerts(&ids, &actor)
+                .bulk_acknowledge_alerts(&ids, &actor, scope.deny_set())
                 .await?
         }
         BulkAction::Close => {
@@ -723,7 +779,7 @@ pub async fn bulk_alerts(
             })?;
             state
                 .detection_service
-                .bulk_close_alerts(&ids, &actor, disposition)
+                .bulk_close_alerts(&ids, &actor, disposition, scope.deny_set())
                 .await?
         }
     };
@@ -785,6 +841,8 @@ pub async fn alert_counts(
     ensure_permission(&auth, permissions::ALERTS_VIEW)?;
 
     let kinds = parse_kinds(&query.kinds);
+    // NAN-1800: counts must agree with the deny-scoped list.
+    let scope = effective_viewer_scope(&auth);
 
     // Demo isolation: compute filtered counts for demo users
     if auth.claims.roles.contains(&"demo_analyst".to_string()) {
@@ -799,7 +857,7 @@ pub async fn alert_counts(
             // non-demo filter semantics.
             let exclude_vec: Vec<Uuid> = exclude_rule_ids.iter().copied().collect();
             let counts = nanosiem_core::db::repository::AlertRepository::new(state.pool.clone())
-                .count_by_status_excluding_rules(kinds.as_deref(), &exclude_vec)
+                .count_by_status_excluding_rules(kinds.as_deref(), &exclude_vec, scope.deny_set())
                 .await
                 .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
 
@@ -827,7 +885,7 @@ pub async fn alert_counts(
 
     let counts = state
         .detection_service
-        .get_alert_counts(kinds.as_deref())
+        .get_alert_counts(kinds.as_deref(), scope.deny_set())
         .await?;
 
     let mut total = 0i64;
@@ -924,7 +982,30 @@ pub async fn alert_velocity(
     // safe to surface across demo_analyst boundaries.
     // NAN-1541: optional kind filter ($3::text[]; NULL = all kinds).
     let kinds = parse_kinds(&query.kinds);
-    let sql = r#"
+    // NAN-1800: even an hourly histogram leaks existence/cadence of alerts
+    // from denied sources — apply the same per-source deny filter as the list.
+    // Empty deny set (unrestricted + audit:view) emits the pre-scoping SQL
+    // byte-identically with no extra bind.
+    let scope = effective_viewer_scope(&auth);
+    let deny_vec: Option<Vec<String>> = if scope.deny_set().is_empty() {
+        None
+    } else {
+        Some(
+            scope
+                .deny_set()
+                .iter()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        )
+    };
+    let scope_sql = if deny_vec.is_some() {
+        "\n              AND ($4::text[] = '{}' OR NOT (source_types && $4::text[]))"
+    } else {
+        ""
+    };
+    let sql = format!(
+        r#"
         SELECT
             bucket as bucket_start,
             COALESCE(c.count, 0) AS count
@@ -937,16 +1018,18 @@ pub async fn alert_velocity(
             SELECT date_trunc('hour', created_at) AS bucket_start, COUNT(*) AS count
             FROM alerts
             WHERE created_at >= $1 AND created_at < $2
-              AND ($3::text[] IS NULL OR kind = ANY($3))
+              AND ($3::text[] IS NULL OR kind = ANY($3)){scope_sql}
             GROUP BY bucket_start
         ) c ON c.bucket_start = bucket
         ORDER BY bucket ASC
-    "#;
+    "#
+    );
 
-    let rows = sqlx::query(sql)
-        .bind(start)
-        .bind(now)
-        .bind(kinds)
+    let mut velocity_query = sqlx::query(&sql).bind(start).bind(now).bind(kinds);
+    if let Some(denied) = &deny_vec {
+        velocity_query = velocity_query.bind(denied);
+    }
+    let rows = velocity_query
         .fetch_all(&state.pool)
         .await
         .map_err(|e| ApiError::DatabaseError(e.to_string()))?;

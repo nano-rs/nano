@@ -2,11 +2,12 @@
 
 import { useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
   Check,
   Eye,
+  EyeOff,
   Globe,
   Loader2,
   MoreHorizontal,
@@ -109,6 +110,21 @@ export function LogSources() {
   const canEdit = hasPermission('log_sources:edit');
   const canDelete = hasPermission('log_sources:delete');
   const canDeploy = hasPermission('log_sources:deploy');
+
+  // Per-source RBAC scoping (NAN-1802): mark feeds whose `source_type` is in the
+  // restricted registry. Only fetched for admins who can view scopes — others
+  // never see the badge (and don't fire a 403). An empty registry = allow-all.
+  const canViewScopes = hasPermission('source_scopes:view');
+  const { data: restrictedResp } = useQuery({
+    queryKey: ['source-scopes-restricted'],
+    queryFn: () => api.sourceScopes.listRestricted(),
+    enabled: canViewScopes,
+    staleTime: 5 * 60 * 1000,
+  });
+  const restrictedSet = useMemo(
+    () => new Set((restrictedResp?.restricted ?? []).map((r) => r.source_type)),
+    [restrictedResp],
+  );
 
   const [searchQuery, setSearchQuery] = useState('');
   const [filter, setFilter] = useState<FilterId>('all');
@@ -340,6 +356,7 @@ export function LogSources() {
           ) : (
             <LogSourceTable
               rows={filtered}
+              restrictedSet={restrictedSet}
               canEdit={canEdit}
               canDeploy={canDeploy}
               canDelete={canDelete}
@@ -718,6 +735,7 @@ function IngestionActivityCard({ history }: { history: IngestionPoint[] }) {
 
 function LogSourceTable({
   rows,
+  restrictedSet,
   canEdit,
   canDeploy,
   canDelete,
@@ -727,6 +745,7 @@ function LogSourceTable({
   onDelete,
 }: {
   rows: LogSource[];
+  restrictedSet: Set<string>;
   canEdit: boolean;
   canDeploy: boolean;
   canDelete: boolean;
@@ -763,6 +782,7 @@ function LogSourceTable({
             <LogSourceRow
               key={ls.id}
               source={ls}
+              restricted={restrictedSet.has(ls.source_type)}
               canEdit={canEdit}
               canDeploy={canDeploy}
               canDelete={canDelete}
@@ -780,6 +800,7 @@ function LogSourceTable({
 
 function LogSourceRow({
   source,
+  restricted,
   canEdit,
   canDeploy,
   canDelete,
@@ -789,6 +810,7 @@ function LogSourceRow({
   onDelete,
 }: {
   source: LogSource;
+  restricted: boolean;
   canEdit: boolean;
   canDeploy: boolean;
   canDelete: boolean;
@@ -848,6 +870,24 @@ function LogSourceRow({
             )}
             <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
               <span className="text-[10px] font-mono text-muted-foreground">{source.source_type}</span>
+              {restricted && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      onClick={(e) => e.stopPropagation()}
+                      className="shrink-0 inline-flex items-center gap-1 h-[15px] px-1 rounded-[3px] bg-amber-500/12 text-amber-500 font-mono text-[9px] uppercase tracking-wider"
+                    >
+                      <EyeOff className="w-[9px] h-[9px]" />
+                      Restricted
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="top" sideOffset={6} collisionPadding={8} className="text-[11px] max-w-[280px]">
+                    This source type is visibility-scoped — only granted groups can see its events.
+                    Manage in Settings → Source Visibility.
+                  </TooltipContent>
+                </Tooltip>
+              )}
               {source.namespace && source.namespace !== 'default' && (
                 <>
                   <span className="w-px h-2.5 bg-border" />

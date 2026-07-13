@@ -26,6 +26,7 @@ import { IncidentsApi } from '@/enterprise/api/incidents';
 import { NotebooksApi } from '@/enterprise/api/notebooks';
 import { LogSourcesApi } from './log-sources';
 import { SourceConfigsApi } from './source-configs';
+import { SourceScopesApi } from './source-scopes';
 import { AccessControlApi } from './access-control';
 import { DashboardsApi } from './dashboards';
 import { StorageApi } from './storage';
@@ -52,6 +53,7 @@ import { OnboardingApi } from './onboarding';
 import { DemoApi } from './demo';
 import { SiemHealthApi } from './siem-health';
 import { PlaybooksApi } from '@/enterprise/api/playbooks';
+import { ReportsApi } from './reports';
 
 // Re-export types
 export * from './types';
@@ -144,6 +146,7 @@ class ApiClient {
   private _notebooks: NotebooksApi;
   private _logSources: LogSourcesApi;
   private _sourceConfigs: SourceConfigsApi;
+  private _sourceScopes: SourceScopesApi;
   private _accessControl: AccessControlApi;
   private _dashboards: DashboardsApi;
   private _storage: StorageApi;
@@ -170,6 +173,7 @@ class ApiClient {
   private _demo: DemoApi;
   private _siemHealth: SiemHealthApi;
   private _playbooks: PlaybooksApi;
+  private _reports: ReportsApi;
 
   constructor(baseUrl: string = API_BASE_URL) {
     this.baseUrl = baseUrl;
@@ -211,6 +215,7 @@ class ApiClient {
     );
     this._logSources = new LogSourcesApi(this.request.bind(this));
     this._sourceConfigs = new SourceConfigsApi(this.request.bind(this));
+    this._sourceScopes = new SourceScopesApi(this.request.bind(this));
     this._accessControl = new AccessControlApi(this.request.bind(this));
     this._dashboards = new DashboardsApi(this.request.bind(this));
     this._storage = new StorageApi(this.request.bind(this));
@@ -237,6 +242,7 @@ class ApiClient {
     this._demo = new DemoApi(this.request.bind(this));
     this._siemHealth = new SiemHealthApi(this.request.bind(this));
     this._playbooks = new PlaybooksApi(this.request.bind(this));
+    this._reports = new ReportsApi(this.request.bind(this), this.getAccessToken.bind(this));
   }
 
   // Expose modules for direct access when needed
@@ -306,6 +312,14 @@ class ApiClient {
 
   get observability(): ObservabilityApi {
     return this._observability;
+  }
+
+  get reports(): ReportsApi {
+    return this._reports;
+  }
+
+  get sourceScopes(): SourceScopesApi {
+    return this._sourceScopes;
   }
 
   private getAccessToken(): string | null {
@@ -442,8 +456,8 @@ class ApiClient {
     return this._search.searchSql(request);
   }
 
-  async explainQuery(query: string, timeRange: import('./types').TimeRange): Promise<{ sql: string }> {
-    return this._search.explainQuery(query, timeRange);
+  async explainQuery(query: string, timeRange: import('./types').TimeRange, dataset?: import('./types').SearchDataset): Promise<{ sql: string }> {
+    return this._search.explainQuery(query, timeRange, true, dataset);
   }
 
   // Fetch single log by ID (for table_view mode row expansion).
@@ -679,6 +693,27 @@ class ApiClient {
 
   async deleteDetection(id: string): Promise<void> {
     return this._detections.deleteDetection(id);
+  }
+
+  // Auto retro-hunt rules (NAN-1791)
+  async listRetroHuntFeeds(): Promise<string[]> {
+    return this._detections.listRetroHuntFeeds();
+  }
+
+  async createRetroHunt(request: import('./types').CreateRetroHuntRequest): Promise<import('./types').DetectionResponse> {
+    return this._detections.createRetroHunt(request);
+  }
+
+  async getRetroHunt(id: string): Promise<import('./types').RetroHuntRuleView> {
+    return this._detections.getRetroHunt(id);
+  }
+
+  async updateRetroHunt(id: string, request: import('./types').UpdateRetroHuntConfigRequest): Promise<import('./types').RetroHuntConfig> {
+    return this._detections.updateRetroHunt(id, request);
+  }
+
+  async listRetroHuntRuns(id: string): Promise<import('./types').RetroHuntRun[]> {
+    return this._detections.listRetroHuntRuns(id);
   }
 
   async pauseDetection(id: string): Promise<import('./types').DetectionRule> {
@@ -1840,6 +1875,14 @@ class ApiClient {
 
   async updateRiskDecayConfig(request: import('./types').UpdateRiskDecayConfigRequest): Promise<import('./types').RiskDecayConfig> {
     return this._risk.updateRiskDecayConfig(request);
+  }
+
+  async getRiskNotableConfig(): Promise<import('./types').RiskNotableConfig> {
+    return this._risk.getRiskNotableConfig();
+  }
+
+  async updateRiskNotableConfig(request: import('./types').RiskNotableConfig): Promise<import('./types').RiskNotableConfig> {
+    return this._risk.updateRiskNotableConfig(request);
   }
 
   async getRiskyEntities(params?: import('./types').RiskEntitiesQuery): Promise<import('./types').RiskEntitiesResponse> {

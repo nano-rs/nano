@@ -11,7 +11,9 @@
 //! `fetch_rows` JSONEachRow helper. The typed `fetch_one::<Row>()` binary
 //! format silently fails on multi-column LowCardinality SELECTs.
 
+use super::lateral::source_scope_sql_predicate;
 use super::SearchService;
+use crate::auth::ScopeSet;
 use crate::query::TimeRange;
 use crate::risk::{EntityRiskSummary, RiskTimeWindow};
 use crate::schema::{SchemaId, SchemaProfile};
@@ -513,6 +515,12 @@ fn classify_ua(ua: &str) -> &'static str {
 // ============================================================================
 
 impl SearchService {
+    /// NAN-1801: this aggregate builds its own hand-rolled SQL over `logs`
+    /// (it does NOT go through the nPL source-scope injection), so the
+    /// caller's `ScopeSet` is threaded down here and its deny-set exclusion
+    /// is ANDed into EVERY subquery's scan (see
+    /// [`source_scope_sql_predicate`]). An empty deny set emits nothing —
+    /// byte-identical SQL to the pre-scoping form.
     pub async fn query_cloud_dossier(
         &self,
         principal: &str,
@@ -520,6 +528,7 @@ impl SearchService {
         provider_filter: Option<&str>,
         facet_filters: &CloudDossierFacetFilters,
         time_range: &TimeRange,
+        scope: &ScopeSet,
     ) -> Result<CloudDossier, SearchError> {
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
@@ -675,6 +684,19 @@ impl SearchService {
             q
         };
 
+        // NAN-1801: render the caller's source-scope deny-set ONCE; ANDed into
+        // every hand-built logs scan below — all 12 subqueries including each
+        // per-dimension facet leg of the UNION-ALL facets query and the
+        // account-wide posture scan (which drops the principal narrowing but
+        // still reads logs). No bind values — the predicate is rendered
+        // inline — so `extra_bind` / `bind_facets_query` placeholder
+        // accounting is untouched. `None` (unrestricted) splices an empty
+        // string: byte-identical SQL to the pre-scoping form.
+        let scope_and = source_scope_sql_predicate("source_type", scope.deny_set())
+            .map(|pred| format!("\n              AND {pred}"))
+            .unwrap_or_default();
+        let scope_and = scope_and.as_str();
+
         // `user` is the principal-scoping column — required for every subquery.
         // It maps under both shipped schemas (UDM `"user"`, OCSF `user.name`),
         // but honour skip-on-None: if a schema lacks a user concept there is no
@@ -742,7 +764,7 @@ impl SearchService {
             PREWHERE timestamp BETWEEN ? AND ?
               AND {identity_match}
               {provider_clause}{facet_clause}
-              {account_clause}"#,
+              {account_clause}{scope_and}"#,
         );
 
         // --- 2. User-agent breakdown ---------------------------------------
@@ -763,7 +785,7 @@ impl SearchService {
             PREWHERE timestamp BETWEEN ? AND ?
               AND {identity_match}
               {ua_present_clause}{provider_clause}{facet_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             GROUP BY ua
             ORDER BY cnt DESC
             LIMIT 8"#,
@@ -814,7 +836,7 @@ impl SearchService {
             PREWHERE timestamp BETWEEN ? AND ?
               AND {identity_match}
               {ip_present_clause}{provider_clause}{facet_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             GROUP BY ip
             ORDER BY cnt DESC
             LIMIT 8"#,
@@ -863,7 +885,7 @@ impl SearchService {
                     r#"(
                 SELECT '{dim}' AS dim, {value_expr} AS value, count() AS cnt FROM {logs_table}
                 PREWHERE timestamp BETWEEN ? AND ? AND {identity_match} AND {col} != ''
-                  {provider_clause}{facet_clause} {account_clause}
+                  {provider_clause}{facet_clause} {account_clause}{scope_and}
                 GROUP BY value ORDER BY cnt DESC LIMIT {limit}
             )"#
                 ))
@@ -916,7 +938,7 @@ impl SearchService {
             PREWHERE timestamp BETWEEN ? AND ?
               {chain_service_clause}{chain_action_clause}AND {identity_match}
               {provider_clause}{facet_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             GROUP BY to_label, to_account
             HAVING to_label != ''
             ORDER BY first_at ASC
@@ -983,7 +1005,7 @@ impl SearchService {
                 {ka_action_pred}
               )
               {provider_clause}{facet_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             GROUP BY role, action, service, change_type
             ORDER BY at DESC
             LIMIT 12"#,
@@ -1007,7 +1029,7 @@ impl SearchService {
             PREWHERE timestamp BETWEEN ? AND ?
               AND {identity_match}
               {tl_service_clause}{provider_clause}{facet_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             GROUP BY service, bucket
             HAVING bucket < {TIMELINE_BUCKETS}"#,
         );
@@ -1045,7 +1067,7 @@ impl SearchService {
             PREWHERE timestamp BETWEEN ? AND ?
               AND {identity_match}
               {act_present_clause}{provider_clause}{facet_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             GROUP BY name, service, principal_role
             ORDER BY cnt DESC
             LIMIT {TOP_ACTIONS_LIMIT}"#,
@@ -1094,7 +1116,7 @@ impl SearchService {
             PREWHERE timestamp BETWEEN ? AND ?
               AND {identity_match}
               {res_exists_clause}{provider_clause}{facet_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             GROUP BY arn
             ORDER BY changes DESC
             LIMIT {TOP_RESOURCES_LIMIT}"#,
@@ -1119,7 +1141,7 @@ impl SearchService {
             PREWHERE timestamp BETWEEN ? AND ?
               AND {identity_match}
               {provider_clause}{facet_clause}
-              {account_clause}"#,
+              {account_clause}{scope_and}"#,
         );
 
         let error_codes_sql = format!(
@@ -1129,7 +1151,7 @@ impl SearchService {
               AND {identity_match}
               AND {status_cmp} != '' AND {status_cmp} != 'success'
               {provider_clause}{facet_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             GROUP BY code
             ORDER BY cnt DESC
             LIMIT {ERROR_CODES_LIMIT}"#,
@@ -1179,7 +1201,7 @@ impl SearchService {
             PREWHERE timestamp BETWEEN ? AND ?
               AND {user_col} != ''
               {provider_clause}{facet_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             GROUP BY name
             ORDER BY calls DESC
             LIMIT {POSTURE_PRINCIPALS_LIMIT}"#,
@@ -1231,7 +1253,7 @@ impl SearchService {
             PREWHERE timestamp BETWEEN ? AND ?
               AND {identity_match}
               {provider_clause}{facet_clause}
-              {account_clause}
+              {account_clause}{scope_and}
             ORDER BY timestamp DESC
             LIMIT {STREAM_LIMIT}"#,
         );

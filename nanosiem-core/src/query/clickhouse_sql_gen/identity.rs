@@ -90,6 +90,29 @@ pub(crate) fn resolve_identity_fill_targets(field: &str) -> Vec<&'static str> {
 }
 
 impl ClickHouseSqlGenerator {
+    /// Attach the caller's source-scope deny set (NAN-1801, P3 side-doors).
+    ///
+    /// Builder-style, mirroring `with_profile` / `with_cluster_routing`, but
+    /// unlike those this is PER-CALLER state: attach it to the per-search
+    /// clone of the service generator, never bake it into the shared
+    /// service-level instance. Consumed by the `resolve_identity` ASOF build
+    /// side below, which scans `identity_observations` — a dataset the P1
+    /// nPL-text deny gate (`enforce_source_scope`) does not cover. The empty
+    /// set (the default on every existing construction site) renders nothing,
+    /// keeping every emitted statement byte-identical.
+    pub fn with_source_scope_deny(
+        mut self,
+        deny: std::collections::BTreeSet<String>,
+    ) -> Self {
+        self.source_scope_deny = deny;
+        self
+    }
+
+    /// The caller's source-scope deny set (empty = unrestricted).
+    pub(crate) fn source_scope_deny(&self) -> &std::collections::BTreeSet<String> {
+        &self.source_scope_deny
+    }
+
     /// Generate SQL for resolve_identity command using priority-aware ASOF JOIN
     ///
     /// Uses a CTE to pre-aggregate identity observations by IP and hour,
@@ -383,6 +406,21 @@ impl ClickHouseSqlGenerator {
         // from ALL shards, not just the LB-connected node. Single-shard (default)
         // keeps the bare `identity_observations` literal — byte-identical.
         let identity_obs_table = self.route_dataset_table("identity_observations");
+        // NAN-1801 (P3 side-doors): the ASOF build side scans
+        // identity_observations — a JOINED dataset the P1 main-scan deny gate
+        // (injected into the nPL text by `enforce_source_scope`) does NOT
+        // cover. Without its own gate the join re-surfaces hostname / user /
+        // mac / `identity_source` values that only a denied source observed.
+        // Render the caller's deny set with the one canonical predicate
+        // builder over the observation `source` column (identity_observations'
+        // source_type). Empty deny set → `None` → both branches below emit
+        // byte-identical SQL to the pre-scoping form.
+        let scope_predicate =
+            crate::search::service::source_scope_sql_predicate("source", self.source_scope_deny());
+        let bounded_scope_and = scope_predicate
+            .as_deref()
+            .map(|pred| format!("\n      AND ({pred})"))
+            .unwrap_or_default();
         let build_side = bounded_window
             .and_then(|tr| {
                 // try_seconds + checked_sub_signed: a crafted max_age (the
@@ -393,12 +431,23 @@ impl ClickHouseSqlGenerator {
                     .and_then(chrono::Duration::try_seconds)
                     .and_then(|d| tr.start.checked_sub_signed(d))?;
                 Some(format!(
-                    "(\n    SELECT * FROM {identity_obs_table}\n    WHERE observed_at BETWEEN '{}' AND '{}'\n  )",
+                    "(\n    SELECT * FROM {identity_obs_table}\n    WHERE observed_at BETWEEN '{}' AND '{}'{bounded_scope_and}\n  )",
                     crate::sql_hygiene::format_ch_bound_micros(&lower),
                     crate::sql_hygiene::format_ch_bound_micros(&tr.end)
                 ))
             })
-            .unwrap_or_else(|| identity_obs_table.clone());
+            .unwrap_or_else(|| match scope_predicate.as_deref() {
+                // The unbounded fallback (upstream timestamp rewrite, no
+                // generation window, or bound underflow — see the guard list
+                // above) must NOT fail open for a scoped caller: wrap the
+                // bare table so the deny gate still applies there too.
+                // Unrestricted callers keep the bare literal — byte-identical
+                // to the legacy unbounded join.
+                Some(pred) => {
+                    format!("(\n    SELECT * FROM {identity_obs_table}\n    WHERE ({pred})\n  )")
+                }
+                None => identity_obs_table.clone(),
+            });
 
         Ok(format!(
             r#"  SELECT
@@ -430,5 +479,108 @@ impl ClickHouseSqlGenerator {
             build_side = build_side,
             max_age_secs = max_age_secs
         ))
+    }
+}
+
+/// NAN-1801 (P3 side-doors) — the resolve_identity ASOF build side must carry
+/// its OWN source-scope gate: the P1 deny gate is injected into the nPL text
+/// by `enforce_source_scope` and therefore only covers the main logs scan,
+/// never the joined identity_observations dataset. Inline (like
+/// `source_scope_otel_strip_tests` in the parent module) because the fixtures
+/// reach the generator's private `generation_time_range` to select the
+/// bounded/unbounded build-side branch directly.
+#[cfg(test)]
+mod source_scope_tests {
+    use super::*;
+    use crate::query::sql_gen::TimeRange;
+    use chrono::{TimeZone, Utc};
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    fn deny(values: &[&str]) -> BTreeSet<String> {
+        values.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Run resolve_identity codegen with the given deny set; `windowed`
+    /// selects the NAN-1638 bounded build side (generation window present)
+    /// vs the legacy unbounded fallback.
+    fn generate(deny_set: BTreeSet<String>, windowed: bool) -> String {
+        let generator = ClickHouseSqlGenerator::new().with_source_scope_deny(deny_set);
+        if windowed {
+            *generator
+                .generation_time_range
+                .write()
+                .expect("time-range lock") = Some(TimeRange {
+                start: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+                end: Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap(),
+            });
+        }
+        generator
+            .generate_resolve_identity_sql(
+                "logs",
+                "src_ip",
+                &Duration::from_secs(86_400),
+                &None,
+                false,
+            )
+            .expect("resolve_identity codegen")
+    }
+
+    /// Unrestricted caller, unbounded join: bare table literal on the build
+    /// side, no scope predicate anywhere — byte-identical back-compat.
+    #[test]
+    fn empty_deny_keeps_bare_unbounded_build_side() {
+        let sql = generate(deny(&[]), false);
+        assert!(
+            sql.contains("ASOF LEFT JOIN identity_observations AS i"),
+            "expected bare build-side table, got:\n{sql}"
+        );
+        assert!(!sql.contains("lower(source)"), "unexpected gate:\n{sql}");
+    }
+
+    /// Unrestricted caller, bounded join: window bound only, no gate.
+    #[test]
+    fn empty_deny_keeps_windowed_build_side_ungated() {
+        let sql = generate(deny(&[]), true);
+        assert!(sql.contains("WHERE observed_at BETWEEN"), "{sql}");
+        assert!(!sql.contains("lower(source)"), "unexpected gate:\n{sql}");
+    }
+
+    /// Single-member deny renders the legacy-shaped `!=` gate inside the
+    /// bounded build-side subquery.
+    #[test]
+    fn single_member_gates_bounded_build_side() {
+        let sql = generate(deny(&["audit"]), true);
+        assert!(sql.contains("WHERE observed_at BETWEEN"), "{sql}");
+        assert!(
+            sql.contains("AND (lower(source) != 'audit')"),
+            "missing build-side gate:\n{sql}"
+        );
+    }
+
+    /// Multi-member deny renders the NOT-IN gate (BTreeSet order).
+    #[test]
+    fn multi_member_gates_bounded_build_side() {
+        let sql = generate(deny(&["insider", "audit"]), true);
+        assert!(
+            sql.contains("AND (lower(source) NOT IN ('audit', 'insider'))"),
+            "missing build-side gate:\n{sql}"
+        );
+    }
+
+    /// The unbounded fallback (timestamp rewritten / no window / underflow)
+    /// must NOT fail open for a scoped caller: the bare table is wrapped in
+    /// a gated subquery.
+    #[test]
+    fn unbounded_fallback_does_not_fail_open() {
+        let sql = generate(deny(&["insider", "audit"]), false);
+        assert!(
+            !sql.contains("ASOF LEFT JOIN identity_observations AS i"),
+            "scoped caller must not join the bare table:\n{sql}"
+        );
+        assert!(
+            sql.contains("WHERE (lower(source) NOT IN ('audit', 'insider'))"),
+            "missing fallback gate:\n{sql}"
+        );
     }
 }

@@ -12,7 +12,9 @@
 //! come from the existing `asset-artifacts` endpoint — so this module focuses purely
 //! on what can be derived from the UDM event stream in ClickHouse.
 
+use super::lateral::source_scope_sql_predicate;
 use super::SearchService;
+use crate::auth::ScopeSet;
 use crate::query::TimeRange;
 use crate::schema::SchemaProfile;
 use crate::search::{parse_clickhouse_error, SearchError};
@@ -222,12 +224,19 @@ impl SearchService {
     ///
     /// Runs identity + timeline + processes + network + auth + files + dns
     /// aggregates in parallel. Missing ClickHouse returns an empty dossier.
+    ///
+    /// `scope` (NAN-1801): the caller's source-scope deny-set. Every aggregate
+    /// below is a fresh hand-built scan of the logs table that does NOT go
+    /// through the nPL search path's injected source-scope gate, so the
+    /// deny-set exclusion is ANDed into each of them here. An empty deny set
+    /// emits nothing (byte-identical SQL to the pre-scoping form).
     pub async fn query_asset_dossier(
         &self,
         identifier_field: &str,
         identifier_value: &str,
         identities: &[serde_json::Value],
         time_range: &TimeRange,
+        scope: &ScopeSet,
     ) -> Result<AssetDossier, SearchError> {
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
@@ -246,6 +255,20 @@ impl SearchService {
                 Some(pair) => pair,
                 None => return Ok(AssetDossier::default()),
             };
+
+        // NAN-1801: render the caller's deny-set ONCE and fold it into the
+        // identity clause — every per-section query below (identity,
+        // log_sources, timeline, processes, network, auth, files, dns,
+        // including their inner scalar/top/rare/recent sub-queries) embeds the
+        // clause as `({ident})`, so this single composition scopes all of
+        // them. Without it, `query_log_sources` alone would enumerate exactly
+        // the caller's hidden sources. `None` (unrestricted) leaves every SQL
+        // string byte-identical to the pre-scoping form.
+        let scope_predicate = source_scope_sql_predicate("source_type", scope.deny_set());
+        let identity_clause = match &scope_predicate {
+            Some(pred) => format!("({identity_clause}) AND {pred}"),
+            None => identity_clause,
+        };
 
         let start_str = crate::sql_hygiene::format_ch_bound_micros(&time_range.start).to_string();
         let end_str = crate::sql_hygiene::format_ch_bound_micros(&time_range.end).to_string();
@@ -289,7 +312,8 @@ impl SearchService {
         // Real fleet denominator for the processes card's "% of fleet" math.
         // Measured once here (fleet-wide, not per-asset) and threaded in, so the
         // percentages aren't projected against a hardcoded demo constant.
-        let fleet_size = query_fleet_size(clickhouse, profile, &logs_table).await;
+        let fleet_size =
+            query_fleet_size(clickhouse, profile, &logs_table, scope_predicate.as_deref()).await;
         let processes_fut = query_processes(
             clickhouse,
             profile,
@@ -640,7 +664,18 @@ async fn query_timeline(
 /// caps execution time so the dossier never blocks on it. Falls back to
 /// [`ASSUMED_FLEET_SIZE`] (and never returns 0) if the schema exposes no host
 /// column or the query fails, so downstream division never hits zero.
-async fn query_fleet_size(ch: &clickhouse::Client, profile: &dyn SchemaProfile, logs: &str) -> f32 {
+///
+/// NAN-1801: `scope_predicate` is the caller's rendered source-scope exclusion
+/// (from [`source_scope_sql_predicate`]). This is the one dossier scan with no
+/// identity clause to fold it into, so it is ANDed in directly — a fleet-wide
+/// `uniq(host)` would otherwise count hosts that appear only in the caller's
+/// hidden sources. `None` (unrestricted) keeps the SQL byte-identical.
+async fn query_fleet_size(
+    ch: &clickhouse::Client,
+    profile: &dyn SchemaProfile,
+    logs: &str,
+    scope_predicate: Option<&str>,
+) -> f32 {
     let src_host = profile.udm_column_sql("src_host");
     let src_ip = profile.udm_column_sql("src_ip");
     let host_expr = match (&src_host, &src_ip) {
@@ -649,9 +684,12 @@ async fn query_fleet_size(ch: &clickhouse::Client, profile: &dyn SchemaProfile, 
         (None, Some(i)) => format!("if({i} != '', {i}, 'unknown')"),
         (None, None) => return ASSUMED_FLEET_SIZE,
     };
+    let scope_and = scope_predicate
+        .map(|p| format!(" AND {p}"))
+        .unwrap_or_default();
     let sql = format!(
         "SELECT uniq({host_expr}) AS fleet FROM {logs} \
-         WHERE timestamp >= now() - INTERVAL 30 DAY \
+         WHERE timestamp >= now() - INTERVAL 30 DAY{scope_and} \
          SETTINGS max_execution_time = 15"
     );
     match ch.query(&sql).fetch_one::<u64>().await {

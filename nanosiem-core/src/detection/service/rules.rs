@@ -20,6 +20,69 @@ impl DetectionService {
     // Detection Rule CRUD Operations
     // ========================================================================
 
+    /// Whether a rule targets the derived `risk` dataset (NAN-1805).
+    pub(crate) fn is_risk_dataset_rule(rule: &DetectionRule) -> bool {
+        crate::query::Dataset::from_selector(rule.dataset.as_deref().unwrap_or("logs"))
+            == crate::query::Dataset::Risk
+    }
+
+    /// Feedback-loop guard for `dataset=risk` rules (NAN-1805), enforced at
+    /// SAVE time (create + update). A detection rule EMITS findings, and
+    /// findings are the risk dataset's input — so a risk-dataset rule must not
+    /// contribute risk scores or its own firings would feed its own input:
+    ///
+    /// * `risk_score` must be EXPLICITLY 0 (`None` falls back to a
+    ///   severity-derived default at scoring time, which is nonzero);
+    /// * `risk_modifiers` must be empty (modifiers add score conditionally);
+    /// * the query must not contain `| risk` (query-derived scores bypass the
+    ///   rule-level score entirely).
+    ///
+    /// Execution re-enforces this as belt-and-suspenders: `execute_rule`
+    /// refuses `| risk` bodies and `risk_result_for_group` zeroes any residual
+    /// score for risk-dataset rules.
+    pub(crate) fn validate_risk_dataset_rule(
+        dataset: Option<&str>,
+        query: &str,
+        risk_score: Option<i32>,
+        risk_modifiers_empty: bool,
+    ) -> Result<(), DetectionError> {
+        if crate::query::Dataset::from_selector(dataset.unwrap_or("logs"))
+            != crate::query::Dataset::Risk
+        {
+            return Ok(());
+        }
+        if risk_score != Some(0) {
+            return Err(DetectionError::InvalidQuery(
+                "Rules on dataset=risk must set risk_score = 0: a risk rule's findings feed the \
+                 risk dataset itself, so any nonzero score would feed the rule's own input \
+                 (feedback loop). Set risk_score to 0 — alert priority is carried by the rule's \
+                 severity instead."
+                    .to_string(),
+            ));
+        }
+        if !risk_modifiers_empty {
+            return Err(DetectionError::InvalidQuery(
+                "Rules on dataset=risk must not define risk modifiers: modifiers add risk score \
+                 conditionally, and a risk rule's findings feed the risk dataset itself \
+                 (feedback loop). Remove the risk modifiers."
+                    .to_string(),
+            ));
+        }
+        // A parse failure is reported by the caller's validate_query; only a
+        // successfully parsed query can be checked for `| risk` here.
+        if let Ok(parsed) = crate::query::parse_query(query) {
+            if crate::query::contains_risk_command(&parsed) {
+                return Err(DetectionError::InvalidQuery(
+                    "`| risk` is not allowed in dataset=risk rules: query-derived risk scores \
+                     would be emitted as findings, which are the risk dataset's own input \
+                     (feedback loop). Remove the `| risk` command."
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Create a new detection rule with query validation
     /// New rules default to Live mode for bake-in period
     #[instrument(skip(self, rule), fields(rule_name = %rule.name))]
@@ -35,7 +98,7 @@ impl DetectionService {
             self.validate_cron(cron)?;
         }
 
-        // NAN-1561: spans/metrics rules are scheduled-only. `create_rule` is the
+        // NAN-1561: non-logs rules are scheduled-only. `create_rule` is the
         // un-moded create path used by rule import (and other non-MV callers), so
         // it must enforce the same real-time/dataset guard as `create_rule_with_mode`
         // — otherwise `/api/rules/import` could persist a non-logs real-time rule
@@ -47,12 +110,21 @@ impl DetectionService {
                 if let Some(ds) = rule.dataset.as_deref() {
                     if crate::query::Dataset::from_selector(ds) != crate::query::Dataset::Logs {
                         return Err(DetectionError::InvalidRealtimeRule(format!(
-                            "dataset '{ds}' is scheduled-only (spans/metrics cannot use real-time materialized views)"
+                            "dataset '{ds}' is scheduled-only (only logs rules can use real-time materialized views)"
                         )));
                     }
                 }
             }
         }
+
+        // NAN-1805: feedback-loop guard for dataset=risk rules (this path is
+        // also the rule-import entry point, so it must enforce the guard too).
+        Self::validate_risk_dataset_rule(
+            rule.dataset.as_deref(),
+            &rule.query,
+            rule.risk_score,
+            rule.risk_modifiers.as_ref().is_none_or(|m| m.is_empty()),
+        )?;
 
         info!(
             "Creating detection rule: {} (mode: {:?})",
@@ -102,6 +174,14 @@ impl DetectionService {
 
         // Get detection mode (default to Scheduled)
         let detection_mode = rule.detection_mode.unwrap_or(DetectionMode::Scheduled);
+
+        // NAN-1805: feedback-loop guard for dataset=risk rules.
+        Self::validate_risk_dataset_rule(
+            rule.dataset.as_deref(),
+            &rule.query,
+            rule.risk_score,
+            rule.risk_modifiers.as_ref().is_none_or(|m| m.is_empty()),
+        )?;
 
         info!(
             "Creating detection rule: {} (mode: {:?}, detection_mode: {:?})",
@@ -259,6 +339,23 @@ impl DetectionService {
             self.validate_cron(cron)?;
         }
 
+        // NAN-1805: feedback-loop guard on the EFFECTIVE (post-patch) rule —
+        // a patch can introduce the risk dataset, a nonzero score, modifiers,
+        // or a `| risk` body onto a rule that was previously compliant.
+        Self::validate_risk_dataset_rule(
+            update
+                .dataset
+                .as_deref()
+                .or(existing_rule.dataset.as_deref()),
+            update.query.as_deref().unwrap_or(&existing_rule.query),
+            update.risk_score.or(existing_rule.risk_score),
+            update
+                .risk_modifiers
+                .as_ref()
+                .map(|m| m.is_empty())
+                .unwrap_or_else(|| existing_rule.risk_modifiers.0.is_empty()),
+        )?;
+
         // Auto-archive rules moved to stash folder
         let update = if let Some(ref folder) = update.folder {
             if folder == "stash" {
@@ -320,7 +417,7 @@ impl DetectionService {
             id, old_mode, new_mode
         );
 
-        // NAN-1561: spans/metrics rules are scheduled-only. If the resulting
+        // NAN-1561: non-logs rules are scheduled-only. If the resulting
         // (post-patch) rule would run real-time over a non-logs dataset, reject
         // before any MV is created. Effective dataset = patch value, else
         // existing value.
@@ -332,11 +429,26 @@ impl DetectionService {
             if let Some(ds) = effective_dataset.as_deref() {
                 if crate::query::Dataset::from_selector(ds) != crate::query::Dataset::Logs {
                     return Err(DetectionError::InvalidRealtimeRule(format!(
-                        "dataset '{ds}' is scheduled-only (spans/metrics cannot use real-time materialized views)"
+                        "dataset '{ds}' is scheduled-only (only logs rules can use real-time materialized views)"
                     )));
                 }
             }
         }
+
+        // NAN-1805: feedback-loop guard on the EFFECTIVE (post-patch) rule.
+        Self::validate_risk_dataset_rule(
+            update
+                .dataset
+                .as_deref()
+                .or(existing_rule.dataset.as_deref()),
+            update.query.as_deref().unwrap_or(&existing_rule.query),
+            update.risk_score.or(existing_rule.risk_score),
+            update
+                .risk_modifiers
+                .as_ref()
+                .map(|m| m.is_empty())
+                .unwrap_or_else(|| existing_rule.risk_modifiers.0.is_empty()),
+        )?;
 
         // If detection mode is changing to real-time, validate the rule
         if new_mode == DetectionMode::RealTime && old_mode != DetectionMode::RealTime {
@@ -407,6 +519,9 @@ impl DetectionService {
                 // Provenance doesn't affect realtime validation; carry it faithfully.
                 source_path: existing_rule.source_path.clone(),
                 source_repo_url: existing_rule.source_repo_url.clone(),
+                alert_cooldown_minutes: update
+                    .alert_cooldown_minutes
+                    .or(existing_rule.alert_cooldown_minutes),
             };
             self.validate_realtime_rule(&validation_rule)?;
         }

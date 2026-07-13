@@ -15,12 +15,13 @@ mod schedulers;
 mod vector_config;
 
 use nanosiem_core::audit::{AuditEmitter, AuditQueryService};
+use nanosiem_core::auth::source_scope_resolver::SourceScopeResolver;
 use nanosiem_core::auth::{
     ApiKeyRepository, ApiKeyService, AuthConfig, AuthService, GroupRepository,
     OidcRepository, OidcService, PermissionService, RoleRepository, SessionConfig,
     SessionRepository, SessionService, TokenConfig, TokenService, UserRepository,
 };
-use nanosiem_core::db::repository::RateLimitRepository;
+use nanosiem_core::db::repository::{RateLimitRepository, SourceScopeRepository};
 use nanosiem_core::db::DualPool;
 use nanosiem_core::detection::{MaterializedViewGenerator, SignalProcessor};
 use nanosiem_core::enrichment::EnrichmentService;
@@ -185,6 +186,15 @@ pub struct AppState {
     pub group_repo: GroupRepository,
     /// Role repository
     pub role_repo: RoleRepository,
+    /// Per-source RBAC scope repository (restricted source_type registry +
+    /// group grants). PG-backed; shared with the source-scopes admin handlers
+    /// (NAN-1799). Mutations must call `source_scope_resolver.invalidate()`.
+    pub source_scope_repo: SourceScopeRepository,
+    /// Per-source RBAC scope resolver. Resolves a user's `ScopeSet` (deny-set
+    /// of restricted source_types) from the registry + their group grants,
+    /// FAIL-CLOSED on PG unavailability. Populated into `AuthContext` by the
+    /// auth middleware; invalidated after any registry/grant mutation.
+    pub source_scope_resolver: SourceScopeResolver,
     /// OIDC repository
     pub oidc_repo: OidcRepository,
     /// OIDC service

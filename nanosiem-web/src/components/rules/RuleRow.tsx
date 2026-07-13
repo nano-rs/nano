@@ -255,7 +255,13 @@ function RuleRowExpanded({ rule }: { rule: RuleView }) {
         </div>
         <div className="px-3 pb-2.5 pt-1 flex items-center gap-1.5 border-t border-border">
           <Link
-            to={`/rules/editor/${rule.id}`}
+            // NAN-1791: a retro-hunt rule has no nPL query — edit it on its own
+            // surface instead of the query editor.
+            to={
+              rule.kind === 'retro_hunt'
+                ? `/rules/retro-hunt/${rule.id}`
+                : `/rules/editor/${rule.id}`
+            }
             className="h-6 px-2 rounded-md text-[11px] flex items-center gap-1.5 text-foreground hover:bg-foreground/5"
           >
             <Pencil className="w-3 h-3" strokeWidth={2} />
@@ -423,13 +429,24 @@ export function RuleRow({ rule, expanded, onToggle, selected, onSelect, onSetMod
         {/* Name + tactic */}
         <td className="py-1.5 pr-3 cursor-pointer" onClick={onToggle}>
           <div className="flex flex-col min-w-0">
-            <Link
-              to={`/rules/${rule.id}/matches`}
-              onClick={(e) => e.stopPropagation()}
-              className="font-mono text-[12px] text-foreground truncate hover:text-primary hover:underline underline-offset-2 w-fit max-w-full"
-            >
-              {rule.name}
-            </Link>
+            <div className="flex items-center gap-1.5 min-w-0">
+              <Link
+                to={`/rules/${rule.id}/matches`}
+                onClick={(e) => e.stopPropagation()}
+                className="font-mono text-[12px] text-foreground truncate hover:text-primary hover:underline underline-offset-2 w-fit max-w-full"
+              >
+                {rule.name}
+              </Link>
+              {/* NAN-1791: retro-hunt rules hunt newly-landed intel over history. */}
+              {rule.kind === 'retro_hunt' && (
+                <span
+                  className="shrink-0 h-[15px] px-1 rounded border border-border text-[9.5px] font-mono uppercase tracking-wide text-muted-foreground leading-[13px]"
+                  title="Auto retro-hunt: matches newly-published threat intel against historical logs"
+                >
+                  retro
+                </span>
+              )}
+            </div>
             {(rule.tactic || rule.tech) && (
               <span className="font-mono text-[10px] text-muted-foreground truncate">
                 {rule.tactic || '—'}

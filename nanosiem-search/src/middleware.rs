@@ -21,8 +21,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use nanosiem_core::auth::{
-    ApiKeyInfo, ApiKeyService, ApiKeyServiceError, PermissionResolver, TokenClaims, TokenConfig,
-    TokenService,
+    ApiKeyInfo, ApiKeyService, ApiKeyServiceError, PermissionResolver, SourceScopeResolver,
+    TokenClaims, TokenConfig, TokenService,
 };
 use nanosiem_core::ip_allowlist::{IpAllowlistScope, IpAllowlistService};
 
@@ -90,6 +90,12 @@ pub struct AuthContext {
     pub is_api_key: bool,
     /// API key ID if authenticated via API key
     pub api_key_id: Option<Uuid>,
+    /// Per-user SOURCE-scope deny set — the restricted `source_type`s this
+    /// principal may NOT read. Populated fail-closed by `SourceScopeResolver`
+    /// in `auth_middleware`; defaults to unrestricted (`ScopeSet::default()`)
+    /// for the constructors. NOTE: the `audit` deny is NOT baked in here —
+    /// handlers UNION it separately based on the `audit:view` permission.
+    pub denied_sources: nanosiem_core::auth::ScopeSet,
 }
 
 impl AuthContext {
@@ -99,6 +105,7 @@ impl AuthContext {
             claims,
             is_api_key: false,
             api_key_id: None,
+            denied_sources: nanosiem_core::auth::ScopeSet::default(),
         }
     }
 
@@ -120,6 +127,7 @@ impl AuthContext {
             },
             is_api_key: true,
             api_key_id: Some(info.id),
+            denied_sources: nanosiem_core::auth::ScopeSet::default(),
         }
     }
 }
@@ -214,6 +222,9 @@ pub struct AuthState {
     pub auth_enabled: bool,
     /// Resolves user permissions from PostgreSQL with caching.
     pub permission_resolver: Option<Arc<PermissionResolver>>,
+    /// Resolves the per-user source-scope deny set (fail-closed). Mirrors
+    /// `permission_resolver`; attached via `with_source_scope_resolver`.
+    pub source_scope_resolver: Option<Arc<SourceScopeResolver>>,
 }
 
 impl AuthState {
@@ -228,6 +239,7 @@ impl AuthState {
             api_key_service: api_key_service.map(Arc::new),
             auth_enabled,
             permission_resolver: None,
+            source_scope_resolver: None,
         }
     }
 
@@ -241,6 +253,7 @@ impl AuthState {
             api_key_service: None,
             auth_enabled: true,
             permission_resolver: None,
+            source_scope_resolver: None,
         }
     }
 
@@ -256,6 +269,13 @@ impl AuthState {
         self
     }
 
+    /// Set the source-scope resolver for fail-closed per-user source deny-set
+    /// resolution (mirrors `with_permission_resolver`).
+    pub fn with_source_scope_resolver(mut self, resolver: SourceScopeResolver) -> Self {
+        self.source_scope_resolver = Some(Arc::new(resolver));
+        self
+    }
+
     /// Disable authentication (for development/testing)
     pub fn disabled() -> Self {
         let token_config = TokenConfig::new("disabled".to_string());
@@ -266,6 +286,46 @@ impl AuthState {
             api_key_service: None,
             auth_enabled: false,
             permission_resolver: None,
+            source_scope_resolver: None,
+        }
+    }
+}
+
+/// Resolve the per-user SOURCE-scope deny set, FAILING CLOSED on registry
+/// unavailability.
+///
+/// On success returns the resolved [`ScopeSet`](nanosiem_core::auth::ScopeSet).
+/// On failure returns the HTTP 503 [`Response`] the caller MUST return — the
+/// request is never allowed to proceed unscoped (an empty/partial deny set is
+/// never substituted on error).
+///
+/// When no resolver is attached (minimal/legacy `AuthState` that never wired
+/// source-scoping) the deny set is empty (unrestricted). That is the
+/// feature-not-configured path — distinct from the resolver erroring — and
+/// preserves prior behavior for setups without a PG-backed resolver.
+async fn resolve_denied_sources(
+    auth_state: &AuthState,
+    user_id: Uuid,
+    roles: &[String],
+) -> Result<nanosiem_core::auth::ScopeSet, Response> {
+    let Some(resolver) = auth_state.source_scope_resolver.as_ref() else {
+        return Ok(nanosiem_core::auth::ScopeSet::default());
+    };
+    match resolver.resolve(user_id, roles).await {
+        Ok(scope) => Ok(scope),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Source-scope registry unavailable — failing closed (503)"
+            );
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(AuthErrorResponse {
+                    error: "source_scope_unavailable".to_string(),
+                    message: "Source-scope authorization is temporarily unavailable".to_string(),
+                }),
+            )
+                .into_response())
         }
     }
 }
@@ -324,7 +384,14 @@ pub async fn auth_middleware(
                 if let Some(ref resolver) = auth_state.permission_resolver {
                     claims.permissions = resolver.resolve_with_roles(claims.sub, &claims.roles).await;
                 }
-                let auth_context = AuthContext::from_jwt(claims.clone());
+                // Resolve the per-user source-scope deny set (fail closed → 503).
+                let denied_sources =
+                    match resolve_denied_sources(&auth_state, claims.sub, &claims.roles).await {
+                        Ok(scope) => scope,
+                        Err(response) => return Err(response),
+                    };
+                let mut auth_context = AuthContext::from_jwt(claims.clone());
+                auth_context.denied_sources = denied_sources;
                 request.extensions_mut().insert(auth_context);
                 request.extensions_mut().insert(claims);
                 return Ok(next.run(request).await);
@@ -344,7 +411,22 @@ pub async fn auth_middleware(
                 .await
             {
                 Ok(info) => {
-                    let auth_context = AuthContext::from_api_key(&info);
+                    let mut auth_context = AuthContext::from_api_key(&info);
+                    // Resolve the per-user source-scope deny set (fail closed → 503).
+                    // NOTE: the API-key principal's `sub` is the KEY id (not the
+                    // owner), so it resolves to empty groups => deny-all-restricted.
+                    // That fail-closed default for API keys is intended — keep it.
+                    let denied_sources = match resolve_denied_sources(
+                        &auth_state,
+                        auth_context.claims.sub,
+                        &auth_context.claims.roles,
+                    )
+                    .await
+                    {
+                        Ok(scope) => scope,
+                        Err(response) => return Err(response),
+                    };
+                    auth_context.denied_sources = denied_sources;
                     let claims = auth_context.claims.clone();
                     request.extensions_mut().insert(auth_context);
                     request.extensions_mut().insert(claims);

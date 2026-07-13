@@ -23,6 +23,8 @@
 //! NO explicit PREWHERE — `optimize_move_to_prewhere` does placement.
 
 use super::*;
+use super::lateral::source_scope_sql_predicate;
+use crate::auth::ScopeSet;
 use crate::query::{IocFeed, IocLookup, RetroAxis, SearchExpr, Value};
 use crate::query::clickhouse_sql_gen::search_expr::{
     classify_indicator, ioc_feed_indicator_subquery, resolve_ioc_observables, scope_observables,
@@ -336,7 +338,12 @@ impl SearchService {
     /// environment" figure, so a small fixed window keeps this cheap (~sub-4s).
     /// A numerator host outside this window can push the ratio >1 → `Common`,
     /// which [`RetroVerdict::from_ratio`] handles as a safe non-rare result.
-    async fn retro_total_hosts(&self) -> u64 {
+    ///
+    /// NAN-1801: the denominator is scoped too (`scope_predicate` is ANDed into
+    /// the WHERE) so a scoped viewer's rarity ratio is measured against the
+    /// population they can see — hosts that only appear in denied sources must
+    /// not leak into the count. `None` (unrestricted) emits byte-identical SQL.
+    async fn retro_total_hosts(&self, scope_predicate: Option<&str>) -> u64 {
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
             None => return 0,
@@ -348,11 +355,12 @@ impl SearchService {
         let start = now - chrono::Duration::hours(RETRO_PREVALENCE_WINDOW_HOURS);
         let sql = format!(
             "SELECT uniq(nullIf({host}, '')) FROM {table} \
-             WHERE timestamp BETWEEN '{start}' AND '{end}'",
+             WHERE timestamp BETWEEN '{start}' AND '{end}'{scope_and}",
             host = host_expr(self.active_profile.as_ref()),
             table = logs_table,
             start = crate::sql_hygiene::format_ch_bound(&start),
             end = crate::sql_hygiene::format_ch_bound(&now),
+            scope_and = scope_and(scope_predicate),
         );
         clickhouse
             .query(&sql)
@@ -408,9 +416,18 @@ impl SearchService {
     /// Re-parses `req.query`, resolves the indicator set (feed pull included),
     /// generates + executes the submode rollup SQL, computes verdict bands
     /// against the environment host count, and paginates server-side.
+    ///
+    /// NAN-1801: the retro rollup is hand-built SQL over the logs table that
+    /// bypasses the nPL search path (the P1 injector never sees it), so the
+    /// caller's effective `ScopeSet` is threaded down here and its deny-set
+    /// predicate is ANDed into EVERY logs scan — the host denominator, the
+    /// summary/top-entities union legs, and the list/pivot rollups. An empty
+    /// deny set renders `None` and every SQL string stays byte-identical to
+    /// the pre-scoping form.
     pub async fn build_retro_view(
         &self,
         req: RetroRequest,
+        scope: &ScopeSet,
     ) -> Result<RetroResponse, SearchError> {
         req.time_range.validate()?;
 
@@ -448,23 +465,47 @@ impl SearchService {
             req.time_range.end,
         ));
         let indicators = self.resolve_retro_indicators(&plan).await?;
-        let total_hosts = self.retro_total_hosts().await;
+
+        // NAN-1801: render the deny-set ONCE; every logs scan below ANDs it.
+        // The indicator-set resolution above is deliberately NOT scoped — it
+        // reads `custom_enrichment_results` / lookup tables (threat intel, not
+        // log events), which carry no `source_type`.
+        let scope_predicate = source_scope_sql_predicate("source_type", scope.deny_set());
+        let scope_predicate = scope_predicate.as_deref();
+
+        let total_hosts = self.retro_total_hosts(scope_predicate).await;
 
         let offset = req.offset.unwrap_or(0);
         let limit = req.limit.unwrap_or(RETRO_PAGE_SIZE).clamp(1, 500);
 
         match plan.submode {
             RetroSubmode::Summary => {
-                self.retro_summary(&plan, &indicators, &range, total_hosts)
+                self.retro_summary(&plan, &indicators, &range, total_hosts, scope_predicate)
                     .await
             }
             RetroSubmode::List => {
-                self.retro_list(&plan, &indicators, &range, total_hosts, offset, limit)
-                    .await
+                self.retro_list(
+                    &plan,
+                    &indicators,
+                    &range,
+                    total_hosts,
+                    offset,
+                    limit,
+                    scope_predicate,
+                )
+                .await
             }
             RetroSubmode::Pivot => {
-                self.retro_pivot(&plan, &indicators, &range, total_hosts, offset, limit)
-                    .await
+                self.retro_pivot(
+                    &plan,
+                    &indicators,
+                    &range,
+                    total_hosts,
+                    offset,
+                    limit,
+                    scope_predicate,
+                )
+                .await
             }
         }
     }
@@ -476,6 +517,7 @@ impl SearchService {
         indicators: &[String],
         range: &TimeRange,
         total_hosts: u64,
+        scope_predicate: Option<&str>,
     ) -> Result<RetroResponse, SearchError> {
         let value = plan
             .values
@@ -494,6 +536,7 @@ impl SearchService {
             &logs_table,
             &value,
             range,
+            scope_predicate,
         );
 
         // Aggregate row: hits, distinct_hosts, first_seen, last_seen, field_counts.
@@ -501,7 +544,7 @@ impl SearchService {
             self.retro_summary_agg(&sql).await?;
 
         let top_entities = self
-            .retro_top_entities(&observables, &value, range)
+            .retro_top_entities(&observables, &value, range, scope_predicate)
             .await
             .unwrap_or_default();
 
@@ -588,6 +631,7 @@ impl SearchService {
         observables: &[ResolvedObservable],
         value: &str,
         range: &TimeRange,
+        scope_predicate: Option<&str>,
     ) -> Result<Vec<RetroTopEntity>, SearchError> {
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
@@ -597,7 +641,7 @@ impl SearchService {
             .table_names
             .read(Self::logs_table_key(self.active_profile.as_ref()));
         let host = host_expr(self.active_profile.as_ref());
-        let union = union_match_legs(observables, &logs_table, value, range, &host);
+        let union = union_match_legs(observables, &logs_table, value, range, &host, scope_predicate);
         let sql = format!(
             "SELECT _host AS id, uniqExact(_rid) AS hits FROM ({union}) \
              WHERE _host != '' GROUP BY _host ORDER BY hits DESC LIMIT 10",
@@ -673,6 +717,7 @@ impl SearchService {
         total_hosts: u64,
         offset: usize,
         limit: usize,
+        scope_predicate: Option<&str>,
     ) -> Result<RetroResponse, SearchError> {
         let logs_table = self
             .table_names
@@ -695,6 +740,7 @@ impl SearchService {
             range,
             0,
             full_limit,
+            scope_predicate,
         );
 
         let clickhouse = self
@@ -767,6 +813,7 @@ impl SearchService {
         total_hosts: u64,
         offset: usize,
         limit: usize,
+        scope_predicate: Option<&str>,
     ) -> Result<RetroResponse, SearchError> {
         let logs_table = self
             .table_names
@@ -784,6 +831,7 @@ impl SearchService {
             range,
             offset,
             limit + 1,
+            scope_predicate,
         );
 
         let clickhouse = self
@@ -857,9 +905,279 @@ impl SearchService {
 
 }
 
+// =============================================================================
+// Auto retro-hunt support (NAN-1791)
+// =============================================================================
+//
+// A retro-hunt DETECTION rule pulls the delta of newly-landed feed indicators
+// and hunts them over historical logs, emitting hits through the standard signal
+// processor. These two methods are the ClickHouse half:
+//   * `retro_hunt_feed_candidates` — the delta candidate set above a watermark.
+//   * `retro_hunt_over_indicators` — the batched list-rollup hunt (ONE query for
+//     the whole indicator set), reusing the same index-pruning machinery as the
+//     interactive `| retro` list submode.
+
+/// Row shape for the feed-candidate scan.
+#[derive(clickhouse::Row, serde::Deserialize)]
+struct RetroFeedCandidateRow {
+    value: String,
+    key_type: String,
+    enrichment_name: String,
+    confidence: u32,
+    fetched_at_ms: i64,
+}
+
+impl SearchService {
+    /// Build the SQL for the delta candidate scan over `custom_enrichment_results`
+    /// (split out for unit testing).
+    ///
+    /// Live IOC rows only (`is_ioc = 1 AND expires_at > now()`), STRICTLY after
+    /// the keyset cursor, optionally narrowed to selected feeds and artifact
+    /// types. Grouped by lowercased value so a ReplacingMergeTree's duplicate
+    /// versions collapse to one candidate carrying its newest `fetched_at`.
+    ///
+    /// ## Why the cursor is a keyset, not a bare timestamp
+    ///
+    /// A feed sync bulk-stamps thousands of indicators with the SAME
+    /// `fetched_at`. With a timestamp-only cursor, a tie group larger than the
+    /// per-run cap can never be drained: advancing past the timestamp skips the
+    /// group's unprocessed tail, and NOT advancing means the capped, ordered
+    /// query keeps returning the same already-hunted rows every run — so the tail
+    /// is never hunted. Ordering by `(fetched_at, value)` and cursoring on the
+    /// pair makes the cursor strictly monotonic, guaranteeing forward progress.
+    ///
+    /// The cursor predicate is applied at ROW level (both `fetched_at` and
+    /// `lower(key_value)` are row expressions, not aggregates), which is sound
+    /// under the `GROUP BY value`: a group's true newest row always satisfies the
+    /// predicate whenever the group belongs above the cursor, so `max(fetched_at)`
+    /// over the surviving rows equals the group's true `fetched_at`.
+    fn retro_hunt_candidates_sql(
+        table: &str,
+        feeds: &[String],
+        artifact_types: &[String],
+        cursor: Option<(i64, &str)>,
+        limit: usize,
+    ) -> String {
+        let mut filters = String::from("is_ioc = 1 AND expires_at > now()");
+        if let Some((ms, value)) = cursor {
+            // fromUnixTimestamp64Milli reconstructs the DateTime64(3) bound so the
+            // comparison stays in the column's own type (no coercion surprises).
+            let v = escape_sql_string(&value.to_lowercase());
+            filters.push_str(&format!(
+                " AND (fetched_at > fromUnixTimestamp64Milli({ms}) \
+                 OR (fetched_at = fromUnixTimestamp64Milli({ms}) AND lower(key_value) > '{v}'))"
+            ));
+        }
+        if !feeds.is_empty() {
+            let list = feeds
+                .iter()
+                .map(|f| format!("'{}'", escape_sql_string(&f.to_lowercase())))
+                .collect::<Vec<_>>()
+                .join(", ");
+            filters.push_str(&format!(" AND lower(enrichment_name) IN ({list})"));
+        }
+        if !artifact_types.is_empty() {
+            let list = artifact_types
+                .iter()
+                .map(|t| format!("'{}'", escape_sql_string(&t.to_lowercase())))
+                .collect::<Vec<_>>()
+                .join(", ");
+            filters.push_str(&format!(" AND key_type IN ({list})"));
+        }
+        format!(
+            "SELECT lower(key_value) AS value, \
+             any(key_type) AS key_type, \
+             any(enrichment_name) AS enrichment_name, \
+             toUInt32(max(confidence)) AS confidence, \
+             toInt64(toUnixTimestamp64Milli(max(fetched_at))) AS fetched_at_ms \
+             FROM {table} \
+             WHERE {filters} \
+             GROUP BY value \
+             HAVING value != '' \
+             ORDER BY fetched_at_ms ASC, value ASC \
+             LIMIT {limit}"
+        )
+    }
+
+    /// Pull the delta candidate set for a retro-hunt run (NAN-1791).
+    ///
+    /// Returns up to `limit` distinct candidate indicators strictly after the
+    /// keyset `cursor`, ordered by `(fetched_at, value)`. The caller applies the
+    /// per-rule hunted-set anti-join + per-run cap and advances the cursor.
+    pub async fn retro_hunt_feed_candidates(
+        &self,
+        feeds: &[String],
+        artifact_types: &[String],
+        cursor: Option<(i64, &str)>,
+        limit: usize,
+    ) -> Result<Vec<RetroFeedCandidate>, SearchError> {
+        let clickhouse = match &self.ch_client {
+            Some(ch) => ch,
+            None => return Ok(Vec::new()),
+        };
+        // Reads via the `_distributed` wrapper on clusters (completeness across
+        // shards); single-node emits the local name unchanged.
+        let table = self.table_names.read("custom_enrichment_results");
+        let sql = Self::retro_hunt_candidates_sql(&table, feeds, artifact_types, cursor, limit);
+        let rows = clickhouse
+            .query(&sql)
+            .fetch_all::<RetroFeedCandidateRow>()
+            .await
+            .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| RetroFeedCandidate {
+                value: r.value,
+                key_type: r.key_type,
+                enrichment_name: r.enrichment_name,
+                confidence: r.confidence,
+                fetched_at_ms: r.fetched_at_ms,
+            })
+            .collect())
+    }
+
+    /// Count distinct candidate indicators still remaining after `cursor` — the
+    /// honest overflow figure when a run truncates. Because the cursor is strict,
+    /// this counts exactly the not-yet-covered candidates. Bounded by the feed
+    /// table (which carries a short TTL), so it stays cheap.
+    pub async fn retro_hunt_candidate_count(
+        &self,
+        feeds: &[String],
+        artifact_types: &[String],
+        cursor: Option<(i64, &str)>,
+    ) -> Result<u64, SearchError> {
+        let clickhouse = match &self.ch_client {
+            Some(ch) => ch,
+            None => return Ok(0),
+        };
+        let table = self.table_names.read("custom_enrichment_results");
+        // Reuse the candidate SQL as a subquery and count its rows (an unbounded
+        // LIMIT via a large ceiling; the feed table is small).
+        let inner =
+            Self::retro_hunt_candidates_sql(&table, feeds, artifact_types, cursor, 1_000_000);
+        let sql = format!("SELECT toUInt64(count()) FROM ({inner})");
+        clickhouse
+            .query(&sql)
+            .fetch_one::<u64>()
+            .await
+            .map_err(|e| parse_clickhouse_error(&e.to_string()))
+    }
+
+    /// Batched retro hunt over an explicit indicator set (NAN-1791).
+    ///
+    /// Reuses the list-submode rollup SQL: ONE index-pruned query over the
+    /// lookback window that groups by indicator and returns per-indicator hits /
+    /// hosts / first-seen / last-seen, with a rarity verdict. Only indicators
+    /// that were actually found in logs (`hits > 0`) come back — those are the
+    /// retro HITS the engine emits as signals.
+    pub async fn retro_hunt_over_indicators(
+        &self,
+        indicators: &[String],
+        lookback_days: i64,
+    ) -> Result<Vec<RetroHuntHit>, SearchError> {
+        if indicators.is_empty() {
+            return Ok(Vec::new());
+        }
+        let end = chrono::Utc::now();
+        let start = end - chrono::Duration::days(lookback_days.clamp(1, RETRO_RETENTION_DAYS));
+        let range = Self::retro_time_range(&TimeRange::new(start, end));
+
+        let observables = scope_observables(&self.retro_observables(), indicators);
+        let predicate = Self::retro_match_predicate(&observables, indicators);
+        let logs_table = self
+            .table_names
+            .read(Self::logs_table_key(self.active_profile.as_ref()));
+
+        // Full grouped result (bounded by indicators.len() <= cap): unpaged.
+        // NAN-1801: deliberately UNSCOPED (`None`). This is the detection-run
+        // system path — the rule executes as the engine, not as a per-user
+        // viewer, so per-source RBAC does not apply here (mirrors scheduled
+        // detection execution; scoping applies at the read surfaces instead).
+        let full_limit = indicators.len().max(1);
+        let sql = build_list_sql(
+            self.active_profile.as_ref(),
+            &observables,
+            &logs_table,
+            &predicate,
+            indicators,
+            &range,
+            0,
+            full_limit,
+            None,
+        );
+
+        let clickhouse = self
+            .ch_client
+            .as_ref()
+            .ok_or_else(|| SearchError::SqlValidationError("ClickHouse unavailable".to_string()))?;
+        let rows = clickhouse
+            .query(&sql)
+            .fetch_all::<RetroListRowRaw>()
+            .await
+            .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
+
+        // Unscoped denominator too (system path — see the build_list_sql note).
+        let total_hosts = self.retro_total_hosts(None).await;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let verdict = if total_hosts == 0 {
+                    RetroVerdict::Rare
+                } else {
+                    RetroVerdict::from_ratio(r.hosts as f64 / total_hosts as f64)
+                };
+                RetroHuntHit {
+                    indicator_type: classify_indicator(&r.value).to_string(),
+                    value: r.value,
+                    field: r.field,
+                    hits: r.hits,
+                    hosts: r.hosts,
+                    total_hosts,
+                    first_seen: normalize_ts(r.first_seen),
+                    last_seen: normalize_ts(r.last_seen),
+                    verdict: verdict.as_str().to_string(),
+                }
+            })
+            .collect())
+    }
+
+    /// List the distinct live IOC feed names (`enrichment_name`) available to a
+    /// retro-hunt rule's feed picker (NAN-1791). Best-effort: an empty list on
+    /// error or no ClickHouse.
+    pub async fn list_ioc_feed_names(&self) -> Result<Vec<String>, SearchError> {
+        let clickhouse = match &self.ch_client {
+            Some(ch) => ch,
+            None => return Ok(Vec::new()),
+        };
+        let table = self.table_names.read("custom_enrichment_results");
+        let sql = format!(
+            "SELECT DISTINCT enrichment_name FROM {table} \
+             WHERE is_ioc = 1 AND expires_at > now() AND enrichment_name != '' \
+             ORDER BY enrichment_name ASC LIMIT 500"
+        );
+        match clickhouse.query(&sql).fetch_all::<String>().await {
+            Ok(rows) => Ok(rows),
+            Err(e) => {
+                tracing::warn!("Retro-hunt feed list query failed: {}", e);
+                Ok(Vec::new())
+            }
+        }
+    }
+}
+
 /// Format a time-range bound for a ClickHouse `timestamp BETWEEN` clause.
 fn ts(t: &chrono::DateTime<chrono::Utc>) -> String {
     crate::sql_hygiene::format_ch_bound(t)
+}
+
+/// Render a pre-built source-scope predicate as an ` AND <pred>` suffix for a
+/// WHERE clause, or the empty string when the caller is unrestricted (NAN-1801).
+/// The empty-string form keeps unrestricted SQL byte-identical to pre-scoping.
+fn scope_and(scope_predicate: Option<&str>) -> String {
+    scope_predicate
+        .map(|p| format!(" AND {p}"))
+        .unwrap_or_default()
 }
 
 /// Per-observable comparison expression (RAW vs `lower()`) over the
@@ -899,9 +1217,10 @@ fn build_summary_sql(
     table: &str,
     value: &str,
     range: &TimeRange,
+    scope_predicate: Option<&str>,
 ) -> String {
     let host = host_expr(profile);
-    let union = union_match_legs(observables, table, value, range, &host);
+    let union = union_match_legs(observables, table, value, range, &host, scope_predicate);
     let count_tuples: Vec<String> = observables
         .iter()
         .map(|obs| format!("('{l}', toUInt64(countIf(_mf = '{l}')))", l = obs.logical))
@@ -935,10 +1254,15 @@ fn union_match_legs(
     value: &str,
     range: &TimeRange,
     host: &str,
+    scope_predicate: Option<&str>,
 ) -> String {
     let escaped_val = escape_sql_string(&value.to_lowercase());
     let start = ts(&range.start);
     let end = ts(&range.end);
+    // NAN-1801: EVERY leg carries the caller's source-scope gate — the legs
+    // are independent scans, so gating only some would leak denied-source rows
+    // through the ungated legs. Empty (unrestricted) appends nothing.
+    let gate = scope_and(scope_predicate);
     let legs: Vec<String> = observables
         .iter()
         .map(|obs| {
@@ -949,7 +1273,7 @@ fn union_match_legs(
             };
             format!(
                 "SELECT id AS _rid, timestamp AS _ts, {host} AS _host, '{l}' AS _mf \
-                 FROM {table} WHERE timestamp BETWEEN '{start}' AND '{end}' AND {cmp}",
+                 FROM {table} WHERE timestamp BETWEEN '{start}' AND '{end}' AND {cmp}{gate}",
                 l = obs.logical,
             )
         })
@@ -979,6 +1303,7 @@ fn build_list_sql(
     range: &TimeRange,
     offset: usize,
     fetch: usize,
+    scope_predicate: Option<&str>,
 ) -> String {
     let tuple_legs: Vec<String> = observables
         .iter()
@@ -999,7 +1324,7 @@ fn build_list_sql(
          formatDateTime(max(timestamp), '%Y-%m-%dT%H:%i:%sZ') AS last_seen \
          FROM {table} \
          ARRAY JOIN {tuples} AS obs \
-         WHERE timestamp BETWEEN '{start}' AND '{end}' AND {pred} \
+         WHERE timestamp BETWEEN '{start}' AND '{end}' AND {pred}{gate} \
          AND obs.2 IN ({values}) \
          GROUP BY value \
          ORDER BY hosts ASC, hits ASC \
@@ -1008,6 +1333,7 @@ fn build_list_sql(
         start = ts(&range.start),
         end = ts(&range.end),
         pred = predicate,
+        gate = scope_and(scope_predicate),
         values = sql_in_list(indicators),
     )
 }
@@ -1026,6 +1352,7 @@ fn build_pivot_sql(
     range: &TimeRange,
     offset: usize,
     fetch: usize,
+    scope_predicate: Option<&str>,
 ) -> String {
     let entity_expr = match axis {
         RetroAxis::User => user_pivot_expr(profile),
@@ -1066,7 +1393,7 @@ fn build_pivot_sql(
          formatDateTime(min(timestamp), '%Y-%m-%dT%H:%i:%sZ') AS first_seen, \
          formatDateTime(max(timestamp), '%Y-%m-%dT%H:%i:%sZ') AS last_seen \
          FROM {table} \
-         WHERE timestamp BETWEEN '{start}' AND '{end}' AND {pred} \
+         WHERE timestamp BETWEEN '{start}' AND '{end}' AND {pred}{gate} \
          AND {entity} != '' \
          GROUP BY id \
          ORDER BY first_seen ASC \
@@ -1076,6 +1403,7 @@ fn build_pivot_sql(
         start = ts(&range.start),
         end = ts(&range.end),
         pred = predicate,
+        gate = scope_and(scope_predicate),
     )
 }
 
@@ -1297,7 +1625,7 @@ mod tests {
         // NAN-1589: the summary is a per-column UNION ALL (each leg index-prunable),
         // not a single OR (which can't combine skip indexes across columns).
         let obs = udm_obs();
-        let sql = build_summary_sql(&udm(), &obs, "logs", "1.2.3.4", &range());
+        let sql = build_summary_sql(&udm(), &obs, "logs", "1.2.3.4", &range(), None);
         assert!(sql.contains("UNION ALL"), "must be a per-column union: {sql}");
         assert!(sql.contains("WHERE timestamp BETWEEN"));
         assert!(!sql.contains("PREWHERE"));
@@ -1321,7 +1649,7 @@ mod tests {
         // NAN-1580/1589: each UNION leg matches the resolved OCSF physical column,
         // but the _mf field-count label stays the LOGICAL UDM name (stable UI label).
         let obs = ocsf_obs();
-        let sql = build_summary_sql(&ocsf(), &obs, "ocsf_logs", "1.2.3.4", &range());
+        let sql = build_summary_sql(&ocsf(), &obs, "ocsf_logs", "1.2.3.4", &range(), None);
         assert!(sql.contains("UNION ALL"), "got: {sql}");
         // leg matches the resolved OCSF column...
         assert!(
@@ -1345,7 +1673,7 @@ mod tests {
         let inds = vec!["a.com".to_string(), "b.com".to_string()];
         let obs = udm_obs();
         let pred = SearchService::retro_match_predicate(&obs, &inds);
-        let sql = build_list_sql(&udm(), &obs, "logs", &pred, &inds, &range(), 0, 51);
+        let sql = build_list_sql(&udm(), &obs, "logs", &pred, &inds, &range(), 0, 51, None);
         assert!(sql.contains("WHERE timestamp BETWEEN") && !sql.contains("PREWHERE"));
         assert!(sql.contains("GROUP BY value"));
         assert!(sql.contains("ORDER BY hosts ASC, hits ASC"));
@@ -1361,7 +1689,7 @@ mod tests {
         let inds = vec!["a.com".to_string()];
         let obs = ocsf_obs();
         let pred = SearchService::retro_match_predicate(&obs, &inds);
-        let sql = build_list_sql(&ocsf(), &obs, "ocsf_logs", &pred, &inds, &range(), 0, 51);
+        let sql = build_list_sql(&ocsf(), &obs, "ocsf_logs", &pred, &inds, &range(), 0, 51, None);
         assert!(sql.contains("ARRAY JOIN"));
         // logical label, OCSF physical value expr.
         assert!(
@@ -1378,8 +1706,9 @@ mod tests {
         let obs = udm_obs();
         let pred = SearchService::retro_match_predicate(&obs, &inds);
 
-        let asset_sql =
-            build_pivot_sql(&udm(), &obs, "logs", RetroAxis::Asset, &pred, &inds, &range(), 0, 51);
+        let asset_sql = build_pivot_sql(
+            &udm(), &obs, "logs", RetroAxis::Asset, &pred, &inds, &range(), 0, 51, None,
+        );
         assert!(asset_sql.contains("WHERE timestamp BETWEEN") && !asset_sql.contains("PREWHERE"));
         assert!(asset_sql.contains("GROUP BY id"));
         assert!(asset_sql.contains("ORDER BY first_seen ASC"));
@@ -1390,8 +1719,9 @@ mod tests {
         assert!(asset_sql.contains("any('') AS ident_name"));
         assert!(asset_sql.contains("any('') AS ident_dept"));
 
-        let user_sql =
-            build_pivot_sql(&udm(), &obs, "logs", RetroAxis::User, &pred, &inds, &range(), 0, 51);
+        let user_sql = build_pivot_sql(
+            &udm(), &obs, "logs", RetroAxis::User, &pred, &inds, &range(), 0, 51, None,
+        );
         // User pivot keys on the user expression.
         assert!(user_sql.contains("lower(\"user\")"));
         // User pivot resolves identity via the user_registry_dict (display_name +
@@ -1422,14 +1752,14 @@ mod tests {
         let pred = SearchService::retro_match_predicate(&obs, &inds);
 
         let asset_sql = build_pivot_sql(
-            &ocsf(), &obs, "ocsf_logs", RetroAxis::Asset, &pred, &inds, &range(), 0, 51,
+            &ocsf(), &obs, "ocsf_logs", RetroAxis::Asset, &pred, &inds, &range(), 0, 51, None,
         );
         // src_ip identity leg → OCSF column; no bare UDM `nullIf(src_ip`.
         assert!(asset_sql.contains("\"src_endpoint.ip\""), "got: {asset_sql}");
         assert!(!asset_sql.contains("nullIf(src_ip"), "got: {asset_sql}");
 
         let user_sql = build_pivot_sql(
-            &ocsf(), &obs, "ocsf_logs", RetroAxis::User, &pred, &inds, &range(), 0, 51,
+            &ocsf(), &obs, "ocsf_logs", RetroAxis::User, &pred, &inds, &range(), 0, 51, None,
         );
         // user → user_unified (OCSF class-split column), not bare `user`.
         assert!(user_sql.contains("user_unified"), "got: {user_sql}");
@@ -1486,5 +1816,154 @@ mod tests {
         assert_eq!(mixed.len(), all.len());
         // Empty indicator set → full set (defensive; never an empty predicate).
         assert_eq!(scope_observables(&all, &[]).len(), all.len());
+    }
+
+    // ------------------------------------------------------------------------
+    // Source-scope gating of the retro logs scans (NAN-1801)
+    // ------------------------------------------------------------------------
+
+    fn deny(vals: &[&str]) -> std::collections::BTreeSet<String> {
+        vals.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// NAN-1801 multi-scan completeness: the rendered deny predicate must land
+    /// in EVERY hand-built logs scan — each summary/top-entities UNION leg
+    /// (they are independent scans; one ungated leg leaks denied rows), the
+    /// list rollup, and the pivot rollup.
+    #[test]
+    fn retro_sql_scope_gate_lands_in_every_logs_scan() {
+        let obs = udm_obs();
+        let rendered = source_scope_sql_predicate("source_type", &deny(&["audit"]));
+        let scope = rendered.as_deref();
+        let gate = "lower(source_type) != 'audit'";
+
+        // Summary: one gate per UNION leg (legs = observables).
+        let sql = build_summary_sql(&udm(), &obs, "logs", "1.2.3.4", &range(), scope);
+        let legs = sql.matches("UNION ALL").count() + 1;
+        assert_eq!(legs, obs.len(), "one leg per observable: {sql}");
+        assert_eq!(
+            sql.matches(gate).count(),
+            legs,
+            "every summary union leg must carry the scope gate: {sql}"
+        );
+
+        // Raw union body (top-entities path) — same per-leg gating.
+        let union = union_match_legs(&obs, "logs", "1.2.3.4", &range(), "host", scope);
+        assert_eq!(union.matches(gate).count(), obs.len(), "got: {union}");
+
+        // List rollup: single scan, gated once, inside the WHERE.
+        let inds = vec!["1.2.3.4".to_string()];
+        let pred = SearchService::retro_match_predicate(&obs, &inds);
+        let list = build_list_sql(&udm(), &obs, "logs", &pred, &inds, &range(), 0, 51, scope);
+        assert_eq!(list.matches(gate).count(), 1, "got: {list}");
+        assert!(list.contains(&format!("AND {gate}")), "got: {list}");
+
+        // Pivot rollup (both axes): single scan, gated once.
+        for axis in [RetroAxis::Asset, RetroAxis::User] {
+            let pivot = build_pivot_sql(
+                &udm(), &obs, "logs", axis, &pred, &inds, &range(), 0, 51, scope,
+            );
+            assert_eq!(pivot.matches(gate).count(), 1, "axis {axis:?}: {pivot}");
+        }
+
+        // Multi-source deny renders the NOT IN form (lexicographic order).
+        let multi = source_scope_sql_predicate("source_type", &deny(&["otel", "audit"]));
+        let list_multi = build_list_sql(
+            &udm(), &obs, "logs", &pred, &inds, &range(), 0, 51, multi.as_deref(),
+        );
+        assert!(
+            list_multi.contains("lower(source_type) NOT IN ('audit', 'otel')"),
+            "got: {list_multi}"
+        );
+    }
+
+    /// NAN-1801 back-compat: an unrestricted caller (empty deny → `None`) must
+    /// leave every retro SQL string byte-identical to the pre-scoping form —
+    /// no `source_type` reference of any kind appears.
+    #[test]
+    fn retro_sql_unrestricted_scope_emits_no_gate() {
+        let obs = udm_obs();
+        // Empty deny set renders no predicate at all.
+        assert_eq!(source_scope_sql_predicate("source_type", &deny(&[])), None);
+
+        let inds = vec!["1.2.3.4".to_string()];
+        let pred = SearchService::retro_match_predicate(&obs, &inds);
+        let summary = build_summary_sql(&udm(), &obs, "logs", "1.2.3.4", &range(), None);
+        let list = build_list_sql(&udm(), &obs, "logs", &pred, &inds, &range(), 0, 51, None);
+        let pivot = build_pivot_sql(
+            &udm(), &obs, "logs", RetroAxis::Asset, &pred, &inds, &range(), 0, 51, None,
+        );
+        for sql in [&summary, &list, &pivot] {
+            assert!(!sql.contains("source_type"), "unscoped SQL must not gate: {sql}");
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Retro-hunt candidate SQL (NAN-1791)
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn retro_hunt_candidates_sql_live_ioc_grouped_oldest_first() {
+        let sql = SearchService::retro_hunt_candidates_sql(
+            "custom_enrichment_results",
+            &[],
+            &[],
+            None,
+            501,
+        );
+        // Live IOC rows only.
+        assert!(sql.contains("is_ioc = 1 AND expires_at > now()"), "got: {sql}");
+        // Grouped by lowercased value so ReplacingMergeTree dupes collapse.
+        assert!(sql.contains("GROUP BY value"), "got: {sql}");
+        assert!(sql.contains("lower(key_value) AS value"), "got: {sql}");
+        // Oldest-first + value tiebreak = deterministic draining.
+        assert!(sql.contains("ORDER BY fetched_at_ms ASC, value ASC"), "got: {sql}");
+        assert!(sql.contains("LIMIT 501"), "got: {sql}");
+        // No cursor / feed / type filters when unset.
+        assert!(!sql.contains("fetched_at >"), "got: {sql}");
+        assert!(!sql.contains("enrichment_name IN"), "got: {sql}");
+        assert!(!sql.contains("key_type IN"), "got: {sql}");
+    }
+
+    #[test]
+    fn retro_hunt_candidates_sql_applies_keyset_cursor_feed_and_type_filters() {
+        let sql = SearchService::retro_hunt_candidates_sql(
+            "custom_enrichment_results",
+            &["ThreatFox".to_string(), "URLhaus".to_string()],
+            &["ip".to_string(), "domain".to_string()],
+            Some((1_700_000_000_000, "1.2.3.4")),
+            51,
+        );
+        // STRICT keyset cursor: later timestamp, OR same timestamp + later value.
+        assert!(
+            sql.contains("fetched_at > fromUnixTimestamp64Milli(1700000000000)"),
+            "got: {sql}"
+        );
+        assert!(
+            sql.contains(
+                "fetched_at = fromUnixTimestamp64Milli(1700000000000) AND lower(key_value) > '1.2.3.4'"
+            ),
+            "got: {sql}"
+        );
+        // Feed filter lowercased.
+        assert!(
+            sql.contains("lower(enrichment_name) IN ('threatfox', 'urlhaus')"),
+            "got: {sql}"
+        );
+        // Artifact-type filter.
+        assert!(sql.contains("key_type IN ('ip', 'domain')"), "got: {sql}");
+    }
+
+    #[test]
+    fn retro_hunt_candidates_sql_cursor_value_is_escaped() {
+        // A single quote in the cursor value must not break out of the literal.
+        let sql = SearchService::retro_hunt_candidates_sql(
+            "t",
+            &[],
+            &[],
+            Some((1000, "o'brien")),
+            10,
+        );
+        assert!(sql.contains("lower(key_value) > 'o''brien'"), "got: {sql}");
     }
 }

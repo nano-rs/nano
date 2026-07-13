@@ -35,7 +35,7 @@ async fn list_does_not_error_on_null_rule_id() {
 
     // Pre-fix this 500'd while decoding column "rule_id": unexpected null.
     let alerts = repo
-        .list(None, None, None, 100, 0)
+        .list(None, None, None, 100, 0, &std::collections::BTreeSet::new())
         .await
         .expect("AlertRepository::list must not error on a NULL rule_id row");
 

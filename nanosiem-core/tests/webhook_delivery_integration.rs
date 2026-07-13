@@ -58,6 +58,9 @@ fn create_req(name: &str, url: String, event_types: Vec<&str>, secret: Option<&s
         secret: secret.map(str::to_string),
         severity_filter: None,
         event_types: Some(event_types.into_iter().map(str::to_string).collect()),
+        channel_type: None,
+        channel_config: None,
+        rule_filter: None,
         enabled: Some(true),
     }
 }

@@ -278,6 +278,7 @@ fn dataset_label(ds: crate::query::clickhouse_sql_gen::otel::Dataset) -> &'stati
         Dataset::Logs => "logs",
         Dataset::Spans => "spans",
         Dataset::Metrics => "metrics",
+        Dataset::Risk => "risk",
     }
 }
 

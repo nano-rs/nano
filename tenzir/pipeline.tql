@@ -39,6 +39,23 @@ accept_http $listen { read_ndjson }
 // them in nano's wire shape {event, source_type}. For raw logs, do your
 // parsing + OCSF mapping here and set a lowercase `source_type` per feed.
 // Every record's `event` must carry `class_uid` and `time` (epoch ms).
+//
+// PRESERVE THE ORIGINAL (NAN-1827). If you parse a raw log here, keep the
+// untouched original — syslog header and all — on `event.raw_data`, and use
+// `event.message` for the human-readable summary. nano persists `raw_data` to
+// its own column for the full retention window, so an OCSF feed re-materializes
+// straight from it by re-running this mapping; no parallel raw archive.
+//
+//   let $original = this                    // BEFORE you parse anything
+//   ... your parsing + OCSF mapping ...
+//   event.raw_data = $original              // the bytes as received
+//   event.message  = "<human-readable summary>"
+//
+// `raw_data` is OCSF `string_t` (not json_t since OCSF 1.5) — send a STRING. An
+// object is stringified with its KEYS REORDERED, so it stops being byte-exact.
+// It is stored, not searched by bare keywords: a bare `foo` hunt still targets
+// `message`, so put something meaningful there. Leave `raw_data` unset and you
+// pay nothing for it (empty column), but the original is gone.
 this = { event: this, source_type: "tenzir" }
 // Guard: `to_clickhouse` drops an event that has a NULL in a required column —
 // even one that has a ClickHouse DEFAULT (only ABSENT columns take the default).

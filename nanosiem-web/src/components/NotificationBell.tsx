@@ -21,6 +21,7 @@ import {
   Search,
   XCircle,
   RefreshCw,
+  FileText,
 } from 'lucide-react';
 import { PivtIcon } from '@/enterprise/icons/PivtIcon';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -47,6 +48,8 @@ const NOTIFICATION_ICONS: Record<NotificationType, typeof Bell> = {
   search_completed: Search,
   search_failed: XCircle,
   notebook_mention: BookOpen,
+  // NAN-1793: a scheduled report finished — link points at the /reports list.
+  report_ready: FileText,
   model_deprecated: RefreshCw,
 };
 
@@ -65,6 +68,7 @@ const NOTIFICATION_TONE: Partial<Record<NotificationType, Tone>> = {
   search_failed: 'danger',
   search_access_removed: 'warn',
   case_access_removed: 'warn',
+  report_ready: 'good',
   model_deprecated: 'warn',
 };
 

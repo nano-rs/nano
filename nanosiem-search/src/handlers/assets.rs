@@ -3,12 +3,26 @@
 //! Asset and cloud event endpoints: pagination, timeline, pivot, time range, artifacts.
 
 use axum::{Json, extract::State};
-use nanosiem_core::TimeRangeInput;
+use nanosiem_core::{TimeRangeInput, auth::permissions};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 use crate::error::ErrorResponse;
 use crate::{SearchState, error::SearchError, metrics::record_search_query};
+
+/// NAN-1801: these endpoints run hand-built scans over logs (and, for cloud,
+/// arbitrary client-echoed nPL) — the same data surface as POST /api/search —
+/// so they require the same `search:execute` permission. They were previously
+/// bearer-only.
+fn require_search_execute(auth: &crate::AuthContext) -> Result<(), SearchError> {
+    if auth.claims.has_permission(permissions::SEARCH_EXECUTE) {
+        Ok(())
+    } else {
+        Err(SearchError::Forbidden(
+            "Asset and cloud queries require the search:execute permission".to_string(),
+        ))
+    }
+}
 
 // ============================================================================
 // Asset Events Pagination
@@ -75,11 +89,16 @@ pub struct AssetEventsResponse {
 )]
 pub async fn get_asset_events(
     State(state): State<SearchState>,
+    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<AssetEventsRequest>,
 ) -> Result<(axum::http::HeaderMap, Json<AssetEventsResponse>), SearchError> {
     let start = Instant::now();
+    require_search_execute(&auth)?;
 
+    // NAN-1801: the caller's effective source scope changes the executed SQL,
+    // so it is part of result identity — fold it into the cache key.
+    let scope = super::search::effective_scope(&auth);
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "aevents",
         &[
@@ -96,6 +115,7 @@ pub async fn get_asset_events(
                 .unwrap_or_default()
                 .as_bytes(),
         ],
+        &scope,
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -121,6 +141,7 @@ pub async fn get_asset_events(
             request.offset,
             request.limit,
             request.filters.as_ref(),
+            &scope,
         )
         .await;
 
@@ -219,11 +240,14 @@ pub struct CloudEventsResponse {
 )]
 pub async fn get_cloud_events(
     State(state): State<SearchState>,
+    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<CloudEventsRequest>,
 ) -> Result<(axum::http::HeaderMap, Json<CloudEventsResponse>), SearchError> {
     let start = Instant::now();
+    require_search_execute(&auth)?;
 
+    let scope = super::search::effective_scope(&auth);
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "cevents",
         &[
@@ -236,6 +260,7 @@ pub async fn get_cloud_events(
                 .unwrap_or_default()
                 .as_bytes(),
         ],
+        &scope,
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -258,6 +283,7 @@ pub async fn get_cloud_events(
             request.offset,
             request.limit,
             request.filters.as_ref(),
+            &scope,
         )
         .await;
 
@@ -333,11 +359,14 @@ pub struct CloudUserTimelineResponse {
 )]
 pub async fn get_cloud_user_timeline(
     State(state): State<SearchState>,
+    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<CloudUserTimelineRequest>,
 ) -> Result<(axum::http::HeaderMap, Json<CloudUserTimelineResponse>), SearchError> {
     let start = Instant::now();
+    require_search_execute(&auth)?;
 
+    let scope = super::search::effective_scope(&auth);
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "cusertl",
         &[
@@ -346,6 +375,7 @@ pub async fn get_cloud_user_timeline(
             request.time_range.end.timestamp_micros().to_string().as_bytes(),
             request.user.as_bytes(),
         ],
+        &scope,
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -365,7 +395,7 @@ pub async fn get_cloud_user_timeline(
 
     let result = state
         .search
-        .query_cloud_user_timeline(&request.query, &time_range, &request.user)
+        .query_cloud_user_timeline(&request.query, &time_range, &request.user, &scope)
         .await;
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -433,11 +463,14 @@ pub struct CloudEntityPivotResponse {
 )]
 pub async fn get_cloud_entity_pivot(
     State(state): State<SearchState>,
+    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<CloudEntityPivotRequest>,
 ) -> Result<(axum::http::HeaderMap, Json<CloudEntityPivotResponse>), SearchError> {
     let start = Instant::now();
+    require_search_execute(&auth)?;
 
+    let scope = super::search::effective_scope(&auth);
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "centity",
         &[
@@ -447,6 +480,7 @@ pub async fn get_cloud_entity_pivot(
             request.entity_type.as_bytes(),
             request.entity_value.as_bytes(),
         ],
+        &scope,
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -471,6 +505,7 @@ pub async fn get_cloud_entity_pivot(
             &time_range,
             &request.entity_type,
             &request.entity_value,
+            &scope,
         )
         .await;
 
@@ -539,11 +574,20 @@ pub struct AssetTrueTimeRangeResponse {
 )]
 pub async fn get_asset_true_time_range(
     State(state): State<SearchState>,
+    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<AssetTrueTimeRangeRequest>,
 ) -> Result<(axum::http::HeaderMap, Json<AssetTrueTimeRangeResponse>), SearchError> {
     let start = Instant::now();
+    require_search_execute(&auth)?;
 
+    // NAN-1801 RESIDUAL: this endpoint reads `entity_time_range_agg`, an
+    // aggregate table that does NOT carry `source_type` — a per-source deny-set
+    // cannot be expressed against it, so the query stays unscoped and the cache
+    // key intentionally stays `unrestricted()` (the result is identical for
+    // every caller). The only P3 fix here is the `search:execute` gate above.
+    // Scoping first/last-seen would require adding source provenance to the
+    // aggregate (tracked in the NAN-1789 threat-model doc).
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "atruerange",
         &[
@@ -553,6 +597,7 @@ pub async fn get_asset_true_time_range(
                 .unwrap_or_default()
                 .as_bytes(),
         ],
+        &nanosiem_core::auth::ScopeSet::unrestricted(),
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -693,11 +738,14 @@ pub struct AssetArtifactsResponse {
 )]
 pub async fn get_asset_artifacts(
     State(state): State<SearchState>,
+    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<AssetArtifactsRequest>,
 ) -> Result<(axum::http::HeaderMap, Json<AssetArtifactsResponse>), SearchError> {
     let start = Instant::now();
+    require_search_execute(&auth)?;
 
+    let scope = super::search::effective_scope(&auth);
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "aartifacts",
         &[
@@ -711,6 +759,7 @@ pub async fn get_asset_artifacts(
             request.max_host_count.to_string().as_bytes(),
             request.prevalence_window.as_bytes(),
         ],
+        &scope,
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -736,6 +785,7 @@ pub async fn get_asset_artifacts(
             &request.identifier_value,
             &request.identities,
             &time_range,
+            &scope,
         )
         .await?;
 
@@ -838,6 +888,7 @@ pub async fn get_asset_artifacts(
             &time_range,
             Some(&hash_filter),
             Some(&domain_filter),
+            &scope,
         )
         .await?;
 

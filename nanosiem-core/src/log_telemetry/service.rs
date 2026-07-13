@@ -37,8 +37,12 @@ impl LogTelemetryService {
         &self,
         source_types: &[String],
         window_hours: i64,
+        deny_set: &std::collections::BTreeSet<String>,
     ) -> Result<HashMap<String, SourceTypeStats>, LogTelemetryError> {
-        Ok(self.repo.stats_by_source_type(source_types, window_hours).await?)
+        Ok(self
+            .repo
+            .stats_by_source_type(source_types, window_hours, deny_set)
+            .await?)
     }
 
     pub async fn stats_all(
@@ -53,8 +57,12 @@ impl LogTelemetryService {
         source_types: &[String],
         window_hours: i64,
         bucket: BucketSize,
+        deny_set: &std::collections::BTreeSet<String>,
     ) -> Result<Vec<HourlyPoint>, LogTelemetryError> {
-        Ok(self.repo.buckets(source_types, window_hours, bucket).await?)
+        Ok(self
+            .repo
+            .buckets(source_types, window_hours, bucket, deny_set)
+            .await?)
     }
 
     /// Cluster-wide per-bucket totals (no source_type filter). Used by the

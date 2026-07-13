@@ -147,7 +147,7 @@ impl DetectionService {
         events: &[serde_json::Value],
         global_weight: f64,
     ) -> Option<super::super::risk::RiskResult> {
-        if has_query_scores {
+        let result = if has_query_scores {
             self.score_calculator
                 .calculate_from_query_result(&events[0], global_weight)
         } else {
@@ -166,7 +166,26 @@ impl DetectionService {
                 Some(field.to_string()),
                 r.factors,
             ))
+        };
+
+        // NAN-1805: execution-side feedback-loop guard. A dataset=risk rule's
+        // findings feed the risk dataset itself, so its score is FORCED to 0 at
+        // this single choke point (shared by the Live, grouped-Alerting, and
+        // per-event paths) — covering the rule-level score, severity defaults,
+        // modifiers, and any query-derived `| risk` score alike. The finding is
+        // still emitted (audit trail / signal visibility); it contributes 0.
+        if Self::is_risk_dataset_rule(rule) {
+            return result.map(|mut r| {
+                r.raw_score = 0;
+                r.weighted_score = 0;
+                r.factors = vec![
+                    "dataset=risk rule: score forced to 0 (feedback-loop guard, NAN-1805)"
+                        .to_string(),
+                ];
+                r
+            });
         }
+        result
     }
 
     /// Log risk signals for an alert's matched events, grouped by entity.
@@ -374,7 +393,10 @@ impl DetectionService {
                     continue;
                 }
             };
-            let alert = match self.alert_repo.find_by_id(alert_id).await {
+            // SYSTEM caller: the reconcile sweep repairs grouping for ALL
+            // alerts regardless of any viewer's per-source scope (NAN-1800).
+            let system_scope = crate::auth::ScopeSet::unrestricted();
+            let alert = match self.alert_repo.find_by_id(alert_id, system_scope.deny_set()).await {
                 Ok(a) => a,
                 Err(e) => {
                     debug!(alert_id = %alert_id, error = %e, "Reconcile: alert load failed; skipping");
@@ -445,20 +467,52 @@ impl DetectionService {
         // Live→Alerting promotion instead of reverting to rule-level grouping.
         let (has_query_scores, groups) = self.partition_entity_groups(rule, results, global_weight);
         let candidates = Self::build_finding_candidates("alert", rule.id, groups.into_iter());
-        let new_findings = self.retain_unemitted(rule.id, candidates).await;
+        let mut new_findings = self.retain_unemitted(rule.id, candidates).await;
+
+        // NAN-1805: per-(rule, entity) alert cooldown. Window-dedup above keys
+        // on the entity's newest activity, so an entity producing NEW activity
+        // every cycle re-surfaces every cycle; when the rule sets a cooldown,
+        // entities that alerted within the window are additionally suppressed
+        // here. Their emissions are deliberately NOT recorded, so the same
+        // finding re-surfaces next cycle and fires once the window expires —
+        // the cooldown DELAYS an alert, it never terminally drops one. The
+        // durable anchors make this restart/failover-safe and time-based (a
+        // flap across the rule's threshold inside the window cannot re-fire).
+        let cooldown_minutes = rule.alert_cooldown_minutes.unwrap_or(0);
+        let mut cooldown_suppressed = 0usize;
+        if cooldown_minutes > 0 && !new_findings.is_empty() {
+            let entities: Vec<String> = new_findings.iter().map(|f| f.entity.clone()).collect();
+            let cooled = self
+                .entities_in_alert_cooldown(rule.id, cooldown_minutes, &entities)
+                .await?;
+            if !cooled.is_empty() {
+                let before = new_findings.len();
+                new_findings.retain(|f| !cooled.contains(&f.entity));
+                cooldown_suppressed = before - new_findings.len();
+            }
+        }
 
         if new_findings.is_empty() {
-            // Every entity over this window was already alerted — suppress the
-            // duplicate alert entirely (matches counted, no new alert/finding,
-            // no webhook, no case).
+            // Every entity over this window was already alerted (or is inside
+            // its alert cooldown) — suppress the duplicate alert entirely
+            // (matches counted, no new alert/finding, no webhook, no case).
             self.rule_repo
                 .record_daily_stats(rule.id, today, match_count, 0)
                 .await?;
             debug!(
-                "Rule {} (ALERTING/grouped) matched {} events but all entities were already alerted for this window — suppressing duplicate alert",
-                rule.name, match_count
+                "Rule {} (ALERTING/grouped) matched {} events but all entities were already alerted for this window ({} in cooldown) — suppressing duplicate alert",
+                rule.name, match_count, cooldown_suppressed
             );
             return Ok(None);
+        }
+        if cooldown_suppressed > 0 {
+            debug!(
+                "Rule {} (ALERTING/grouped): {} entities suppressed by the {}m alert cooldown; alerting on the remaining {}",
+                rule.name,
+                cooldown_suppressed,
+                cooldown_minutes,
+                new_findings.len()
+            );
         }
 
         self.store_detection_match(rule, results).await?;
@@ -499,8 +553,16 @@ impl DetectionService {
                 // The alert already exists for these entities, so record the
                 // emissions now (repairing the crash-before-emissions case) — this
                 // stops retain_unemitted from re-surfacing them every cycle — and
-                // count no new alert.
+                // count no new alert. NAN-1805: repair the cooldown anchors the
+                // same way (the crash may have preceded the anchor write too);
+                // slightly conservative — the anchor is stamped now() rather
+                // than the earlier alert's created_at.
                 self.record_finding_emissions(rule.id, &new_findings).await;
+                if cooldown_minutes > 0 {
+                    let entities: Vec<String> =
+                        new_findings.iter().map(|f| f.entity.clone()).collect();
+                    self.record_alert_cooldown_anchors(rule.id, &entities).await;
+                }
                 self.rule_repo
                     .record_daily_stats(rule.id, today, match_count, 0)
                     .await?;
@@ -523,6 +585,13 @@ impl DetectionService {
         // Record the emissions only now that the alert exists, then emit a
         // finding per new entity stamped with its source event window.
         self.record_finding_emissions(rule.id, &new_findings).await;
+
+        // NAN-1805: anchor the alert cooldown for the entities that just
+        // alerted (durable upsert; best-effort like the emissions record).
+        if cooldown_minutes > 0 {
+            let entities: Vec<String> = new_findings.iter().map(|f| f.entity.clone()).collect();
+            self.record_alert_cooldown_anchors(rule.id, &entities).await;
+        }
 
         info!(
             "Rule {} (ALERTING/grouped) matched {} events ({} new entities), generated alert {}",
@@ -676,7 +745,49 @@ impl DetectionService {
             );
         }
 
+        // NAN-1805: per-(rule, entity) alert cooldown for per-event mode. One
+        // batched anchor read up front; an event is suppressed when EVERY
+        // entity it carries is inside the window (an event with at least one
+        // non-cooled entity still alerts, mirroring the grouped path's
+        // any-entity-passes semantics). Entities that alert within THIS batch
+        // join the suppression set, so two events for the same entity in one
+        // window produce one alert.
+        let cooldown_minutes = rule.alert_cooldown_minutes.unwrap_or(0);
+        let cooled: std::collections::HashSet<String> = if cooldown_minutes > 0 {
+            let (_, groups) = self.partition_entity_groups(rule, results, global_weight);
+            let entities: Vec<String> = groups
+                .into_iter()
+                .map(|(entity, _, _)| entity)
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            self.entities_in_alert_cooldown(rule.id, cooldown_minutes, &entities)
+                .await?
+        } else {
+            std::collections::HashSet::new()
+        };
+        let mut fired_entities: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut cooldown_suppressed = 0usize;
+
         for event in results.iter().take(alert_cap) {
+            // NAN-1805: cooldown gate before any per-event writes.
+            let event_entities: Vec<String> = if cooldown_minutes > 0 {
+                let (_, ev_groups) =
+                    self.partition_entity_groups(rule, std::slice::from_ref(event), global_weight);
+                ev_groups.into_iter().map(|(entity, _, _)| entity).collect()
+            } else {
+                Vec::new()
+            };
+            if cooldown_minutes > 0
+                && !event_entities.is_empty()
+                && event_entities
+                    .iter()
+                    .all(|e| cooled.contains(e) || fired_entities.contains(e))
+            {
+                cooldown_suppressed += 1;
+                continue;
+            }
+
             // Store each event as its own detection match (1:1 with alerts)
             self.store_detection_match(rule, std::slice::from_ref(event))
                 .await?;
@@ -704,6 +815,7 @@ impl DetectionService {
             };
 
             alerts_created += 1;
+            fired_entities.extend(event_entities);
 
             // Log signals for this single event
             self.log_alert_signals(rule, &alert, std::slice::from_ref(event), global_weight)
@@ -716,6 +828,19 @@ impl DetectionService {
             if first_alert.is_none() {
                 first_alert = Some(alert);
             }
+        }
+
+        // NAN-1805: anchor the cooldown for every entity that alerted in this
+        // batch (single durable upsert; best-effort).
+        if cooldown_minutes > 0 && !fired_entities.is_empty() {
+            let entities: Vec<String> = fired_entities.into_iter().collect();
+            self.record_alert_cooldown_anchors(rule.id, &entities).await;
+        }
+        if cooldown_suppressed > 0 {
+            debug!(
+                "Rule {} (ALERTING/per_event): {} events suppressed by the {}m alert cooldown",
+                rule.name, cooldown_suppressed, cooldown_minutes
+            );
         }
 
         // Record daily stats with actual number of alerts created
@@ -735,15 +860,23 @@ impl DetectionService {
     // Alert Management
     // ========================================================================
 
-    /// Get an alert by ID
-    #[instrument(skip(self))]
-    pub async fn get_alert(&self, id: Uuid) -> Result<Alert, DetectionError> {
-        let alert = self.alert_repo.find_by_id(id).await?;
+    /// Get an alert by ID.
+    ///
+    /// NAN-1800: `deny` is the effective viewer per-source deny set (see the
+    /// handler-side scope composition). System callers pass
+    /// `ScopeSet::unrestricted().deny_set()` — greppable opt-out.
+    #[instrument(skip(self, deny))]
+    pub async fn get_alert(
+        &self,
+        id: Uuid,
+        deny: &std::collections::BTreeSet<String>,
+    ) -> Result<Alert, DetectionError> {
+        let alert = self.alert_repo.find_by_id(id, deny).await?;
         Ok(alert)
     }
 
-    /// List alerts with optional filters
-    #[instrument(skip(self))]
+    /// List alerts with optional filters (deny-scoped per NAN-1800)
+    #[instrument(skip(self, deny))]
     pub async fn list_alerts(
         &self,
         status: Option<AlertStatus>,
@@ -751,69 +884,81 @@ impl DetectionService {
         kinds: Option<&[String]>,
         limit: i64,
         offset: i64,
+        deny: &std::collections::BTreeSet<String>,
     ) -> Result<Vec<Alert>, DetectionError> {
         let alerts = self
             .alert_repo
-            .list(status, severity, kinds, limit, offset)
+            .list(status, severity, kinds, limit, offset, deny)
             .await?;
         Ok(alerts)
     }
 
     /// List alerts for a specific rule (limited to 100 most recent)
-    #[instrument(skip(self))]
-    pub async fn list_alerts_by_rule(&self, rule_id: Uuid) -> Result<Vec<Alert>, DetectionError> {
-        let alerts = self.alert_repo.list_by_rule(rule_id).await?;
+    #[instrument(skip(self, deny))]
+    pub async fn list_alerts_by_rule(
+        &self,
+        rule_id: Uuid,
+        deny: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<Alert>, DetectionError> {
+        let alerts = self.alert_repo.list_by_rule(rule_id, deny).await?;
         Ok(alerts)
     }
 
     /// List alerts for a specific rule with custom limit
-    #[instrument(skip(self))]
+    #[instrument(skip(self, deny))]
     pub async fn list_alerts_by_rule_limited(
         &self,
         rule_id: Uuid,
         limit: i64,
+        deny: &std::collections::BTreeSet<String>,
     ) -> Result<Vec<Alert>, DetectionError> {
-        let alerts = self.alert_repo.list_by_rule_limited(rule_id, limit).await?;
+        let alerts = self
+            .alert_repo
+            .list_by_rule_limited(rule_id, limit, deny)
+            .await?;
         Ok(alerts)
     }
 
     /// List alerts after a specific cursor (timestamp + ID)
-    #[instrument(skip(self))]
+    #[instrument(skip(self, deny))]
     pub async fn list_alerts_after(
         &self,
         after_timestamp: chrono::DateTime<chrono::Utc>,
         after_id: Uuid,
         limit: i64,
+        deny: &std::collections::BTreeSet<String>,
     ) -> Result<Vec<Alert>, DetectionError> {
         let alerts = self
             .alert_repo
-            .list_after(after_timestamp, after_id, limit)
+            .list_after(after_timestamp, after_id, limit, deny)
             .await?;
         Ok(alerts)
     }
 
     /// Acknowledge an alert
-    #[instrument(skip(self))]
+    #[instrument(skip(self, deny))]
     pub async fn acknowledge_alert(
         &self,
         id: Uuid,
         acknowledged_by: &str,
+        deny: &std::collections::BTreeSet<String>,
     ) -> Result<Alert, DetectionError> {
         info!("Acknowledging alert {} by {}", id, acknowledged_by);
         let ack = AcknowledgeAlert {
             acknowledged_by: acknowledged_by.to_string(),
         };
-        let alert = self.alert_repo.acknowledge(id, &ack).await?;
+        let alert = self.alert_repo.acknowledge(id, &ack, deny).await?;
         Ok(alert)
     }
 
     /// Close an alert with disposition
-    #[instrument(skip(self))]
+    #[instrument(skip(self, deny))]
     pub async fn close_alert(
         &self,
         id: Uuid,
         closed_by: &str,
         disposition: Disposition,
+        deny: &std::collections::BTreeSet<String>,
     ) -> Result<Alert, DetectionError> {
         info!(
             "Closing alert {} by {} with disposition {:?}",
@@ -823,24 +968,30 @@ impl DetectionService {
             closed_by: closed_by.to_string(),
             disposition,
         };
-        let alert = self.alert_repo.close(id, &close).await?;
+        let alert = self.alert_repo.close(id, &close, deny).await?;
         Ok(alert)
     }
 
     /// Assign an alert to an analyst
-    #[instrument(skip(self))]
-    pub async fn assign_alert(&self, id: Uuid, assignee: &str) -> Result<Alert, DetectionError> {
+    #[instrument(skip(self, deny))]
+    pub async fn assign_alert(
+        &self,
+        id: Uuid,
+        assignee: &str,
+        deny: &std::collections::BTreeSet<String>,
+    ) -> Result<Alert, DetectionError> {
         info!("Assigning alert {} to {}", id, assignee);
-        let alert = self.alert_repo.assign(id, assignee).await?;
+        let alert = self.alert_repo.assign(id, assignee, deny).await?;
         Ok(alert)
     }
 
     /// Bulk acknowledge alerts
-    #[instrument(skip(self, ids))]
+    #[instrument(skip(self, ids, deny))]
     pub async fn bulk_acknowledge_alerts(
         &self,
         ids: &[Uuid],
         acknowledged_by: &str,
+        deny: &std::collections::BTreeSet<String>,
     ) -> Result<usize, DetectionError> {
         info!(
             "Bulk acknowledging {} alerts by {}",
@@ -849,18 +1000,19 @@ impl DetectionService {
         );
         let count = self
             .alert_repo
-            .bulk_acknowledge(ids, acknowledged_by)
+            .bulk_acknowledge(ids, acknowledged_by, deny)
             .await?;
         Ok(count)
     }
 
     /// Bulk close alerts
-    #[instrument(skip(self, ids))]
+    #[instrument(skip(self, ids, deny))]
     pub async fn bulk_close_alerts(
         &self,
         ids: &[Uuid],
         closed_by: &str,
         disposition: Disposition,
+        deny: &std::collections::BTreeSet<String>,
     ) -> Result<usize, DetectionError> {
         info!(
             "Bulk closing {} alerts by {} with disposition {:?}",
@@ -870,18 +1022,19 @@ impl DetectionService {
         );
         let count = self
             .alert_repo
-            .bulk_close(ids, disposition, closed_by)
+            .bulk_close(ids, disposition, closed_by, deny)
             .await?;
         Ok(count)
     }
 
     /// Get alert counts by status
-    #[instrument(skip(self))]
+    #[instrument(skip(self, deny))]
     pub async fn get_alert_counts(
         &self,
         kinds: Option<&[String]>,
+        deny: &std::collections::BTreeSet<String>,
     ) -> Result<Vec<(AlertStatus, i64)>, DetectionError> {
-        let counts = self.alert_repo.count_by_status(kinds).await?;
+        let counts = self.alert_repo.count_by_status(kinds, deny).await?;
         Ok(counts)
     }
 

@@ -177,7 +177,21 @@ pub async fn dry_resolve(
         // Authoritative path — load the real alert from Postgres and build
         // the snapshot the same way the rule-fire path does.
         let alert_uuid = parse_alert_id(alert_id_str)?;
-        let alert = state.detection_service.get_alert(alert_uuid).await?;
+        // NAN-1800: VIEWER scope, not unrestricted — a playbook author must
+        // not use dry-resolve to read matched events of an alert derived from
+        // sources denied to them (per-source RBAC + the audit gate). Mirrors
+        // the handlers/alerts.rs composition.
+        let scope = {
+            let mut deny = auth.denied_sources.deny_set().clone();
+            if !auth.has_permission(permissions::AUDIT_VIEW) {
+                deny.insert("audit".to_string());
+            }
+            nanosiem_core::auth::ScopeSet::from_denied(deny)
+        };
+        let alert = state
+            .detection_service
+            .get_alert(alert_uuid, scope.deny_set())
+            .await?;
         let entities = EntityExtractor::new().extract_from_events(&alert.matched_events);
 
         let sev_str = severity_str(&alert.severity);

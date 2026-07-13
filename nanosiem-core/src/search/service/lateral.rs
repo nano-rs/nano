@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
-use super::lateral_graph::{build_lateral_graph_payload, RawEvent};
+use super::lateral_graph::{build_lateral_graph_payload, LateralRiskContext, RawEvent};
 use super::*;
+use crate::auth::ScopeSet;
 use crate::query::{LateralMethod, LateralSeedType};
 use crate::search::query_processing::LateralCommandInfo;
 
@@ -66,11 +67,19 @@ impl SearchService {
     /// 2. Iteratively expands hops via BFS, querying auth, network, and process events
     /// 3. Builds structured output rows with hop tracking
     /// 4. Returns results with `_display_type: "lateral"` metadata
+    ///
+    /// NAN-1797/NAN-1799: the hop expansion issues FRESH secondary queries
+    /// against the logs table that do NOT inherit the base query's injected
+    /// source-scope gate, so the caller's `ScopeSet` is threaded down here and
+    /// its deny-set exclusion is appended to every secondary query's WHERE
+    /// (see [`source_scope_sql_predicate`]). An empty deny set emits nothing
+    /// (byte-identical SQL to the pre-scoping form).
     pub(crate) async fn build_lateral_view(
         &self,
         results: Vec<serde_json::Value>,
         lateral_info: &LateralCommandInfo,
         time_range: &TimeRange,
+        scope: &ScopeSet,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
         let start_time = std::time::Instant::now();
 
@@ -108,6 +117,11 @@ impl SearchService {
         // that depend on it are dropped so no unknown column is referenced.
         let profile = self.active_profile.as_ref();
         let cols = LateralPredicateColumns::resolve(profile);
+
+        // NAN-1797: render the caller's deny-set once; appended to every
+        // secondary hop query's WHERE below. `None` (unrestricted) emits
+        // byte-identical SQL to the pre-scoping form.
+        let scope_predicate = source_scope_sql_predicate(&cols.source_type, scope.deny_set());
 
         // Step 2: BFS hop expansion
         let mut all_edges: Vec<LateralEdge> = Vec::new();
@@ -156,14 +170,12 @@ impl SearchService {
             // Query each method type
             if lateral_info.methods.contains(&LateralMethod::Auth) {
                 let auth_where = cols.auth_where();
-                let auth_sql = format!(
-                    r#"SELECT {lateral_columns}
-                    FROM {logs_table}
-                    PREWHERE timestamp BETWEEN ? AND ?
-                        AND ({entity_clause})
-                    WHERE {auth_where}
-                    ORDER BY timestamp ASC
-                    LIMIT {MAX_EVENTS_PER_HOP}"#
+                let auth_sql = build_hop_sql(
+                    &lateral_columns,
+                    &logs_table,
+                    &entity_clause,
+                    &auth_where,
+                    scope_predicate.as_deref(),
                 );
 
                 let events = self
@@ -211,14 +223,12 @@ impl SearchService {
 
                 // Focus on lateral movement ports: RDP (3389), SSH (22), SMB (445), WinRM (5985/5986)
                 let network_where = cols.network_where();
-                let network_sql = format!(
-                    r#"SELECT {lateral_columns}
-                    FROM {logs_table}
-                    PREWHERE timestamp BETWEEN ? AND ?
-                        AND ({network_clause})
-                    WHERE {network_where}
-                    ORDER BY timestamp ASC
-                    LIMIT {MAX_EVENTS_PER_HOP}"#
+                let network_sql = build_hop_sql(
+                    &lateral_columns,
+                    &logs_table,
+                    &network_clause,
+                    &network_where,
+                    scope_predicate.as_deref(),
                 );
 
                 let events = self
@@ -239,14 +249,12 @@ impl SearchService {
                     // Look for remote execution tools — require a destination to filter
                     // out local process executions (svchost, wermgr, etc.) that aren't
                     // lateral movement.
-                    let process_sql = format!(
-                        r#"SELECT {lateral_columns}
-                    FROM {logs_table}
-                    PREWHERE timestamp BETWEEN ? AND ?
-                        AND ({entity_clause})
-                    WHERE {process_where}
-                    ORDER BY timestamp ASC
-                    LIMIT {MAX_EVENTS_PER_HOP}"#
+                    let process_sql = build_hop_sql(
+                        &lateral_columns,
+                        &logs_table,
+                        &entity_clause,
+                        &process_where,
+                        scope_predicate.as_deref(),
                     );
 
                     let events = self
@@ -342,8 +350,18 @@ impl SearchService {
                 auth_result: e.auth_result.clone(),
             })
             .collect();
+        // NAN-1798 P4: the node-band risk fan-out is ClickHouse-backed — the
+        // same findings source and decay/cleared config (cached provider) the
+        // Risk page binds, replacing the retired PG sweep-snapshot read.
+        let risk_ctx = LateralRiskContext {
+            ch_client: self.ch_client.as_ref(),
+            findings_source: crate::risk::clickhouse_sql::RiskFindingsSource::resolve(
+                self.table_names.is_clustered(),
+            ),
+            config: self.risk_query_config.resolve().await,
+        };
         let graph_payload =
-            build_lateral_graph_payload(&raw_events, &seed_field, &seed_value, &self.pg_pool).await;
+            build_lateral_graph_payload(&raw_events, &seed_field, &seed_value, &risk_ctx).await;
 
         // First row is metadata
         output.push(json!({
@@ -816,7 +834,8 @@ impl LateralPredicateColumns {
             crate::schema::SchemaId::Ocsf => self.auth_where_ocsf(),
             crate::schema::SchemaId::Udm
             | crate::schema::SchemaId::Spans
-            | crate::schema::SchemaId::Metrics => self.auth_where_udm(),
+            | crate::schema::SchemaId::Metrics
+            | crate::schema::SchemaId::Risk => self.auth_where_udm(),
         }
     }
 
@@ -951,6 +970,79 @@ fn build_host_clause(
     (sql, bind_values)
 }
 
+/// Build one lateral-hop secondary query (auth / network / process — all three
+/// share this exact shape). Extracted into a free function so the NAN-1797
+/// source-scope gate is unit-testable without a live ClickHouse.
+///
+/// With `scope_predicate = None` the output is byte-identical to the
+/// pre-scoping inline `format!` blocks. With a predicate, the method WHERE is
+/// parenthesized (it is an OR-chain for auth) and the predicate is ANDed in,
+/// so a scoped caller's hop expansion can never read a denied source_type.
+fn build_hop_sql(
+    lateral_columns: &str,
+    logs_table: &str,
+    entity_clause: &str,
+    method_where: &str,
+    scope_predicate: Option<&str>,
+) -> String {
+    let where_body = match scope_predicate {
+        Some(pred) => format!("({method_where}) AND {pred}"),
+        None => method_where.to_string(),
+    };
+    format!(
+        r#"SELECT {lateral_columns}
+                    FROM {logs_table}
+                    PREWHERE timestamp BETWEEN ? AND ?
+                        AND ({entity_clause})
+                    WHERE {where_body}
+                    ORDER BY timestamp ASC
+                    LIMIT {MAX_EVENTS_PER_HOP}"#
+    )
+}
+
+/// Render a caller's source-scope deny-set as a ClickHouse WHERE predicate over
+/// `column_expr` (NAN-1797/NAN-1799).
+///
+/// - Empty deny set → `None` (unrestricted callers pay nothing; callers must
+///   emit byte-identical SQL to the pre-scoping form).
+/// - Single member → `lower(col) != 'x'` — byte-identical to the legacy audit
+///   gate string for `{"audit"}` (see `build_fetch_log_sql`, NAN-694).
+/// - Multiple members → `lower(col) NOT IN ('a', 'b', …)` in BTreeSet
+///   (lexicographic) order — mirrors how the nPL injector's negated `InList`
+///   conjunct renders, and is case-safe on OCSF via the `lower()` wrap.
+///
+/// Values are lowercased and single-quote/backslash-escaped. Shared by the
+/// hand-built SQL paths in this service (lateral hops, `fetch_log_by_id`,
+/// `get_ext_field_names`, `query_udm_field`); nPL paths go through
+/// `enforce_source_scope` instead — never both (no double gating).
+///
+/// Crate-public (NAN-1801, P3): the "side-door" hand-built SQL paths in other
+/// crates (identity API, prevalence, telemetry, AI) reuse THIS single canonical
+/// builder rather than re-deriving the predicate shape — any divergence from the
+/// nPL injector's negated-`InList` rendering is the correctness risk. Re-exported
+/// as `nanosiem_core::search::service::source_scope_sql_predicate`.
+pub fn source_scope_sql_predicate(
+    column_expr: &str,
+    deny_set: &BTreeSet<String>,
+) -> Option<String> {
+    use crate::sql_hygiene::escape_sql_string;
+
+    let mut values = deny_set
+        .iter()
+        .map(|v| escape_sql_string(&v.to_lowercase()));
+    let first = values.next()?;
+    if deny_set.len() == 1 {
+        return Some(format!("lower({column_expr}) != '{first}'"));
+    }
+    let mut list = format!("'{first}'");
+    for v in values {
+        list.push_str(", '");
+        list.push_str(&v);
+        list.push('\'');
+    }
+    Some(format!("lower({column_expr}) NOT IN ({list})"))
+}
+
 /// Strip everything after the first dot and lowercase. Mirror of the old
 /// `normalizeHostname` so `ws-sales-002.corp.local` and `ws-sales-002`
 /// collapse to the same frontier key.
@@ -1017,6 +1109,119 @@ fn extract_field_value(results: &[serde_json::Value], field: &str) -> Option<Str
         }
     }
     None
+}
+
+#[cfg(test)]
+mod source_scope_tests {
+    use super::*;
+
+    fn deny(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Build the three secondary hop SQLs (auth / network / process) exactly as
+    /// `build_lateral_view` does for the UDM profile.
+    fn secondary_sqls(scope_predicate: Option<&str>) -> Vec<String> {
+        let profile = crate::schema::UdmProfile::new();
+        let cols = LateralPredicateColumns::resolve(&profile);
+        let entity_clause = "lower(user) = lower(?)";
+        [
+            cols.auth_where(),
+            cols.network_where(),
+            cols.process_where().expect("UDM maps process_name"),
+        ]
+        .iter()
+        .map(|method_where| {
+            build_hop_sql(
+                "timestamp, source_type, user",
+                "logs",
+                entity_clause,
+                method_where,
+                scope_predicate,
+            )
+        })
+        .collect()
+    }
+
+    /// NAN-1797: a nonempty deny-set must gate ALL THREE secondary queries —
+    /// they are fresh scans that do not inherit the base query's injection.
+    #[test]
+    fn nonempty_deny_set_gates_all_three_secondary_queries() {
+        let pred = source_scope_sql_predicate(
+            "source_type",
+            &deny(&["audit", "windows_sysmon"]),
+        )
+        .expect("nonempty deny set must render");
+        assert_eq!(
+            pred,
+            "lower(source_type) NOT IN ('audit', 'windows_sysmon')"
+        );
+        for sql in secondary_sqls(Some(&pred)) {
+            assert!(
+                sql.contains("lower(source_type) NOT IN ('audit', 'windows_sysmon')"),
+                "secondary query missing scope gate: {sql}"
+            );
+            // The method WHERE is an OR-chain (auth) — the gate must be ANDed
+            // against the PARENTHESIZED method predicate, not the last OR term.
+            assert!(
+                sql.contains(") AND lower(source_type) NOT IN"),
+                "scope gate must AND against the whole method WHERE: {sql}"
+            );
+        }
+    }
+
+    /// Empty deny set (unrestricted / SYSTEM caller) → predicate absent and the
+    /// SQL byte-identical to the pre-scoping form.
+    #[test]
+    fn empty_deny_set_emits_no_gate_in_any_secondary_query() {
+        assert_eq!(
+            source_scope_sql_predicate("source_type", &BTreeSet::new()),
+            None
+        );
+        for sql in secondary_sqls(None) {
+            assert!(
+                !sql.contains("NOT IN") && !sql.to_lowercase().contains("lower(source_type) !="),
+                "unrestricted scope must not inject any source_type gate: {sql}"
+            );
+        }
+    }
+
+    /// Single-member deny set renders the `!=` form — byte-identical to the
+    /// legacy audit gate for `{"audit"}`.
+    #[test]
+    fn single_member_deny_set_renders_inequality() {
+        assert_eq!(
+            source_scope_sql_predicate("source_type", &deny(&["audit"])).as_deref(),
+            Some("lower(source_type) != 'audit'")
+        );
+    }
+
+    /// Values are lowercased and escaped so the predicate is case-safe on OCSF
+    /// and injection-safe on hostile source_type names.
+    #[test]
+    fn deny_values_are_lowercased_and_escaped() {
+        assert_eq!(
+            source_scope_sql_predicate("source_type", &deny(&["Weird'Name", "OTEL_TRACES"]))
+                .as_deref(),
+            Some("lower(source_type) NOT IN ('otel_traces', 'weird''name')")
+        );
+    }
+
+    /// The empty-predicate hop SQL is byte-identical to the legacy inline
+    /// `format!` block (whitespace and all) — regression guard for the
+    /// extraction into `build_hop_sql`.
+    #[test]
+    fn hop_sql_without_scope_matches_legacy_shape() {
+        let sql = build_hop_sql("a, b", "logs", "1=1", "x != ''", None);
+        let expected = r#"SELECT a, b
+                    FROM logs
+                    PREWHERE timestamp BETWEEN ? AND ?
+                        AND (1=1)
+                    WHERE x != ''
+                    ORDER BY timestamp ASC
+                    LIMIT 10000"#;
+        assert_eq!(sql, expected);
+    }
 }
 
 #[cfg(test)]

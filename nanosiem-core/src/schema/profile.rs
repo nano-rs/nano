@@ -120,12 +120,45 @@ pub trait SchemaProfile: Send + Sync {
         None
     }
 
-    /// The column a bare free-text keyword (`error`, `"failed login"`) tokenizes
-    /// against (NAN-1515 / NAN-1555). UDM/OCSF logs search `message` (the
-    /// `idx_message_words` text index); spans search `span_name` (`idx_span_words`).
-    /// Default `message` keeps every logs path byte-identical.
+    /// The PRIMARY free-text column (NAN-1515 / NAN-1555). UDM/OCSF logs use
+    /// `message`; spans use `span_name`. Default `message` keeps every logs path
+    /// byte-identical.
+    ///
+    /// This is the column used in IDENTIFIER contexts — the `transaction`
+    /// command's free-text capture (`commands.rs`), display projections. For the
+    /// bare-keyword *predicate*, use [`keyword_search_columns`] instead: OCSF has
+    /// two body columns and searching only this one misses half of them.
+    ///
+    /// [`keyword_search_columns`]: SchemaProfile::keyword_search_columns
     fn keyword_search_column(&self) -> &'static str {
         "message"
+    }
+
+    /// Additional columns that can carry the event body, OR-folded with
+    /// [`keyword_search_column`] into the bare-keyword predicate (NAN-1828).
+    ///
+    /// Empty for every profile except OCSF, so UDM / spans / metrics / risk emit
+    /// byte-identical SQL to the pre-NAN-1828 single-column form. This is
+    /// deliberately a SEPARATE seam rather than widening `keyword_search_column()`
+    /// to a slice: that method is consumed in identifier position, where a second
+    /// column is meaningless.
+    ///
+    /// OCSF returns `["raw_data"]` because the raw log lands in a different column
+    /// depending on the producer — Vector parsers write it to `message`, direct
+    /// producers (Tenzir) write the original to `raw_data` and a summary to
+    /// `message`. Searching one column alone silently misses the other lane.
+    ///
+    /// [`keyword_search_column`]: SchemaProfile::keyword_search_column
+    fn keyword_search_secondary_columns(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Every column a bare keyword must tokenize against: the primary plus any
+    /// secondaries. Length 1 for all profiles but OCSF.
+    fn keyword_search_columns(&self) -> Vec<&'static str> {
+        std::iter::once(self.keyword_search_column())
+            .chain(self.keyword_search_secondary_columns().iter().copied())
+            .collect()
     }
 
     /// The always-projected core fields a slim/table-view query needs for basic

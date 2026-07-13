@@ -5,16 +5,18 @@
 //! `| lateral` view (NAN-396).
 //!
 //! Inputs: the per-event edges produced by `build_lateral_view` (already
-//! deduped + identity-resolved), plus the seed entity and a Postgres pool for
-//! risk fan-out.
+//! deduped + identity-resolved), plus the seed entity and a ClickHouse-backed
+//! risk context for the node-band fan-out (NAN-1798 P4 — previously a PG read
+//! of the 15-min-stale `entity_risk_scores.decayed_score` sweep snapshot).
 //!
 //! Outputs: a single `serde_json::Value` attached to the `_lateral_graph`
 //! field of the metadata row. The frontend reads it directly.
 
 use serde::Serialize;
 use serde_json::json;
-use sqlx::PgPool;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+
+use crate::risk::clickhouse_sql::{lateral_scores_query, RiskFindingsSource, RiskQueryConfig};
 
 /// Raw event fields the aggregator needs from each deduped lateral edge.
 /// Mirror of `LateralEdge` in `service/lateral.rs` — kept narrow so this module
@@ -121,6 +123,16 @@ const MAX_NODES_PER_HOP: usize = 30;
 /// `MAX_NODES_PER_HOP`.
 const MAX_TOTAL_NODES: usize = 200;
 
+/// ClickHouse-backed risk fan-out context for the lateral graph (NAN-1798 P4):
+/// the client plus the SAME decay factors and cleared boundaries the Risk page
+/// binds (resolved by the cached `RiskQueryConfigProvider`), so node bands
+/// reflect the live 7d decayed score instead of the retired sweep snapshot.
+pub(crate) struct LateralRiskContext<'a> {
+    pub ch_client: Option<&'a clickhouse::Client>,
+    pub findings_source: RiskFindingsSource,
+    pub config: RiskQueryConfig,
+}
+
 /// Build the full graph payload from deduped lateral events.
 ///
 /// The seed entity's normalized id is whatever flows through from the existing
@@ -130,7 +142,7 @@ pub(crate) async fn build_lateral_graph_payload(
     raw: &[RawEvent],
     seed_field: &str,
     seed_value: &str,
-    pg_pool: &PgPool,
+    risk: &LateralRiskContext<'_>,
 ) -> serde_json::Value {
     if raw.is_empty() {
         return json!({
@@ -303,7 +315,7 @@ pub(crate) async fn build_lateral_graph_payload(
     let hops = compute_hops(&seed_id, &adjacency);
 
     // ─── Stage 3: risk fan-out ──────────────────────────────────────────────
-    let risk_map = fetch_risk_for_nodes(pg_pool, node_meta.keys()).await;
+    let risk_map = fetch_risk_for_nodes(risk, node_meta.keys()).await;
 
     // ─── Stage 4: assemble nodes (band, role, hop) ──────────────────────────
     // Compute per-node degree first for role inference.
@@ -773,7 +785,10 @@ fn compute_critical_path(
     (path, path_edges)
 }
 
-async fn fetch_risk_for_nodes<'a, I>(pg_pool: &PgPool, ids: I) -> HashMap<String, i32>
+async fn fetch_risk_for_nodes<'a, I>(
+    risk: &LateralRiskContext<'_>,
+    ids: I,
+) -> HashMap<String, i32>
 where
     I: IntoIterator<Item = &'a String>,
 {
@@ -781,34 +796,53 @@ where
     if entities.is_empty() {
         return HashMap::new();
     }
-    // entity_risk_scores stores `entity` verbatim from the firing rule
-    // (arbitrary casing, may be FQDN). Our graph keys are `normalize_id`'d
-    // (lowercased + FQDN-stripped), so a direct `entity = ANY($1)` silently
-    // misses the majority of real risk rows. Match on both the raw lowered
-    // form and the FQDN-stripped short form so either style of stored
-    // entity still lights up the node's band.
-    // Read the DECAYED score (maintained by the enterprise RiskDecayScheduler,
-    // NAN-1675), not the cumulative accumulator — so node bands match the Risk
-    // page's decayed view. It's a plain PG column, so core reads it without
-    // reaching into the enterprise decay computation.
-    let rows: Result<Vec<(String, i32)>, sqlx::Error> = sqlx::query_as(
-        r#"
-        SELECT entity, MAX(decayed_score)::int4
-        FROM entity_risk_scores
-        WHERE lower(entity) = ANY($1)
-           OR lower(split_part(entity, '.', 1)) = ANY($1)
-        GROUP BY entity
-        "#,
-    )
-    .bind(&entities)
-    .fetch_all(pg_pool)
-    .await;
+    let Some(ch_client) = risk.ch_client else {
+        return HashMap::new();
+    };
+
+    // Findings store `risk_entity` verbatim from the firing rule (arbitrary
+    // casing, may be FQDN). Our graph keys are `normalize_id`'d (lowercased +
+    // FQDN-stripped), so a direct `entity IN` silently misses the majority of
+    // real risk rows. The batched statement matches both the lowered form and
+    // the FQDN-stripped first label in SQL (NAN-1798 P4) — the same
+    // double-match the retired PG reader performed — and recomputes the 7d
+    // DECAYED score live from ClickHouse with the same decay/cleared config
+    // the Risk page binds, so node bands match its decayed view without the
+    // 15-minute sweep staleness.
+    let query = lateral_scores_query(
+        &risk.findings_source,
+        risk.config.now,
+        &risk.config.decay,
+        &risk.config.cleared,
+        &entities,
+    );
+
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct LateralRiskRow {
+        entity: String,
+        decayed_score_7d: i64,
+    }
+
+    let rows: Result<Vec<LateralRiskRow>, clickhouse::error::Error> =
+        query.to_clickhouse_query(ch_client).fetch_all().await;
 
     match rows {
-        Ok(r) => r
-            .into_iter()
-            .map(|(entity, score)| (normalize_id(&entity), score))
-            .collect(),
+        Ok(r) => {
+            // Several stored `risk_entity` values can normalize to the SAME
+            // graph node (e.g. `WEB-01`, `web-01.corp`, `web-01` → `web-01`).
+            // Keep the MAX per node — matching the old PG reader's explicit
+            // `MAX(decayed_score)` intent and giving the node its highest risk
+            // band deterministically, rather than an arbitrary colliding row.
+            let mut map: HashMap<String, i32> = HashMap::new();
+            for row in r {
+                let node = normalize_id(&row.entity);
+                let score = row.decayed_score_7d.clamp(0, i32::MAX as i64) as i32;
+                map.entry(node)
+                    .and_modify(|s| *s = (*s).max(score))
+                    .or_insert(score);
+            }
+            map
+        }
         Err(e) => {
             tracing::warn!(
                 subquery = "lateral_graph_risk",

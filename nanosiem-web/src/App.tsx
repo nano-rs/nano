@@ -141,11 +141,15 @@ const NotebookDetail = lazyWithRetryNamed(() => import('@/enterprise/pages/Noteb
 // NAN-483: redesigned per-rule Matches page replaces pre-redesign DetectionMatches.
 const Rules = lazyWithRetryNamed(() => import('@/pages/Rules'), 'Rules');
 const Matches = lazyWithRetryNamed(() => import('@/pages/Matches'), 'Matches');
+// NAN-1791: auto retro-hunt rules (new + config/run-history).
+const RetroHunt = lazyWithRetryNamed(() => import('@/pages/RetroHunt'), 'RetroHunt');
 const LogSources = lazyWithRetryNamed(() => import('@/pages/LogSources'), 'LogSources');
 const Risk = lazyWithRetryNamed(() => import('@/enterprise/pages/Risk'), 'Risk');
 const Prevalence = lazyWithRetryNamed(() => import('@/pages/Prevalence'), 'Prevalence');
 const Dashboards = lazyWithRetryNamed(() => import('@/pages/Dashboards'), 'Dashboards');
 const DashboardView = lazyWithRetryNamed(() => import('@/pages/DashboardView'), 'DashboardView');
+// NAN-1793: scheduled reports (saved search / dashboard → CSV/HTML artifacts).
+const Reports = lazyWithRetryNamed(() => import('@/pages/Reports'), 'Reports');
 const TuningDashboard = lazyWithRetryNamed(() => import('@/enterprise/pages/TuningDashboard'), 'TuningDashboard');
 const TuningDetail = lazyWithRetryNamed(() => import('@/enterprise/pages/TuningDetail'), 'TuningDetail');
 const MitreCoverage = lazyWithRetryNamed(() => import('@/pages/MitreCoverage'), 'MitreCoverage');
@@ -194,7 +198,6 @@ const SourceConfigurationDetail = lazyWithRetry(() => import('@/pages/SourceConf
 // LAZY IMPORTS - Settings pages
 // ============================================================================
 const SettingsLandingPage = lazyWithRetryNamed(() => import('@/pages/Settings/SettingsLanding'), 'SettingsLanding');
-const SettingsComingSoon = lazyWithRetryNamed(() => import('@/pages/Settings/SettingsComingSoon'), 'SettingsComingSoon');
 const MelodSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/MelodSettings'), 'MelodSettings');
 const RetentionSettings = lazyWithRetryNamed(() => import('@/pages/Settings/RetentionSettings'), 'RetentionSettings');
 const RiskSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/RiskSettings'), 'RiskSettings');
@@ -206,8 +209,9 @@ const PrevalenceSettings = lazyWithRetryNamed(() => import('@/pages/Settings/Pre
 const CaseSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/CaseSettings'), 'CaseSettings');
 const QueueSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/QueueSettings'), 'QueueSettings');
 const UserSettings = lazyWithRetryNamed(() => import('@/pages/Settings/UserSettings'), 'UserSettings');
-const WebhookSettings = lazyWithRetryNamed(() => import('@/pages/Settings/WebhookSettings'), 'WebhookSettings');
+const NotificationSettings = lazyWithRetryNamed(() => import('@/pages/Settings/NotificationSettings'), 'NotificationSettings');
 const SearchSettings = lazyWithRetryNamed(() => import('@/pages/Settings/SearchSettings'), 'SearchSettings');
+const SourceScopes = lazyWithRetryNamed(() => import('@/pages/Settings/SourceScopes'), 'SourceScopes');
 const GdprAnonymization = lazyWithRetryNamed(() => import('@/pages/Settings/GdprAnonymization'), 'GdprAnonymizationPage');
 const AirgapImportPage = lazyWithRetryNamed(() => import('@/enterprise/airgap/AirgapImportPage'), 'AirgapImportPage');
 
@@ -479,6 +483,15 @@ function ProtectedAppRoutes() {
             } />
           } />
 
+          {/* Scheduled reports (NAN-1793) */}
+          <Route path="/reports" element={
+            <PermissionRoute permission="search:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <Reports key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
           {/* Search */}
           <Route path="/search" element={
             <PermissionRoute permission="search:view" element={
@@ -549,6 +562,22 @@ function ProtectedAppRoutes() {
             <PermissionRoute permission="detections:view" element={
               <Suspense fallback={<ChartPageLoadingFallback />}>
                 <Matches key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          {/* NAN-1791: auto retro-hunt rules. Static "retro-hunt" segment outranks
+              the `/rules/:id` dynamic route in React Router's specificity order. */}
+          <Route path="/rules/retro-hunt/new" element={
+            <PermissionRoute permission="detections:create" element={
+              <Suspense fallback={<EditorLoadingFallback />}>
+                <RetroHunt key={`new-${resetKey ?? ''}`} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/rules/retro-hunt/:id" element={
+            <PermissionRoute permission="detections:view" element={
+              <Suspense fallback={<EditorLoadingFallback />}>
+                <RetroHunt key={resetKey} />
               </Suspense>
             } />
           } />
@@ -876,11 +905,11 @@ function ProtectedAppRoutes() {
               </Suspense>
             } />
           } />
-          {/* Sections with a rail entry but no real page yet — render a stub. */}
+          {/* Notification channels — unified Slack/Teams/PagerDuty/generic surface (NAN-1790). */}
           <Route path="/settings/notifications" element={
-            <PermissionRoute permission="settings:system" element={
+            <PermissionRoute permission="settings:webhooks" element={
               <Suspense fallback={<SettingsLoadingFallback />}>
-                <SettingsComingSoon key={resetKey} />
+                <NotificationSettings key={resetKey} />
               </Suspense>
             } />
           } />
@@ -888,6 +917,14 @@ function ProtectedAppRoutes() {
             <PermissionRoute permission="settings:system" element={
               <Suspense fallback={<SettingsLoadingFallback />}>
                 <SearchSettings key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          {/* Per-source RBAC scoping — source-visibility registry + grants (NAN-1802). */}
+          <Route path="/settings/source-scopes" element={
+            <PermissionRoute permission="source_scopes:view" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <SourceScopes key={resetKey} />
               </Suspense>
             } />
           } />
@@ -905,12 +942,11 @@ function ProtectedAppRoutes() {
               </Suspense>
             } />
           } />
+          {/* Webhooks were absorbed into the unified Notifications surface
+              (channels). Keep the old path as a redirect for existing
+              deep links / bookmarks so nobody lands on the retired page. */}
           <Route path="/settings/webhooks" element={
-            <PermissionRoute permission="settings:webhooks" element={
-              <Suspense fallback={<SettingsLoadingFallback />}>
-                <WebhookSettings key={resetKey} />
-              </Suspense>
-            } />
+            <Navigate to="/settings/notifications" replace />
           } />
           <Route path="/settings/gdpr" element={
             <PermissionRoute permission="gdpr:anonymize" element={

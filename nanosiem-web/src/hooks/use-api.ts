@@ -364,8 +364,8 @@ export function useSearchSql() {
 
 export function useExplainQuery() {
   return useMutation(
-    ({ query, timeRange }: { query: string; timeRange: TimeRange }) =>
-      api.explainQuery(query, timeRange)
+    ({ query, timeRange, dataset }: { query: string; timeRange: TimeRange; dataset?: import('@/lib/api/types').SearchDataset }) =>
+      api.explainQuery(query, timeRange, dataset)
   );
 }
 
@@ -870,6 +870,14 @@ export function useRiskDecayConfig() {
 
 export function useUpdateRiskDecayConfig() {
   return useMutation(api.updateRiskDecayConfig.bind(api));
+}
+
+export function useRiskNotableConfig() {
+  return useQuery(() => api.getRiskNotableConfig(), []);
+}
+
+export function useUpdateRiskNotableConfig() {
+  return useMutation(api.updateRiskNotableConfig.bind(api));
 }
 
 // Risk Analytics hooks

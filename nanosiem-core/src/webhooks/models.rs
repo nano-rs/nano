@@ -16,10 +16,18 @@ pub const EVENT_TYPE_SIEM_ALERT: &str = "siem_alert";
 pub const EVENT_TYPE_OBS_ALERT: &str = "obs_alert";
 /// Webhook subscribes to case lifecycle events (created / status changed).
 pub const EVENT_TYPE_CASE: &str = "case";
+/// Webhook subscribes to scheduled-report completion events (`report_ready`).
+/// Opt-in (not in [`default_event_types`]) so existing webhooks are unaffected;
+/// a future notification-channels layer can route this stream (NAN-1793).
+pub const EVENT_TYPE_REPORT: &str = "report";
 
 /// Every valid `event_types` value. Used to validate create/update requests.
-pub const VALID_EVENT_TYPES: [&str; 3] =
-    [EVENT_TYPE_SIEM_ALERT, EVENT_TYPE_OBS_ALERT, EVENT_TYPE_CASE];
+pub const VALID_EVENT_TYPES: [&str; 4] = [
+    EVENT_TYPE_SIEM_ALERT,
+    EVENT_TYPE_OBS_ALERT,
+    EVENT_TYPE_CASE,
+    EVENT_TYPE_REPORT,
+];
 
 /// The default subscription for a new (or pre-column) webhook: both alert
 /// streams, no cases. Mirrors migration 217's column default so the Rust default
@@ -32,12 +40,13 @@ pub fn default_event_types() -> Vec<String> {
 }
 
 /// Map an `alerts.kind` discriminator to the webhook subscription category that
-/// gates it. `detection` → SIEM; everything else (`metric_monitor`, `slo`,
-/// `synthetic`) is observability. Centralized so the fire site and any future
-/// alert kind agree on the mapping.
+/// gates it. `detection` and `risk_notable` → SIEM (both are security-analyst
+/// alert streams; risk notables aggregate detection-rule risk, NAN-1792);
+/// everything else (`metric_monitor`, `slo`, `synthetic`) is observability.
+/// Centralized so the fire site and any future alert kind agree on the mapping.
 pub fn alert_kind_to_event_type(kind: &str) -> &'static str {
     match kind {
-        "detection" => EVENT_TYPE_SIEM_ALERT,
+        "detection" | "risk_notable" => EVENT_TYPE_SIEM_ALERT,
         _ => EVENT_TYPE_OBS_ALERT,
     }
 }
@@ -59,6 +68,17 @@ pub struct Webhook {
     /// column is NOT NULL DEFAULT {siem_alert, obs_alert}).
     #[sqlx(default)]
     pub event_types: Vec<String>,
+    /// Notification channel type (`generic` | `slack` | `teams` | `pagerduty` |
+    /// `email`). Selects the payload formatter. Legacy rows default `generic`.
+    #[sqlx(default)]
+    pub channel_type: String,
+    /// Non-secret provider config (JSON). Secrets live in `secret_encrypted`.
+    #[sqlx(default)]
+    pub channel_config: serde_json::Value,
+    /// Optional detection-rule routing filter: fire only for these rule ids.
+    /// `None`/empty = all rules.
+    #[sqlx(default)]
+    pub rule_filter: Option<Vec<Uuid>>,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -69,6 +89,39 @@ impl Webhook {
     /// (one of `VALID_EVENT_TYPES`). An empty subscription set means "all".
     pub fn subscribes_to(&self, event_type: &str) -> bool {
         self.event_types.is_empty() || self.event_types.iter().any(|e| e == event_type)
+    }
+
+    /// Whether this channel's optional detection-rule filter admits `rule_id`.
+    /// An unset/empty filter admits everything; a set filter admits only its
+    /// members. A `None` rule_id is NOT admitted by a set filter — a rule filter
+    /// is inherently detection-scoped, so a rule-less alert (observability:
+    /// metric_monitor / slo / synthetic) doesn't match a rule-scoped channel.
+    ///
+    /// Applied to ALERT routing only. Case events are a separate stream, gated
+    /// solely by the `case` subscription — see `fire_case_event`. (The UI states
+    /// this: "Restrict this channel to alerts from specific detection rules.")
+    pub fn passes_rule_filter(&self, rule_id: Option<Uuid>) -> bool {
+        match &self.rule_filter {
+            None => true,
+            Some(f) if f.is_empty() => true,
+            Some(f) => rule_id.map(|id| f.contains(&id)).unwrap_or(false),
+        }
+    }
+
+    /// The parsed channel type. An empty value (legacy row, or the column
+    /// default) resolves to `Generic`. An UNKNOWN non-empty value is an ERROR,
+    /// not a silent fallback to `Generic`: falling back would HMAC-sign this
+    /// row's secret and POST the raw payload to its URL — and for any channel
+    /// type whose secret is a provider token (a routing key, a future channel's
+    /// API key) that leaks the token to the endpoint. Fail closed instead; the
+    /// delivery is recorded as failed and nothing is sent.
+    pub fn resolve_channel_type(&self) -> Result<super::channels::ChannelType, String> {
+        let raw = self.channel_type.trim();
+        if raw.is_empty() {
+            return Ok(super::channels::ChannelType::Generic);
+        }
+        super::channels::ChannelType::parse(raw)
+            .ok_or_else(|| format!("unknown channel_type '{raw}'; refusing to deliver"))
     }
 }
 
@@ -87,6 +140,12 @@ pub struct WebhookResponse {
     pub severity_filter: Option<Vec<String>>,
     /// Event streams this webhook fires for (see `VALID_EVENT_TYPES`).
     pub event_types: Vec<String>,
+    /// Channel type (`generic` | `slack` | `teams` | `pagerduty` | `email`).
+    pub channel_type: String,
+    /// Non-secret provider config echoed back for editing.
+    pub channel_config: serde_json::Value,
+    /// Optional detection-rule routing filter as `rule_…` typeids (null = all).
+    pub rule_filter: Option<Vec<String>>,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -94,6 +153,11 @@ pub struct WebhookResponse {
 
 impl From<&Webhook> for WebhookResponse {
     fn from(w: &Webhook) -> Self {
+        let channel_type = if w.channel_type.is_empty() {
+            "generic".to_string()
+        } else {
+            w.channel_type.clone()
+        };
         Self {
             id: w.id,
             name: w.name.clone(),
@@ -105,6 +169,12 @@ impl From<&Webhook> for WebhookResponse {
             has_secret: w.secret_encrypted.as_ref().map_or(false, |s| !s.is_empty()),
             severity_filter: w.severity_filter.clone(),
             event_types: w.event_types.clone(),
+            channel_type,
+            channel_config: w.channel_config.clone(),
+            rule_filter: w
+                .rule_filter
+                .as_ref()
+                .map(|ids| ids.iter().map(encode_rule_id).collect()),
             enabled: w.enabled,
             created_at: w.created_at,
             updated_at: w.updated_at,
@@ -126,6 +196,13 @@ pub struct CreateWebhookRequest {
     /// Event streams to subscribe to (see `VALID_EVENT_TYPES`). Omit/null =
     /// default ({siem_alert, obs_alert}).
     pub event_types: Option<Vec<String>>,
+    /// Channel type (`generic` | `slack` | `teams` | `pagerduty`). Omit = generic.
+    pub channel_type: Option<String>,
+    /// Non-secret provider config (JSON object). Omit = `{}`.
+    pub channel_config: Option<serde_json::Value>,
+    /// Optional detection-rule routing filter (`rule_…` typeids or bare UUIDs).
+    /// Omit/empty = all rules.
+    pub rule_filter: Option<Vec<String>>,
     pub enabled: Option<bool>,
 }
 
@@ -142,6 +219,13 @@ pub struct UpdateWebhookRequest {
     /// Replace the subscription set (omit = no change). Must be non-empty and
     /// contain only `VALID_EVENT_TYPES` values.
     pub event_types: Option<Vec<String>>,
+    /// Change the channel type (omit = no change).
+    pub channel_type: Option<String>,
+    /// Replace the non-secret provider config (omit = no change).
+    pub channel_config: Option<serde_json::Value>,
+    /// Replace the detection-rule routing filter (omit = no change; pass `[]` to
+    /// clear). `rule_…` typeids or bare UUIDs.
+    pub rule_filter: Option<Vec<String>>,
     pub enabled: Option<bool>,
 }
 
@@ -150,6 +234,16 @@ impl CreateWebhookRequest {
     pub fn validate_event_types(&self) -> Result<(), String> {
         validate_event_types(self.event_types.as_deref())
     }
+
+    /// Validate the channel type + its required fields for a create.
+    pub fn validate_channel(&self) -> Result<(), String> {
+        validate_channel(self.channel_type.as_deref(), Some(self.url.as_str()), true)
+    }
+
+    /// Decode the request's `rule_filter` typeids/UUIDs to raw UUIDs.
+    pub fn decoded_rule_filter(&self) -> Result<Option<Vec<Uuid>>, String> {
+        decode_rule_filter(self.rule_filter.as_deref())
+    }
 }
 
 impl UpdateWebhookRequest {
@@ -157,6 +251,77 @@ impl UpdateWebhookRequest {
     pub fn validate_event_types(&self) -> Result<(), String> {
         validate_event_types(self.event_types.as_deref())
     }
+
+    /// Validate the channel type on update. `url` is only required at create
+    /// time (an update that doesn't touch the URL keeps the stored one), so the
+    /// required-URL check is relaxed here.
+    pub fn validate_channel(&self) -> Result<(), String> {
+        validate_channel(self.channel_type.as_deref(), self.url.as_deref(), false)
+    }
+
+    /// Decode the request's `rule_filter` typeids/UUIDs to raw UUIDs.
+    pub fn decoded_rule_filter(&self) -> Result<Option<Vec<Uuid>>, String> {
+        decode_rule_filter(self.rule_filter.as_deref())
+    }
+}
+
+/// Encode a detection-rule UUID as a `rule_…` typeid for the API surface.
+pub fn encode_rule_id(id: &Uuid) -> String {
+    typeid::encode(typeid::rule::PREFIX, id)
+}
+
+/// Decode an API `rule_filter` list (typeids or bare UUIDs) to raw UUIDs.
+/// `None` stays `None` (no change); an empty list decodes to `Some(vec![])`
+/// (clear the filter). A malformed id is a hard error naming the value.
+fn decode_rule_filter(ids: Option<&[String]>) -> Result<Option<Vec<Uuid>>, String> {
+    match ids {
+        None => Ok(None),
+        Some(list) => {
+            let mut out = Vec::with_capacity(list.len());
+            for raw in list {
+                let id = typeid::decode(typeid::rule::PREFIX, raw)
+                    .map_err(|_| format!("invalid rule id in rule_filter: '{raw}'"))?;
+                out.push(id);
+            }
+            Ok(Some(out))
+        }
+    }
+}
+
+/// Shared channel validation for create/update. Checks the type is known and
+/// creatable, and (when `require_url`) that URL-bearing channel types carry one.
+/// The PagerDuty routing key requirement is enforced at the handler, which knows
+/// whether a secret already exists on an update.
+fn validate_channel(
+    channel_type: Option<&str>,
+    url: Option<&str>,
+    require_url: bool,
+) -> Result<(), String> {
+    let ct = match channel_type {
+        None => return Ok(()), // omitted → generic (create) / unchanged (update)
+        Some(s) => s,
+    };
+    let parsed = super::channels::ChannelType::parse(ct).ok_or_else(|| {
+        format!(
+            "invalid channel_type '{ct}'; expected one of {:?}",
+            super::channels::VALID_CHANNEL_TYPES
+        )
+    })?;
+
+    if !parsed.supports_delivery() {
+        return Err(format!(
+            "channel_type '{ct}' is not yet available (formatter seam only); use generic, slack, teams, or pagerduty"
+        ));
+    }
+
+    if require_url && parsed.user_supplies_url() {
+        let has_url = url.map(|u| !u.trim().is_empty()).unwrap_or(false);
+        if !has_url {
+            return Err(format!("channel_type '{ct}' requires a destination URL"));
+        }
+    }
+
+    Ok(())
 }
 
 /// Shared validation for a request's `event_types`, consistent across create and

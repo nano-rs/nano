@@ -338,11 +338,14 @@ pub struct SearchRequest {
     /// Only "interactive" and "analytics" are accepted from API clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
-    /// Observability dataset to run the nPL pipeline against (NAN-1534).
-    /// `"logs"` (default) | `"spans"` | `"metrics"`. Selects the FROM table and
-    /// the time-bound column (spans → `start_time`, logs/metrics → `timestamp`)
-    /// in the SQL generator. Unknown values fall back to `logs` (never an error)
-    /// via [`Dataset::from_selector`](crate::query::Dataset::from_selector).
+    /// Dataset to run the nPL pipeline against (NAN-1534).
+    /// `"logs"` (default) | `"spans"` | `"metrics"` | `"risk"`. Selects the FROM
+    /// source and the time-bound column (spans → `start_time`, logs/metrics →
+    /// `timestamp`) in the SQL generator. `"risk"` (NAN-1798 P2) targets the
+    /// DERIVED accumulated-entity-risk grain (one row per entity; fixed trailing
+    /// 24h/7d score windows the time picker does not reshape). Unknown values
+    /// fall back to `logs` (never an error) via
+    /// [`Dataset::from_selector`](crate::query::Dataset::from_selector).
     /// Omit for the default logs dataset — `with_dataset(Logs)` is byte-identical
     /// to the prior generator, so existing clients are unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -895,6 +898,51 @@ pub struct RetroTopEntity {
     pub hits: u64,
     /// Entity kind: `asset` | `user`.
     pub kind: String,
+}
+
+/// A newly-landed feed indicator considered by an auto retro-hunt run (NAN-1791).
+///
+/// Pulled from `custom_enrichment_results` above the rule's watermark, before the
+/// per-run cap + hunted-set anti-join. `value` is lowercased to match the
+/// ingest-lowercased raw columns and the `lower(col)` expression indexes.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RetroFeedCandidate {
+    /// Lowercased indicator value.
+    pub value: String,
+    /// Artifact type (`ip` | `domain` | `hash` | `url` | `custom`).
+    pub key_type: String,
+    /// Feed name (`enrichment_name`) the indicator came from.
+    pub enrichment_name: String,
+    /// Intel confidence (0-100).
+    pub confidence: u32,
+    /// When the indicator most recently landed in the feed table (the watermark
+    /// cursor value), as epoch milliseconds.
+    pub fetched_at_ms: i64,
+}
+
+/// A retro-hunt HIT: a delta indicator that was found in historical logs
+/// (NAN-1791). Emitted as a synthesized detection match through the standard
+/// signal processor → alerts path.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RetroHuntHit {
+    /// The indicator value that matched.
+    pub value: String,
+    /// Inferred indicator type (ip | hash | domain | url | …).
+    pub indicator_type: String,
+    /// The logical observable field the indicator matched on (e.g. `src_ip`).
+    pub field: String,
+    /// Total event hits in the lookback window.
+    pub hits: u64,
+    /// Distinct hosts the indicator touched.
+    pub hosts: u64,
+    /// Total distinct hosts in the environment (verdict denominator).
+    pub total_hosts: u64,
+    /// First seen in logs (ISO-8601).
+    pub first_seen: Option<String>,
+    /// Last seen in logs (ISO-8601).
+    pub last_seen: Option<String>,
+    /// Rarity verdict band (`rare` | `uncommon` | `common`).
+    pub verdict: String,
 }
 
 /// Summary submode payload — a single indicator's environment-wide footprint.

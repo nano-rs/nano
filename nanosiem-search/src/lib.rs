@@ -64,6 +64,12 @@ pub struct SearchState {
     pub prevalence: Arc<PrevalenceService>,
     /// Authentication state
     pub auth_state: AuthState,
+    /// Fail-closed source-scope resolver (NAN-1797). Shares the Arc-backed
+    /// cache with `auth_state.source_scope_resolver`; retained on the shared
+    /// state so handlers can resolve the per-user deny set without reaching
+    /// through `auth_state`. `None` when source-scoping is not wired
+    /// (auth-disabled / minimal setups).
+    pub source_scope_resolver: Option<Arc<nanosiem_core::auth::SourceScopeResolver>>,
     /// Audit emitter for logging sharing events
     pub audit_emitter: Arc<AuditEmitter>,
     /// Service start time for uptime tracking
@@ -235,12 +241,17 @@ impl SearchState {
         // Create IP allowlist service for access control
         let ip_allowlist_service = Arc::new(IpAllowlistService::new(dual_pool.postgres().clone()));
 
+        // Share the middleware's fail-closed source-scope resolver (NAN-1797)
+        // so handler-side resolution hits the same Arc-backed registry cache.
+        let source_scope_resolver = auth_state.source_scope_resolver.clone();
+
         Self {
             dual_pool,
             search,
             lookup,
             prevalence,
             auth_state,
+            source_scope_resolver,
             audit_emitter,
             start_time: Instant::now(),
             leader_rx: None,

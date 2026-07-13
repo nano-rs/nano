@@ -33,6 +33,14 @@ pub enum Dataset {
     Spans,
     /// OTLP metric data points (`otel_metrics`, time column `timestamp`).
     Metrics,
+    /// Accumulated (decayed) entity risk (NAN-1798 P2): a DERIVED dataset —
+    /// one row per entity, aggregated at query time from the findings stream
+    /// in the logs table by the shared risk builder
+    /// (`crate::risk::clickhouse_sql::risk_dataset_base_query`). The generator
+    /// swaps in a `FROM (<risk aggregation>)` subquery instead of a storage
+    /// table; the 24h/7d score windows are FIXED trailing windows anchored at
+    /// evaluation time, so the search time picker does not reshape them.
+    Risk,
 }
 
 impl Default for Dataset {
@@ -79,6 +87,7 @@ impl Dataset {
         match s.trim().to_ascii_lowercase().as_str() {
             "spans" | "span" | "traces" | "trace" => Dataset::Spans,
             "metrics" | "metric" => Dataset::Metrics,
+            "risk" => Dataset::Risk,
             _ => Dataset::Logs,
         }
     }
@@ -93,28 +102,36 @@ impl Dataset {
             "logs" | "log" => Some(Dataset::Logs),
             "spans" | "span" | "traces" | "trace" => Some(Dataset::Spans),
             "metrics" | "metric" => Some(Dataset::Metrics),
+            "risk" => Some(Dataset::Risk),
             _ => None,
         }
     }
 
     /// The ClickHouse storage table this dataset reads from (unqualified — the
     /// generator/executor prepends the `nanosiem.` database as needed, matching
-    /// the existing `"logs"` convention).
+    /// the existing `"logs"` convention). `Risk` is a DERIVED dataset whose
+    /// UNDERLYING storage is the findings stream in the logs table — the
+    /// generator's `with_dataset(Risk)` swap never consults this literal (it
+    /// builds the derived subquery from its captured tenant logs table), so
+    /// this is only the physical-scan answer for introspection callers.
     pub fn table_name(self) -> &'static str {
         match self {
-            Dataset::Logs => "logs",
+            Dataset::Logs | Dataset::Risk => "logs",
             Dataset::Spans => "otel_spans",
             Dataset::Metrics => "otel_metrics",
         }
     }
 
     /// The primary time column for this dataset — `timestamp` for logs/metrics,
-    /// `start_time` for spans (OTLP span start). Used by callers that build
-    /// time-bounded WHERE clauses against the OTLP tables.
+    /// `start_time` for spans (OTLP span start), and the entity's
+    /// `last_finding_at` for the derived risk grain (its only time-typed
+    /// column; used for the default ORDER BY — the risk windows themselves are
+    /// fixed trailing windows the picker does not reshape).
     pub fn time_column(self) -> &'static str {
         match self {
             Dataset::Logs | Dataset::Metrics => "timestamp",
             Dataset::Spans => "start_time",
+            Dataset::Risk => "last_finding_at",
         }
     }
 }
@@ -167,6 +184,50 @@ pub const METRIC_COLUMNS: &[&str] = &[
 /// `count`, `sum`. (Time columns are handled by the dedicated time-bound path.)
 pub const OTEL_NUMERIC_COLUMNS: &[&str] = &["duration_ns", "value", "count", "sum"];
 
+/// The column universe of the derived `risk` dataset (NAN-1798 P2) — the
+/// projection of the shared risk builder's entity-grain base source
+/// (`risk_dataset_base_query`), one row per entity. Same rationale as
+/// [`SPAN_COLUMNS`]: nPL field tokens on a risk query resolve DIRECTLY to
+/// these derived columns (the subquery has no `ext` spill, so a fallthrough
+/// would be a hard SQL error). `score_24h`/`score_7d` are the canonical
+/// decayed sums (presented as `decayed_score_24h/7d` by the Risk page API);
+/// `raw_score_*` the undecayed sums; `distinct_rules_*`/`distinct_tactics_*`
+/// the rule/tactic widths behind risk-notable conditions.
+pub const RISK_COLUMNS: &[&str] = &[
+    "entity",
+    "entity_type",
+    "score_24h",
+    "score_7d",
+    "raw_score_24h",
+    "raw_score_7d",
+    "findings_24h",
+    "findings_7d",
+    "distinct_rules_24h",
+    "distinct_rules_7d",
+    "distinct_tactics_24h",
+    "distinct_tactics_7d",
+    "last_finding_at",
+    "last_rule_name",
+    "last_severity",
+];
+
+/// Numeric columns of the `risk` dataset — every score/count/width column.
+/// Comparisons must not be `lower()`-wrapped and string literals coerce to
+/// numbers, so `score_24h > 100` and `score_24h > "100"` both work
+/// (`last_finding_at` is time-typed, not numeric).
+pub const RISK_NUMERIC_COLUMNS: &[&str] = &[
+    "score_24h",
+    "score_7d",
+    "raw_score_24h",
+    "raw_score_7d",
+    "findings_24h",
+    "findings_7d",
+    "distinct_rules_24h",
+    "distinct_rules_7d",
+    "distinct_tactics_24h",
+    "distinct_tactics_7d",
+];
+
 impl Dataset {
     /// The set of promoted columns referenceable directly in nPL for this
     /// dataset (NAN-1534). Empty for [`Dataset::Logs`] — logs field resolution is
@@ -179,6 +240,7 @@ impl Dataset {
             Dataset::Logs => &[],
             Dataset::Spans => SPAN_COLUMNS,
             Dataset::Metrics => METRIC_COLUMNS,
+            Dataset::Risk => RISK_COLUMNS,
         }
     }
 
@@ -188,6 +250,7 @@ impl Dataset {
         match self {
             Dataset::Logs => &[],
             Dataset::Spans | Dataset::Metrics => OTEL_NUMERIC_COLUMNS,
+            Dataset::Risk => RISK_NUMERIC_COLUMNS,
         }
     }
 }

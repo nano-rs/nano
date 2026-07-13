@@ -3785,3 +3785,128 @@
             );
         }
     }
+
+    /// NAN-1828: on OCSF a bare keyword must tokenize against BOTH body columns.
+    ///
+    /// The raw log lands in a different column depending on the producer: our
+    /// Vector parsers write it to `message` (and emit no `raw_data`), while a
+    /// direct producer (Tenzir) writes the untouched original to `raw_data` and a
+    /// human summary to `message`. Searching `message` alone left a Tenzir
+    /// tenant's original log unfindable — NAN-1827 persisted it, but the only nPL
+    /// form that reached it (`raw_data=*kw*`) emits `iLike`, which extracts no
+    /// index tokens (verified: `Condition: (mode: All; tokens: [])`) and degrades
+    /// to a dictionary scan.
+    ///
+    /// Both `hasAllTokens` terms are index-served (`idx_message_words`,
+    /// `idx_raw_data_words`); ClickHouse combines them and the granule union is
+    /// tight, because the body lives in exactly one of the two.
+    #[test]
+    fn ocsf_bare_keyword_or_folds_message_and_raw_data() {
+        use crate::schema::OcsfProfile;
+        use std::sync::Arc;
+        let gen = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
+        let sql = gen.generate(&parse_query("nano1827probe").unwrap(), &time_range()).unwrap();
+
+        assert!(
+            sql.contains(
+                "(hasAllTokens(lower(message), 'nano1827probe') \
+                 OR hasAllTokens(lower(raw_data), 'nano1827probe'))"
+            ),
+            "OCSF bare keyword must OR-fold both body columns, got:\n{sql}"
+        );
+        // Parenthesized, or the OR would rebind against the surrounding AND-chain
+        // (`ts BETWEEN … AND a OR b` == `(ts AND a) OR b`) and silently match every
+        // row whose raw_data hits, ignoring the time bounds.
+        assert!(
+            !sql.contains("AND hasAllTokens(lower(message), 'nano1827probe') OR "),
+            "the OR-fold must be parenthesized or it rebinds against the AND-chain, got:\n{sql}"
+        );
+    }
+
+    /// The all-separator fallback arm must OR-fold too. `!!!` tokenizes to nothing,
+    /// so it falls back to a substring iLike — which, unfolded, would search only
+    /// `message` and miss a Tenzir tenant's original entirely.
+    #[test]
+    fn ocsf_bare_keyword_or_folds_the_all_separator_arm() {
+        use crate::schema::OcsfProfile;
+        use std::sync::Arc;
+        let gen = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
+        let sql = gen.generate(&parse_query("\"!!!\"").unwrap(), &time_range()).unwrap();
+        assert!(
+            sql.contains("lower(message) iLike") && sql.contains("lower(raw_data) iLike"),
+            "all-separator arm must cover both body columns, got:\n{sql}"
+        );
+    }
+
+    /// KNOWN GAP (NAN-1829), pinned so it cannot regress silently or be mistaken
+    /// for a NAN-1828 oversight.
+    ///
+    /// A bare wildcard is rewritten BY THE PARSER into an explicit field filter on
+    /// `message`:
+    ///
+    ///   "*probe*"  =>  FieldFilter { field: "message", op: Regex, .. }
+    ///
+    /// The parser has no `SchemaProfile`, so it hardcodes the column at parse time
+    /// and never reaches `bare_keyword_predicate`. On OCSF that means `*probe*`
+    /// searches only the summary and misses a Tenzir producer's `raw_data`.
+    ///
+    /// It cannot be fixed in codegen: `*probe*` and an explicit `message=*probe*`
+    /// produce IDENTICAL ASTs, so widening one silently widens the other — and a
+    /// user who names `message` must get `message`. The real fix is a sentinel
+    /// body-field in the AST that codegen resolves per profile.
+    ///
+    /// The primary hunt path (bare keyword -> `hasAllTokens`, the only index-served
+    /// form) IS fixed; this is the unindexed substring escape hatch.
+    #[test]
+    fn ocsf_bare_wildcard_is_parser_pinned_to_message_known_gap() {
+        use crate::schema::OcsfProfile;
+        use std::sync::Arc;
+        let gen = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
+        let sql = gen.generate(&parse_query("*probe*").unwrap(), &time_range()).unwrap();
+        // Assert on the WHERE clause alone: `raw_data` is a promoted OCSF column, so it
+        // legitimately appears in the SELECT projection of every OCSF query.
+        let where_clause = &sql[sql.find(" WHERE ").expect("generated SQL has a WHERE")..];
+        assert!(
+            where_clause.contains("lower(message) iLike '%probe%'"),
+            "bare wildcard is parser-rewritten onto `message`, got:\n{sql}"
+        );
+        assert!(
+            !where_clause.contains("raw_data"),
+            "if the bare wildcard now reaches raw_data, NAN-1829 landed — delete this test, got:\n{where_clause}"
+        );
+    }
+
+    /// The OR-fold is OCSF-only. Every single-body profile must emit SQL that is
+    /// byte-identical to the pre-NAN-1828 form — no parens, no OR, no `raw_data`
+    /// (a column those tables do not even have; naming it would be Code 47).
+    #[test]
+    fn non_ocsf_bare_keyword_is_unchanged_single_column() {
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&parse_query("nano1827probe").unwrap(), &time_range())
+            .unwrap();
+
+        assert!(
+            sql.contains("hasAllTokens(lower(message), 'nano1827probe')"),
+            "UDM bare keyword must stay the single-column form, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("raw_data"),
+            "UDM has no raw_data column — emitting it would be UNKNOWN_IDENTIFIER, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("(hasAllTokens(lower(message), 'nano1827probe') OR"),
+            "UDM must not OR-fold — its SQL must be byte-identical to pre-NAN-1828, got:\n{sql}"
+        );
+    }
+
+    /// `keyword_search_column()` is consumed in IDENTIFIER position (the
+    /// `transaction` command's free-text capture), so it must stay `message` on
+    /// OCSF even though the *predicate* now spans two columns. Widening it would
+    /// silently repoint the transaction capture at `raw_data`.
+    #[test]
+    fn ocsf_keyword_search_column_stays_message_for_identifier_use() {
+        use crate::schema::{OcsfProfile, SchemaProfile};
+        let p = OcsfProfile::new();
+        assert_eq!(p.keyword_search_column(), "message");
+        assert_eq!(p.keyword_search_columns(), vec!["message", "raw_data"]);
+    }

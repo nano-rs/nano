@@ -19,6 +19,30 @@ use crate::{
     state::AppState,
 };
 
+/// NAN-1808: compose the caller's EFFECTIVE per-source deny scope for
+/// detection-match reads — the per-source RBAC deny set (NAN-1799) unioned
+/// with the `audit` source unless the caller holds `audit:view`. Mirrors
+/// `handlers::alerts::effective_viewer_scope`. Returns `None` for an
+/// unrestricted caller so the emitted SQL stays byte-identical to the
+/// pre-scoping query; otherwise the normalized (trimmed + lowercased) deny
+/// values to bind against `detection_matches.source_types`.
+fn effective_viewer_deny(auth: &AuthContext) -> Option<Vec<String>> {
+    let mut deny = auth.denied_sources.deny_set().clone();
+    if !auth.has_permission(permissions::AUDIT_VIEW) {
+        deny.insert("audit".to_string());
+    }
+    let deny: Vec<String> = deny
+        .iter()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if deny.is_empty() {
+        None
+    } else {
+        Some(deny)
+    }
+}
+
 /// Manually trigger a detection rule to run now
 #[utoipa::path(
     post,
@@ -192,6 +216,14 @@ pub async fn get_detection_matches(
 ) -> Result<Json<DetectionMatchesResponse>, ApiError> {
     ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
+    // NAN-1808: per-source RBAC — detection_matches stores the full matched
+    // events, a sibling surface to alerts NOT covered by alerts.source_types.
+    // A restricted viewer must not read matches derived from a denied source.
+    // A row is visible iff NONE of its stamped source_types is denied; rows
+    // stamped '{}' (pre-feature / non-source-derived) never overlap and stay
+    // visible. `None` (unrestricted) keeps the SQL byte-identical.
+    let deny_vec = effective_viewer_deny(&auth);
+
     // Build the base query from detection_matches table.
     // LEFT JOIN match_reviews so the UI can show a "reviewed" chip without an
     // extra round-trip per row (NAN-494).
@@ -221,6 +253,14 @@ pub async fn get_detection_matches(
     if query.end_time.is_some() {
         param_count += 1;
         sql.push_str(&format!(" AND dm.detected_at <= ${}", param_count));
+    }
+
+    if deny_vec.is_some() {
+        param_count += 1;
+        sql.push_str(&format!(
+            " AND (${p}::text[] = '{{}}' OR NOT (dm.source_types && ${p}::text[]))",
+            p = param_count
+        ));
     }
 
     // Order by most recent first
@@ -254,6 +294,10 @@ pub async fn get_detection_matches(
         query_builder = query_builder.bind(end);
     }
 
+    if let Some(deny) = &deny_vec {
+        query_builder = query_builder.bind(deny);
+    }
+
     query_builder = query_builder.bind(query.limit).bind(query.offset);
 
     // Execute the query
@@ -273,6 +317,16 @@ pub async fn get_detection_matches(
         count_sql.push_str(&format!(" AND detected_at <= ${}", count_param));
     }
 
+    // NAN-1808: total must count the same scope-filtered rows the page shows —
+    // an unfiltered count would leak the existence of denied-source matches.
+    if deny_vec.is_some() {
+        count_param += 1;
+        count_sql.push_str(&format!(
+            " AND (${p}::text[] = '{{}}' OR NOT (source_types && ${p}::text[]))",
+            p = count_param
+        ));
+    }
+
     let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql).bind(*id);
 
     if let Some(start) = query.start_time {
@@ -281,6 +335,10 @@ pub async fn get_detection_matches(
 
     if let Some(end) = query.end_time {
         count_query = count_query.bind(end);
+    }
+
+    if let Some(deny) = &deny_vec {
+        count_query = count_query.bind(deny);
     }
 
     let total = count_query.fetch_one(&state.pool).await?;

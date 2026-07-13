@@ -205,6 +205,17 @@ pub(crate) fn analyze_required_fields(
                         fields.insert(f.to_string());
                     }
                 }
+                // Risk (NAN-1798 P2): the derived entity grain is 15 columns
+                // total and the generator forces `SELECT *` for the risk
+                // dataset (`required_fields = None` in `generate_with_options`),
+                // so this slim summary is effectively unused; keep it aligned
+                // with the profile's triage shape for totality.
+                crate::schema::SchemaId::Risk => {
+                    use crate::schema::SchemaProfile as _;
+                    for f in crate::schema::RiskProfile::new().default_table_fields() {
+                        fields.insert(f.to_string());
+                    }
+                }
             }
         }
         return Some(fields);

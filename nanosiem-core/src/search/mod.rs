@@ -20,7 +20,7 @@ pub mod jobs;
 mod processing;
 pub mod query_processing;
 mod query_tracking;
-mod service;
+pub mod service;
 pub mod streaming;
 mod types;
 
@@ -64,8 +64,8 @@ pub use types::{
     parse_clickhouse_error, AssetEventFilters, AssetFacets, AssetPagination, CloudEventFilters,
     CloudFacets, CloudUserActivity, CloudUserSessionSummary, DisplayType, EntityCrossReference,
     FieldInfo, FieldStatistics, FieldValueInfo, HistogramBucket, QueryWarningOutput, RawSqlRequest,
-    RetroIndicatorSummary, RetroListRow, RetroPivotRow, RetroRequest, RetroResponse, RetroTopEntity,
-    RetroVerdict, SearchError, SearchRequest, SearchResponse, TimeRangeInput, UdmFieldQueryRequest,
-    UdmQueryOperator,
+    RetroFeedCandidate, RetroHuntHit, RetroIndicatorSummary, RetroListRow, RetroPivotRow,
+    RetroRequest, RetroResponse, RetroTopEntity, RetroVerdict, SearchError, SearchRequest,
+    SearchResponse, TimeRangeInput, UdmFieldQueryRequest, UdmQueryOperator,
 };
 pub(crate) use types::SearchExecutionLimits;

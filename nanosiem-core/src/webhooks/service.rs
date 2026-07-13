@@ -8,15 +8,17 @@
 use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::auth::source_scope_resolver::SourceScopeResolver;
 use crate::inputlookup::{IpCidr, SsrfConfig, SsrfValidator};
 
+use super::channels::{build_channel_body, ChannelType, FormatContext};
 use super::models::*;
 use super::repository::WebhookRepository;
 
@@ -64,6 +66,18 @@ pub(crate) fn parse_egress_allowlist(raw: &str) -> Vec<IpCidr> {
         .collect()
 }
 
+/// Normalize a configured/env base into a scheme-qualified origin with no
+/// trailing slash: `nano.example.com` → `https://nano.example.com`,
+/// `http://host/` → `http://host`. Pure (no env read) for testability.
+pub(crate) fn normalize_base_url(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    }
+}
+
 /// Hard cap on how many bytes of a receiver's response we read before dropping
 /// the rest. A malicious/compromised endpoint must not be able to exhaust
 /// memory by returning a huge body (the delivery-log truncation happens only
@@ -74,6 +88,13 @@ const RESPONSE_READ_CAP: usize = 8 * 1024;
 #[derive(Clone)]
 pub struct WebhookService {
     repo: WebhookRepository,
+    /// Redacts restricted-source alert content at the webhook egress choke
+    /// point (NAN-1800). `None` means the construction site has not been wired
+    /// with a resolver yet — redaction is skipped (status-quo behavior, not a
+    /// new leak). `WebhookRepository` does not expose its `PgPool`, so the
+    /// service cannot self-build one; inject the shared resolver via
+    /// [`with_scope_resolver`](Self::with_scope_resolver).
+    scope_resolver: Option<SourceScopeResolver>,
     /// Gates actual in-flight HTTP requests.
     semaphore: Arc<Semaphore>,
     /// Bounds total outstanding delivery tasks (see `MAX_INFLIGHT_DELIVERIES`).
@@ -88,11 +109,25 @@ impl WebhookService {
         // `resolve_to_addrs` (see `ssrf_checked_client`) — a shared client can't
         // be pinned to a per-URL address set. Redirects are disabled on every
         // client so there is no second, unvalidated hop.
+        // Self-build the scope resolver from the repo's pool so restricted-source
+        // redaction (NAN-1800) is active at every construction site. Its own
+        // cache converges with other processes via the NAN-1807 version counter.
+        let scope_resolver = Some(SourceScopeResolver::new(repo.pool()));
         Self {
             repo,
+            scope_resolver,
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES)),
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_DELIVERIES)),
         }
+    }
+
+    /// Wire the shared [`SourceScopeResolver`] so `fire_alert` redacts
+    /// restricted-source content before fanout (NAN-1800). Additive builder —
+    /// existing `new(repo)` call sites keep compiling; each must be migrated to
+    /// chain this so redaction is active there.
+    pub fn with_scope_resolver(mut self, resolver: SourceScopeResolver) -> Self {
+        self.scope_resolver = Some(resolver);
+        self
     }
 
     /// The SSRF validator used for BOTH the create-time URL check and the
@@ -214,17 +249,66 @@ impl WebhookService {
         String::from_utf8_lossy(&buf).into_owned()
     }
 
-    /// Build a deep link back to a resource in the nano UI, or `None` when
-    /// `NANOSIEM_HOSTNAME` is unset (same source the OIDC issuer uses). `path`
-    /// is the SPA route without a leading slash, e.g. `alerts/alert_…`.
-    fn ui_link(path: &str) -> Option<String> {
-        std::env::var("NANOSIEM_HOSTNAME").ok().and_then(|h| {
-            if h.is_empty() {
-                None
-            } else {
-                Some(format!("https://{h}/{path}"))
+    /// Resolve the external base origin (e.g. `https://nano.example.com`) for
+    /// notification deep links. Resolution order (NAN-1790):
+    ///   1. the admin-configured `system_settings.notification_base_url`
+    ///   2. the `NANOSIEM_HOSTNAME` env var (as `https://<host>`; same source
+    ///      the OIDC issuer uses)
+    ///   3. `None` — deep links are omitted from payloads
+    /// Returned without a trailing slash. Read once per fire so the deep link is
+    /// consistent across all channels fanned out from a single alert. Public so
+    /// the settings handler can surface the effective (resolved) base URL.
+    pub async fn resolve_base_url(&self) -> Option<String> {
+        // Prefer the DB setting; a DB error falls through to the env var rather
+        // than dropping the link entirely.
+        if let Ok(Some(configured)) = self.repo.notification_base_url().await {
+            return Some(normalize_base_url(&configured));
+        }
+        std::env::var("NANOSIEM_HOSTNAME")
+            .ok()
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+            .map(|h| normalize_base_url(&h))
+    }
+
+    /// Build a deep link back to a resource in the nano UI from a resolved
+    /// `base` (see [`resolve_base_url`]), or `None` when no base is configured.
+    /// `path` is the SPA route without a leading slash, e.g. `alerts/alert_…`.
+    fn ui_link(base: Option<&str>, path: &str) -> Option<String> {
+        base.map(|b| format!("{b}/{path}"))
+    }
+
+    /// Should this alert's payload be redacted because it derives from a
+    /// restricted source (NAN-1800)?
+    ///
+    /// Origin attribution comes from the stored `matched_events` blob (each
+    /// event row carries the `source_type` column). Three regimes:
+    ///
+    /// - **No resolver wired** (`scope_resolver = None`): status-quo — no
+    ///   redaction. Not a new leak; the construction site simply hasn't been
+    ///   migrated to [`with_scope_resolver`](Self::with_scope_resolver) yet.
+    /// - **Fully attributed blob**: redact iff ANY origin `source_type` is
+    ///   restricted, per [`SourceScopeResolver::any_restricted`] (which is
+    ///   fail-closed when the registry is unavailable).
+    /// - **Unattributed blob** (aggregate/notable results, empty array,
+    ///   non-array, or any event missing `source_type`): the origin cannot be
+    ///   proven unrestricted, so FAIL CLOSED whenever any restriction exists —
+    ///   redact if the registry is non-empty, and also when the registry is
+    ///   unavailable. An empty registry (pre-feature) never redacts.
+    async fn origin_restricted(&self, matched_events: &serde_json::Value) -> bool {
+        let Some(resolver) = &self.scope_resolver else {
+            return false;
+        };
+        let (source_types, fully_attributed) = origin_source_types(matched_events);
+        if fully_attributed {
+            resolver.any_restricted(&source_types).await
+        } else {
+            match resolver.restricted_snapshot().await {
+                Ok(restricted) => !restricted.is_empty(),
+                // Registry never loaded + PG down: fail closed.
+                Err(_) => true,
             }
-        })
+        }
     }
 
     /// Fire webhook notifications for a newly created alert of any `kind`
@@ -274,6 +358,27 @@ impl WebhookService {
         // would need it stored on the alert row (schema+model change, out of scope).
         let matched_event_count = matched_events.as_array().map_or(0, |a| a.len()) as i64;
 
+        // Resolve the deep-link base once so every fanned-out channel links
+        // consistently (NAN-1790).
+        let base = self.resolve_base_url().await;
+
+        // NAN-1800: webhook receivers sit OUTSIDE per-user RBAC — once a
+        // restricted-source event body leaves here, source scoping is moot.
+        // Redact the shared payload ONCE, before the fanout clone, so every
+        // channel formatter (generic serializes full matched_events;
+        // Slack/Teams/PagerDuty embed `entity`) is covered by construction.
+        // The notification still fires as a redacted stub (rule name /
+        // severity / count / link kept) — the receiver learns something
+        // happened and pivots into the UI, where read-path RBAC applies.
+        let origin_restricted = self.origin_restricted(matched_events).await;
+        if origin_restricted {
+            info!(
+                alert_id = %alert_id,
+                rule_name = %rule_name,
+                "Webhook payload redacted: alert derives from a restricted source (matched_events + entity stripped)"
+            );
+        }
+
         let payload = WebhookPayload {
             event_type: "alert.created".to_string(),
             kind: Some(kind.to_string()),
@@ -281,13 +386,20 @@ impl WebhookService {
             rule_id,
             rule_name: Some(rule_name.to_string()),
             severity: Some(severity.to_string()),
-            entity,
-            link_url: Self::ui_link(&format!(
-                "alerts/{}",
-                crate::typeid::encode(crate::typeid::alert::PREFIX, &alert_id)
-            )),
+            entity: if origin_restricted { None } else { entity },
+            link_url: Self::ui_link(
+                base.as_deref(),
+                &format!(
+                    "alerts/{}",
+                    crate::typeid::encode(crate::typeid::alert::PREFIX, &alert_id)
+                ),
+            ),
             matched_event_count: Some(matched_event_count),
-            matched_events: Some(events_array),
+            matched_events: if origin_restricted {
+                None
+            } else {
+                Some(events_array)
+            },
             created_at,
         };
 
@@ -301,6 +413,17 @@ impl WebhookService {
                     webhook_name = %webhook.name,
                     category = category,
                     "Skipping webhook: not subscribed to event stream"
+                );
+                continue;
+            }
+
+            // Detection-rule routing filter (NAN-1790): skip channels scoped to
+            // specific rules when this alert didn't come from one of them.
+            if !webhook.passes_rule_filter(rule_id) {
+                debug!(
+                    webhook_id = %webhook.id,
+                    webhook_name = %webhook.name,
+                    "Skipping channel: alert rule not in channel rule filter"
                 );
                 continue;
             }
@@ -396,6 +519,8 @@ impl WebhookService {
             return;
         }
 
+        let base = self.resolve_base_url().await;
+
         // Reuse WebhookPayload: case events carry title in `rule_name`, status in
         // `severity`, assignee in `entity` — the generic string slots — plus the
         // case typeid link. `kind = "case"` disambiguates for the consumer.
@@ -407,10 +532,13 @@ impl WebhookService {
             rule_name: Some(title.to_string()),
             severity: Some(status.to_string()),
             entity: assignee,
-            link_url: Self::ui_link(&format!(
-                "cases/{}",
-                crate::typeid::encode(crate::typeid::case::PREFIX, &case_id)
-            )),
+            link_url: Self::ui_link(
+                base.as_deref(),
+                &format!(
+                    "cases/{}",
+                    crate::typeid::encode(crate::typeid::case::PREFIX, &case_id)
+                ),
+            ),
             matched_event_count: None,
             matched_events: None,
             created_at,
@@ -456,6 +584,93 @@ impl WebhookService {
         }
     }
 
+    /// Fire `report_ready` webhooks when a scheduled report finishes (NAN-1793).
+    ///
+    /// Additive event stream (`EVENT_TYPE_REPORT`), gated by the opt-in `report`
+    /// subscription category — a future notification-channels layer can route it.
+    /// Reuses [`WebhookPayload`]'s generic slots the same way `fire_case_event`
+    /// does: `rule_name` carries the report name, `severity` the run status,
+    /// `entity` the source type (search | dashboard), and `matched_event_count`
+    /// the result row count. Fire-and-forget; never blocks the scheduler.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fire_report_ready(
+        &self,
+        report_id: Uuid,
+        report_name: &str,
+        source_type: &str,
+        status: &str,
+        row_count: Option<i64>,
+        created_at: chrono::DateTime<Utc>,
+    ) {
+        let webhooks = match self.repo.list_enabled().await {
+            Ok(w) => w,
+            Err(e) => {
+                error!("Failed to load webhooks: {}", e);
+                return;
+            }
+        };
+        if webhooks.is_empty() {
+            return;
+        }
+
+        let base = self.resolve_base_url().await;
+
+        let payload = WebhookPayload {
+            event_type: "report_ready".to_string(),
+            kind: Some("report".to_string()),
+            alert_id: None,
+            rule_id: None,
+            rule_name: Some(report_name.to_string()),
+            severity: Some(status.to_string()),
+            entity: Some(source_type.to_string()),
+            link_url: Self::ui_link(
+                base.as_deref(),
+                &format!(
+                    "reports/{}",
+                    crate::typeid::encode(crate::typeid::report::PREFIX, &report_id)
+                ),
+            ),
+            matched_event_count: row_count,
+            matched_events: None,
+            created_at,
+        };
+
+        for webhook in webhooks {
+            if !webhook.subscribes_to(EVENT_TYPE_REPORT) {
+                continue;
+            }
+            let inflight_permit = match self.inflight.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    warn!(
+                        webhook_id = %webhook.id,
+                        webhook_name = %webhook.name,
+                        "Webhook report delivery shed: in-flight cap reached"
+                    );
+                    self.record(
+                        &webhook,
+                        None,
+                        "report_ready",
+                        None,
+                        None,
+                        false,
+                        Some("shed: in-flight cap"),
+                        0,
+                    )
+                    .await;
+                    continue;
+                }
+            };
+            let svc = self.clone();
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                let _inflight = inflight_permit;
+                let _permit = svc.semaphore.acquire().await;
+                svc.deliver(&webhook, &payload, None, "report_ready").await;
+            });
+        }
+    }
+
     /// Build a request with custom headers and HMAC signature. The `client` is
     /// the per-delivery SSRF-pinned client (see `ssrf_checked_client`).
     ///
@@ -469,57 +684,102 @@ impl WebhookService {
         client: &reqwest::Client,
         webhook: &super::models::Webhook,
         payload_bytes: &[u8],
+        sign_generic: bool,
     ) -> Result<reqwest::RequestBuilder, String> {
         let mut request = client
             .post(&webhook.url)
             .header("Content-Type", "application/json")
             .header("User-Agent", "NanoSIEM-Webhook/1.0");
 
-        // Add custom headers. reqwest's typed `HeaderName`/`HeaderValue` reject
-        // CRLF / control chars, so a header key/value can't be used to inject a
-        // second header or smuggle a request; an invalid pair surfaces as a
-        // build error at send. A decrypt failure fails closed (below).
-        if let Some(ref encrypted) = webhook.headers_encrypted {
-            if !encrypted.is_empty() {
-                let headers = self
-                    .repo
-                    .decrypt_json::<HashMap<String, String>>(encrypted)
-                    .map_err(|e| {
-                        format!("configured custom headers could not be decrypted: {e}")
+        // Custom headers + HMAC signing apply ONLY to the generic channel
+        // (`sign_generic`). Provider channels (Slack / Teams / PagerDuty)
+        // authenticate by their secret URL or in-body routing key, and their
+        // receivers reject unexpected headers; `secret_encrypted` for those
+        // holds the routing key, NOT an HMAC secret, so it must never be signed
+        // over here.
+        if sign_generic {
+            // Add custom headers. reqwest's typed `HeaderName`/`HeaderValue`
+            // reject CRLF / control chars, so a header key/value can't be used
+            // to inject a second header or smuggle a request; an invalid pair
+            // surfaces as a build error at send. A decrypt failure fails closed.
+            if let Some(ref encrypted) = webhook.headers_encrypted {
+                if !encrypted.is_empty() {
+                    let headers = self
+                        .repo
+                        .decrypt_json::<HashMap<String, String>>(encrypted)
+                        .map_err(|e| {
+                            format!("configured custom headers could not be decrypted: {e}")
+                        })?;
+                    for (key, value) in &headers {
+                        request = request.header(key, value);
+                    }
+                }
+            }
+
+            // Add HMAC signature. If a secret is configured it MUST sign; a
+            // decrypt failure fails closed rather than delivering unsigned.
+            if let Some(ref encrypted_secret) = webhook.secret_encrypted {
+                if !encrypted_secret.is_empty() {
+                    let secret = self.repo.decrypt_string(encrypted_secret).map_err(|e| {
+                        format!("configured HMAC secret could not be decrypted: {e}")
                     })?;
-                for (key, value) in &headers {
-                    request = request.header(key, value);
+                    // Sign `<unix_ts>.<body>` (Stripe-style) and send the
+                    // timestamp in `X-NanoSIEM-Timestamp` so a receiver can
+                    // reject stale replays within a freshness window — HMAC-over-
+                    // body alone is replayable forever. A fresh timestamp per
+                    // attempt is fine (each retry is an independently-fresh
+                    // request).
+                    let timestamp = Utc::now().timestamp();
+                    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+                        .map_err(|e| format!("HMAC init failed: {e}"))?;
+                    mac.update(timestamp.to_string().as_bytes());
+                    mac.update(b".");
+                    mac.update(payload_bytes);
+                    let signature = hex::encode(mac.finalize().into_bytes());
+                    request = request
+                        .header("X-NanoSIEM-Timestamp", timestamp.to_string())
+                        .header("X-NanoSIEM-Signature", format!("sha256={}", signature));
                 }
             }
         }
 
-        // Add HMAC signature. If a secret is configured it MUST sign; a decrypt
-        // failure fails closed rather than delivering unsigned.
-        if let Some(ref encrypted_secret) = webhook.secret_encrypted {
-            if !encrypted_secret.is_empty() {
-                let secret = self
-                    .repo
-                    .decrypt_string(encrypted_secret)
-                    .map_err(|e| format!("configured HMAC secret could not be decrypted: {e}"))?;
-                // Sign `<unix_ts>.<body>` (Stripe-style) and send the timestamp
-                // in `X-NanoSIEM-Timestamp` so a receiver can reject stale
-                // replays within a freshness window — HMAC-over-body alone is
-                // replayable forever. A fresh timestamp per attempt is fine
-                // (each retry is an independently-fresh request).
-                let timestamp = Utc::now().timestamp();
-                let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-                    .map_err(|e| format!("HMAC init failed: {e}"))?;
-                mac.update(timestamp.to_string().as_bytes());
-                mac.update(b".");
-                mac.update(payload_bytes);
-                let signature = hex::encode(mac.finalize().into_bytes());
-                request = request
-                    .header("X-NanoSIEM-Timestamp", timestamp.to_string())
-                    .header("X-NanoSIEM-Signature", format!("sha256={}", signature));
-            }
-        }
-
         Ok(request)
+    }
+
+    /// Render the outbound body for a channel and whether it should be HMAC-
+    /// signed (generic only). Decrypts the PagerDuty routing key here (fail
+    /// closed — a channel whose secret can't be decrypted must not deliver an
+    /// unauthenticated event). Deterministic, so `deliver` computes it once
+    /// before the retry loop.
+    fn channel_body(
+        &self,
+        webhook: &super::models::Webhook,
+        payload: &WebhookPayload,
+    ) -> Result<(Vec<u8>, bool), String> {
+        // Strict: an unknown stored channel_type fails closed rather than
+        // silently delivering as `generic` (which would sign + ship this row's
+        // secret to its endpoint).
+        let channel_type = webhook.resolve_channel_type()?;
+
+        // PagerDuty carries its routing key in the encrypted secret column.
+        let routing_key = if channel_type == ChannelType::PagerDuty {
+            match &webhook.secret_encrypted {
+                Some(enc) if !enc.is_empty() => Some(
+                    self.repo
+                        .decrypt_string(enc)
+                        .map_err(|e| format!("PagerDuty routing key could not be decrypted: {e}"))?,
+                ),
+                _ => None, // build_channel_body reports the missing-key error
+            }
+        } else {
+            None
+        };
+
+        let ctx = FormatContext {
+            routing_key: routing_key.as_deref(),
+        };
+        let formatted = build_channel_body(channel_type, payload, &ctx)?;
+        Ok((formatted.bytes, formatted.sign_hmac))
     }
 
     /// Deliver a webhook payload with delivery-time SSRF pinning and bounded
@@ -540,10 +800,21 @@ impl WebhookService {
     ) {
         let start = Instant::now();
 
-        let payload_bytes = match serde_json::to_vec(payload) {
-            Ok(b) => b,
-            Err(e) => {
-                error!(webhook_id = %webhook.id, "Failed to serialize webhook payload: {}", e);
+        // Render the provider-specific body once (deterministic across retries).
+        // A formatter or secret-decrypt failure is recorded as a failed delivery
+        // and never retried (it won't fix itself).
+        let (payload_bytes, sign_generic) = match self.channel_body(webhook, payload) {
+            Ok(v) => v,
+            Err(reason) => {
+                warn!(
+                    webhook_id = %webhook.id,
+                    webhook_name = %webhook.name,
+                    reason = %reason,
+                    "Webhook not sent (fail-closed): channel body could not be built"
+                );
+                let duration_ms = start.elapsed().as_millis() as i32;
+                self.record(webhook, alert_id, event_type, None, None, false, Some(&reason), duration_ms)
+                    .await;
                 return;
             }
         };
@@ -569,7 +840,7 @@ impl WebhookService {
 
         for attempt in 1..=MAX_DELIVERY_ATTEMPTS {
             // Fail closed on a crypto error (deterministic — don't burn retries).
-            let request = match self.build_request(&client, webhook, &payload_bytes) {
+            let request = match self.build_request(&client, webhook, &payload_bytes, sign_generic) {
                 Ok(r) => r,
                 Err(reason) => {
                     warn!(
@@ -706,15 +977,16 @@ impl WebhookService {
             .await
             .map_err(|e| format!("Webhook not found: {}", e))?;
 
+        let base = self.resolve_base_url().await;
         let payload = WebhookPayload {
             event_type: "webhook.test".to_string(),
             kind: None,
             alert_id: None,
             rule_id: None,
-            rule_name: Some("Test Webhook Delivery".to_string()),
+            rule_name: Some("nano test notification".to_string()),
             severity: Some("informational".to_string()),
             entity: None,
-            link_url: None,
+            link_url: Self::ui_link(base.as_deref(), "settings/notifications"),
             matched_event_count: Some(0),
             matched_events: Some(vec![]),
             created_at: Utc::now(),
@@ -722,8 +994,34 @@ impl WebhookService {
 
         let start = Instant::now();
 
-        let payload_bytes =
-            serde_json::to_vec(&payload).map_err(|e| format!("Serialization error: {}", e))?;
+        // Render the body for this channel's type (Slack/Teams/PagerDuty/generic).
+        // A formatter or secret-decrypt failure surfaces as a failed test rather
+        // than a 500 — the operator sees exactly why nothing could be sent.
+        let (payload_bytes, sign_generic) = match self.channel_body(&webhook, &payload) {
+            Ok(v) => v,
+            Err(reason) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                let _ = self
+                    .repo
+                    .log_delivery(
+                        webhook.id,
+                        None,
+                        "webhook.test",
+                        None,
+                        None,
+                        false,
+                        Some(&reason),
+                        Some(duration_ms as i32),
+                    )
+                    .await;
+                return Ok(WebhookTestResult {
+                    success: false,
+                    status_code: None,
+                    error: Some(reason),
+                    duration_ms,
+                });
+            }
+        };
 
         // Test delivery is a single, synchronous attempt (immediate UX feedback,
         // no retries), but still SSRF-pinned like real delivery.
@@ -753,7 +1051,7 @@ impl WebhookService {
             }
         };
 
-        let request = match self.build_request(&client, &webhook, &payload_bytes) {
+        let request = match self.build_request(&client, &webhook, &payload_bytes, sign_generic) {
             Ok(r) => r,
             Err(reason) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
@@ -848,5 +1146,41 @@ impl WebhookService {
     pub fn repo(&self) -> &WebhookRepository {
         &self.repo
     }
+}
+
+/// Extract the distinct origin `source_type`s from a stored `matched_events`
+/// blob (NAN-1800). Returns `(source_types, fully_attributed)`:
+///
+/// - `source_types`: deduped, normalized (`trim` + `lowercase` — OCSF
+///   `source_type` is NOT ingest-lowercased) values found on the events.
+/// - `fully_attributed`: `true` only when the blob is a non-empty array whose
+///   EVERY element carries a non-empty string `source_type`. Aggregate /
+///   notable alerts (stats rows), empty arrays, and non-array blobs are NOT
+///   fully attributed — the caller must treat those fail-closed.
+///
+/// Pure so the attribution semantics are unit-testable without a database.
+pub(crate) fn origin_source_types(matched_events: &serde_json::Value) -> (Vec<String>, bool) {
+    let Some(events) = matched_events.as_array() else {
+        return (Vec::new(), false);
+    };
+    if events.is_empty() {
+        return (Vec::new(), false);
+    }
+    let mut types: BTreeSet<String> = BTreeSet::new();
+    let mut fully_attributed = true;
+    for event in events {
+        match event
+            .get("source_type")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+        {
+            Some(source_type) => {
+                types.insert(source_type);
+            }
+            None => fully_attributed = false,
+        }
+    }
+    (types.into_iter().collect(), fully_attributed)
 }
 

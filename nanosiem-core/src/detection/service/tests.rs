@@ -130,6 +130,7 @@ fn test_validate_realtime_rule_simple_filter() {
         playbook_id: None,
         source_path: None,
         source_repo_url: None,
+        alert_cooldown_minutes: None,
     };
 
     assert!(DetectionService::validate_realtime_rule_static(&rule).is_ok());
@@ -172,6 +173,7 @@ fn test_validate_realtime_rule_with_aggregation() {
         playbook_id: None,
         source_path: None,
         source_repo_url: None,
+        alert_cooldown_minutes: None,
     };
 
     let result = DetectionService::validate_realtime_rule_static(&rule);
@@ -218,6 +220,7 @@ fn test_validate_realtime_rule_with_join() {
         playbook_id: None,
         source_path: None,
         source_repo_url: None,
+        alert_cooldown_minutes: None,
     };
 
     let result = DetectionService::validate_realtime_rule_static(&rule);
@@ -264,6 +267,7 @@ fn test_validate_realtime_rule_without_risk_entity() {
         playbook_id: None,
         source_path: None,
         source_repo_url: None,
+        alert_cooldown_minutes: None,
     };
 
     // Should succeed with auto-detection

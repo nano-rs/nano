@@ -365,6 +365,9 @@ typeid_prefix!(playbook_approval, "pbappr");
 typeid_prefix!(slo, "slo");
 typeid_prefix!(synth, "synth");
 typeid_prefix!(metric_monitor, "mon");
+typeid_prefix!(report, "report");
+typeid_prefix!(report_run, "reprun");
+typeid_prefix!(report_artifact, "repart");
 
 // ============================================================================
 // Tests

@@ -8,7 +8,7 @@
 
 import { useCallback, useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Download, Plus, RefreshCw, Search as SearchIcon, Database, ShieldAlert } from 'lucide-react';
+import { Download, Plus, RefreshCw, Search as SearchIcon, Database, ShieldAlert, History } from 'lucide-react';
 
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import {
@@ -261,6 +261,16 @@ export function Rules() {
             {/* NAN-957: label matches destination page title "Rule repositories". */}
             Repositories
           </Link>
+          {canCreate && (
+            <Link
+              to="/rules/retro-hunt/new"
+              className="h-8 px-2.5 rounded-md border border-border text-[11.5px] text-foreground hover:bg-foreground/5 flex items-center gap-1.5 @max-[900px]:hidden"
+              title="Auto retro-hunt: match newly-published threat intel against historical logs"
+            >
+              <History className="w-3.5 h-3.5" strokeWidth={2} />
+              Retro-hunt
+            </Link>
+          )}
           {canCreate && (
             <Link
               to="/rules/editor/new"

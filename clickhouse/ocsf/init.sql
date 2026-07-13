@@ -354,6 +354,25 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     `status` LowCardinality(String) CODEC(ZSTD(1)),
     -- Human-readable summary; the primary full-text hunt field (text index).
     `message` String CODEC(ZSTD(3)),
+    -- The original event exactly as the producer received it (OCSF `raw_data`,
+    -- string_t since OCSF 1.5 — NOT json_t). This is the compliance-grade
+    -- original: an OCSF feed can be re-materialized from it by re-running the
+    -- mapping pipeline, so no parallel raw archive is needed (NAN-1827).
+    --
+    -- EMPTY unless the producer sends it. Our own Vector OCSF parsers do NOT
+    -- emit `raw_data` — they put the raw log in `message` (5 of 6 lanes set
+    -- `message = raw_log` byte-for-byte). Having them also fill `raw_data`
+    -- would re-create the duplication NAN-1443 deleted (the raw log was stored
+    -- twice; `event` was 46% of the table). Producers that DO split the two
+    -- (Tenzir: `message` = human summary, `raw_data` = original) get both.
+    -- Consequence, deliberately accepted: on a Vector tenant the raw log lives
+    -- in `message`, on a Tenzir tenant in `raw_data`.
+    --
+    -- Empty String under ZSTD is ~free, so a Vector-only OCSF tenant pays
+    -- nothing for this column existing. It is NOT the bare-keyword search
+    -- column (that stays `message` via keyword_search_column()); the text index
+    -- below exists so an EXPLICIT raw_data hunt prunes instead of full-scanning.
+    `raw_data` String CODEC(ZSTD(3)),
     -- The OCSF `unmapped` spill — producer source fields that did not map to a
     -- standard OCSF attribute (the OCSF analog of UDM's `ext`). This is the ONLY
     -- part of the arriving `event` we persist verbatim (NAN-1443): everything else
@@ -929,6 +948,10 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     INDEX idx_metadata_correlation_uid `metadata.correlation_uid` TYPE bloom_filter GRANULARITY 4,
     -- Message: tokenized text (UDM message parity — primary full-text hunt).
     INDEX idx_message_words lower(message) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
+    -- raw_data: tokenized text so an explicit `raw_data` hunt prunes. Costs
+    -- nothing on tenants whose producer leaves the column empty, and is far
+    -- cheaper to attach now than to MATERIALIZE INDEX over existing parts later.
+    INDEX idx_raw_data_words lower(`raw_data`) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     -- Operational provenance key set index (byte-for-byte parity with UDM
     -- logs.idx_source_type — the high-frequency first-filter fast-path).
     INDEX idx_source_type source_type TYPE set(100) GRANULARITY 4,
@@ -1061,6 +1084,7 @@ AS SELECT
     JSONExtractUInt(event, 'status_id') AS `status_id`,
     JSONExtractString(event, 'status') AS `status`,
     JSONExtractString(event, 'message') AS `message`,
+    JSONExtractString(event, 'raw_data') AS `raw_data`,
     event.^unmapped AS `unmapped`,
     lower(JSONExtractString(event, 'src_endpoint', 'ip')) AS `src_endpoint.ip`,
     lower(JSONExtractString(event, 'dst_endpoint', 'ip')) AS `dst_endpoint.ip`,

@@ -155,6 +155,20 @@ function shortAlertId(id: string): string {
   return id.slice(0, 12);
 }
 
+// NAN-1792: risk notables ride the alert spine with rule_id NULL; the display
+// name is derived from the payload entity instead of a rule.
+function alertDisplayName(alert: ApiAlert): string {
+  if (alert.kind === 'risk_notable') {
+    const first = Array.isArray(alert.matched_events) ? alert.matched_events[0] : undefined;
+    const entity =
+      first && typeof first === 'object' ? (first as Record<string, unknown>).entity : undefined;
+    return typeof entity === 'string' && entity.length > 0
+      ? `Risk alert — ${entity}`
+      : 'Risk alert';
+  }
+  return alert.rule_name || 'Unknown rule';
+}
+
 function timeRangeCutoff(range: TimeRangeFilter): number | null {
   const now = Date.now();
   switch (range) {
@@ -239,9 +253,10 @@ export function Alerts() {
       setError(null);
       const params: Parameters<typeof api.listAlerts>[0] = {
         limit: PAGE_SIZE,
-        // NAN-1541: SIEM alerts view shows ONLY security detections.
-        // Observability monitor alerts (metric_monitor/slo/synthetic) live in their own surface.
-        kinds: ['detection'],
+        // NAN-1541: SIEM alerts view shows ONLY security streams — detections
+        // plus risk notables (NAN-1792). Observability monitor alerts
+        // (metric_monitor/slo/synthetic) live in their own surface.
+        kinds: ['detection', 'risk_notable'],
       };
       if (statusFilter !== 'all') params.status = statusFilter;
       if (severityFilter !== 'all') params.severity = severityFilter;
@@ -258,7 +273,7 @@ export function Alerts() {
 
   const fetchCounts = useCallback(async () => {
     try {
-      const data = await api.getAlertCounts(['detection']);
+      const data = await api.getAlertCounts(['detection', 'risk_notable']);
       setCounts(data);
     } catch (err) {
       // eslint-disable-next-line no-console
@@ -296,7 +311,7 @@ export function Alerts() {
     }
     if (q.length > 0) {
       out = out.filter((a) => {
-        const name = (a.rule_name || '').toLowerCase();
+        const name = alertDisplayName(a).toLowerCase();
         return name.includes(q) || a.id.toLowerCase().includes(q);
       });
     }
@@ -308,7 +323,7 @@ export function Alerts() {
         case 'status':
           return ((STATUS_ORDER[a.status] ?? 99) - (STATUS_ORDER[b.status] ?? 99)) * dir;
         case 'rule_name':
-          return (a.rule_name || '').localeCompare(b.rule_name || '') * dir;
+          return alertDisplayName(a).localeCompare(alertDisplayName(b)) * dir;
         case 'matched_event_count':
           return (
             ((a.matched_event_count ?? a.matched_events?.length ?? 0) -
@@ -690,7 +705,7 @@ export function Alerts() {
                 filteredAlerts.map((alert) => {
                   const isSelected = selected.has(alert.id);
                   const eventCount = alert.matched_event_count ?? alert.matched_events?.length ?? 0;
-                  const ruleName = alert.rule_name || 'Unknown rule';
+                  const ruleName = alertDisplayName(alert);
                   return (
                     <TableRow
                       key={alert.id}
@@ -790,7 +805,7 @@ export function Alerts() {
                             <button
                               type="button"
                               onClick={() =>
-                                setCloseDialog({ id: alert.id, ruleName: alert.rule_name })
+                                setCloseDialog({ id: alert.id, ruleName })
                               }
                               disabled={actionBusy}
                               title="Close"
@@ -803,7 +818,7 @@ export function Alerts() {
                             <button
                               type="button"
                               onClick={() => {
-                                setAssignDialog({ id: alert.id, ruleName: alert.rule_name });
+                                setAssignDialog({ id: alert.id, ruleName });
                                 setAssignTo(alert.assigned_to || '');
                               }}
                               disabled={actionBusy}

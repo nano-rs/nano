@@ -15,6 +15,14 @@ impl SearchService {
         query_id: Option<&str>,
         dataset: crate::query::Dataset,
     ) -> Result<Vec<HistogramBucket>, SearchError> {
+        // NAN-1798 P2: the risk dataset has no meaningful time axis at entity
+        // grain (one row per entity; fixed trailing 24h/7d windows) — an empty
+        // timeline, guarded HERE so every caller (core_search, streaming) is
+        // covered without per-site checks.
+        if dataset == crate::query::Dataset::Risk {
+            return Ok(Vec::new());
+        }
+
         // Extract base filter (everything before the first pipe command)
         let base_query = extract_base_query(query);
 

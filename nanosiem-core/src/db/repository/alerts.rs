@@ -5,6 +5,7 @@
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::collections::BTreeSet;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -93,17 +94,88 @@ fn strip_volatile_fields(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// NAN-1800: derive the DISTINCT normalized `source_type` values carried by an
+/// alert's matched events, for the `alerts.source_types` stamp (migration 246).
+///
+/// Two forms are read from each event object:
+/// * `source_type` — the raw per-event column (raw / grouped-raw detection
+///   rules, real-time signal alerts, vendor pass-through).
+/// * `_nano_source_types` — an array the detection engine stamps onto
+///   AGGREGATE rows (stats/timechart/top/rare collapse the raw stream, so the
+///   rows carry no per-event `source_type`; execution annotates them with the
+///   window's distinct source types). The `_nano_` prefix keeps it out of every
+///   dedup hash (`compute_event_hash` strips `_nano_*`).
+///
+/// Values are trimmed + lowercased (OCSF source_type is NOT ingest-lowercased)
+/// and returned sorted-unique. An empty result (producer events carry no
+/// source_type — observability / risk-notable alerts) stamps `'{}'`, which the
+/// read-side filter treats as visible-to-everyone (back-compat).
+pub fn distinct_source_types(matched_events: &serde_json::Value) -> Vec<String> {
+    fn insert_normalized(raw: &str, set: &mut BTreeSet<String>) {
+        let norm = raw.trim().to_lowercase();
+        if !norm.is_empty() {
+            set.insert(norm);
+        }
+    }
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    if let Some(events) = matched_events.as_array() {
+        for event in events {
+            if let Some(st) = event.get("source_type").and_then(|v| v.as_str()) {
+                insert_normalized(st, &mut set);
+            }
+            if let Some(arr) = event.get("_nano_source_types").and_then(|v| v.as_array()) {
+                for v in arr {
+                    if let Some(st) = v.as_str() {
+                        insert_normalized(st, &mut set);
+                    }
+                }
+            }
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// NAN-1800: build the read-side per-source scope filter fragment.
+///
+/// Returns `("", None)` for an EMPTY deny set so the emitted SQL is
+/// byte-identical to the pre-scoping query (back-compat; system callers pass
+/// `ScopeSet::unrestricted().deny_set()`). For a restricted viewer it returns
+/// the `AND ($N::text[] = '{}' OR NOT (<col> && $N::text[]))` clause plus the
+/// normalized (trimmed + lowercased) deny values to bind at `$N`. A row is
+/// visible iff NONE of its stamped source_types is denied; rows stamped `'{}'`
+/// (pre-feature / non-source-derived) never overlap and stay visible.
+fn scope_clause(deny: &BTreeSet<String>, column: &str, param: usize) -> (String, Option<Vec<String>>) {
+    let denied: Vec<String> = deny
+        .iter()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if denied.is_empty() {
+        (String::new(), None)
+    } else {
+        (
+            format!(
+                " AND (${p}::text[] = '{{}}' OR NOT ({col} && ${p}::text[]))",
+                p = param,
+                col = column
+            ),
+            Some(denied),
+        )
+    }
+}
+
 /// NAN-1541: a single alert produced by the spine, parameterized over its
 /// `kind` discriminator. This is the unified raise contract: detection and the
 /// three observability evaluators all build one of these and route through
 /// [`AlertRepository::create_alert`].
 ///
-/// - `kind` is one of `detection`, `metric_monitor`, `slo`, `synthetic`
-///   (enforced by the migration-212 CHECK).
+/// - `kind` is one of `detection`, `metric_monitor`, `slo`, `synthetic`,
+///   `risk_notable` (enforced by the migration-212 CHECK, extended by 237).
 /// - `rule_id` is `Some` only for detection alerts; observability rows leave it
 ///   `None` (the FK is nullable).
 /// - `source_id` carries the producer's identifier as text — the rule UUID for
-///   detections, the monitor/check typeid for observability alerts.
+///   detections, the monitor/check typeid for observability alerts, the
+///   `<entity_type>:<entity>` pair for risk notables (NAN-1792).
 /// - `event_hash` drives dedup. `Some` uses `ON CONFLICT (rule_id, event_hash)
 ///   DO NOTHING`; `None` skips the dedup conflict path entirely.
 pub struct AlertInsert<'a> {
@@ -213,13 +285,18 @@ impl AlertRepository {
         let match_count_col: Option<i32> = insert
             .match_count
             .map(|c| i32::try_from(c).unwrap_or(i32::MAX));
+        // NAN-1800: stamp the alert with the distinct normalized source_type
+        // values of its matched events, derived HERE so every producer (all six
+        // AlertInsert construction sites) gets it without changes. The read
+        // side enforces per-source RBAC via array overlap on this column.
+        let source_types = distinct_source_types(insert.matched_events);
         match insert.event_hash {
             Some(event_hash) => {
                 // Atomic insert with conflict detection - no race condition window
                 let result = sqlx::query_as::<_, Alert>(
                     r#"
-                    INSERT INTO alerts (rule_id, severity, matched_events, event_hash, kind, source_id, matched_event_count)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    INSERT INTO alerts (rule_id, severity, matched_events, event_hash, kind, source_id, matched_event_count, source_types)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                     ON CONFLICT (rule_id, event_hash) WHERE event_hash IS NOT NULL DO NOTHING
                     RETURNING *
                     "#,
@@ -231,6 +308,7 @@ impl AlertRepository {
                 .bind(insert.kind)
                 .bind(&insert.source_id)
                 .bind(match_count_col)
+                .bind(&source_types)
                 .fetch_optional(&self.pool)
                 .await?;
 
@@ -247,8 +325,8 @@ impl AlertRepository {
             None => {
                 let result = sqlx::query_as::<_, Alert>(
                     r#"
-                    INSERT INTO alerts (rule_id, severity, matched_events, kind, source_id, matched_event_count)
-                    VALUES ($1, $2, $3, $4, $5, $6)
+                    INSERT INTO alerts (rule_id, severity, matched_events, kind, source_id, matched_event_count, source_types)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
                     RETURNING *
                     "#,
                 )
@@ -258,6 +336,7 @@ impl AlertRepository {
                 .bind(insert.kind)
                 .bind(&insert.source_id)
                 .bind(match_count_col)
+                .bind(&source_types)
                 .fetch_one(&self.pool)
                 .await?;
 
@@ -343,9 +422,19 @@ impl AlertRepository {
         Ok(created_at)
     }
 
-    /// Find an alert by ID (with rule name)
-    pub async fn find_by_id(&self, id: Uuid) -> Result<Alert, AlertRepositoryError> {
-        let result = sqlx::query_as::<_, Alert>(
+    /// Find an alert by ID (with rule name).
+    ///
+    /// NAN-1800: `deny` is the viewer's per-source deny set — an alert whose
+    /// `source_types` overlap it is reported as `NotFound` (indistinguishable
+    /// from nonexistent). System callers pass
+    /// `ScopeSet::unrestricted().deny_set()` (empty = byte-identical SQL).
+    pub async fn find_by_id(
+        &self,
+        id: Uuid,
+        deny: &BTreeSet<String>,
+    ) -> Result<Alert, AlertRepositoryError> {
+        let (scope_sql, scope_bind) = scope_clause(deny, "a.source_types", 2);
+        let sql = format!(
             r#"
             SELECT
                 a.*,
@@ -367,13 +456,17 @@ impl AlertRepository {
                 WHERE status = 'completed'
                 ORDER BY alert_id, created_at DESC
             ) t ON t.alert_id = a.id
-            WHERE a.id = $1
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(AlertRepositoryError::NotFound(id))?;
+            WHERE a.id = $1{scope_sql}
+            "#
+        );
+        let mut query = sqlx::query_as::<_, Alert>(&sql).bind(id);
+        if let Some(denied) = &scope_bind {
+            query = query.bind(denied);
+        }
+        let result = query
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(AlertRepositoryError::NotFound(id))?;
 
         Ok(result)
     }
@@ -392,10 +485,10 @@ impl AlertRepository {
         kinds: Option<&[String]>,
         limit: i64,
         offset: i64,
+        deny: &BTreeSet<String>,
     ) -> Result<Vec<Alert>, AlertRepositoryError> {
-        // Thin wrapper: no rule scoping. Kept at its original arity so existing
-        // callers (DetectionService::list_alerts) compile unchanged.
-        self.list_filtered(status, severity, None, kinds, limit, offset)
+        // Thin wrapper: no rule scoping.
+        self.list_filtered(status, severity, None, kinds, limit, offset, deny)
             .await
     }
 
@@ -418,9 +511,11 @@ impl AlertRepository {
         kinds: Option<&[String]>,
         limit: i64,
         offset: i64,
+        deny: &BTreeSet<String>,
     ) -> Result<Vec<Alert>, AlertRepositoryError> {
         let kinds_filter = normalize_kinds(kinds);
-        let results = sqlx::query_as::<_, Alert>(
+        let (scope_sql, scope_bind) = scope_clause(deny, "a.source_types", 7);
+        let sql = format!(
             r#"
             SELECT
                 a.*,
@@ -445,7 +540,7 @@ impl AlertRepository {
             WHERE ($1::text IS NULL OR a.status = $1)
               AND ($2::text IS NULL OR a.severity = $2)
               AND ($5::uuid IS NULL OR a.rule_id = $5)
-              AND ($6::text[] IS NULL OR a.kind = ANY($6))
+              AND ($6::text[] IS NULL OR a.kind = ANY($6)){scope_sql}
             ORDER BY
                 CASE a.severity
                     WHEN 'critical' THEN 1
@@ -457,24 +552,32 @@ impl AlertRepository {
                 a.created_at DESC,
                 a.id DESC
             LIMIT $3 OFFSET $4
-            "#,
-        )
-        .bind(status.map(|s| format!("{:?}", s).to_lowercase()))
-        .bind(severity.map(|s| format!("{:?}", s).to_lowercase()))
-        .bind(limit)
-        .bind(offset)
-        .bind(rule_id)
-        .bind(kinds_filter)
-        .fetch_all(&self.pool)
-        .await?;
+            "#
+        );
+        let mut query = sqlx::query_as::<_, Alert>(&sql)
+            .bind(status.map(|s| format!("{:?}", s).to_lowercase()))
+            .bind(severity.map(|s| format!("{:?}", s).to_lowercase()))
+            .bind(limit)
+            .bind(offset)
+            .bind(rule_id)
+            .bind(kinds_filter);
+        if let Some(denied) = &scope_bind {
+            query = query.bind(denied);
+        }
+        let results = query.fetch_all(&self.pool).await?;
 
         Ok(results)
     }
 
     /// List alerts by rule ID (with rule name)
     /// Limited to most recent 100 alerts to prevent memory issues
-    pub async fn list_by_rule(&self, rule_id: Uuid) -> Result<Vec<Alert>, AlertRepositoryError> {
-        let results = sqlx::query_as::<_, Alert>(
+    pub async fn list_by_rule(
+        &self,
+        rule_id: Uuid,
+        deny: &BTreeSet<String>,
+    ) -> Result<Vec<Alert>, AlertRepositoryError> {
+        let (scope_sql, scope_bind) = scope_clause(deny, "a.source_types", 2);
+        let sql = format!(
             r#"
             SELECT
                 a.*,
@@ -484,14 +587,16 @@ impl AlertRepository {
                 COALESCE(a.matched_event_count, jsonb_array_length(a.matched_events)) as matched_event_count
             FROM alerts a
             LEFT JOIN detection_rules r ON a.rule_id = r.id
-            WHERE a.rule_id = $1
+            WHERE a.rule_id = $1{scope_sql}
             ORDER BY a.created_at DESC
             LIMIT 100
-            "#,
-        )
-        .bind(rule_id)
-        .fetch_all(&self.pool)
-        .await?;
+            "#
+        );
+        let mut query = sqlx::query_as::<_, Alert>(&sql).bind(rule_id);
+        if let Some(denied) = &scope_bind {
+            query = query.bind(denied);
+        }
+        let results = query.fetch_all(&self.pool).await?;
 
         Ok(results)
     }
@@ -501,8 +606,10 @@ impl AlertRepository {
         &self,
         rule_id: Uuid,
         limit: i64,
+        deny: &BTreeSet<String>,
     ) -> Result<Vec<Alert>, AlertRepositoryError> {
-        let results = sqlx::query_as::<_, Alert>(
+        let (scope_sql, scope_bind) = scope_clause(deny, "a.source_types", 3);
+        let sql = format!(
             r#"
             SELECT
                 a.*,
@@ -512,49 +619,59 @@ impl AlertRepository {
                 COALESCE(a.matched_event_count, jsonb_array_length(a.matched_events)) as matched_event_count
             FROM alerts a
             LEFT JOIN detection_rules r ON a.rule_id = r.id
-            WHERE a.rule_id = $1
+            WHERE a.rule_id = $1{scope_sql}
             ORDER BY a.created_at DESC
             LIMIT $2
-            "#,
-        )
-        .bind(rule_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+            "#
+        );
+        let mut query = sqlx::query_as::<_, Alert>(&sql).bind(rule_id).bind(limit);
+        if let Some(denied) = &scope_bind {
+            query = query.bind(denied);
+        }
+        let results = query.fetch_all(&self.pool).await?;
 
         Ok(results)
     }
 
     /// Acknowledge an alert
     ///
-    /// Uses atomic status check in WHERE clause to prevent race conditions
+    /// Uses atomic status check in WHERE clause to prevent race conditions.
+    /// NAN-1800: the viewer's `deny` set guards the UPDATE itself — a denied
+    /// alert is never mutated, and the fallthrough `find_by_id` (same deny)
+    /// reports it as `NotFound`.
     pub async fn acknowledge(
         &self,
         id: Uuid,
         ack: &AcknowledgeAlert,
+        deny: &BTreeSet<String>,
     ) -> Result<Alert, AlertRepositoryError> {
         // Atomic state transition - status check in WHERE prevents race conditions
-        let result = sqlx::query_as::<_, Alert>(
+        let (scope_sql, scope_bind) = scope_clause(deny, "source_types", 4);
+        let sql = format!(
             r#"
             UPDATE alerts SET
                 status = 'acknowledged',
                 acknowledged_by = $2,
                 acknowledged_at = $3
-            WHERE id = $1 AND status = 'new'
+            WHERE id = $1 AND status = 'new'{scope_sql}
             RETURNING *
-            "#,
-        )
-        .bind(id)
-        .bind(&ack.acknowledged_by)
-        .bind(Utc::now())
-        .fetch_optional(&self.pool)
-        .await?;
+            "#
+        );
+        let mut query = sqlx::query_as::<_, Alert>(&sql)
+            .bind(id)
+            .bind(&ack.acknowledged_by)
+            .bind(Utc::now());
+        if let Some(denied) = &scope_bind {
+            query = query.bind(denied);
+        }
+        let result = query.fetch_optional(&self.pool).await?;
 
         match result {
             Some(alert) => Ok(alert),
             None => {
-                // Check if alert exists to provide appropriate error
-                match self.find_by_id(id).await {
+                // Check if alert exists (and is visible to this viewer) to
+                // provide the appropriate error
+                match self.find_by_id(id, deny).await {
                     Ok(alert) => Err(AlertRepositoryError::InvalidStateTransition(format!(
                         "Can only acknowledge alerts with 'new' status, current status is '{:?}'",
                         alert.status
@@ -568,31 +685,42 @@ impl AlertRepository {
     /// Close an alert
     ///
     /// Uses atomic status check in WHERE clause to prevent race conditions
-    pub async fn close(&self, id: Uuid, close: &CloseAlert) -> Result<Alert, AlertRepositoryError> {
-        // Atomic state transition - status check in WHERE prevents race conditions
-        let result = sqlx::query_as::<_, Alert>(
+    pub async fn close(
+        &self,
+        id: Uuid,
+        close: &CloseAlert,
+        deny: &BTreeSet<String>,
+    ) -> Result<Alert, AlertRepositoryError> {
+        // Atomic state transition - status check in WHERE prevents race
+        // conditions. NAN-1800: deny-scope guard on the UPDATE (see acknowledge).
+        let (scope_sql, scope_bind) = scope_clause(deny, "source_types", 5);
+        let sql = format!(
             r#"
             UPDATE alerts SET
                 status = 'closed',
                 disposition = $2,
                 closed_by = $3,
                 closed_at = $4
-            WHERE id = $1 AND status != 'closed'
+            WHERE id = $1 AND status != 'closed'{scope_sql}
             RETURNING *
-            "#,
-        )
-        .bind(id)
-        .bind(&close.disposition)
-        .bind(&close.closed_by)
-        .bind(Utc::now())
-        .fetch_optional(&self.pool)
-        .await?;
+            "#
+        );
+        let mut query = sqlx::query_as::<_, Alert>(&sql)
+            .bind(id)
+            .bind(&close.disposition)
+            .bind(&close.closed_by)
+            .bind(Utc::now());
+        if let Some(denied) = &scope_bind {
+            query = query.bind(denied);
+        }
+        let result = query.fetch_optional(&self.pool).await?;
 
         match result {
             Some(alert) => Ok(alert),
             None => {
-                // Check if alert exists to provide appropriate error
-                match self.find_by_id(id).await {
+                // Check if alert exists (and is visible to this viewer) to
+                // provide the appropriate error
+                match self.find_by_id(id, deny).await {
                     Ok(_) => Err(AlertRepositoryError::InvalidStateTransition(
                         "Alert is already closed".to_string(),
                     )),
@@ -608,70 +736,97 @@ impl AlertRepository {
     /// `NotFound`. `fetch_one().map_err(|_| NotFound)` masked every transient DB
     /// error (connection drop, pool timeout) as a 404 for an alert that exists;
     /// real DB errors now propagate as `DatabaseError` (→ 500) via `?`.
-    pub async fn assign(&self, id: Uuid, assignee: &str) -> Result<Alert, AlertRepositoryError> {
-        let result = sqlx::query_as::<_, Alert>(
+    pub async fn assign(
+        &self,
+        id: Uuid,
+        assignee: &str,
+        deny: &BTreeSet<String>,
+    ) -> Result<Alert, AlertRepositoryError> {
+        // NAN-1800: deny-scope guard on the UPDATE — a denied alert reads as
+        // NotFound and is never mutated.
+        let (scope_sql, scope_bind) = scope_clause(deny, "source_types", 3);
+        let sql = format!(
             r#"
             UPDATE alerts SET assigned_to = $2
-            WHERE id = $1
+            WHERE id = $1{scope_sql}
             RETURNING *
-            "#,
-        )
-        .bind(id)
-        .bind(assignee)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(AlertRepositoryError::NotFound(id))?;
+            "#
+        );
+        let mut query = sqlx::query_as::<_, Alert>(&sql).bind(id).bind(assignee);
+        if let Some(denied) = &scope_bind {
+            query = query.bind(denied);
+        }
+        let result = query
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(AlertRepositoryError::NotFound(id))?;
 
         Ok(result)
     }
 
-    /// Bulk acknowledge alerts
+    /// Bulk acknowledge alerts.
+    ///
+    /// NAN-1800: rows whose `source_types` overlap the viewer's `deny` set are
+    /// silently excluded from the UPDATE (they don't count toward the returned
+    /// affected total) — a restricted viewer cannot mutate alerts they can't see.
     pub async fn bulk_acknowledge(
         &self,
         ids: &[Uuid],
         acknowledged_by: &str,
+        deny: &BTreeSet<String>,
     ) -> Result<usize, AlertRepositoryError> {
-        let result = sqlx::query(
+        let (scope_sql, scope_bind) = scope_clause(deny, "source_types", 4);
+        let sql = format!(
             r#"
             UPDATE alerts SET
                 status = 'acknowledged',
                 acknowledged_by = $2,
                 acknowledged_at = $3
-            WHERE id = ANY($1) AND status = 'new'
-            "#,
-        )
-        .bind(ids)
-        .bind(acknowledged_by)
-        .bind(Utc::now())
-        .execute(&self.pool)
-        .await?;
+            WHERE id = ANY($1) AND status = 'new'{scope_sql}
+            "#
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(ids)
+            .bind(acknowledged_by)
+            .bind(Utc::now());
+        if let Some(denied) = &scope_bind {
+            query = query.bind(denied);
+        }
+        let result = query.execute(&self.pool).await?;
 
         Ok(result.rows_affected() as usize)
     }
 
-    /// Bulk close alerts
+    /// Bulk close alerts.
+    ///
+    /// NAN-1800: deny-scoped like [`bulk_acknowledge`].
     pub async fn bulk_close(
         &self,
         ids: &[Uuid],
         disposition: Disposition,
         closed_by: &str,
+        deny: &BTreeSet<String>,
     ) -> Result<usize, AlertRepositoryError> {
-        let result = sqlx::query(
+        let (scope_sql, scope_bind) = scope_clause(deny, "source_types", 5);
+        let sql = format!(
             r#"
             UPDATE alerts SET
                 status = 'closed',
                 disposition = $2,
                 closed_by = $3,
                 closed_at = $4
-            WHERE id = ANY($1) AND status != 'closed'
-            "#,
-        )
-        .bind(ids)
-        .bind(&disposition)
-        .bind(closed_by)
-        .bind(Utc::now())
-        .execute(&self.pool)
-        .await?;
+            WHERE id = ANY($1) AND status != 'closed'{scope_sql}
+            "#
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(ids)
+            .bind(&disposition)
+            .bind(closed_by)
+            .bind(Utc::now());
+        if let Some(denied) = &scope_bind {
+            query = query.bind(denied);
+        }
+        let result = query.execute(&self.pool).await?;
 
         Ok(result.rows_affected() as usize)
     }
@@ -690,16 +845,20 @@ impl AlertRepository {
     pub async fn count_by_status(
         &self,
         kinds: Option<&[String]>,
+        deny: &BTreeSet<String>,
     ) -> Result<Vec<(AlertStatus, i64)>, AlertRepositoryError> {
         let kinds_filter = normalize_kinds(kinds);
-        let results: Vec<(String, i64)> = sqlx::query_as(
+        let (scope_sql, scope_bind) = scope_clause(deny, "source_types", 2);
+        let sql = format!(
             r#"SELECT status, COUNT(*) FROM alerts
-               WHERE ($1::text[] IS NULL OR kind = ANY($1))
-               GROUP BY status"#,
-        )
-        .bind(kinds_filter)
-        .fetch_all(&self.pool)
-        .await?;
+               WHERE ($1::text[] IS NULL OR kind = ANY($1)){scope_sql}
+               GROUP BY status"#
+        );
+        let mut query = sqlx::query_as(&sql).bind(kinds_filter);
+        if let Some(denied) = &scope_bind {
+            query = query.bind(denied);
+        }
+        let results: Vec<(String, i64)> = query.fetch_all(&self.pool).await?;
 
         Ok(map_status_counts(results))
     }
@@ -715,18 +874,21 @@ impl AlertRepository {
         &self,
         kinds: Option<&[String]>,
         exclude_rule_ids: &[Uuid],
+        deny: &BTreeSet<String>,
     ) -> Result<Vec<(AlertStatus, i64)>, AlertRepositoryError> {
         let kinds_filter = normalize_kinds(kinds);
-        let results: Vec<(String, i64)> = sqlx::query_as(
+        let (scope_sql, scope_bind) = scope_clause(deny, "source_types", 3);
+        let sql = format!(
             r#"SELECT status, COUNT(*) FROM alerts
                WHERE ($1::text[] IS NULL OR kind = ANY($1))
-                 AND (rule_id IS NULL OR NOT (rule_id = ANY($2)))
-               GROUP BY status"#,
-        )
-        .bind(kinds_filter)
-        .bind(exclude_rule_ids)
-        .fetch_all(&self.pool)
-        .await?;
+                 AND (rule_id IS NULL OR NOT (rule_id = ANY($2))){scope_sql}
+               GROUP BY status"#
+        );
+        let mut query = sqlx::query_as(&sql).bind(kinds_filter).bind(exclude_rule_ids);
+        if let Some(denied) = &scope_bind {
+            query = query.bind(denied);
+        }
+        let results: Vec<(String, i64)> = query.fetch_all(&self.pool).await?;
 
         Ok(map_status_counts(results))
     }
@@ -755,9 +917,11 @@ impl AlertRepository {
         after_timestamp: DateTime<Utc>,
         after_id: Uuid,
         limit: i64,
+        deny: &BTreeSet<String>,
     ) -> Result<Vec<Alert>, AlertRepositoryError> {
         let cutoff = apply_safety_lag(Utc::now(), stream_safety_lag_secs());
-        let results = sqlx::query_as::<_, Alert>(
+        let (scope_sql, scope_bind) = scope_clause(deny, "a.source_types", 5);
+        let sql = format!(
             r#"
             SELECT
                 a.*,
@@ -778,17 +942,20 @@ impl AlertRepository {
                 ORDER BY alert_id, created_at DESC
             ) t ON t.alert_id = a.id
             WHERE ((a.created_at > $1) OR (a.created_at = $1 AND a.id > $2))
-              AND a.created_at <= $4
+              AND a.created_at <= $4{scope_sql}
             ORDER BY a.created_at ASC, a.id ASC
             LIMIT $3
-            "#,
-        )
-        .bind(after_timestamp)
-        .bind(after_id)
-        .bind(limit)
-        .bind(cutoff)
-        .fetch_all(&self.pool)
-        .await?;
+            "#
+        );
+        let mut query = sqlx::query_as::<_, Alert>(&sql)
+            .bind(after_timestamp)
+            .bind(after_id)
+            .bind(limit)
+            .bind(cutoff);
+        if let Some(denied) = &scope_bind {
+            query = query.bind(denied);
+        }
+        let results = query.fetch_all(&self.pool).await?;
 
         Ok(results)
     }
@@ -889,6 +1056,67 @@ mod tests {
             compute_event_hash(&before),
             compute_event_hash(&after_new_activity),
             "an advanced _last_seen (new activity) must produce a new hash"
+        );
+    }
+
+    /// NAN-1800: source_types stamping — raw events (per-event `source_type`)
+    /// and aggregate rows (engine-stamped `_nano_source_types` array) both
+    /// contribute; values are trimmed + lowercased + sorted-unique.
+    #[test]
+    fn distinct_source_types_reads_both_forms_normalized() {
+        let events = serde_json::json!([
+            {"source_type": "  Windows_Event_Log ", "message": "a"},
+            {"source_type": "syslog", "message": "b"},
+            {"count": 12, "_nano_source_types": ["Syslog", "aws_cloudtrail", " "]},
+            {"count": 3, "_nano_source_types": ["insider_threat"]},
+            {"message": "no source_type at all"}
+        ]);
+        assert_eq!(
+            distinct_source_types(&events),
+            vec![
+                "aws_cloudtrail".to_string(),
+                "insider_threat".to_string(),
+                "syslog".to_string(),
+                "windows_event_log".to_string(),
+            ]
+        );
+    }
+
+    /// NAN-1800: producers whose events carry no source_type (observability /
+    /// risk-notable alerts, non-array payloads) stamp an empty array — the
+    /// back-compat "visible to everyone" form.
+    #[test]
+    fn distinct_source_types_empty_for_non_source_events() {
+        assert!(distinct_source_types(&serde_json::json!([{"value": 1.0}])).is_empty());
+        assert!(distinct_source_types(&serde_json::json!({})).is_empty());
+        assert!(distinct_source_types(&serde_json::json!(null)).is_empty());
+    }
+
+    /// NAN-1800: empty deny set emits NO clause and NO bind — byte-identical
+    /// back-compat SQL for system callers.
+    #[test]
+    fn scope_clause_empty_deny_is_noop() {
+        let (sql, bind) = scope_clause(&BTreeSet::new(), "a.source_types", 7);
+        assert!(sql.is_empty());
+        assert!(bind.is_none());
+    }
+
+    /// NAN-1800: a restricted deny set emits the overlap-rejection clause at
+    /// the requested parameter index with normalized bind values.
+    #[test]
+    fn scope_clause_restricted_deny_emits_overlap_filter() {
+        let deny: BTreeSet<String> =
+            [" Audit ".to_string(), "Insider_Threat".to_string(), "".to_string()]
+                .into_iter()
+                .collect();
+        let (sql, bind) = scope_clause(&deny, "a.source_types", 7);
+        assert_eq!(
+            sql,
+            " AND ($7::text[] = '{}' OR NOT (a.source_types && $7::text[]))"
+        );
+        assert_eq!(
+            bind,
+            Some(vec!["audit".to_string(), "insider_threat".to_string()])
         );
     }
 

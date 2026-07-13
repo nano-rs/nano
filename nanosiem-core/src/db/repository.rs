@@ -22,9 +22,11 @@ pub mod notifications;
 pub mod query_explanations;
 pub mod rate_limit;
 pub mod recent_activity;
+pub mod retro_hunt;
 pub mod saved_searches;
 pub mod search_history;
 pub mod shared_searches;
+pub mod source_scope;
 
 pub use alerts::{compute_event_hash, AlertInsert, AlertRepository, AlertRepositoryError};
 #[cfg(feature = "enterprise")]
@@ -40,6 +42,7 @@ pub use folder_settings::{FolderSetting, FolderSettingsError, FolderSettingsRepo
 pub use incidents::{IncidentRepository, IncidentRepositoryError};
 pub use notebooks::{NotebookRepository, NotebookRepositoryError};
 pub use notifications::{NotificationError, NotificationRepository};
+pub use retro_hunt::{RetroHuntRepository, RetroHuntRepositoryError};
 pub use query_explanations::{
     NewQueryExplanation, QueryExplanation, QueryExplanationError, QueryExplanationRepository,
     ReasoningStepRow,
@@ -53,3 +56,6 @@ pub use search_history::{
     NewSearchHistoryEntry, SearchHistoryEntry, SearchHistoryError, SearchHistoryRepository,
 };
 pub use shared_searches::{SharedSearchRepository, SharedSearchRepositoryError};
+pub use source_scope::{
+    RestrictedSourceType, SourceScopeError, SourceScopeRepository, SourceTypeGrant,
+};

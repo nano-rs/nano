@@ -248,16 +248,17 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
           <section className="mt-6">
             <SectionHead icon={<Clock className="w-3.5 h-3.5" strokeWidth={1.75} />} title="Schedule" />
             <div className="pt-1">
-              {/* NAN-1561: dataset selector. Spans/metrics are scheduled-only —
-                  picking one forces detection_mode to 'scheduled' and the
-                  detection-mode control below is locked to scheduled. */}
+              {/* NAN-1561/NAN-1805: dataset selector. Non-logs datasets
+                  (spans/metrics/risk) are scheduled-only — picking one forces
+                  detection_mode to 'scheduled' and the detection-mode control
+                  below is locked to scheduled. */}
               <FormField
                 label="Dataset"
                 yamlKey="dataset"
-                hint="logs = UDM/OCSF events. spans/metrics query OTLP datasets and run scheduled-only."
+                hint="logs = UDM/OCSF events. spans/metrics query OTLP datasets; risk queries accumulated entity risk. Non-logs datasets run scheduled-only."
               >
                 <div className="inline-flex rounded-md border border-border p-0.5">
-                  {(['logs', 'spans', 'metrics'] as DatasetKey[]).map((d) => {
+                  {(['logs', 'spans', 'metrics', 'risk'] as DatasetKey[]).map((d) => {
                     const active = (meta.dataset || 'logs') === d;
                     return (
                       <button
@@ -291,13 +292,24 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
                     );
                   })}
                 </div>
+                {/* NAN-1825: mirror the backend feedback-loop guard (NAN-1805)
+                    in copy — a risk rule's findings feed the risk dataset, so
+                    it must not contribute risk itself. Save forces risk_score
+                    to 0 and the backend rejects `| risk` bodies. */}
+                {(meta.dataset || 'logs') === 'risk' && (
+                  <div className="mt-1.5 text-[11px] text-muted-foreground leading-relaxed">
+                    Risk rules query accumulated risk — they don't add to it. Risk contribution
+                    is forced to 0, and the <span className="font-mono">| risk</span> command is
+                    not allowed in the query body.
+                  </div>
+                )}
               </FormField>
               <FormField label="Detection mode" yamlKey="detection_mode">
                 <div className="inline-flex rounded-md border border-border p-0.5">
                   {(['realtime', 'scheduled'] as DetectionModeKey[]).map((m) => {
                     const active = (meta.detection_mode || 'realtime') === m;
-                    // Lock to scheduled for non-logs datasets (spans/metrics
-                    // have no real-time materialized-view path).
+                    // Lock to scheduled for non-logs datasets (spans/metrics/
+                    // risk have no real-time materialized-view path).
                     const datasetLocked = (meta.dataset || 'logs') !== 'logs';
                     const lockedOut = datasetLocked && m === 'realtime';
                     return (
@@ -309,7 +321,7 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
                           setField('detection_mode', m);
                         }}
                         disabled={readOnly || lockedOut}
-                        title={lockedOut ? 'spans/metrics datasets are scheduled-only' : undefined}
+                        title={lockedOut ? 'non-logs datasets (spans/metrics/risk) are scheduled-only' : undefined}
                         className={cn(
                           'h-7 px-2.5 rounded text-[11px] font-mono',
                           active
@@ -412,7 +424,13 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
             />
             <div className="pt-3">
               <pre className="font-mono text-[12px] leading-[1.6] bg-[color-mix(in_srgb,var(--foreground)_3%,transparent)] border border-border rounded p-3 whitespace-pre-wrap overflow-x-auto">
-                {query || <span className="text-muted-foreground">// empty query — switch to CODE to author it</span>}
+                {query || (
+                  <span className="text-muted-foreground">
+                    {(meta.dataset || 'logs') === 'risk'
+                      ? '// empty query — e.g. * | where score_24h > 100 | where distinct_tactics_24h >= 3 — switch to CODE to author it'
+                      : '// empty query — switch to CODE to author it'}
+                  </span>
+                )}
               </pre>
               <div className="mt-1.5 text-[11px] font-mono text-muted-foreground">
                 Edit in CODE view for syntax highlighting, autocomplete, and validation.

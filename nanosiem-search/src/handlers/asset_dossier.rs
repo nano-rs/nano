@@ -44,18 +44,38 @@ pub struct AssetDossierRequest {
         (status = 200, description = "Asset dossier aggregates", body = AssetDossier),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Missing search:execute permission", body = ErrorResponse),
     )
 )]
 pub async fn get_asset_dossier(
     State(state): State<SearchState>,
+    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<AssetDossierRequest>,
 ) -> Result<(axum::http::HeaderMap, Json<AssetDossier>), SearchError> {
+    // NAN-1801: this endpoint was bearer-only — it runs hand-built aggregates
+    // over the logs table, so it needs the same execute gate as /api/search.
+    if !auth
+        .claims
+        .has_permission(nanosiem_core::auth::permissions::SEARCH_EXECUTE)
+    {
+        return Err(SearchError::Forbidden(
+            "Asset dossier queries require the search:execute permission".to_string(),
+        ));
+    }
+
+    // NAN-1801: compose the caller's effective source-scope deny-set once —
+    // it is ANDed into every dossier aggregate by the service AND folded into
+    // the cache key below (the scope changes the executed SQL, so it is part
+    // of result identity; two users with different scopes must not share a
+    // cached dossier).
+    let scope = super::search::effective_scope(&auth);
+
     // NAN-1593: the asset dossier fires on every Asset-view load / shared-link
     // follow and runs 8 parallel ClickHouse aggregates — cache it through the
     // same Dragonfly layer so reloads return instantly. Keyed on the
-    // identifier, the resolved identities (they widen the match set), and the
-    // time range.
+    // identifier, the resolved identities (they widen the match set), the
+    // time range, and the caller's effective scope.
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "adossier",
         &[
@@ -67,6 +87,7 @@ pub async fn get_asset_dossier(
             request.time_range.start.timestamp_micros().to_string().as_bytes(),
             request.time_range.end.timestamp_micros().to_string().as_bytes(),
         ],
+        &scope,
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -90,6 +111,7 @@ pub async fn get_asset_dossier(
             &request.identifier_value,
             &request.identities,
             &time_range,
+            &scope,
         )
         .await;
 

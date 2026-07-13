@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use super::*;
+use super::lateral::source_scope_sql_predicate;
+use crate::auth::ScopeSet;
 use crate::search::parse_clickhouse_error;
 
 /// Parse an asset time-range timestamp (`query_asset_true_time_range` emits
@@ -174,12 +176,20 @@ impl SearchService {
     /// their range or use the broader search/dashboard surfaces.
     pub(crate) const MAX_ASSET_VIEW_HOURS: i64 = 6;
 
+    /// NAN-1797/NAN-1799: `| asset` runs FRESH identity-clause queries against
+    /// the logs table (and identity_observations) that do NOT inherit the base
+    /// query's injected source-scope gate — on the fast path there is no base
+    /// query at all. The caller's `ScopeSet` is threaded down here and its
+    /// deny-set exclusion is ANDed into every scan those helpers issue (see
+    /// [`source_scope_sql_predicate`]). An empty deny set emits nothing
+    /// (byte-identical SQL to the pre-scoping form).
     pub(crate) async fn build_asset_view(
         &self,
         results: Vec<serde_json::Value>,
         asset_info: &AssetCommandInfo,
         time_range: &TimeRange,
         pre_extracted_identifier: Option<(String, String)>,
+        scope: &ScopeSet,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
         use serde_json::json;
 
@@ -244,6 +254,7 @@ impl SearchService {
                 &identifier_value,
                 time_range,
                 asset_info.max_identity_age,
+                scope,
             )
             .await?;
         tracing::info!("Resolved {} identities for asset", identities.len());
@@ -260,6 +271,7 @@ impl SearchService {
                 0,
                 Self::ASSET_EVENT_PAGE_SIZE,
                 None,
+                scope,
             )
             .await?;
         tracing::info!(
@@ -300,6 +312,7 @@ impl SearchService {
                             &identifier_value,
                             &anchored,
                             asset_info.max_identity_age,
+                            scope,
                         )
                         .await?;
                     let (ev, tc, fc) = self
@@ -311,6 +324,7 @@ impl SearchService {
                             0,
                             Self::ASSET_EVENT_PAGE_SIZE,
                             None,
+                            scope,
                         )
                         .await?;
                     paginated_events = ev;
@@ -582,6 +596,11 @@ impl SearchService {
     /// - A page of events (limited by offset/limit)
     /// - Total count of matching events
     /// - Facet counts for source_type, event_type, and user
+    ///
+    /// `scope` (NAN-1797/NAN-1799): the caller's source-scope deny-set. Every
+    /// scan below is a fresh hand-built query that does not inherit the main
+    /// search's injected gate, so the deny-set exclusion is ANDed into each of
+    /// them here. An empty deny set emits nothing (byte-identical SQL).
     pub async fn query_asset_events_paginated(
         &self,
         identifier_field: &str,
@@ -591,6 +610,7 @@ impl SearchService {
         offset: usize,
         limit: usize,
         filters: Option<&AssetEventFilters>,
+        scope: &ScopeSet,
     ) -> Result<(Vec<serde_json::Value>, u64, AssetFacets), SearchError> {
         // Same cap as build_asset_view — prevents bypassing the limit via the
         // pagination endpoint with an offset of 0.
@@ -684,11 +704,16 @@ impl SearchService {
             }
         }
 
-        let where_clause = if filter_conditions.is_empty() {
-            String::new()
-        } else {
-            format!("\n            WHERE ({})", filter_conditions.join(" AND "))
-        };
+        // NAN-1797: render the caller's deny-set ONCE; ANDed into every logs
+        // scan below — the events page, the filtered count, the combined
+        // source_type/event_type facet (which otherwise enumerated exactly the
+        // caller's hidden sources), the user facet, and the unfiltered count.
+        // `None` (unrestricted) leaves every SQL string byte-identical to the
+        // pre-scoping form.
+        let scope_predicate = source_scope_sql_predicate("source_type", scope.deny_set());
+
+        let where_clause =
+            build_asset_events_where(&filter_conditions, scope_predicate.as_deref());
 
         // Combine identity + filter bind values for queries that use both
         let events_binds: Vec<String> = bind_values
@@ -807,35 +832,32 @@ impl SearchService {
             Ok((events, total_count, AssetFacets::default()))
         } else {
             // Initial load: run full facet aggregation + reliable count (4 queries)
-            let combined_facet_sql = format!(
-                "SELECT source_type, {} as event_type, count() as cnt \
-                 FROM {} \
-                 PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({}) \
-                 GROUP BY source_type, event_type \
-                 ORDER BY cnt DESC",
+            let combined_facet_sql = build_asset_combined_facet_sql(
                 crate::search::classification::event_type_sql(self.active_profile.as_ref()),
-                logs_table,
-                start_str,
-                end_str,
-                identity_clause
+                &logs_table,
+                &start_str,
+                &end_str,
+                &identity_clause,
+                scope_predicate.as_deref(),
             );
 
-            let user_facet_sql = format!(
-                r#"SELECT {user_col} AS user, count() as cnt
-                FROM {logs_table}
-                PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({})
-                WHERE {user_col} != ''
-                GROUP BY {user_col}
-                ORDER BY cnt DESC
-                LIMIT 50"#,
-                start_str, end_str, identity_clause
+            let user_facet_sql = build_asset_user_facet_sql(
+                &user_col,
+                &logs_table,
+                &start_str,
+                &end_str,
+                &identity_clause,
+                scope_predicate.as_deref(),
             );
 
             // Separate count query as fallback — the combined facet query can fail
             // (e.g. complex CASE WHEN in GROUP BY) while this simple count always works
-            let count_sql = format!(
-                "SELECT count() FROM {} PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({})",
-                logs_table, start_str, end_str, identity_clause
+            let count_sql = build_asset_count_sql(
+                &logs_table,
+                &start_str,
+                &end_str,
+                &identity_clause,
+                scope_predicate.as_deref(),
             );
 
             // Facet/count queries only use identity binds (no filter binds)
@@ -1013,12 +1035,20 @@ impl SearchService {
     }
 
     /// Resolve all related identities for an asset using identity_observations table
+    ///
+    /// `scope` (NAN-1797): identity_observations is per-event data derived from
+    /// logs — its `source` column IS the originating source_type (see
+    /// `identity_observations_mv` in clickhouse/init.sql) — so a denied source
+    /// must not contribute identity correlations (the user↔host↔ip rows shown
+    /// in the asset profile, which also widen the events-scan identity clause)
+    /// to a scoped caller. An empty deny set emits nothing (byte-identical SQL).
     async fn resolve_asset_identities(
         &self,
         identifier_field: &str,
         identifier_value: &str,
         time_range: &TimeRange,
         max_age: std::time::Duration,
+        scope: &ScopeSet,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
         use serde_json::json;
 
@@ -1079,6 +1109,12 @@ impl SearchService {
         };
 
         // Query to resolve identities with time bounds (case-insensitive hostname match)
+        // NAN-1797: `source` is identity_observations' name for source_type
+        // (stamped by identity_observations_mv). Empty deny set → empty splice
+        // (byte-identical SQL).
+        let scope_and = source_scope_sql_predicate("source", scope.deny_set())
+            .map(|pred| format!("\n              AND {pred}"))
+            .unwrap_or_default();
         let identity_observations_table = self.table_names.read("identity_observations");
         let sql = format!(
             r#"
@@ -1094,7 +1130,7 @@ impl SearchService {
             WHERE {}
               AND observed_at >= '{}'
               AND observed_at <= '{}'
-              AND observed_at >= now() - INTERVAL {} SECOND
+              AND observed_at >= now() - INTERVAL {} SECOND{scope_and}
             GROUP BY ip, hostname, mac, user
             ORDER BY max(observed_at) DESC
             LIMIT 100
@@ -1216,12 +1252,18 @@ impl SearchService {
 
     /// Query artifact (hash/domain) summaries with timestamps across the full search time range.
     /// Returns aggregated first_ts, last_ts, and count for each unique artifact.
+    ///
+    /// `scope` (NAN-1801): every UNION ALL branch below is a fresh hand-built
+    /// scan over the logs table that bypasses the nPL injection gate, so the
+    /// caller's deny-set predicate is ANDed into each branch's WHERE directly.
+    /// An empty deny set emits nothing (byte-identical SQL).
     pub async fn query_asset_artifact_summary(
         &self,
         identifier_field: &str,
         identifier_value: &str,
         identities: &[serde_json::Value],
         time_range: &TimeRange,
+        scope: &ScopeSet,
     ) -> Result<serde_json::Value, SearchError> {
         use serde_json::json;
 
@@ -1255,6 +1297,12 @@ impl SearchService {
             .read(Self::logs_table_key(profile));
         let ip_exclude = r"^\d+\.\d+\.\d+\.\d+$";
 
+        // NAN-1801: caller's source-scope gate, ANDed into every branch's WHERE.
+        // Empty deny set → empty splice (byte-identical SQL).
+        let scope_and = source_scope_sql_predicate("source_type", scope.deny_set())
+            .map(|pred| format!(" AND {pred}"))
+            .unwrap_or_default();
+
         // Build one UNION ALL branch for a hash artifact (file_hash / process_hash).
         // Returns None when the source column is unmapped under the active schema.
         let hash_branch = |udm_col: &str, prevalence_udm: &str| -> Option<String> {
@@ -1267,7 +1315,7 @@ impl SearchService {
                     max({prev}) as host_count \
                 FROM {logs_table} \
                 PREWHERE timestamp BETWEEN '{start_str}' AND '{end_str}' AND ({identity_clause}) \
-                WHERE {col} != '' AND length({col}) >= 32 AND match({col}, '^[a-fA-F0-9]+$') \
+                WHERE {col} != '' AND length({col}) >= 32 AND match({col}, '^[a-fA-F0-9]+$'){scope_and} \
                 GROUP BY lower({col})"
             ))
         };
@@ -1293,7 +1341,7 @@ impl SearchService {
                     max(dictGetOrDefault('nanosiem.domain_prevalence_dict', 'host_count', lower({col}), toUInt16(9999))) as host_count \
                 FROM {logs_table} \
                 PREWHERE timestamp BETWEEN '{start_str}' AND '{end_str}' AND ({identity_clause}) \
-                WHERE {col} != '' AND position({col}, '.') > 0 AND match({col}, '{ip_exclude}') = 0 \
+                WHERE {col} != '' AND position({col}, '.') > 0 AND match({col}, '{ip_exclude}') = 0{scope_and} \
                 GROUP BY lower({col})"
             ))
         };
@@ -1404,6 +1452,10 @@ impl SearchService {
     /// Returns individual (artifact, timestamp) rows so the scatter chart can
     /// show one dot per event at its actual timestamp.
     /// Optional hash_filter/domain_filter restrict to only those artifact values.
+    ///
+    /// `scope` (NAN-1801): like the summary query, every UNION ALL branch is a
+    /// hand-built logs scan outside the nPL injection gate — the deny-set
+    /// predicate is ANDed into each branch. Empty deny set → byte-identical SQL.
     pub async fn query_asset_artifact_occurrences(
         &self,
         identifier_field: &str,
@@ -1412,6 +1464,7 @@ impl SearchService {
         time_range: &TimeRange,
         hash_filter: Option<&[String]>,
         domain_filter: Option<&[String]>,
+        scope: &ScopeSet,
     ) -> Result<serde_json::Value, SearchError> {
         use serde_json::json;
 
@@ -1435,6 +1488,12 @@ impl SearchService {
             .table_names
             .read(Self::logs_table_key(profile));
         let ip_exclude = r"^\d+\.\d+\.\d+\.\d+$";
+
+        // NAN-1801: caller's source-scope gate, ANDed into every branch's WHERE.
+        // Empty deny set → empty splice (byte-identical SQL).
+        let scope_and = source_scope_sql_predicate("source_type", scope.deny_set())
+            .map(|pred| format!(" AND {pred}"))
+            .unwrap_or_default();
 
         // Build artifact IN placeholders
         let in_placeholders = |artifacts: &[String]| -> String {
@@ -1480,7 +1539,7 @@ impl SearchService {
                 "SELECT lower({col}) as artifact, timestamp as ts \
                  FROM {logs_table} \
                  PREWHERE timestamp BETWEEN '{start_str}' AND '{end_str}' AND ({identity_clause}) \
-                 WHERE {predicate}"
+                 WHERE {predicate}{scope_and}"
             );
             Some((sql, binds))
         };
@@ -1769,6 +1828,217 @@ impl SearchService {
             }
             _ => s("message").or_else(|| s("action")).unwrap_or("Event").to_string(),
         }
+    }
+}
+
+/// Build the WHERE clause shared by the asset events-page and filtered-count
+/// scans, combining the analyst's optional UI filters with the caller's
+/// source-scope gate (NAN-1797/NAN-1799). Extracted into a free function so
+/// the gating is unit-testable without a live ClickHouse (mirrors
+/// `build_hop_sql` in `lateral.rs`).
+///
+/// Shape contract (leading `\n` + 12-space indent match the pre-scoping
+/// inline `format!` byte-for-byte):
+/// - no filters, no scope → `""` (byte-identical)
+/// - filters only         → `"\n            WHERE (f1 AND f2)"` (byte-identical)
+/// - scope only           → `"\n            WHERE <pred>"`
+/// - both                 → `"\n            WHERE (f1 AND f2) AND <pred>"`
+fn build_asset_events_where(
+    filter_conditions: &[String],
+    scope_predicate: Option<&str>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !filter_conditions.is_empty() {
+        parts.push(format!("({})", filter_conditions.join(" AND ")));
+    }
+    if let Some(pred) = scope_predicate {
+        parts.push(pred.to_string());
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("\n            WHERE {}", parts.join(" AND "))
+    }
+}
+
+/// Build the combined `GROUP BY source_type, event_type` facet scan
+/// (NAN-1797): without the scope gate this facet enumerated EXACTLY the
+/// denied sources — name and event count — for a scoped caller. With
+/// `scope_predicate = None` the output is byte-identical to the pre-scoping
+/// inline `format!`.
+fn build_asset_combined_facet_sql(
+    event_type_sql: &str,
+    logs_table: &str,
+    start: &str,
+    end: &str,
+    identity_clause: &str,
+    scope_predicate: Option<&str>,
+) -> String {
+    let scope_and = scope_predicate
+        .map(|pred| format!(" AND {pred}"))
+        .unwrap_or_default();
+    format!(
+        "SELECT source_type, {} as event_type, count() as cnt \
+         FROM {} \
+         PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({}){} \
+         GROUP BY source_type, event_type \
+         ORDER BY cnt DESC",
+        event_type_sql, logs_table, start, end, identity_clause, scope_and
+    )
+}
+
+/// Build the user facet scan for the asset view (NAN-1797: the scope gate is
+/// ANDed against the existing `user != ''` WHERE; `None` → byte-identical to
+/// the pre-scoping inline `format!`, leading whitespace included).
+fn build_asset_user_facet_sql(
+    user_col: &str,
+    logs_table: &str,
+    start: &str,
+    end: &str,
+    identity_clause: &str,
+    scope_predicate: Option<&str>,
+) -> String {
+    let scope_and = scope_predicate
+        .map(|pred| format!(" AND {pred}"))
+        .unwrap_or_default();
+    format!(
+        r#"SELECT {user_col} AS user, count() as cnt
+                FROM {logs_table}
+                PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({identity_clause})
+                WHERE {user_col} != ''{scope_and}
+                GROUP BY {user_col}
+                ORDER BY cnt DESC
+                LIMIT 50"#
+    )
+}
+
+/// Build the unfiltered total-count scan for the asset view (NAN-1797 scope
+/// gate; `None` → byte-identical to the pre-scoping inline `format!`).
+fn build_asset_count_sql(
+    logs_table: &str,
+    start: &str,
+    end: &str,
+    identity_clause: &str,
+    scope_predicate: Option<&str>,
+) -> String {
+    let scope_and = scope_predicate
+        .map(|pred| format!(" AND {pred}"))
+        .unwrap_or_default();
+    format!(
+        "SELECT count() FROM {} PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({}){}",
+        logs_table, start, end, identity_clause, scope_and
+    )
+}
+
+#[cfg(test)]
+mod source_scope_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn deny(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// NAN-1797: with a nonempty deny-set, every logs scan `| asset` reaches
+    /// must carry the source_type exclusion — most critically the
+    /// `GROUP BY source_type` facet, which otherwise enumerated exactly the
+    /// caller's hidden sources, and the events page, which returned their raw
+    /// events.
+    #[test]
+    fn nonempty_deny_set_gates_every_asset_scan() {
+        let pred = source_scope_sql_predicate(
+            "source_type",
+            &deny(&["audit", "insider_threat"]),
+        )
+        .expect("nonempty deny set must render");
+        assert_eq!(
+            pred,
+            "lower(source_type) NOT IN ('audit', 'insider_threat')"
+        );
+
+        // Events page / filtered count (shared WHERE builder).
+        assert_eq!(
+            build_asset_events_where(&[], Some(&pred)),
+            format!("\n            WHERE {pred}")
+        );
+        let filters = vec!["lower(source_type) IN (?)".to_string()];
+        assert_eq!(
+            build_asset_events_where(&filters, Some(&pred)),
+            format!("\n            WHERE (lower(source_type) IN (?)) AND {pred}")
+        );
+
+        // The GROUP BY source_type facet — the gate must be ANDed into the
+        // scan's PREWHERE conjunction, before the GROUP BY.
+        let facet = build_asset_combined_facet_sql("ET", "logs", "S", "E", "src_ip = ?", Some(&pred));
+        assert!(
+            facet.contains(&format!("AND (src_ip = ?) AND {pred} GROUP BY source_type")),
+            "source_type facet scan missing scope gate: {facet}"
+        );
+
+        let user_facet = build_asset_user_facet_sql("user", "logs", "S", "E", "src_ip = ?", Some(&pred));
+        assert!(
+            user_facet.contains(&format!("WHERE user != '' AND {pred}")),
+            "user facet scan missing scope gate: {user_facet}"
+        );
+
+        let count = build_asset_count_sql("logs", "S", "E", "src_ip = ?", Some(&pred));
+        assert!(
+            count.ends_with(&format!("AND (src_ip = ?) AND {pred}")),
+            "count scan missing scope gate: {count}"
+        );
+    }
+
+    /// Empty deny set (unrestricted caller) → every scan's SQL byte-identical
+    /// to the pre-scoping form (zero-restricted-sources back-compat).
+    #[test]
+    fn empty_deny_set_leaves_every_asset_scan_byte_identical() {
+        assert_eq!(
+            source_scope_sql_predicate("source_type", &BTreeSet::new()),
+            None
+        );
+
+        assert_eq!(build_asset_events_where(&[], None), "");
+        let filters = vec!["a = ?".to_string(), "b = ?".to_string()];
+        assert_eq!(
+            build_asset_events_where(&filters, None),
+            "\n            WHERE (a = ? AND b = ?)"
+        );
+
+        assert_eq!(
+            build_asset_combined_facet_sql("ET", "logs", "S", "E", "id", None),
+            "SELECT source_type, ET as event_type, count() as cnt \
+             FROM logs \
+             PREWHERE timestamp BETWEEN 'S' AND 'E' AND (id) \
+             GROUP BY source_type, event_type \
+             ORDER BY cnt DESC"
+        );
+
+        assert_eq!(
+            build_asset_user_facet_sql("user", "logs", "S", "E", "id", None),
+            "SELECT user AS user, count() as cnt\n                \
+             FROM logs\n                \
+             PREWHERE timestamp BETWEEN 'S' AND 'E' AND (id)\n                \
+             WHERE user != ''\n                \
+             GROUP BY user\n                \
+             ORDER BY cnt DESC\n                \
+             LIMIT 50"
+        );
+
+        assert_eq!(
+            build_asset_count_sql("logs", "S", "E", "id", None),
+            "SELECT count() FROM logs PREWHERE timestamp BETWEEN 'S' AND 'E' AND (id)"
+        );
+    }
+
+    /// The identity-resolution splice targets identity_observations' `source`
+    /// column (that table's name for source_type, stamped by
+    /// identity_observations_mv).
+    #[test]
+    fn identity_observation_gate_targets_source_column() {
+        assert_eq!(
+            source_scope_sql_predicate("source", &deny(&["audit"])).as_deref(),
+            Some("lower(source) != 'audit'")
+        );
     }
 }
 

@@ -9,8 +9,11 @@
 //! ```text
 //! rule (DetectionRuleRepository) → MV (MaterializedViewGenerator, live CH)
 //!   → INSERT nanosiem.logs → MV writes nanosiem.signals
-//!   → SignalProcessor (THIS branch's code) → alerts / findings / entity risk
+//!   → SignalProcessor (THIS branch's code) → alerts / CH findings
 //! ```
+//!
+//! (NAN-1810: the PG `entity_risk_scores` rollup is gone; the per-entity risk
+//! surface is the CH findings stream itself, asserted directly.)
 //!
 //! Isolation: the test creates a scratch Postgres database (rules, alerts,
 //! watermark, emission store) so it never touches the dev stack's PG state or
@@ -82,6 +85,7 @@ fn new_realtime_rule(name: &str, source: &str, alert_mode: AlertMode) -> NewDete
         playbook_id: None,
         source_path: None,
         source_repo_url: None,
+        alert_cooldown_minutes: None,
     }
 }
 
@@ -168,14 +172,51 @@ async fn emission_count(pool: &PgPool, rule_id: Uuid) -> Result<i64, String> {
     .map_err(|e| format!("count emissions: {e}"))
 }
 
-async fn entity_signal_count(pool: &PgPool, entity: &str) -> Result<i64, String> {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT COALESCE(sum(signal_count), 0)::bigint FROM entity_risk_scores WHERE entity = $1",
+/// Count the CH finding rows for one entity across the test rules — the risk
+/// surface D13 protects from inflation. NAN-1810 dropped the PG
+/// `entity_risk_scores` accumulator; the findings stream in `nanosiem.logs`
+/// IS the store every risk score is computed from, so the dedup invariant is
+/// asserted directly on it (one finding row per (rule, entity, window)).
+async fn entity_finding_count(
+    ch: &clickhouse::Client,
+    rule_ids: &[Uuid],
+    entity: &str,
+) -> Result<i64, String> {
+    let ids: Vec<String> = rule_ids.iter().map(|id| id.to_string()).collect();
+    ch.query(
+        "SELECT count() FROM nanosiem.logs \
+         WHERE source_type = 'findings' AND risk_entity = ? AND rule_id IN ?",
     )
     .bind(entity)
-    .fetch_one(pool)
+    .bind(ids)
+    .fetch_one::<u64>()
     .await
-    .map_err(|e| format!("entity risk for {entity}: {e}"))
+    .map(|n| n as i64)
+    .map_err(|e| format!("entity findings for {entity}: {e}"))
+}
+
+/// Poll the CH finding count for `entity` until it reaches `at_least`
+/// (findings are fire-and-forget async inserts, so they land shortly after
+/// the alert/emission state the phases wait on).
+async fn wait_findings_at_least(
+    ch: &clickhouse::Client,
+    rule_ids: &[Uuid],
+    entity: &str,
+    at_least: i64,
+    what: &str,
+) -> Result<i64, String> {
+    let start = Instant::now();
+    let mut last = -1;
+    while start.elapsed() < PHASE_TIMEOUT {
+        last = entity_finding_count(ch, rule_ids, entity).await?;
+        if last >= at_least {
+            return Ok(last);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(format!(
+        "timed out waiting for {what} >= {at_least} (last seen: {last})"
+    ))
 }
 
 fn ensure(cond: bool, msg: String) -> Result<(), String> {
@@ -202,33 +243,9 @@ async fn realtime_grouped_dedups_per_entity_window_per_event_unchanged() {
     let pg = PgPool::connect(&scratch_url).await.expect("connect scratch db");
     run_postgres_migrations(&pg).await.expect("migrate scratch db");
 
-    // entity_risk_scores is an enterprise table (stripped from core
-    // migrations); create it so the FindingLogger's rollup — the risk surface
-    // D13 protects from inflation — is observable. Shape mirrors
-    // migrations/postgres-enterprise/9000002 (+ the (entity, entity_type)
-    // uniqueness its ON CONFLICT upsert requires).
-    sqlx::query(
-        r#"
-        CREATE TABLE entity_risk_scores (
-            id serial PRIMARY KEY,
-            entity text NOT NULL,
-            entity_type text NOT NULL DEFAULT 'unknown',
-            risk_score integer NOT NULL DEFAULT 0,
-            signal_count integer NOT NULL DEFAULT 0,
-            last_signal_at timestamptz,
-            first_signal_at timestamptz,
-            last_rule_name text,
-            last_severity text,
-            created_at timestamptz NOT NULL DEFAULT now(),
-            updated_at timestamptz NOT NULL DEFAULT now(),
-            cleared_at timestamptz,
-            UNIQUE (entity, entity_type)
-        )
-        "#,
-    )
-    .execute(&pg)
-    .await
-    .expect("create entity_risk_scores");
+    // NAN-1810: no PG risk rollup to create — the dedup invariant on the risk
+    // surface is asserted directly on the CH findings stream (see
+    // `entity_finding_count`).
 
     // ---- DualPool: scratch PG + the LIVE local ClickHouse ----
     let config = DualPoolConfig::with_auth(scratch_url.clone(), CH_URL, "nanosiem", "default", "");
@@ -283,6 +300,7 @@ async fn realtime_grouped_dedups_per_entity_window_per_event_unchanged() {
 
     let ch = dual_pool.clickhouse().clone();
     let match_count_sql = "SELECT match_count FROM detection_rules WHERE id = $1";
+    let rule_ids = [grouped.id, per_event.id];
 
     let phases: Result<(), String> = async {
         // ---- Phase 1: Grouped burst — 5 signals, ONE entity, ONE window ----
@@ -294,16 +312,18 @@ async fn realtime_grouped_dedups_per_entity_window_per_event_unchanged() {
         ensure(alerts == 1, format!("phase 1: expected 1 grouped alert for a 5-signal burst, got {alerts}"))?;
         let emissions = emission_count(&pg, grouped.id).await?;
         ensure(emissions == 1, format!("phase 1: expected 1 emission, got {emissions}"))?;
-        let risk = entity_signal_count(&pg, "10.0.0.9").await?;
-        ensure(risk == 1, format!("phase 1: expected entity risk signal_count 1 for 10.0.0.9, got {risk}"))?;
+        let findings =
+            wait_findings_at_least(&ch, &rule_ids, "10.0.0.9", 1, "phase 1 findings").await?;
+        ensure(findings == 1, format!("phase 1: expected 1 CH finding for 10.0.0.9, got {findings}"))?;
 
         // ---- Phase 2: DIFFERENT entity, same window → its own alert ----
         insert_events(&ch, GROUPED_SOURCE, "10.0.0.10", base, 3, "p2").await?;
         wait_at_least(&pg, match_count_sql, grouped.id, 8, "grouped match_count").await?;
         let alerts = alert_count(&pg, grouped.id).await?;
         ensure(alerts == 2, format!("phase 2: expected a 2nd alert for the new entity, got {alerts}"))?;
-        let risk = entity_signal_count(&pg, "10.0.0.10").await?;
-        ensure(risk == 1, format!("phase 2: expected entity risk signal_count 1 for 10.0.0.10, got {risk}"))?;
+        let findings =
+            wait_findings_at_least(&ch, &rule_ids, "10.0.0.10", 1, "phase 2 findings").await?;
+        ensure(findings == 1, format!("phase 2: expected 1 CH finding for 10.0.0.10, got {findings}"))?;
 
         // ---- Phase 3: SAME entity, genuinely LATER window → re-emits ----
         insert_events(&ch, GROUPED_SOURCE, "10.0.0.9", base + ChronoDuration::minutes(2), 4, "p3").await?;
@@ -313,18 +333,16 @@ async fn realtime_grouped_dedups_per_entity_window_per_event_unchanged() {
         let emissions = emission_count(&pg, grouped.id).await?;
         ensure(emissions == 3, format!("phase 3: expected 3 emissions total, got {emissions}"))?;
         // One finding per (entity, window): 10.0.0.9 has two windows → 2.
-        let risk = entity_signal_count(&pg, "10.0.0.9").await?;
-        ensure(risk == 2, format!("phase 3: expected entity risk signal_count 2 for 10.0.0.9, got {risk}"))?;
+        let findings =
+            wait_findings_at_least(&ch, &rule_ids, "10.0.0.9", 2, "phase 3 findings").await?;
+        ensure(findings == 2, format!("phase 3: expected 2 CH findings for 10.0.0.9, got {findings}"))?;
 
         // ---- Phase 4: PerEvent rule — N signals → N alerts (unchanged) ----
         insert_events(&ch, PEREVENT_SOURCE, "10.0.0.99", base, 5, "p4").await?;
         wait_at_least(&pg, match_count_sql, per_event.id, 5, "per-event match_count").await?;
-        // Findings land right after the last alert; wait on the risk rollup.
-        // (The `$1::uuid IS NOT NULL` tail only satisfies `wait_at_least`'s
-        // rule-id bind — the filter itself is the literal entity.)
-        let risk_sql =
-            "SELECT COALESCE(sum(signal_count), 0)::bigint FROM entity_risk_scores WHERE entity = '10.0.0.99' AND $1::uuid IS NOT NULL";
-        wait_at_least(&pg, risk_sql, per_event.id, 5, "per-event entity risk").await?;
+        // Findings land right after the last alert (fire-and-forget async
+        // inserts into CH) — one per per-event alert.
+        wait_findings_at_least(&ch, &rule_ids, "10.0.0.99", 5, "per-event findings").await?;
         let alerts = alert_count(&pg, per_event.id).await?;
         ensure(alerts == 5, format!("phase 4: expected 5 per-event alerts, got {alerts}"))?;
         let emissions = emission_count(&pg, per_event.id).await?;

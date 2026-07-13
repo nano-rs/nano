@@ -126,6 +126,33 @@ Rules:
 - Don't drop unroutable input — land a minimal debuggable record (class `1007`,
   `activity_id=99`, `message=<raw>`) like the Vector parsers do.
 
+### `raw_data` — keep the original (NAN-1827)
+
+If you parse a raw log, put the **untouched original** (syslog header included) on
+`event.raw_data`, and use `event.message` for the human-readable summary. nano
+persists `raw_data` to its own column for the full retention window, so an OCSF
+feed re-materializes by re-reading it through this same mapping — no parallel raw
+archive.
+
+- `raw_data` is OCSF `string_t` (**not** `json_t`, since OCSF 1.5) — **send a string.**
+  An object is not rejected, it is stringified — and ClickHouse's JSON type
+  **reorders its keys** on the way through (measured: `{"EventID":…,"Channel":…}`
+  came back `{"Channel":…,"EventID":…}`). It survives, but no longer byte-for-byte,
+  which defeats the point of keeping an original. Byte-exact round-trip is only
+  guaranteed for a string.
+- Capture it **before** you parse: `let $original = this`, then set
+  `event.raw_data = $original` after mapping.
+- It is **stored, not bare-keyword-searched.** A bare `foo` hunt targets `message`
+  only (`keyword_search_column()`), so `message` still needs to carry something
+  meaningful. Explicit `raw_data` hunts do get a text index (`idx_raw_data_words`).
+- Costs nothing if you skip it (empty column), but the original is then gone — the
+  Vector lanes take that route deliberately, putting the raw log in `message`
+  instead. Don't do **both**: the raw log stored twice is exactly what NAN-1443
+  deleted (it was ~46% of the table).
+- `raw_data_hash` / `raw_data_size` are **not** promoted — nothing emits them yet.
+  Send them and they are dropped (they are standard OCSF attributes, so they will
+  not land in `unmapped` either). Ask before relying on them.
+
 ### `time` fallback
 
 `event.time` should be epoch ms. nano's `timestamp` derivation never silently

@@ -900,9 +900,16 @@ impl SearchService {
     /// This extracts distinct domains, hashes, and IPs from the logs matching the query,
     /// then looks up their prevalence data. This is more efficient than extracting from
     /// individual results since it queries distinct values directly from ClickHouse.
+    ///
+    /// `scope` (NAN-1799): the caller's source-scope deny-set is injected into
+    /// the query text before SQL generation — the artifact scan below slices
+    /// this query's WHERE out of the generated base SQL, so the exclusion
+    /// rides along into the `matching_logs` CTE and a scoped caller cannot
+    /// enumerate artifacts from denied sources.
     pub async fn get_prevalence_artifacts(
         &self,
         request: &SearchRequest,
+        scope: &crate::auth::ScopeSet,
     ) -> Result<crate::prevalence::PrevalenceScatterData, SearchError> {
         use crate::prevalence::{PrevalenceScatterData, TimeWindow};
 
@@ -913,8 +920,14 @@ impl SearchService {
             )
         })?;
 
+        // NAN-1799: gate, then parse. Empty deny-set → text unchanged.
+        let enforced_query = crate::search::query_processing::enforce_source_scope(
+            &request.query,
+            scope.deny_set(),
+        )?;
+
         // Parse the query
-        let query = parse_query(&request.query).map_err(convert_parse_error)?;
+        let query = parse_query(&enforced_query).map_err(convert_parse_error)?;
         let time_range = TimeRange::new(request.time_range.start, request.time_range.end);
 
         // Generate base WHERE clause using ClickHouse generator

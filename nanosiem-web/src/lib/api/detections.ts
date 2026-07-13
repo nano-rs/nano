@@ -31,6 +31,11 @@ import type {
   FleetHealthSummary,
   NoisyRulesResponse,
   RuleVersionResponse,
+  CreateRetroHuntRequest,
+  UpdateRetroHuntConfigRequest,
+  RetroHuntConfig,
+  RetroHuntRuleView,
+  RetroHuntRun,
 } from './types';
 
 export class DetectionsApi {
@@ -75,6 +80,42 @@ export class DetectionsApi {
     return this.request(`/api/rules/${id}`, {
       method: 'DELETE',
     });
+  }
+
+  // --- Auto retro-hunt rules (NAN-1791) ---
+
+  /** IOC feed names available to a retro-hunt rule's feed picker. */
+  async listRetroHuntFeeds(): Promise<string[]> {
+    return this.request('/api/rules/retro-hunt/feeds');
+  }
+
+  /** Create an auto retro-hunt rule. */
+  async createRetroHunt(request: CreateRetroHuntRequest): Promise<DetectionResponse> {
+    return this.request('/api/rules/retro-hunt', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  /** Get a rule's retro-hunt config + current delta state. */
+  async getRetroHunt(id: string): Promise<RetroHuntRuleView> {
+    return this.request(`/api/rules/${id}/retro-hunt`);
+  }
+
+  /** Update a rule's retro-hunt config. */
+  async updateRetroHunt(
+    id: string,
+    request: UpdateRetroHuntConfigRequest,
+  ): Promise<RetroHuntConfig> {
+    return this.request(`/api/rules/${id}/retro-hunt`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  /** List a retro-hunt rule's recent run history. */
+  async listRetroHuntRuns(id: string): Promise<RetroHuntRun[]> {
+    return this.request(`/api/rules/${id}/retro-hunt/runs`);
   }
 
   async pauseDetection(id: string): Promise<DetectionRule> {

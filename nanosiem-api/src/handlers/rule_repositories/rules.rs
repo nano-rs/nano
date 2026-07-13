@@ -257,15 +257,19 @@ pub async fn import_rule(
             let sigma_rule = nanosiem_core::rule_repository::parse_sigma(&repo_rule.raw_content)
                 .map_err(|e| ApiError::BadRequest(format!("Failed to parse Sigma rule: {}", e)))?;
 
-            // Get available source_types from the environment for smarter conversion
+            // Get available source_types from the environment for smarter conversion.
+            // NAN-1801: user-initiated AI conversion — enumerate with the
+            // requester's per-source scope so restricted sources stay invisible.
             let available_source_types = {
                 let time_range = nanosiem_core::TimeRangeInput {
                     start: chrono::Utc::now() - chrono::Duration::days(7),
                     end: chrono::Utc::now(),
                 };
+                let scope =
+                    nanosiem_core::auth::ScopeSet::from_denied(auth.effective_source_deny_set());
                 melod_service
                     .data_access()
-                    .get_source_types(&time_range)
+                    .get_source_types(&time_range, &scope)
                     .await
                     .map(|types| types.into_iter().map(|t| t.source_type).collect::<Vec<_>>())
                     .unwrap_or_default()

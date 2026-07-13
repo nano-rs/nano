@@ -64,7 +64,10 @@ async fn test_search_service_with_clickhouse() {
         include_sql: Some(true),
     };
 
-    match search_service.search(request).await {
+    match search_service
+        .search(request, &nanosiem_core::auth::ScopeSet::unrestricted())
+        .await
+    {
         Ok(response) => {
             println!("Total count: {}", response.total_count);
             println!("Results returned: {}", response.results.len());
@@ -94,7 +97,10 @@ async fn test_search_service_with_clickhouse() {
         include_sql: Some(true),
     };
 
-    match search_service.search(request).await {
+    match search_service
+        .search(request, &nanosiem_core::auth::ScopeSet::unrestricted())
+        .await
+    {
         Ok(response) => {
             println!("Total count: {}", response.total_count);
             println!("Results returned: {}", response.results.len());
@@ -122,7 +128,10 @@ async fn test_search_service_with_clickhouse() {
         include_sql: Some(true),
     };
 
-    match search_service.search(request).await {
+    match search_service
+        .search(request, &nanosiem_core::auth::ScopeSet::unrestricted())
+        .await
+    {
         Ok(response) => {
             println!("Total count: {}", response.total_count);
             println!("Results returned: {}", response.results.len());
@@ -180,7 +189,10 @@ async fn test_search_service_with_clickhouse() {
         include_sql: Some(true),
     };
 
-    match search_service.search(request).await {
+    match search_service
+        .search(request, &nanosiem_core::auth::ScopeSet::unrestricted())
+        .await
+    {
         Ok(response) => {
             println!(
                 "Page 1 - Total: {}, Returned: {}",

@@ -10,8 +10,19 @@
 //! both reads are bounded (trace fetch is partition-pruned + `LIMIT 100000`,
 //! the metric series is GROUP BY bucket) so the count-companion round trip
 //! (NAN-1032) would only double the I/O for no caller benefit.
+//!
+//! Source scoping (NAN-1801): `otel_spans` / `otel_metrics` have NO
+//! `source_type` column — the per-source RBAC deny-set does not apply to them
+//! (out of scope by design; the scoping unit is the ingest `source_type`
+//! string, which OTLP-native tables never carry). The ONE read in this module
+//! that touches a source-scopeable table is
+//! [`SearchService::observability_service_security_signals`], which reads the
+//! detection `signals` table — that path takes the caller's [`ScopeSet`] and
+//! AND-s the deny-set exclusion onto both its signals reads.
 
 use super::*;
+use super::lateral::source_scope_sql_predicate;
+use crate::auth::ScopeSet;
 use crate::query::{
     infra_hosts_sql, metric_names_sql, metric_scalar_sql, metric_tag_keys_sql,
     metric_tag_values_sql, metric_timeseries_sql, metric_timeseries_v2_sql, recent_traces_sql,
@@ -821,12 +832,25 @@ impl SearchService {
     /// use `execute_sql_to_json` directly; the count companion (3) is a deliberate
     /// exception to the NAN-1032 "no companion" default because the `limit` cap
     /// makes the true total unrecoverable from the bounded sample rows.
-    #[instrument(skip(self))]
+    ///
+    /// NAN-1801 (P3 side-doors): the `signals` table is source-scopeable
+    /// (`source_type`, migration 164), and this hand-built path bypasses the P1
+    /// nPL search-path gate — so the caller's `ScopeSet` is threaded down here
+    /// and its deny-set exclusion is AND-ed onto BOTH signals reads (the bounded
+    /// sample (2) AND the count companion (3) — they must agree or
+    /// `signal_total` would leak the existence of hidden-source signals). The
+    /// entity-resolution read (1) is `otel_spans`, which has no `source_type`
+    /// column and stays unscoped by design. An empty deny set emits
+    /// byte-identical SQL to the pre-scoping form. Residual: pre-rollout MV rows
+    /// carry `source_type = 'unknown'` (migration 164 DEFAULT) and stay visible
+    /// until the supervised backfill — accepted (NAN-1801).
+    #[instrument(skip(self, scope))]
     pub async fn observability_service_security_signals(
         &self,
         service: &str,
         time_range: &TimeRange,
         limit: Option<u32>,
+        scope: &ScopeSet,
     ) -> Result<(usize, usize, u64, Vec<serde_json::Value>), SearchError> {
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
@@ -858,13 +882,36 @@ impl SearchService {
             .map(|s| s.as_str())
             .collect();
 
+        // NAN-1801: render the caller's source-scope deny-set ONCE — it gates
+        // both the sample read below and the count companion, which must stay
+        // predicate-identical. `None` (unrestricted) leaves both reads
+        // byte-identical to the pre-scoping form.
+        let scope_predicate = source_scope_sql_predicate("source_type", scope.deny_set());
+
         // 2) Find detection signals against those entities.
-        let signals_sql = security_signals_for_entities_sql(
+        let mut signals_sql = security_signals_for_entities_sql(
             &entities,
             time_range,
             limit,
             self.table_names.is_clustered(),
         );
+        if let Some(pred) = scope_predicate.as_deref() {
+            // NAN-1801: `security_signals_for_entities_sql` does not (yet) take
+            // a scope predicate, so splice the conjunct into its WHERE ahead of
+            // the ORDER BY. The marker is pinned by the builder's format string;
+            // if the builder's shape ever drifts, FAIL CLOSED (error out) rather
+            // than run the read unscoped for a restricted caller.
+            const ORDER_BY_MARKER: &str = "\nORDER BY timestamp DESC";
+            match signals_sql.find(ORDER_BY_MARKER) {
+                Some(idx) => signals_sql.insert_str(idx, &format!("\n  AND ({pred})")),
+                None => {
+                    return Err(SearchError::SqlGenError(
+                        "security-signals SQL shape changed; cannot inject source scope"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
         debug!("OTEL service-security-signals SQL: {}", signals_sql);
         let signal_rows = ch_executor.execute_sql_to_json(&signals_sql).await?;
 
@@ -914,11 +961,19 @@ impl SearchService {
             .join(", ");
         let sig_table = self.table_names.read("signals");
         let sig_ref = self.table_names.read_bare("signals");
+        // NAN-1801: the count carries the SAME source-scope conjunct as the
+        // sample — otherwise "+N more in range" would count hidden-source
+        // signals a restricted viewer can't see. Empty deny → empty splice
+        // (byte-identical SQL).
+        let scope_and = scope_predicate
+            .as_deref()
+            .map(|pred| format!("\n  AND ({pred})"))
+            .unwrap_or_default();
         let count_sql = format!(
             "SELECT count() AS signal_total\n\
              FROM {sig_table}\n\
              WHERE {sig_ref}.timestamp BETWEEN '{start}' AND '{end}'\n  \
-               AND (risk_entity IN ({entity_list}))",
+               AND (risk_entity IN ({entity_list})){scope_and}",
             start = crate::sql_hygiene::format_ch_bound_micros(&time_range.start),
             end = crate::sql_hygiene::format_ch_bound_micros(&time_range.end),
         );

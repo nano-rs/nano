@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use super::*;
+use crate::auth::ScopeSet;
+use crate::search::query_processing::enforce_source_scope;
 
 impl SearchService {
     /// Execute a streaming search, sending events through an mpsc channel.
@@ -11,10 +13,18 @@ impl SearchService {
     ///
     /// Progress events are sent periodically by polling ClickHouse system.processes.
     /// The caller receives `SearchStreamEvent` variants and should forward them as SSE events.
+    ///
+    /// `scope` (NAN-1799): the caller's source-scope deny-set. The STREAMING
+    /// path enforces it on the cleaned query text below (chunk SQL, count
+    /// companion and histogram all derive from that text / its parse); the
+    /// BUFFERED path passes the ORIGINAL request through to
+    /// [`SearchService::search`], which enforces it itself — exactly one
+    /// injection on either path.
     pub async fn search_streaming(
         &self,
         request: SearchRequest,
         event_tx: tokio::sync::mpsc::Sender<crate::search::streaming::SearchStreamEvent>,
+        scope: &ScopeSet,
     ) {
         use crate::search::streaming::{is_query_streamable, SearchStreamEvent};
 
@@ -57,6 +67,23 @@ impl SearchService {
         // Extract time modifiers and parse query
         let (cleaned_query, earliest_offset, latest_offset) =
             extract_time_modifiers(&request.query);
+
+        // NAN-1799: gate the streaming path's query text with the caller's
+        // source-scope deny-set BEFORE the parse below — chunk SQL, the count
+        // companion and the histogram all derive from it. Empty deny-set
+        // returns the text unchanged (byte-identical). The buffered path
+        // deliberately re-runs `search()` on the ORIGINAL request so this is
+        // never a double injection.
+        let cleaned_query = match enforce_source_scope(&cleaned_query, scope.deny_set()) {
+            Ok(q) => q,
+            Err(e) => {
+                send_event!(SearchStreamEvent::Error {
+                    code: "PARSE_ERROR".to_string(),
+                    message: format!("{}", e),
+                });
+                return;
+            }
+        };
         let mut adjusted_time_range = request.time_range.clone();
         if let Some(offset_secs) = earliest_offset {
             adjusted_time_range.start = chrono::Utc::now() + chrono::Duration::seconds(offset_secs);
@@ -122,7 +149,17 @@ impl SearchService {
             lateral_command.is_some(),
             funnel_command.is_some(),
             is_command_page,
-        );
+        )
+            // NAN-1798 P2: the risk dataset is a derived entity grain whose
+            // time bound is constant-true — the streaming path's day-chunk
+            // loop relies on the time bound to partition rows, so every chunk
+            // would re-emit the SAME full entity set (duplicate rows). Force
+            // risk requests onto the buffered path; the grain is
+            // entity-cardinality, well within a single response. (A LOGS
+            // stream carrying a `[dataset=risk …]` bracket chunks fine — the
+            // OUTER logs bound partitions the rows.)
+            && crate::query::Dataset::from_selector(request.dataset.as_deref().unwrap_or("logs"))
+                != crate::query::Dataset::Risk;
 
         let display_type = determine_display_type(&query);
         let column_order = get_column_order(&query);
@@ -161,6 +198,7 @@ impl SearchService {
                 start_time,
                 display_type,
                 column_order,
+                scope,
             )
             .await;
         }
@@ -331,10 +369,20 @@ impl SearchService {
             let dataset = crate::query::Dataset::from_selector(
                 request.dataset.as_deref().unwrap_or("logs"),
             );
+            // NAN-1798 P2: the derived risk base needs the per-request
+            // decay/cleared config resolved BEFORE any dataset swap, same as
+            // core_search — otherwise a streamed table-view first page (or a
+            // streamed logs query carrying a `[dataset=risk …]` bracket)
+            // would silently compute default-config scores. Same cheap
+            // textual pre-filter as core_search for the subsearch case.
+            let mut generator = self.ch_sql_generator.clone();
+            if super::touches_risk_dataset(request.dataset.as_deref(), &request.query) {
+                generator = generator.with_risk_config(self.risk_query_config.resolve().await);
+            }
             if dataset == crate::query::Dataset::Logs {
-                self.ch_sql_generator.clone()
+                generator
             } else {
-                self.ch_sql_generator.clone().with_dataset(dataset)
+                generator.with_dataset(dataset)
             }
         };
 
@@ -661,6 +709,10 @@ impl SearchService {
     }
 
     /// Buffered execution path: runs the full search and delivers all results at once via SSE.
+    ///
+    /// `request` carries the ORIGINAL (un-enforced) query text: `search()`
+    /// applies the source-scope injection itself, so passing the pre-enforced
+    /// text here would double-gate (NAN-1799).
     async fn execute_buffered_path(
         &self,
         request: SearchRequest,
@@ -672,6 +724,7 @@ impl SearchService {
         _start_time: Instant,
         _display_type: DisplayType,
         _column_order: Option<Vec<String>>,
+        scope: &ScopeSet,
     ) {
         use crate::search::streaming::SearchStreamEvent;
 
@@ -680,7 +733,7 @@ impl SearchService {
             Self::spawn_progress_poller(self.ch_client.clone(), query_id, event_tx.clone());
 
         // Execute full search
-        let result = self.search(request).await;
+        let result = self.search(request, scope).await;
         progress_handle.abort();
 
         match result {

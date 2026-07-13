@@ -54,6 +54,7 @@ use crate::handlers;
         (name = "mitre", description = "MITRE ATT&CK framework data and coverage"),
         (name = "log_sources", description = "Log source configuration, VRL validation, and deployment"),
         (name = "source_configs", description = "Source infrastructure configuration and routing rules"),
+        (name = "source_scopes", description = "Per-source RBAC scope registry (restricted source_types) and group grants"),
         (name = "credentials", description = "Cloud credential management"),
         (name = "dashboards", description = "Dashboard CRUD, panel queries, import/export"),
         (name = "notebooks", description = "Investigation notebooks, entries, sharing, and tabs"),
@@ -143,6 +144,8 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
         handlers::mitre::MitreApiDoc::openapi(),
         handlers::log_sources::LogSourcesApiDoc::openapi(),
         handlers::source_configs::SourceConfigsApiDoc::openapi(),
+        // Per-source RBAC scope admin (NAN-1799) — core (open + enterprise).
+        handlers::source_scopes::SourceScopesApiDoc::openapi(),
         handlers::credentials::CredentialsApiDoc::openapi(),
         handlers::dashboards::DashboardsApiDoc::openapi(),
         handlers::demo::DemoApiDoc::openapi(),
@@ -153,6 +156,7 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
         handlers::folder_settings::FolderSettingsApiDoc::openapi(),
         handlers::recent_activity::RecentActivityApiDoc::openapi(),
         handlers::query_library::QueryLibraryApiDoc::openapi(),
+        handlers::reports::ReportsApiDoc::openapi(),
         handlers::lookup::LookupApiDoc::openapi(),
         handlers::rule_repositories::RuleRepositoriesApiDoc::openapi(),
         handlers::detection_code_targets::DetectionCodeTargetsApiDoc::openapi(),
@@ -307,10 +311,37 @@ mod tests {
         // POST /api/search/retro (IOC retro-hunt rollup), counted in both editions.
         // NAN-1745 added 4 shared paths (detection-as-code push targets):
         // /api/detection-code-targets, /{id}, /{id}/token, /{id}/test — both editions.
+        // NAN-1790 added 2 shared paths (notification channels): GET + PUT
+        // /api/settings/notifications/config (deep-link base URL), both editions.
+        // NAN-1792 added 1 ENTERPRISE path: /api/settings/risk-notables
+        // (GET + PUT — risk-notable thresholds/cooldown config).
+        // NAN-1793 added 9 shared paths (scheduled reports): /api/reports (GET,
+        // POST), /api/reports/{id} (GET, PUT, DELETE), /api/reports/{id}/run,
+        // /api/reports/{id}/runs, /api/reports/runs/{run_id}, and
+        // /api/reports/artifacts/{artifact_id}/download — counted in both editions.
+        // NAN-1791 added 4 shared paths (auto retro-hunt rules): POST
+        // /api/rules/retro-hunt, GET /api/rules/retro-hunt/feeds, GET+PUT
+        // /api/rules/{id}/retro-hunt (one path), GET /api/rules/{id}/retro-hunt/runs
+        // — counted in both editions.
+        // NAN-1799 +6 source-scope paths (per-source RBAC admin CRUD, shared/core):
+        // 6 operations across 5 distinct path templates —
+        // GET+POST /api/source-scopes/restricted (one template, two methods),
+        // DELETE /api/source-scopes/restricted/{source_type},
+        // GET /api/source-scopes/restricted/{source_type}/grants,
+        // POST /api/source-scopes/grants,
+        // DELETE /api/source-scopes/grants/{source_type}/{group_id}.
+        // Floor bumped by 6 (operation count, matching the ledger convention);
+        // the floors are loose lower bounds so this stays a valid minimum.
+        // Counted in both editions.
+        // NAN-1806 removed 1 ENTERPRISE path: GET /api/risk/thresholds (the
+        // retired RiskNotableScheduler's candidate view; consumer-free after
+        // NAN-1805 made risk alerting a dataset=risk detection rule). The
+        // enterprise floor nets 513 + 6 (NAN-1799) − 1 (NAN-1806) = 518; the
+        // open edition never had the thresholds path.
         #[cfg(feature = "enterprise")]
-        let min_paths = 497;
+        let min_paths = 518;
         #[cfg(not(feature = "enterprise"))]
-        let min_paths = 387;
+        let min_paths = 408;
 
         assert!(
             path_count >= min_paths,

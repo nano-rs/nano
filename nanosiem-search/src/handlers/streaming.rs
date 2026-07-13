@@ -8,26 +8,11 @@ use axum::{
     response::sse::{Event, Sse},
 };
 use futures::stream::Stream;
-use nanosiem_core::{
-    SearchRequest, SearchResponse, auth::permissions, search::SearchStreamEvent,
-};
+use nanosiem_core::{SearchRequest, SearchResponse, search::SearchStreamEvent};
 use std::convert::Infallible;
 
 use crate::error::ErrorResponse;
 use crate::{SearchState, error::SearchError, metrics::record_search_query};
-
-/// NAN-704: thin shim around the canonical
-/// `nanosiem_core::search::query_processing::enforce_non_audit_query`,
-/// mapping its `nanosiem_core::SearchError` into this crate's local
-/// `SearchError` for handler ergonomics.
-fn enforce_non_audit_query(query: &str) -> Result<String, SearchError> {
-    nanosiem_core::search::query_processing::enforce_non_audit_query(query).map_err(|e| {
-        SearchError::QueryError(format!(
-            "Query parsing failed for access control enforcement: {}",
-            e
-        ))
-    })
-}
 
 /// Execute a streaming search via Server-Sent Events
 ///
@@ -60,14 +45,17 @@ pub async fn search_stream(
     State(state): State<SearchState>,
     Extension(auth): Extension<crate::AuthContext>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
-    Json(mut request): Json<SearchRequest>,
+    Json(request): Json<SearchRequest>,
 ) -> Result<(axum::http::HeaderMap, Sse<impl Stream<Item = Result<Event, Infallible>>>), SearchError>
 {
     let user_id = auth.claims.sub;
 
-    if !auth.claims.has_permission(permissions::AUDIT_VIEW) {
-        request.query = enforce_non_audit_query(&request.query)?;
-    }
+    // NAN-1799: compose the effective deny-set (per-user source scope ∪ audit
+    // gate) ONCE, before the cache lookup below — the scope is folded into
+    // the cache key, and the service injects the exclusion into the executed
+    // SQL. This replaces the old `enforce_non_audit_query` rewrite of
+    // request.query.
+    let scope = super::search::effective_scope(&auth);
 
     if let Some(request_id) = request.request_id.clone() {
         match state.reserve_query_owner(&request_id, user_id).await {
@@ -92,13 +80,16 @@ pub async fn search_stream(
     // Rows are chunked into batches of 1000 to avoid SSE buffer overflow.
     // NAN-1595: skip the read on an explicit refresh (bypass), and capture the
     // entry age so the response can carry `x-nano-cache: hit` + age for the UI.
+    // NAN-1799: the lookup below keys on the caller's effective deny-set
+    // (composed above, BEFORE the cache read) so differently-scoped users
+    // never share a cache entry.
     let mut cache_age: Option<u64> = None;
     let cache_hit = if !bypass {
         if let Some(ref cache) = state.result_cache {
-            if let Some(cached) = cache.get(&request).await {
+            if let Some(cached) = cache.get(&request, &scope).await {
                 record_search_query("stream_cached", 0.0, true);
                 cache_age = cache
-                    .age_secs(&crate::cache::SearchResultCache::cache_key(&request))
+                    .age_secs(&crate::cache::SearchResultCache::cache_key(&request, &scope))
                     .await;
                 let tx = event_tx.clone();
             let total_row_count = cached.results.len() as u64;
@@ -155,12 +146,14 @@ pub async fn search_stream(
         state.result_cache.clone()
     };
     let request_for_cache = request.clone();
+    let scope_for_cache = scope.clone();
     if !cache_hit {
         let search_service = state.search.clone();
         let event_tx_clone = event_tx.clone();
+        let scope_for_search = scope.clone();
         tokio::spawn(async move {
             search_service
-                .search_streaming(request, event_tx_clone)
+                .search_streaming(request, event_tx_clone, &scope_for_search)
                 .await;
         });
     }
@@ -267,8 +260,9 @@ pub async fn search_stream(
                     column_order: meta_column_order,
                 };
                 let req = request_for_cache;
+                let scope = scope_for_cache;
                 tokio::spawn(async move {
-                    cache.set(&req, &response).await;
+                    cache.set(&req, &response, &scope).await;
                 });
             }
         }

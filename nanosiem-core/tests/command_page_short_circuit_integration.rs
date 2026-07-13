@@ -80,7 +80,7 @@ async fn command_pages_short_circuit_without_scanning() {
 
     for (query, expected_dt, entity) in cases {
         let resp = svc
-            .search(request(query))
+            .search(request(query), &nanosiem_core::auth::ScopeSet::unrestricted())
             .await
             .unwrap_or_else(|e| panic!("`{query}` should short-circuit, got error: {e}"));
 

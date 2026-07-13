@@ -27,14 +27,15 @@ export interface SearchRequest {
   /**
    * Observability dataset selector (NAN-1534). The nPL search terms + pipeline
    * run against the selected ClickHouse table. Omitted/"logs" = the UDM logs
-   * lane (default); "spans" = otel_spans; "metrics" = otel_metrics. Unknown
-   * values fall back to logs server-side (never an error).
+   * lane (default); "spans" = otel_spans; "metrics" = otel_metrics; "risk" =
+   * the derived accumulated-entity-risk grain (NAN-1805). Unknown values fall
+   * back to logs server-side (never an error).
    */
   dataset?: SearchDataset;
 }
 
-/** Observability dataset a search runs against (NAN-1534). */
-export type SearchDataset = 'logs' | 'spans' | 'metrics';
+/** Dataset a search runs against (NAN-1534, NAN-1805). */
+export type SearchDataset = 'logs' | 'spans' | 'metrics' | 'risk';
 
 // ============================================================================
 // Async Search Types
@@ -994,8 +995,9 @@ export interface DetectionRule {
   materialized_view_name?: string;
   schedule_cron?: string;
   lookback_minutes?: number;
-  // NAN-1561: dataset this rule queries ('logs' default; 'spans'/'metrics' are
-  // scheduled-only). Mirrors the search dataset selector.
+  // NAN-1561/NAN-1805: dataset this rule queries ('logs' default; non-logs
+  // datasets — spans/metrics/risk — are scheduled-only). Mirrors the search
+  // dataset selector.
   dataset?: SearchDataset;
   mitre_tactics: string[];
   mitre_techniques: string[];
@@ -1026,11 +1028,80 @@ export interface DetectionRule {
   // NAN-452: playbook to auto-attach when this rule fires and produces a case
   playbook_selector_mode?: 'none' | 'specific' | 'adaptive';
   playbook_id?: string | null;
+  // NAN-1791: rule kind. 'standard' (default nPL detection) or 'retro_hunt'
+  // (auto retro-hunt of newly-landed threat-intel indicators).
+  kind?: 'standard' | 'retro_hunt';
 }
 
 // Response type for create/update operations that may include warnings
 export interface DetectionResponse extends DetectionRule {
   warning?: string; // Warning message from backend (e.g., auto-correction)
+}
+
+// ---------------------------------------------------------------------------
+// Auto retro-hunt rules (NAN-1791)
+// ---------------------------------------------------------------------------
+
+export interface RetroHuntConfig {
+  rule_id: string;
+  feeds: string[]; // empty = all feeds
+  artifact_types: string[]; // empty = all types
+  lookback_days: number;
+  max_indicators_per_run: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RetroHuntState {
+  rule_id: string;
+  // Keyset cursor over the feed ordered by (fetched_at, value).
+  watermark?: string | null;
+  watermark_value?: string | null;
+  last_run_at?: string | null;
+  updated_at: string;
+}
+
+export interface RetroHuntRuleView {
+  config: RetroHuntConfig;
+  state?: RetroHuntState | null;
+}
+
+export interface RetroHuntRun {
+  id: number;
+  rule_id: string;
+  started_at: string;
+  finished_at?: string | null;
+  status: 'running' | 'ok' | 'error';
+  candidates_considered: number;
+  indicators_hunted: number;
+  hits: number;
+  truncated: boolean;
+  overflow_remaining: number;
+  watermark_before?: string | null;
+  watermark_after?: string | null;
+  error?: string | null;
+}
+
+export interface CreateRetroHuntRequest {
+  name: string;
+  description?: string;
+  severity?: 'critical' | 'high' | 'medium' | 'low' | 'informational';
+  mode?: 'live' | 'alerting';
+  schedule_cron?: string;
+  folder?: string;
+  tags?: string[];
+  feeds?: string[];
+  artifact_types?: string[];
+  lookback_days?: number;
+  max_indicators_per_run?: number;
+  risk_score?: number;
+}
+
+export interface UpdateRetroHuntConfigRequest {
+  feeds?: string[];
+  artifact_types?: string[];
+  lookback_days?: number;
+  max_indicators_per_run?: number;
 }
 
 export interface CreateDetectionRequest {
@@ -1042,8 +1113,8 @@ export interface CreateDetectionRequest {
   detection_mode?: 'real-time' | 'scheduled';
   schedule_cron?: string;
   lookback_minutes?: number; // Custom lookback period in minutes
-  // NAN-1561: dataset this rule queries ('logs' default; 'spans'/'metrics' are
-  // scheduled-only).
+  // NAN-1561/NAN-1805: dataset this rule queries ('logs' default; non-logs
+  // datasets — spans/metrics/risk — are scheduled-only).
   dataset?: SearchDataset;
   mitre_tactics?: string[];
   mitre_techniques?: string[];
@@ -1102,8 +1173,11 @@ export interface Alert {
   source_id?: string;
 }
 
-/** NAN-1541 alert-spine kinds. `detection` → SIEM; the rest → Observability. */
-export type AlertKind = 'detection' | 'metric_monitor' | 'slo' | 'synthetic';
+/**
+ * NAN-1541 alert-spine kinds. `detection` + `risk_notable` (NAN-1792) → SIEM;
+ * the rest → Observability.
+ */
+export type AlertKind = 'detection' | 'metric_monitor' | 'slo' | 'synthetic' | 'risk_notable';
 
 export interface AlertCounts {
   total: number;
@@ -5298,6 +5372,24 @@ export interface UpdateRiskDecayConfigRequest {
   decay_5_7d: number;
 }
 
+/** Per-entity-type threshold overrides for risk notables (NAN-1792). */
+export interface RiskNotableTypeThresholds {
+  threshold_24h?: number | null;
+  threshold_7d?: number | null;
+}
+
+/**
+ * Risk-notable generation settings (NAN-1792) — kind:"risk_notable" alerts
+ * raised when an entity's accumulated decayed risk score crosses a threshold.
+ */
+export interface RiskNotableConfig {
+  enabled: boolean;
+  threshold_24h: number;
+  threshold_7d: number;
+  cooldown_minutes: number;
+  entity_type_overrides: Record<string, RiskNotableTypeThresholds>;
+}
+
 export interface TimeWindowedRiskScore {
   entity: string;
   entity_type: string;
@@ -5533,6 +5625,7 @@ export type NotificationType =
   | 'search_completed'
   | 'search_failed'
   | 'notebook_mention'
+  | 'report_ready'
   | 'model_deprecated';
 
 export interface Notification {
@@ -5558,6 +5651,105 @@ export interface UnreadCountResponse {
 
 export interface MarkAllReadResponse {
   marked_count: number;
+}
+
+// ============================================================================
+// Scheduled Reports (NAN-1793)
+// ============================================================================
+
+export type ReportSourceType = 'search' | 'dashboard';
+export type ReportRunStatus = 'running' | 'success' | 'failed';
+export type ReportRunTrigger = 'schedule' | 'manual';
+export type ReportArtifactKind = 'csv' | 'html';
+
+export interface ReportDefinition {
+  id: string; // "report_..."
+  name: string;
+  description?: string;
+  source_type: ReportSourceType;
+  source_query?: string;
+  saved_query_id?: number;
+  source_dashboard_id?: string; // "dash_..."
+  time_range_seconds: number;
+  cron_expression: string;
+  owner_id: string; // "user_..."
+  owner_name?: string;
+  enabled: boolean;
+  retention_runs: number;
+  last_run_at?: string;
+  last_run_status?: string;
+  last_run_error?: string;
+  next_run_at?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ReportArtifactMeta {
+  id: string; // "repart_..."
+  run_id: string;
+  kind: ReportArtifactKind;
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  created_at: string;
+}
+
+export interface ReportRun {
+  id: string; // "reprun_..."
+  definition_id: string;
+  status: ReportRunStatus;
+  triggered_by: ReportRunTrigger;
+  started_at: string;
+  finished_at?: string;
+  duration_ms?: number;
+  row_count?: number;
+  truncated: boolean;
+  artifact_truncated: boolean;
+  error?: string;
+  artifacts: ReportArtifactMeta[];
+}
+
+export interface CreateReportRequest {
+  name: string;
+  description?: string;
+  source_type: ReportSourceType;
+  source_query?: string; // required when source_type=search
+  saved_query_id?: number;
+  source_dashboard_id?: string; // required when source_type=dashboard
+  time_range_seconds?: number; // default 86400
+  cron_expression: string;
+  enabled?: boolean;
+  retention_runs?: number; // default 20, 1..100
+}
+
+export interface UpdateReportRequest {
+  name?: string;
+  description?: string | null;
+  source_query?: string; // search reports only; must be non-empty when provided
+  time_range_seconds?: number;
+  cron_expression?: string;
+  enabled?: boolean;
+  retention_runs?: number;
+}
+
+export interface ReportListResponse {
+  reports: ReportDefinition[];
+}
+
+export interface ReportResponse {
+  report: ReportDefinition;
+}
+
+export interface ReportRunsResponse {
+  runs: ReportRun[];
+}
+
+export interface ReportRunResponse {
+  run: ReportRun;
+}
+
+export interface RunReportResponse {
+  run_id: string;
 }
 
 // ============================================================================
@@ -5824,6 +6016,9 @@ export interface RecordActivityRequest {
 // Webhook Types
 // ============================================================================
 
+/** Notification channel type. `generic` is the classic signed-JSON webhook. */
+export type ChannelType = 'generic' | 'slack' | 'teams' | 'pagerduty' | 'email';
+
 export interface WebhookConfig {
   id: string;
   name: string;
@@ -5832,6 +6027,12 @@ export interface WebhookConfig {
   has_secret: boolean;
   severity_filter: string[] | null;
   event_types: string[];
+  /** Notification channel type (selects the payload formatter). */
+  channel_type: ChannelType;
+  /** Non-secret provider config echoed back for editing. */
+  channel_config: Record<string, unknown>;
+  /** Optional detection-rule routing filter as rule_… typeids (null = all). */
+  rule_filter: string[] | null;
   enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -5844,6 +6045,9 @@ export interface CreateWebhookRequest {
   secret?: string;
   severity_filter?: string[];
   event_types?: string[];
+  channel_type?: ChannelType;
+  channel_config?: Record<string, unknown>;
+  rule_filter?: string[];
   enabled?: boolean;
 }
 
@@ -5854,7 +6058,20 @@ export interface UpdateWebhookRequest {
   secret?: string;
   severity_filter?: string[];
   event_types?: string[];
+  channel_type?: ChannelType;
+  channel_config?: Record<string, unknown>;
+  rule_filter?: string[];
   enabled?: boolean;
+}
+
+/** Notification deep-link base URL configuration. */
+export interface NotificationConfig {
+  base_url: string | null;
+  resolved_base_url: string | null;
+}
+
+export interface UpdateNotificationConfigRequest {
+  base_url: string | null;
 }
 
 export interface WebhookDeliveryLog {
@@ -7291,4 +7508,57 @@ export interface PlaybookAnalytics {
   hours_since_last_run: number | null;
   /** Exactly 30 daily attach counts, oldest → newest. */
   spark_30d: number[];
+}
+
+// =============================================================================
+// Source Scopes — per-source RBAC visibility (NAN-1789 / NAN-1802)
+// =============================================================================
+
+/**
+ * The well-known "Everyone" system group. Granting a restricted source_type to
+ * this group re-opens it for every user (it stays in the registry, but the
+ * grant makes it effectively un-restricted).
+ */
+export const EVERYONE_GROUP_ID = '00000000-0000-0000-0000-000000000001';
+
+/**
+ * A `source_type` listed in the restricted registry. An EMPTY registry means
+ * allow-all (the default — every source is visible to everyone). Listing a
+ * source_type makes it invisible-by-default; it is then visible only to the
+ * groups granted it.
+ */
+export interface RestrictedSource {
+  source_type: string;
+  description?: string | null;
+  created_by?: string | null;
+  created_at: string;
+}
+
+export interface RestrictedSourcesResponse {
+  restricted: RestrictedSource[];
+  total: number;
+}
+
+export interface CreateRestrictedSourceRequest {
+  source_type: string;
+  description?: string;
+}
+
+/** A group granted visibility of a restricted `source_type`. */
+export interface SourceScopeGrant {
+  source_type: string;
+  group_id: string;
+  group_name: string;
+  created_by?: string | null;
+  created_at: string;
+}
+
+export interface SourceScopeGrantsResponse {
+  grants: SourceScopeGrant[];
+  total: number;
+}
+
+export interface CreateSourceScopeGrantRequest {
+  source_type: string;
+  group_id: string;
 }

@@ -55,6 +55,8 @@ fn sample_rule() -> DetectionRule {
         playbook_id: None,
         source_path: None,
         source_repo_url: None,
+        kind: "standard".to_string(),
+        alert_cooldown_minutes: None,
     }
 }
 

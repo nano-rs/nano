@@ -7,6 +7,8 @@
 //! enriched with user registry data via `dictGetOrDefault`.
 
 use axum::{Json, extract::State};
+use nanosiem_core::auth::permissions;
+use nanosiem_core::search::service::source_scope_sql_predicate;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ErrorResponse;
@@ -37,7 +39,9 @@ pub struct IdentityResolveResponse {
     /// When the identity observation was recorded
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<String>,
-    /// Source of the identity observation (e.g., DHCP, EDR, static)
+    /// Log source type the observation was derived from (the `logs.source_type`
+    /// of the event that carried the src_ip↔src_host pairing, e.g.
+    /// `windows_event_log`, `sysmon`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     /// Fully qualified domain name
@@ -73,13 +77,25 @@ pub struct IdentityResolveResponse {
         (status = 200, description = "Identity resolution result", body = IdentityResolveResponse),
         (status = 400, description = "Invalid IP address", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Missing enrichments:view permission", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse),
     )
 )]
 pub async fn resolve_identity(
     State(state): State<SearchState>,
+    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     axum::extract::Query(params): axum::extract::Query<IdentityResolveParams>,
 ) -> Result<Json<IdentityResolveResponse>, SearchError> {
+    // NAN-1801: identity resolution exposes hostname/user/email/department/title
+    // for arbitrary IPs — gate it like its nanosiem-api twin (enrichments:view),
+    // not bearer-only.
+    if !auth.claims.has_permission(permissions::ENRICHMENTS_VIEW) {
+        return Err(SearchError::Forbidden(format!(
+            "Missing permission: {}",
+            permissions::ENRICHMENTS_VIEW
+        )));
+    }
+
     // Validate IP address (prevent injection — only valid IPs pass through)
     let ip = params.ip.trim().to_string();
     if ip.parse::<std::net::IpAddr>().is_err() {
@@ -103,6 +119,17 @@ pub async fn resolve_identity(
         "now64(3)".to_string()
     };
 
+    // NAN-1801: fold the viewer's source-scope deny-set into the hand-built SQL.
+    // identity_observations is populated by identity_observations_mv, which
+    // writes `source_type AS source` (clickhouse/init.sql) — the scoped column
+    // HERE is `source`, NOT `source_type`. Filtering on `source_type` would
+    // silently fail OPEN (unknown column never matches the deny predicate).
+    // Empty deny-set → None → byte-identical SQL (back-compat).
+    let scope = crate::handlers::search::effective_scope(&auth);
+    let scope_predicate = source_scope_sql_predicate("source", scope.deny_set())
+        .map(|pred| format!("\n    AND ({pred})"))
+        .unwrap_or_default();
+
     // Query identity_observations for the most recent highest-priority observation.
     // IP is validated above as a valid IP address so it is safe to interpolate.
     let identity_table = state.dual_pool.table_names().read("identity_observations");
@@ -122,12 +149,13 @@ pub async fn resolve_identity(
     dictGetOrDefault('nanosiem.user_registry_dict', 'title', lower(user), '') AS title
 FROM {identity_table}
 PREWHERE ip = '{ip}'
-    AND observed_at <= {reference_time}
+    AND observed_at <= {reference_time}{scope_predicate}
 ORDER BY source_priority DESC, observed_at DESC
 LIMIT 1"#,
         identity_table = identity_table,
         ip = ip,
         reference_time = reference_time,
+        scope_predicate = scope_predicate,
     );
 
     let ch_client = state.dual_pool.clickhouse();

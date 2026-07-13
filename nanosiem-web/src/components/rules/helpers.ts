@@ -135,6 +135,9 @@ export function buildRuleView(rule: DetectionRule, todayCount: number, activity:
     author: rule.author || '—',
     query: rule.query,
     matchCount: rule.match_count || 0,
+    // NAN-1791: retro-hunt rules have no nPL query — they edit/inspect on their
+    // own surface (/rules/retro-hunt/:id) and are badged in the list.
+    kind: rule.kind || 'standard',
   };
 }
 

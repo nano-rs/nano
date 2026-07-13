@@ -16,7 +16,7 @@
  *   - skip `folder` and `freq` in the UI for now
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { X, Search, Bookmark, User, Users, Clock, Play, Edit3, Share2 } from 'lucide-react';
+import { X, Search, Bookmark, User, Users, Clock, Play, Edit3, Share2, CalendarClock } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { SavedSearch } from '@/lib/api';
 
@@ -30,6 +30,8 @@ interface SavedQueriesPaletteProps {
   onEditQuery?: (id: string) => void;
   onShareQuery?: (id: string) => void;
   onDeleteQuery?: (id: string) => void;
+  /** NAN-1793: schedule this saved query as a recurring report. */
+  onScheduleQuery?: (query: { id: string | number; name: string; query: string }) => void;
 }
 
 const PINNED_KEY = 'nanosiem-saved-queries-pinned';
@@ -152,6 +154,7 @@ function QueryRow({
   onTogglePin,
   onEdit,
   onShare,
+  onSchedule,
 }: {
   item: EnrichedQuery;
   selected: boolean;
@@ -160,6 +163,7 @@ function QueryRow({
   onTogglePin: () => void;
   onEdit?: () => void;
   onShare?: () => void;
+  onSchedule?: () => void;
 }) {
   return (
     <div
@@ -222,6 +226,17 @@ function QueryRow({
               <Share2 className="w-[12px] h-[12px]" />
             </button>
           )}
+          {onSchedule && (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onSchedule(); }}
+              className="p-1 rounded hover:bg-foreground/10 text-muted-foreground hover:text-foreground"
+              title="Schedule report"
+              aria-label="Schedule report"
+            >
+              <CalendarClock className="w-[12px] h-[12px]" />
+            </button>
+          )}
         </div>
       </div>
       <div className="font-mono text-[11px] text-foreground/70 truncate mb-1.5 pl-[1px]">{item.query}</div>
@@ -255,6 +270,7 @@ export function SavedQueriesPalette({
   onEditQuery,
   onShareQuery,
   onDeleteQuery: _onDeleteQuery,
+  onScheduleQuery,
 }: SavedQueriesPaletteProps) {
   const [filter, setFilter] = useState('');
   const [scope, setScope] = useState<string>('all'); // 'all' | 'pinned' | 'mine' | 'shared' | 'recent' | `type:${st}`
@@ -454,6 +470,11 @@ export function SavedQueriesPalette({
                   onTogglePin={() => togglePin(q.id)}
                   onEdit={onEditQuery ? () => onEditQuery(q.id) : undefined}
                   onShare={onShareQuery ? () => onShareQuery(q.id) : undefined}
+                  onSchedule={
+                    onScheduleQuery
+                      ? () => onScheduleQuery({ id: q.id, name: q.name, query: q.query })
+                      : undefined
+                  }
                 />
               ))
             )}

@@ -9,6 +9,7 @@
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
+use nanosiem_core::auth::ScopeSet;
 use nanosiem_core::{SearchRequest, SearchResponse};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -91,11 +92,19 @@ impl SearchResultCache {
         }
     }
 
-    /// Compute a deterministic cache key from the search request.
+    /// Compute a deterministic cache key from the search request AND the
+    /// caller's effective source-scope deny-set.
     /// Includes all query-affecting fields so that different source_type,
     /// table_view, or skip_histogram settings produce distinct cache entries.
     /// Uses SHA-256 for collision resistance.
-    pub fn cache_key(request: &SearchRequest) -> String {
+    ///
+    /// NAN-1799: `scope` is the EFFECTIVE deny-set (per-user source scope
+    /// unioned with the audit gate, composed by the handler). The service
+    /// injects the exclusion into the executed SQL, so the same request text
+    /// produces DIFFERENT result sets for different scopes — the scope must
+    /// be part of result identity or two users collide on one key and one is
+    /// served the other's rows from cache (cross-user data leak).
+    pub fn cache_key(request: &SearchRequest, scope: &ScopeSet) -> String {
         // Length-prefixed components (see `companion_key`): the query is
         // free-form and contains `|`, so a delimiter join is collision-prone.
         Self::companion_key(
@@ -115,12 +124,14 @@ impl SearchResultCache {
                 // cross-dataset cache poisoning.
                 request.dataset.as_deref().unwrap_or("logs").as_bytes(),
             ],
+            scope,
         )
     }
 
-    /// Try to get a cached search response.
-    pub async fn get(&self, request: &SearchRequest) -> Option<SearchResponse> {
-        let key = Self::cache_key(request);
+    /// Try to get a cached search response for this request under the
+    /// caller's effective scope (NAN-1799 — see [`Self::cache_key`]).
+    pub async fn get(&self, request: &SearchRequest, scope: &ScopeSet) -> Option<SearchResponse> {
+        let key = Self::cache_key(request, scope);
         let mut conn = self.conn.clone();
 
         let data: Option<Vec<u8>> = match conn.get::<_, Option<Vec<u8>>>(&key).await {
@@ -180,33 +191,36 @@ impl SearchResultCache {
     pub async fn execute_or_cache<F, Fut, E>(
         &self,
         request: &SearchRequest,
+        scope: &ScopeSet,
         run_search: F,
     ) -> Result<SearchResponse, E>
     where
         F: FnOnce(SearchRequest) -> Fut,
         Fut: std::future::Future<Output = Result<SearchResponse, E>>,
     {
-        if let Some(cached) = self.get(request).await {
+        if let Some(cached) = self.get(request, scope).await {
             return Ok(cached);
         }
         let response = run_search(request.clone()).await?;
         let cache = self.clone();
         let req = request.clone();
+        let scope = scope.clone();
         let resp = response.clone();
         tokio::spawn(async move {
-            cache.set(&req, &resp).await;
+            cache.set(&req, &resp, &scope).await;
         });
         Ok(response)
     }
 
-    /// Store a search response in the cache.
-    pub async fn set(&self, request: &SearchRequest, response: &SearchResponse) {
+    /// Store a search response in the cache under the caller's effective
+    /// scope (NAN-1799 — see [`Self::cache_key`]).
+    pub async fn set(&self, request: &SearchRequest, response: &SearchResponse, scope: &ScopeSet) {
         if let Some(reason) = skip_cache_reason(response) {
             debug!("Skipping cache: {}", reason);
             return;
         }
 
-        let key = Self::cache_key(request);
+        let key = Self::cache_key(request, scope);
         let mut conn = self.conn.clone();
 
         // Serialize
@@ -294,12 +308,32 @@ impl SearchResultCache {
     /// request served from the wrong cache entry (false results from a SIEM).
     /// Prefixing each component with its byte length makes the boundary
     /// unambiguous regardless of content.
-    pub fn companion_key(prefix: &str, components: &[&[u8]]) -> String {
+    ///
+    /// NAN-1799: `scope` is the caller's EFFECTIVE deny-set (per-user source
+    /// scope unioned with the audit gate, composed by the handler). The
+    /// service injects the exclusion into the executed SQL, so the same
+    /// components produce DIFFERENT results per scope — the deny-set must be
+    /// part of the key or two users with different scopes collide and one is
+    /// served the other's rows from cache (cross-user data leak). The
+    /// deny-set is folded as ONE final component whose bytes are the
+    /// length-prefixed concatenation of the sorted deny values (`BTreeSet`
+    /// iteration order): it can never be confused with a caller component
+    /// regardless of component count, `{"ab"}` vs `{"a","b"}` stay distinct,
+    /// and an empty deny-set folds an empty component — deterministic and
+    /// identical across all unrestricted callers.
+    pub fn companion_key(prefix: &str, components: &[&[u8]], scope: &ScopeSet) -> String {
         let mut hasher = Sha256::new();
         for c in components {
             hasher.update((c.len() as u64).to_le_bytes());
             hasher.update(c);
         }
+        let mut deny_bytes: Vec<u8> = Vec::new();
+        for denied in scope.deny_set() {
+            deny_bytes.extend_from_slice(&(denied.len() as u64).to_le_bytes());
+            deny_bytes.extend_from_slice(denied.as_bytes());
+        }
+        hasher.update((deny_bytes.len() as u64).to_le_bytes());
+        hasher.update(&deny_bytes);
         format!("{}:{}", prefix, hex::encode(hasher.finalize()))
     }
 
@@ -544,13 +578,14 @@ mod tests {
             priority: None,
             dataset: None,
         };
+        let scope = ScopeSet::unrestricted();
         assert_ne!(
-            SearchResultCache::cache_key(&mk(1)),
-            SearchResultCache::cache_key(&mk(2))
+            SearchResultCache::cache_key(&mk(1), &scope),
+            SearchResultCache::cache_key(&mk(2), &scope)
         );
         assert_ne!(
-            SearchResultCache::cache_key(&mk(2)),
-            SearchResultCache::cache_key(&mk(3))
+            SearchResultCache::cache_key(&mk(2), &scope),
+            SearchResultCache::cache_key(&mk(3), &scope)
         );
     }
 
@@ -580,44 +615,47 @@ mod tests {
             dataset: dataset.map(String::from),
         };
         // logs (None) vs spans vs metrics are all distinct.
+        let scope = ScopeSet::unrestricted();
         assert_ne!(
-            SearchResultCache::cache_key(&mk(None)),
-            SearchResultCache::cache_key(&mk(Some("spans")))
+            SearchResultCache::cache_key(&mk(None), &scope),
+            SearchResultCache::cache_key(&mk(Some("spans")), &scope)
         );
         assert_ne!(
-            SearchResultCache::cache_key(&mk(Some("spans"))),
-            SearchResultCache::cache_key(&mk(Some("metrics")))
+            SearchResultCache::cache_key(&mk(Some("spans")), &scope),
+            SearchResultCache::cache_key(&mk(Some("metrics")), &scope)
         );
         // None and the explicit "logs" default collapse to the same key (byte-identical).
         assert_eq!(
-            SearchResultCache::cache_key(&mk(None)),
-            SearchResultCache::cache_key(&mk(Some("logs")))
+            SearchResultCache::cache_key(&mk(None), &scope),
+            SearchResultCache::cache_key(&mk(Some("logs")), &scope)
         );
     }
 
     #[test]
     fn companion_key_is_deterministic_and_keyspace_isolated() {
+        let scope = ScopeSet::unrestricted();
+
         // NAN-1593: same prefix + same components → identical key.
-        let a = SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"200"]);
-        let b = SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"200"]);
+        let a = SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"200"], &scope);
+        let b = SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"200"], &scope);
         assert_eq!(a, b);
 
         // A changed component → different key.
-        let c = SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"201"]);
+        let c = SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"201"], &scope);
         assert_ne!(a, c);
 
         // Different keyspace prefixes never collide, even with identical
         // components — retro / field-stats / search stay disjoint.
-        let retro = SearchResultCache::companion_key("retro", &[b"q", b"t"]);
-        let fstats = SearchResultCache::companion_key("fstats", &[b"q", b"t"]);
+        let retro = SearchResultCache::companion_key("retro", &[b"q", b"t"], &scope);
+        let fstats = SearchResultCache::companion_key("fstats", &[b"q", b"t"], &scope);
         assert_ne!(retro, fstats);
         assert!(retro.starts_with("retro:"));
         assert!(fstats.starts_with("fstats:"));
 
         // Component boundaries are unambiguous: ["ab","c"] != ["a","bc"].
         assert_ne!(
-            SearchResultCache::companion_key("x", &[b"ab", b"c"]),
-            SearchResultCache::companion_key("x", &[b"a", b"bc"]),
+            SearchResultCache::companion_key("x", &[b"ab", b"c"], &scope),
+            SearchResultCache::companion_key("x", &[b"a", b"bc"], &scope),
         );
 
         // Poisoning regression: a `|` inside a component (nPL queries contain
@@ -625,8 +663,85 @@ mod tests {
         // these two would hash identically — a different query served from the
         // wrong cache entry. Length-prefixing keeps them distinct.
         assert_ne!(
-            SearchResultCache::companion_key("retro", &[b"ioc=x | retro", b"100"]),
-            SearchResultCache::companion_key("retro", &[b"ioc=x", b" retro|100"]),
+            SearchResultCache::companion_key("retro", &[b"ioc=x | retro", b"100"], &scope),
+            SearchResultCache::companion_key("retro", &[b"ioc=x", b" retro|100"], &scope),
+        );
+    }
+
+    fn scope_of(items: &[&str]) -> ScopeSet {
+        ScopeSet::from_denied(items.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// NAN-1799: the effective deny-set is part of result identity. Two users
+    /// whose scopes differ must NEVER share a cache entry — the service
+    /// injects the exclusion into the executed SQL, so a shared key would
+    /// serve one user the other's rows (cross-user data leak).
+    #[test]
+    fn cache_key_and_companion_key_distinguish_deny_sets() {
+        // Fixed timestamps so the request is byte-identical across calls.
+        let start = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let mk = || SearchRequest {
+            query: "error | stats count by src_ip".into(),
+            time_range: TimeRangeInput {
+                start,
+                end: start + chrono::Duration::hours(1),
+            },
+            limit: Some(100),
+            offset: None,
+            include_sql: None,
+            skip_histogram: false,
+            skip_field_stats: false,
+            use_cache: false,
+            table_view: false,
+            request_id: None,
+            async_mode: false,
+            priority: None,
+            dataset: None,
+        };
+
+        let unrestricted = ScopeSet::unrestricted();
+        let audit_only = scope_of(&["audit"]);
+        let audit_insider = scope_of(&["audit", "insider"]);
+
+        // cache_key: all three scopes produce pairwise-distinct keys.
+        let k_unrestricted = SearchResultCache::cache_key(&mk(), &unrestricted);
+        let k_audit = SearchResultCache::cache_key(&mk(), &audit_only);
+        let k_audit_insider = SearchResultCache::cache_key(&mk(), &audit_insider);
+        assert_ne!(k_unrestricted, k_audit);
+        assert_ne!(k_unrestricted, k_audit_insider);
+        assert_ne!(k_audit, k_audit_insider);
+
+        // companion_key: same pairwise distinction on identical components.
+        let comps: &[&[u8]] = &[b"error", b"100", b"200"];
+        let c_unrestricted = SearchResultCache::companion_key("fstats", comps, &unrestricted);
+        let c_audit = SearchResultCache::companion_key("fstats", comps, &audit_only);
+        let c_audit_insider = SearchResultCache::companion_key("fstats", comps, &audit_insider);
+        assert_ne!(c_unrestricted, c_audit);
+        assert_ne!(c_unrestricted, c_audit_insider);
+        assert_ne!(c_audit, c_audit_insider);
+
+        // Empty deny-set is stable: the same request + unrestricted scope is
+        // unaffected relative to itself (deterministic key, so all
+        // unrestricted callers — today's admin behavior — still share one
+        // entry). `from_denied(∅)` and `unrestricted()` are the same scope.
+        assert_eq!(
+            k_unrestricted,
+            SearchResultCache::cache_key(&mk(), &ScopeSet::unrestricted())
+        );
+        assert_eq!(
+            k_unrestricted,
+            SearchResultCache::cache_key(&mk(), &ScopeSet::from_denied(Default::default()))
+        );
+        assert_eq!(
+            c_unrestricted,
+            SearchResultCache::companion_key("fstats", comps, &ScopeSet::unrestricted())
+        );
+
+        // Deny-value boundaries are unambiguous inside the fold:
+        // {"ab"} must not collide with {"a","b"}.
+        assert_ne!(
+            SearchResultCache::companion_key("x", &[b"q"], &scope_of(&["ab"])),
+            SearchResultCache::companion_key("x", &[b"q"], &scope_of(&["a", "b"])),
         );
     }
 }

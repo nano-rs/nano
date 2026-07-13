@@ -63,7 +63,20 @@ export function AlertDetail() {
   // of the rule-centric "Unknown Rule" view.
   const monitor = useMemo(() => (apiAlert ? parseMonitorAlert(apiAlert) : null), [apiAlert]);
   const isMonitor = monitor != null;
-  const displayName = monitor ? monitor.title : alert?.ruleName ?? null;
+
+  // NAN-1792: risk notables also carry rule_id = NULL; derive the title from
+  // the payload entity instead of falling back to "Unknown Rule".
+  const riskNotableTitle = useMemo(() => {
+    if (apiAlert?.kind !== 'risk_notable') return null;
+    const first = Array.isArray(apiAlert.matched_events) ? apiAlert.matched_events[0] : undefined;
+    const entity =
+      first && typeof first === 'object' ? (first as Record<string, unknown>).entity : undefined;
+    return typeof entity === 'string' && entity.length > 0
+      ? `Risk alert — ${entity}`
+      : 'Risk alert';
+  }, [apiAlert]);
+
+  const displayName = monitor ? monitor.title : riskNotableTitle ?? alert?.ruleName ?? null;
 
   // Monitor alerts have no rule; `alert.ruleId` is undefined so `useDetection`
   // no-ops. The rule fetch only matters for detection alerts.
@@ -126,11 +139,17 @@ export function AlertDetail() {
   }
 
   // Monitor alerts have no rule logic; the breach context lives in the hero +
-  // the payload. Detection alerts keep the full Matched events / Rule / Timeline
-  // set.
+  // the payload. Risk notables (NAN-1792) likewise have no single rule — the
+  // payload carries the per-rule score breakdown. Detection alerts keep the
+  // full Matched events / Rule / Timeline set.
   const tabs: Array<{ id: TabId; label: string; count?: number }> = isMonitor
     ? [
         { id: 'events',   label: 'Breach payload', count: matchedEvents.length },
+        { id: 'timeline', label: 'Timeline' },
+      ]
+    : riskNotableTitle != null
+    ? [
+        { id: 'events',   label: 'Matched events', count: matchedEvents.length },
         { id: 'timeline', label: 'Timeline' },
       ]
     : [
@@ -169,7 +188,9 @@ export function AlertDetail() {
             alert={{
               id: alert.id,
               ruleId: alert.ruleId,
-              ruleName: alert.ruleName,
+              // Risk notables have no rule; surface the derived title instead
+              // of "Unknown Rule" (NAN-1792).
+              ruleName: alert.ruleName ?? riskNotableTitle ?? undefined,
               severity: alert.severity,
               status: alert.status as 'open' | 'acknowledged' | 'closed',
               disposition: alert.disposition,

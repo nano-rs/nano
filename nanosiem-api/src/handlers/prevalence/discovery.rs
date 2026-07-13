@@ -245,8 +245,16 @@ pub async fn get_artifact_explorer(
             // NAN-849: enrich each row with inline-subtitle context so the
             // list view is scannable without expanding every row. One CH
             // pass per artifact-type bucket, bounded by `limit`.
+            //
+            // NAN-1801 (P3 side-doors): the enrichment queries are raw-logs
+            // drilldowns that bypass the nPL scope injector, so pass the
+            // caller's effective source scope (per-source RBAC ∪ audit unless
+            // `audit:view`). Unrestricted callers yield an empty scope —
+            // byte-identical SQL.
+            let scope =
+                nanosiem_core::auth::ScopeSet::from_denied(auth.effective_source_deny_set());
             prevalence_service
-                .enrich_explorer_items(&mut response.artifacts, &logs_table, time_window)
+                .enrich_explorer_items(&mut response.artifacts, &logs_table, &scope, time_window)
                 .await;
 
             // IP-only: layer geo/ASN onto the inline context from the PG
@@ -362,8 +370,21 @@ pub async fn get_artifact_detail(
         .table_names()
         .read(nanosiem_core::schema::active_logs_table());
 
+    // NAN-1801 (P3 side-doors): the detail drilldown runs seven raw-logs
+    // sub-queries (including a `source_type` GROUP BY — a direct existence
+    // leak) that bypass the nPL scope injector. Pass the caller's effective
+    // source scope (per-source RBAC ∪ audit unless `audit:view`) so denied
+    // sources contribute nothing. Empty scope is byte-identical.
+    let scope = nanosiem_core::auth::ScopeSet::from_denied(auth.effective_source_deny_set());
+
     match prevalence_service
-        .get_artifact_detail(&params.artifact, &artifact_type, &logs_table, time_window)
+        .get_artifact_detail(
+            &params.artifact,
+            &artifact_type,
+            &logs_table,
+            &scope,
+            time_window,
+        )
         .await
     {
         Ok(mut response) => {
@@ -670,6 +691,23 @@ pub async fn get_query_artifacts(
 
     // Combine time filter with query filter
     let combined_filter = format!("({}) AND ({})", time_filter, query_filter);
+
+    // NAN-1801 (P3 side-doors): this handler parses the user's nPL and turns
+    // it into a WHERE clause via `generate_search_expr` WITHOUT the search
+    // service's deny-set injection — the clearest scope bypass in the
+    // prevalence surface. A viewer could otherwise enumerate hashes/domains
+    // that only a denied source (or audit rows, absent `audit:view`) observed
+    // by probing with crafted queries. Fold the caller's effective deny set
+    // into the combined filter before BOTH DISTINCT extraction reads below.
+    // Empty deny set appends nothing — byte-identical SQL.
+    let deny_set = auth.effective_source_deny_set();
+    let combined_filter = match nanosiem_core::search::service::source_scope_sql_predicate(
+        "source_type",
+        &deny_set,
+    ) {
+        Some(pred) => format!("{combined_filter} AND ({pred})"),
+        None => combined_filter,
+    };
     tracing::debug!("Combined filter for prevalence query: {}", combined_filter);
 
     // Resolve the FROM table + the file-hash / dest-host columns through the

@@ -12,6 +12,7 @@ pub(crate) fn dataset_selector_str(
         Dataset::Logs => "logs",
         Dataset::Spans => "spans",
         Dataset::Metrics => "metrics",
+        Dataset::Risk => "risk",
     }
 }
 

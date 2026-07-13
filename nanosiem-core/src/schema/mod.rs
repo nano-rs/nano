@@ -17,6 +17,7 @@ mod boot_validation;
 mod metrics;
 mod ocsf;
 mod profile;
+mod risk;
 mod spans;
 mod types;
 mod udm;
@@ -26,6 +27,7 @@ pub use metrics::MetricsProfile;
 pub(crate) use metrics::canonicalize_metric_field;
 pub use ocsf::{OcsfProfile, OCSF_BOOKKEEPING_COLUMNS};
 pub use profile::SchemaProfile;
+pub use risk::RiskProfile;
 pub use spans::SpansProfile;
 pub(crate) use spans::canonicalize_span_field;
 pub use types::{
@@ -53,6 +55,8 @@ pub fn profile_for_id(id: SchemaId) -> Arc<dyn SchemaProfile> {
         // `with_dataset(...)` — never selected as a tenant log schema.
         SchemaId::Spans => Arc::new(SpansProfile::new()),
         SchemaId::Metrics => Arc::new(MetricsProfile::new()),
+        // NAN-1798 P2: the derived accumulated-risk dataset, likewise per-query.
+        SchemaId::Risk => Arc::new(RiskProfile::new()),
     }
 }
 
@@ -94,6 +98,9 @@ pub fn logs_table_for(id: SchemaId) -> &'static str {
         // `NANO_SCHEMA_PROFILE=spans|metrics`) but keep the dispatch total.
         SchemaId::Spans => "otel_spans",
         SchemaId::Metrics => "otel_metrics",
+        // NAN-1798 P2: the risk dataset is DERIVED from the findings stream in
+        // the logs table; unreachable as a tenant schema, kept for totality.
+        SchemaId::Risk => "logs",
     }
 }
 
@@ -110,6 +117,9 @@ pub fn ingest_table_for(id: SchemaId) -> &'static str {
         // own `otel_*_raw` Null+MV lanes (migrations 138/140), kept for totality.
         SchemaId::Spans => "otel_spans_raw",
         SchemaId::Metrics => "otel_metrics_raw",
+        // NAN-1798 P2: risk is derived (no ingest lane of its own); findings
+        // ingest through the logs lane. Unreachable as a tenant schema.
+        SchemaId::Risk => "logs",
     }
 }
 
@@ -130,8 +140,9 @@ pub fn active_ingest_table() -> &'static str {
 /// `active_repo_path` is the env-resolving wrapper. NAN-1266.
 pub fn repo_path_for(id: SchemaId, stored: &str) -> String {
     match id {
-        // NAN-1555: spans/metrics have no parser/rule repo tree; passthrough like UDM.
-        SchemaId::Udm | SchemaId::Spans | SchemaId::Metrics => stored.to_string(),
+        // NAN-1555: spans/metrics have no parser/rule repo tree; passthrough like
+        // UDM (and NAN-1798 P2: likewise the derived risk dataset).
+        SchemaId::Udm | SchemaId::Spans | SchemaId::Metrics | SchemaId::Risk => stored.to_string(),
         SchemaId::Ocsf => {
             let base = stored.trim_end_matches('/');
             if base.ends_with("-ocsf") {
@@ -166,8 +177,9 @@ pub fn active_repo_path(stored: &str) -> String {
 /// NAN-1387.
 pub fn selected_repo_path_for(id: SchemaId, stored_base: &str, selected: &str) -> String {
     match id {
-        // NAN-1555: spans/metrics have no repo tree; passthrough like UDM.
-        SchemaId::Udm | SchemaId::Spans | SchemaId::Metrics => selected.to_string(),
+        // NAN-1555: spans/metrics have no repo tree; passthrough like UDM
+        // (and NAN-1798 P2: likewise the derived risk dataset).
+        SchemaId::Udm | SchemaId::Spans | SchemaId::Metrics | SchemaId::Risk => selected.to_string(),
         SchemaId::Ocsf => {
             let base = stored_base.trim_start_matches('/').trim_end_matches('/');
             let sel = selected.trim_start_matches('/').trim_end_matches('/');

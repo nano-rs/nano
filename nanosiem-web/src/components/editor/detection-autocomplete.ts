@@ -41,6 +41,13 @@ export const YAML_FIELD_OPTIONS: Record<string, YamlOption[]> = {
     { value: 'realtime', label: 'Real-time', description: 'Fast detection (10-30s latency)' },
     { value: 'scheduled', label: 'Scheduled', description: 'Cron-based execution' },
   ],
+  // NAN-1561/NAN-1805: dataset the rule queries. Non-logs values are scheduled-only.
+  dataset: [
+    { value: 'logs', label: 'Logs', description: 'UDM/OCSF events (default)' },
+    { value: 'spans', label: 'Traces', description: 'OTLP spans (scheduled-only)' },
+    { value: 'metrics', label: 'Metrics', description: 'OTLP metrics (scheduled-only)' },
+    { value: 'risk', label: 'Risk', description: 'Accumulated entity risk (scheduled-only; rules cannot add risk)' },
+  ],
   alert_mode: [
     { value: 'grouped', label: 'Grouped', description: 'All matches → 1 alert (default)' },
     { value: 'per_event', label: 'Per Event', description: 'Each match → its own alert (vendor pass-through)' },
@@ -273,6 +280,7 @@ const yamlFieldSnippets: Completion[] = [
   snippetCompletion('severity: ${1|critical,high,medium,low|}', { label: 'severity', info: 'Alert severity' }),
   snippetCompletion('mode: ${1|staging,live,alerting,paused|}', { label: 'mode', info: 'Rule mode' }),
   snippetCompletion('detection_mode: ${1|realtime,scheduled|}', { label: 'detection_mode', info: 'Detection mode' }),
+  snippetCompletion('dataset: ${1|logs,spans,metrics,risk|}', { label: 'dataset', info: 'Dataset the rule queries (non-logs are scheduled-only)' }),
   snippetCompletion('alert_mode: ${1|grouped,per_event|}', { label: 'alert_mode', info: 'Alert mode (grouped or per_event)' }),
   snippetCompletion('schedule: ${1|*/1 * * * *,*/30 * * * * *,*/5 * * * *,*/15 * * * *,0 * * * *|}', { label: 'schedule', info: 'Cron schedule (select or type custom)' }),
   snippetCompletion('lookback: ${1|15m,1h,6h,24h,7d|}', { label: 'lookback', info: 'Lookback window' }),

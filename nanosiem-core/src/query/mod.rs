@@ -84,6 +84,7 @@ pub use validation::{
     collect_derived_fields,
     contains_aggregation,
     contains_join,
+    contains_risk_command,
     is_aggregation_command,
     pre_aggregation_subquery,
     suggest_similar_fields,

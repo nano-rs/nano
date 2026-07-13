@@ -568,6 +568,22 @@ pub async fn resolve_identity_ip(
 
     let dual_pool = state.dual_pool();
 
+    // NAN-1801 (P3 side-doors): this hand-built SELECT bypasses the nPL
+    // search-path scope gate, so fold the caller's source-scope deny set in
+    // directly — otherwise a viewer denied a source (or lacking `audit:view`)
+    // could recover hostname/user/source values that only a denied source
+    // observed. The predicate goes INSIDE the windowed scan (before
+    // ROW_NUMBER) so a denied-source observation can never win `rn = 1` and
+    // mask an allowed one, and never surfaces as a filtered-out empty result
+    // when an allowed observation exists. An empty deny set (unrestricted
+    // caller with `audit:view`) renders nothing — byte-identical SQL.
+    // `source` is the identity_observations source_type column.
+    let deny_set = auth.effective_source_deny_set();
+    let scope_clause =
+        nanosiem_core::search::service::source_scope_sql_predicate("source", &deny_set)
+            .map(|pred| format!("\n              AND ({pred})"))
+            .unwrap_or_default();
+
     let identity_table = dual_pool.table_names().read("identity_observations");
     let sql = format!(
         r#"
@@ -583,7 +599,7 @@ pub async fn resolve_identity_ip(
             FROM {identity_table}
             WHERE ip = ?
               AND observed_at <= parseDateTime64BestEffort(?)
-              AND (hostname != '' OR user != '' OR fqdn != '')
+              AND (hostname != '' OR user != '' OR fqdn != ''){scope_clause}
         )
         WHERE rn = 1
         LIMIT 1
