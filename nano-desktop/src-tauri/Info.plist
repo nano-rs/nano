@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged into the generated Info.plist by the Tauri bundler.
+
+  This is what puts "Search in nano" into every other app's Services menu. macOS
+  reads it out of the BUNDLE, which is why the service only exists in a built
+  `.app` and never under `tauri dev`.
+
+  NSMessage is the method AppKit will call on our services provider: `searchInNano`
+  becomes the selector `searchInNano:userData:error:`, implemented in
+  src/services.rs. If the two drift apart the menu item still appears and silently
+  does nothing, so a test pins this file's NSMessage against the Rust selector.
+-->
+<plist version="1.0">
+  <dict>
+    <key>NSServices</key>
+    <array>
+      <dict>
+        <key>NSMenuItem</key>
+        <dict>
+          <key>default</key>
+          <string>Search in nano</string>
+        </dict>
+        <key>NSMessage</key>
+        <string>searchInNano</string>
+        <key>NSPortName</key>
+        <string>nano</string>
+        <!-- We only take text, and we never write back to the pasteboard. -->
+        <key>NSSendTypes</key>
+        <array>
+          <string>NSStringPboardType</string>
+          <string>public.utf8-plain-text</string>
+        </array>
+      </dict>
+    </array>
+  </dict>
+</plist>

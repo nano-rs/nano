@@ -76,6 +76,16 @@ struct CachedDenied {
 /// Bounds cross-process propagation of a scope change to roughly this interval
 /// (plus one resolve), independent of the longer per-cache TTLs. One cheap PK
 /// lookup per interval per process (NAN-1807).
+///
+/// F-35 (ACCEPTED LIMITATION): after a grant is revoked on the api process, a
+/// denied user can keep seeing the just-revoked source on ANOTHER process (e.g.
+/// the search service) for up to this many seconds — the poll-convergence
+/// window, NOT an unbounded TTL leak. The revoke handler
+/// (`nanosiem-api` `source_scopes::*` → `SourceScopeResolver::invalidate`) drops
+/// caches synchronously on the LOCAL process; remote processes converge on the
+/// next `sync_version` read. This bounded (~3s) staleness is knowingly accepted;
+/// a synchronous cross-process fix (PG LISTEN/NOTIFY on the version bump, or an
+/// authenticated api→search push) is deferred — see the F-35 recommendation.
 const VERSION_CHECK_SECS: u64 = 3;
 
 /// Tracks the last-seen value of the PG `source_scope_version` counter and when

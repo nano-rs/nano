@@ -242,6 +242,26 @@ impl ApiKeyService {
                     }
                 }
 
+                // F-32: reject the key when its OWNER is no longer active. The
+                // `enabled`/`expires_at` checks above never consulted the owning
+                // user, so a disabled user's API key worked forever. A `system`
+                // service account is exempt — those own non-interactive keys and
+                // legitimately have no `active` login status. FAIL CLOSED: a
+                // deleted owner (owner_status => None) or a PG error rejects the key.
+                //
+                // NULL created_by is only reachable now for genuine ownerless
+                // system/bootstrap keys: key-chaining propagates the human owner
+                // (api_keys handler) and delete_user removes a deleted user's keys
+                // (users repo), so the two paths that previously produced orphaned
+                // NULL-owner keys are closed. Pre-existing legacy NULL-owner keys
+                // should be audited separately (see the red-team handoff note).
+                if let Some(owner_id) = api_key.created_by {
+                    match self.repo.owner_status(owner_id).await? {
+                        Some(status) if status == "active" || status == "system" => {}
+                        _ => return Err(ApiKeyServiceError::Disabled),
+                    }
+                }
+
                 // Atomic increment — every authed call consumes a token
                 // regardless of audit emission (NAN-675).
                 if let Some(limit) = api_key.rate_limit {

@@ -356,11 +356,14 @@ pub async fn create_key(
     // Use IP from ClientContext (populated by auth middleware with ConnectInfo fallback)
     let ip_address = client.ip_address.clone();
     let user_agent = client.user_agent.clone();
-    let created_by = if auth.is_api_key {
-        None
-    } else {
-        Some(auth.user_id())
-    };
+    // F-32: bind every new key to the human owner. `auth.user_id()` is the
+    // owner's user_id even for an api-key principal (AuthContext::from_api_key
+    // sets sub = owner), so a key minted VIA another key stays owner-bound and
+    // is covered by the owner-status check in validate_key — it can no longer
+    // outlive the owner's disable as a NULL-owner orphan. An already-orphaned
+    // creating key resolves to a non-user subject and FK-fails here, which is
+    // the intended outcome (orphaned keys must not mint new keys).
+    let created_by = Some(auth.user_id());
     let key_name = request.name.clone();
 
     let api_key = state

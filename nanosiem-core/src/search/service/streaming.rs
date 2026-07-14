@@ -534,6 +534,9 @@ impl SearchService {
             let sql_clone = paginated_sql.clone();
             let qid_clone = chunk_qid.clone();
             let settings = self.active_ch_settings.clone();
+            // NAN-1848: same contract as the buffered path — a grouped query's
+            // keys are its rows' identity and must not be pruned when empty.
+            let grouped_output = query_produces_grouped_rows(query);
             let exec_handle = tokio::spawn(async move {
                 executor
                     .execute_dynamic_query_streaming(
@@ -541,6 +544,7 @@ impl SearchService {
                         &qid_clone,
                         settings.as_ref(),
                         chunk_tx,
+                        grouped_output,
                     )
                     .await
             });

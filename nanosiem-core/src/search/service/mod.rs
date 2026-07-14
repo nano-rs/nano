@@ -362,6 +362,55 @@ fn collect_column_order_recursive(query: &Query, columns: &mut Vec<String>) {
     }
 }
 
+/// Whether the query's result rows are grouped buckets — one row per distinct
+/// value of the grouping dimensions, as produced by `stats`/`chart`/`timechart`
+/// `by …`, or by `top`/`rare`.
+///
+/// Those dimension columns carry each row's identity, so they must survive
+/// result serialization even when empty. The executor otherwise prunes empty
+/// columns to keep payloads small, which is right for a raw event — most of the
+/// 75+ UDM columns are empty on any given event — but on a grouped row it
+/// deletes the group-by key itself. The "no user" bucket of `stats count by
+/// user` arrives as a bare `{"count": 634}`, indistinguishable from a grand
+/// total; and grouping by a field that exists nowhere yields exactly one such
+/// bucket, so a meaningless query answers with a confident number and no error
+/// (NAN-1848).
+///
+/// Deliberately an AST question, not a SQL-text one. `eventstats … by user`
+/// groups in a subquery but returns wide raw events through it, and `dedup`
+/// likewise — sniffing the generated SQL for `GROUP BY` would stop pruning
+/// those, bloating every row with all 75+ mostly-empty UDM columns.
+///
+/// True as soon as *any* command in the pipeline groups, not just the terminal
+/// one: nothing downstream can un-aggregate those buckets back into raw events,
+/// so `stats count by user | table user, count` and `… | rename user as who`
+/// still deliver buckets, and their keys must survive. Because this only decides
+/// whether to prune — never what to name anything — it needs no knowledge of how
+/// a later command reshapes the columns.
+pub(super) fn query_produces_grouped_rows(query: &Query) -> bool {
+    match query {
+        Query::Search(_) => false,
+        Query::Piped { source, command } => {
+            command_groups_rows(command) || query_produces_grouped_rows(source)
+        }
+    }
+}
+
+/// Whether this single command turns rows into buckets keyed by a dimension.
+/// See [`query_produces_grouped_rows`], which is this over a whole pipeline —
+/// and the prevalence-join path, which pushes a *slice* of post-prevalence
+/// commands into SQL and so must ask the question per command.
+pub(super) fn command_groups_rows(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Stats { .. }
+            | Command::Chart { .. }
+            | Command::Timechart { .. }
+            | Command::Top { .. }
+            | Command::Rare { .. }
+    )
+}
+
 /// Check if the query has any aggregation command before the terminal command
 fn has_aggregation_in_query(query: &Query) -> bool {
     match query {
@@ -1307,5 +1356,50 @@ mod tests {
             Some(0),
             "latest= lost through audit enforcement: {enforced}"
         );
+    }
+
+    // === NAN-1848: which queries return grouped buckets ===
+
+    fn grouped(query: &str) -> bool {
+        query_produces_grouped_rows(&parse_query(query).unwrap())
+    }
+
+    #[test]
+    fn grouping_commands_produce_keyed_buckets() {
+        assert!(grouped("* | stats count by source_type"));
+        assert!(grouped("* | chart count by user"));
+        assert!(grouped("* | top user"));
+        assert!(grouped("* | rare dest_port"));
+        assert!(grouped("* | timechart span=1h count by source_type"));
+
+        // Formatting commands don't change the row shape — this is the reported
+        // query, whose empty bucket must keep its key.
+        assert!(grouped("* | stats count by source_type | sort -count | head 25"));
+
+        // A grouping command with no `by` still returns one summary row; keeping
+        // its columns costs nothing and stays consistent.
+        assert!(grouped("* | stats count"));
+
+        // Nothing downstream can un-aggregate buckets back into raw events, so a
+        // reshaping command after the grouping does not forfeit the keys.
+        assert!(grouped("* | stats count by user | table user, count"));
+        assert!(grouped("* | stats count by user | rename user as who"));
+        assert!(grouped("* | stats count by user | eval x = count + 1"));
+    }
+
+    #[test]
+    fn event_shaped_queries_keep_their_payload_pruning() {
+        // The regression to avoid. `eventstats` GROUPS in a subquery but returns
+        // wide raw events through it, so a SQL-text "does it contain GROUP BY"
+        // check would wrongly stop pruning and bloat every row with all 75+
+        // mostly-empty UDM columns. The row shape is an AST question, not a
+        // SQL-text one.
+        assert!(!grouped("* | eventstats avg(bytes_out) by src_ip"));
+        assert!(!grouped("* | dedup src_ip"));
+
+        // Plain event searches and projections keep pruning too.
+        assert!(!grouped("error"));
+        assert!(!grouped("error | head 10"));
+        assert!(!grouped("* | table src_ip, user"));
     }
 }

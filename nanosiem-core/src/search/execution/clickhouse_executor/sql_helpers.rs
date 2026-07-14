@@ -441,4 +441,44 @@ mod tests {
         assert_eq!(count, wrap_query_for_count(sql));
         assert!(!count.to_uppercase().contains(" LIMIT "));
     }
+
+    // === NAN-1848: a grouped query's keys must survive empty-value pruning ===
+
+    #[test]
+    fn grouped_rows_keep_an_empty_group_key() {
+        use crate::search::execution::ClickHouseExecutor;
+
+        // The line ClickHouse actually emits for `stats count by relevance`, where
+        // `relevance` exists nowhere: one bucket, empty key. (Verified against local
+        // ClickHouse — it returns {"relevance":"","count":634}.)
+        let line = r#"{"relevance":"","count":634}"#;
+
+        // Pruned, this row becomes a bare `{"count":634}` — which reads as a grand
+        // total, so a meaningless query answers with a confident number.
+        let pruned = ClickHouseExecutor::parse_and_postprocess_row(line, true).unwrap();
+        assert_eq!(
+            pruned,
+            serde_json::json!({"count": 634}),
+            "documents the bug being fixed: the grouping dimension vanishes"
+        );
+
+        // Kept, the bucket is honest about what it is.
+        let kept = ClickHouseExecutor::parse_and_postprocess_row(line, false).unwrap();
+        assert_eq!(kept, serde_json::json!({"relevance": "", "count": 634}));
+    }
+
+    #[test]
+    fn raw_event_rows_are_still_pruned() {
+        use crate::search::execution::ClickHouseExecutor;
+
+        // The payload optimization must survive for raw events: a wide row with
+        // mostly-empty UDM columns still comes back trimmed.
+        let line = r#"{"id":"1","message":"hello","src_ip":"","dest_ip":"","user":"","bytes_in":0}"#;
+        let row = ClickHouseExecutor::parse_and_postprocess_row(line, true).unwrap();
+
+        let obj = row.as_object().unwrap();
+        assert!(!obj.contains_key("src_ip"), "empty columns should still be pruned");
+        assert!(!obj.contains_key("user"));
+        assert_eq!(obj.get("message").unwrap(), "hello");
+    }
 }

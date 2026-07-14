@@ -635,11 +635,18 @@ impl TuningRepository {
                     .bind(rule_id)
                     .fetch_one(&mut *tx)
                     .await?;
+            // F-38: reject a malformed composed head branch when the frozen PR
+            // operation is first minted, so a bad `pr_branch_prefix` never
+            // reaches GitHub as a doomed ref.
             let branch = DetectionCodePushService::branch_for_identity(
                 target.try_get("pr_branch_prefix")?,
                 &frozen_rule.name,
                 proposal_id,
-            );
+            )
+            .map_err(|error| PrOperationError::InvalidMetadata {
+                proposal_id,
+                reason: format!("composed PR branch is not a valid git ref: {error}"),
+            })?;
             FrozenPrOperation {
                 proposal_id,
                 target_id,

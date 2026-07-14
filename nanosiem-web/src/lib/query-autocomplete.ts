@@ -16,12 +16,61 @@ interface AutocompleteResult {
   context: 'command' | 'field' | 'source_type' | 'function' | 'table_wildcard' | null;
 }
 
-interface UdmFieldInfo {
+export interface UdmFieldInfo {
   name: string;
   column_name: string;
   data_type: string;
   category: string;
   description: string;
+}
+
+/**
+ * Where the dynamic half of autocomplete (source types + the field universe)
+ * comes from. The static half — pipe commands, eval functions, command params —
+ * needs no I/O.
+ *
+ * The web app uses the default below. The desktop app cannot: its webview is
+ * cross-origin to the SIEM, so it issues HTTP from Rust and injects a provider
+ * that goes over IPC instead. Same suggestions, different transport.
+ */
+export interface AutocompleteDataSource {
+  /** `/api/source-types` — [value, count] pairs. */
+  getSourceTypes(timeRange?: { start: string; end: string }): Promise<[string, number][]>;
+  /** `/api/schema/fields` — the active profile's promoted columns. */
+  getSchemaFields(): Promise<{
+    schema: string;
+    fields: { name: string; type: string; category: string }[];
+  } | null>;
+  /** `/api/udm/fields` — UDM only, but carries the human-readable descriptions. */
+  getLegacyUdmFields(): Promise<UdmFieldInfo[]>;
+}
+
+const defaultDataSource: AutocompleteDataSource = {
+  getSourceTypes: (timeRange) => api.getSourceTypes(timeRange),
+  getSchemaFields: () => api.getSchemaFields(),
+  getLegacyUdmFields: () => {
+    const token = getAccessToken();
+    return fetch(`${import.meta.env.VITE_API_URL ?? ''}/api/udm/fields`, {
+      headers: {
+        Authorization: token ? `Bearer ${token}` : '',
+      },
+    })
+      .then((res) => res.json())
+      .then((data) => (data.fields || []) as UdmFieldInfo[])
+      .catch(() => [] as UdmFieldInfo[]);
+  },
+};
+
+let dataSource: AutocompleteDataSource = defaultDataSource;
+
+/** Swap the transport (see AutocompleteDataSource). Clears any cached results. */
+export function setAutocompleteDataSource(source: AutocompleteDataSource) {
+  dataSource = source;
+  sourceTypesCache = null;
+  sourceTypesCacheKey = null;
+  sourceTypesFetchPromise = null;
+  udmFieldsCache = null;
+  udmFieldsFetchPromise = null;
 }
 
 const pipeCommands = PIPE_COMMANDS as readonly string[];
@@ -66,7 +115,7 @@ async function fetchSourceTypes(): Promise<string[]> {
   sourceTypesFetchPromise = null;
   sourceTypesCacheKey = cacheKey;
 
-  sourceTypesFetchPromise = api.getSourceTypes(_currentTimeRange)
+  sourceTypesFetchPromise = dataSource.getSourceTypes(_currentTimeRange)
     .then(values => {
       sourceTypesCache = values.map(([value]) => value);
       return sourceTypesCache;
@@ -84,15 +133,7 @@ async function fetchSourceTypes(): Promise<string[]> {
  *  profile (to keep suggestions byte-identical) and as the fallback when the
  *  profile-aware schema endpoint is unavailable. */
 async function fetchLegacyUdmFields(): Promise<UdmFieldInfo[]> {
-  const token = getAccessToken();
-  return fetch(`${import.meta.env.VITE_API_URL ?? ''}/api/udm/fields`, {
-    headers: {
-      'Authorization': token ? `Bearer ${token}` : '',
-    },
-  })
-    .then(res => res.json())
-    .then(data => (data.fields || []) as UdmFieldInfo[])
-    .catch(() => [] as UdmFieldInfo[]);
+  return dataSource.getLegacyUdmFields();
 }
 
 /**
@@ -112,7 +153,7 @@ async function fetchUdmFields(): Promise<UdmFieldInfo[]> {
   if (udmFieldsCache) return udmFieldsCache;
   if (udmFieldsFetchPromise) return udmFieldsFetchPromise;
 
-  udmFieldsFetchPromise = api
+  udmFieldsFetchPromise = dataSource
     .getSchemaFields()
     .then(async (resp) => {
       // UDM: keep the existing description-bearing source for byte-identical

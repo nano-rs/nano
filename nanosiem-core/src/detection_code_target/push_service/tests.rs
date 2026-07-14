@@ -153,6 +153,44 @@ fn branch_identity_uses_the_full_proposal_uuid() {
     assert!(second_branch.ends_with(&second.simple().to_string()));
 }
 
+#[test]
+fn composed_branch_is_a_valid_ref() {
+    // F-38: the branch a proposal ships to GitHub is `{prefix}{rule}-{uuid}`.
+    // Every legal prefix combined with any (adversarial) rule name must compose
+    // a branch that `validate_git_ref` accepts — the exact validator now applied
+    // in `branch_for_identity` and re-applied in `github_write::ensure_branch`.
+    // If this fails, `branch_for_identity` would reject a legitimate tuning PR.
+    use crate::detection_code_target::validate_git_ref;
+
+    // All of these pass `validate_ref_prefix` (see validation/tests.rs).
+    let prefixes = ["", "nano-tuning/", "tuning/", "auto-", "prefix/sub/"];
+    // Rule names are user-controlled and only `sanitize_component`-cleaned, so
+    // exercise the hazards F-38 cares about: dots, a `.lock` fragment, embedded
+    // slashes, `..` traversal, trailing dot, spaces/symbols, unicode, and an
+    // all-symbol name that sanitizes to the empty -> "rule" fallback.
+    let rule_names = [
+        "Simple Rule",
+        "rule.with.dots",
+        "weird///name",
+        "..traversal..",
+        "name.lock",
+        "trailing.",
+        "spaces and $ymbols!",
+        "ünïcodé rule",
+        "!!!",
+    ];
+    let id = Uuid::parse_str("01900000-0000-7000-8000-000000000001").unwrap();
+    for prefix in prefixes {
+        for name in rule_names {
+            let branch = proposal_branch(prefix, name, id);
+            assert!(
+                validate_git_ref(&branch).is_ok(),
+                "composed branch {branch:?} (prefix={prefix:?}, rule={name:?}) must be a valid git ref"
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailureBoundary {
     GithubBranch,

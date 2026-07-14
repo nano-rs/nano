@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 mod error_messages;
+mod leading_command;
 mod syntax_fixes;
 
 use crate::query::{parse_query, Command, Query};

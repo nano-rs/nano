@@ -74,6 +74,7 @@ async fn bounded_execution_runs_one_query_with_server_result_limits() {
             "tuning-test-window-0",
             None,
             Some(&limits),
+            false,
         )
         .await
         .expect("bounded execution");
@@ -137,6 +138,7 @@ async fn bounded_execution_rejects_response_before_materializing_past_byte_cap()
             "tuning-byte-cap-0",
             None,
             Some(&limits),
+            false,
         )
         .await
         .expect_err("oversized response must fail");
@@ -177,6 +179,7 @@ async fn bounded_execution_fails_closed_on_malformed_rows() {
             "tuning-malformed-row-0",
             None,
             Some(&limits),
+            false,
         )
         .await
         .expect_err("malformed rows must make exact validation fail");

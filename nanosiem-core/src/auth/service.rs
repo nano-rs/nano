@@ -733,6 +733,11 @@ impl AuthService {
             .update_password(user_id, new_password)
             .await?;
 
+        // F-32: stamp the forced-revocation watermark so already-issued access
+        // tokens (the account stays `active` across a password change, so the
+        // status gate alone would not catch them) are rejected by the middleware.
+        self.user_repo.stamp_tokens_valid_from(user_id).await?;
+
         // Invalidate all existing sessions for security
         self.session_repo.delete_user_sessions(user_id).await?;
 

@@ -228,6 +228,16 @@ impl UserRepository {
 
     /// Delete a user
     pub async fn delete_user(&self, id: Uuid) -> Result<(), UserRepositoryError> {
+        // F-32: delete the user's API keys first. The api_keys.created_by FK is
+        // ON DELETE SET NULL, which would orphan the keys (created_by => NULL)
+        // and let them keep authenticating with the deleted user's permissions
+        // (the owner-status check in validate_key can't fire on a NULL owner).
+        // Removing them makes deletion a real revocation.
+        sqlx::query("DELETE FROM api_keys WHERE created_by = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
         let result = sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(id)
             .execute(&self.pool)
@@ -458,13 +468,41 @@ impl UserRepository {
         Ok(count > 0)
     }
 
-    /// Disable a user account
+    /// Disable a user account.
+    ///
+    /// F-32: also stamps `tokens_valid_from = NOW()` in the SAME update so every
+    /// already-issued (still-unexpired) access token is invalidated atomically
+    /// with the status flip — the auth middleware rejects any token whose `iat`
+    /// predates this watermark. Flipping `status` alone left outstanding JWTs
+    /// working until natural expiry (default 900s).
     pub async fn disable_user(&self, id: Uuid) -> Result<(), UserRepositoryError> {
-        let result =
-            sqlx::query("UPDATE users SET status = 'disabled', updated_at = NOW() WHERE id = $1")
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
+        let result = sqlx::query(
+            "UPDATE users SET status = 'disabled', tokens_valid_from = NOW(), updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(UserRepositoryError::NotFound(id));
+        }
+
+        Ok(())
+    }
+
+    /// F-32: stamp the forced-revocation watermark (`tokens_valid_from = NOW()`)
+    /// for a user without changing their status. Called on password change so a
+    /// still-`active` user's previously-issued access tokens stop working
+    /// immediately (the refresh path + session delete already handle refresh
+    /// tokens; this closes the access-token hole).
+    pub async fn stamp_tokens_valid_from(&self, id: Uuid) -> Result<(), UserRepositoryError> {
+        let result = sqlx::query(
+            "UPDATE users SET tokens_valid_from = NOW(), updated_at = NOW() WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
 
         if result.rows_affected() == 0 {
             return Err(UserRepositoryError::NotFound(id));

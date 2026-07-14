@@ -38,6 +38,7 @@ use uuid::Uuid;
 use crate::auth::ScopeSet;
 use crate::db::repository::SourceScopeRepository;
 use crate::models::{NewNotification, NotificationType};
+use crate::query::{parse_query, PrettyPrint, Query};
 use crate::scheduler::{calculate_next_run, calculate_next_runs, validate_cron};
 use crate::search::query_processing::enforce_non_audit_query;
 use crate::shutdown::ShutdownToken;
@@ -154,6 +155,50 @@ struct ExecutionOutput {
     row_count: Option<i64>,
     result_truncated: bool,
     artifact_truncated: bool,
+    /// F-31: the DISTINCT `source_type` manifest of the rendered artifacts —
+    /// what a later source-access revocation is checked against at download.
+    source_types: Vec<String>,
+    /// F-31: whether `source_types` is a COMPLETE, trustworthy account of the
+    /// artifact's provenance. `false` (aggregate/projection/SQL/dashboard rows
+    /// that dropped `source_type`, or a companion that could not resolve) makes
+    /// the download gate deny every source-restricted requester.
+    source_types_complete: bool,
+}
+
+/// F-31: authorization predicate for downloading (or seeing the artifact
+/// metadata of) a stored report run, given the requester's per-source deny set
+/// `denied` and the run's stored `source_types` manifest + completeness flag.
+///
+/// OWNERSHIP IS NOT AN EXEMPTION — this is applied to the owner and admins alike
+/// (a source-scoped admin downloading someone else's report is exactly the leak
+/// F-31 closes). Rules:
+///
+/// - `denied` empty (unrestricted requester) → allow.
+/// - else if the manifest is COMPLETE and disjoint from `denied` → allow.
+/// - else → deny. In particular an incomplete manifest (`complete == false`,
+///   which every pre-feature run carries) denies any restricted requester,
+///   because the frozen bytes may contain anything.
+///
+/// Pure so the matrix is unit-testable without a database.
+pub fn report_artifact_download_allowed(
+    denied: &BTreeSet<String>,
+    run_source_types: &[String],
+    complete: bool,
+) -> bool {
+    if denied.is_empty() {
+        return true;
+    }
+    if !complete {
+        return false;
+    }
+    // Normalize the stored manifest the same way deny sets are normalized
+    // (trim + lowercase) before the disjointness test.
+    let manifest: BTreeSet<String> = run_source_types
+        .iter()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    denied.is_disjoint(&manifest)
 }
 
 /// Report service: definition CRUD + execution + the distributed scheduler loop.
@@ -313,7 +358,7 @@ impl ReportService {
     pub async fn get_artifact(
         &self,
         artifact_id: Uuid,
-    ) -> Result<(ReportArtifactContent, Uuid), ReportError> {
+    ) -> Result<(ReportArtifactContent, ArtifactScope), ReportError> {
         self.repository
             .get_artifact_content(artifact_id)
             .await
@@ -422,15 +467,19 @@ impl ReportService {
             .await?;
 
         let timeout = Duration::from_secs(run_timeout_secs());
-        // Resolve the report OWNER's per-source scope ONCE per run (NAN-1809).
-        // FAIL-CLOSED: a resolution error fails the run below — it must never
-        // fall back to an unrestricted execution, which would leak rows from
-        // sources the owner is denied.
-        let outcome = match self.owner_scope(def).await {
+        // F-32: the scheduler checks the OWNER independently of any caller — a
+        // disabled owner's report must not execute (and produce downloadable
+        // artifacts) under their identity. FAIL-CLOSED: a status-lookup error
+        // fails the run rather than proceeding. Then resolve the owner's
+        // per-source scope ONCE per run (NAN-1809), also fail-closed.
+        let outcome = match self.ensure_owner_active(def).await {
             Err(e) => Err(e),
-            Ok(scope) => match tokio::time::timeout(timeout, self.produce(def, &scope)).await {
-                Ok(res) => res,
-                Err(_) => Err(ReportError::Timeout),
+            Ok(()) => match self.owner_scope(def).await {
+                Err(e) => Err(e),
+                Ok(scope) => match tokio::time::timeout(timeout, self.produce(def, &scope)).await {
+                    Ok(res) => res,
+                    Err(_) => Err(ReportError::Timeout),
+                },
             },
         };
 
@@ -448,6 +497,8 @@ impl ReportService {
                         out.result_truncated,
                         out.artifact_truncated,
                         &out.artifacts,
+                        &out.source_types,
+                        out.source_types_complete,
                     )
                     .await?;
                 if !stored {
@@ -507,6 +558,137 @@ impl ReportService {
             .filter(|s| !s.is_empty())
             .collect();
         Ok(ScopeSet::from_denied(deny))
+    }
+
+    /// F-32: fail the run unless the report OWNER is currently `active`.
+    ///
+    /// FAIL-CLOSED: a status-lookup error is a run-failing
+    /// [`ReportError::Execution`], never a silent proceed. The recorded message
+    /// is what analysts see on the failed run.
+    async fn ensure_owner_active(&self, def: &ReportDefinition) -> Result<(), ReportError> {
+        let status: Option<String> =
+            sqlx::query_scalar::<_, String>("SELECT status FROM users WHERE id = $1")
+                .bind(def.owner_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| {
+                    ReportError::Execution(format!(
+                        "could not resolve the report owner's status ({e}); \
+                         failing closed — the report was not run"
+                    ))
+                })?;
+        match status.as_deref() {
+            Some("active") => Ok(()),
+            _ => Err(ReportError::Execution(
+                "report owner disabled; run skipped".to_string(),
+            )),
+        }
+    }
+
+    /// F-31: snapshot the global restricted-`source_type` registry (best-effort,
+    /// normalized). Used as the fail-closed stamp when a run's manifest cannot be
+    /// trusted (`source_types_complete = false`). An error/empty registry yields
+    /// an empty set — harmless, because an incomplete manifest already denies
+    /// every restricted requester at download regardless of its contents.
+    async fn restricted_registry(&self) -> BTreeSet<String> {
+        match sqlx::query_scalar::<_, String>("SELECT source_type FROM restricted_source_types")
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            Err(e) => {
+                warn!(error = %e, "F-31: could not load restricted registry for report manifest; using empty set (incomplete manifest still denies restricted viewers)");
+                BTreeSet::new()
+            }
+        }
+    }
+
+    /// F-31: derive `(source_types, complete)` for ONE rendered result set.
+    ///
+    /// - No rows → `({}, true)`: an empty artifact has nothing to protect.
+    /// - Every row carries a non-empty `source_type` → the row-derived DISTINCT
+    ///   set, `complete = true` (raw / grouped-raw / vendor pass-through).
+    /// - Some/all rows LACK `source_type` (aggregates, `table`/`fields`
+    ///   projections that dropped the column, SQL panels) → run the OWNER-scoped
+    ///   companion `<base search> | stats count by source_type` to recover the
+    ///   window's true source types. A trustworthy non-empty companion result →
+    ///   `(row ∪ companion, true)`. If the query is not companionable (no nPL
+    ///   base / SQL panel) or the companion fails/empties → `(row-derived, false)`
+    ///   so the download gate denies every restricted requester.
+    ///
+    /// `companion_query` is the ORIGINAL nPL base (not audit-stripped); `None`
+    /// for non-nPL (SQL) result sets, which are never companionable.
+    async fn source_types_for_result(
+        &self,
+        companion_query: Option<&str>,
+        rows: &[Value],
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        scope: &ScopeSet,
+    ) -> (BTreeSet<String>, bool) {
+        if rows.is_empty() {
+            return (BTreeSet::new(), true);
+        }
+
+        let lacks_source_type = |event: &Value| {
+            event
+                .get("source_type")
+                .and_then(|v| v.as_str())
+                .map_or(true, |s| s.trim().is_empty())
+        };
+        // Derive DIRECTLY over the slice — never clone up to REPORT_RESULT_ROW_CAP
+        // (50k) rows just to read their source_type values.
+        let direct = distinct_source_types_over(rows);
+
+        // Fast path: every row already carries a per-event source_type.
+        if !rows.iter().any(lacks_source_type) {
+            return (direct, true);
+        }
+
+        // Rows dropped source_type — recover it via the owner-scoped companion.
+        let base = match companion_query.and_then(|q| report_companion_query(q)) {
+            Some(base) => base,
+            None => return (direct, false),
+        };
+        // Audit-strip the companion exactly as the main query is stripped; a
+        // strip error means we can't trust it → incomplete.
+        let safe = match enforce_non_audit_query(&base) {
+            Ok(q) => q,
+            Err(_) => return (direct, false),
+        };
+        let req = SearchRequest {
+            query: safe,
+            time_range: TimeRangeInput::new(start, end),
+            limit: Some(REPORT_PANEL_ROW_CAP),
+            offset: None,
+            include_sql: Some(false),
+            skip_histogram: true,
+            skip_field_stats: true,
+            use_cache: false,
+            table_view: false,
+            request_id: None,
+            async_mode: false,
+            priority: None,
+            dataset: None,
+        };
+        match self.search_service.search(req, scope).await {
+            Ok(resp) => {
+                let companion_types = distinct_source_types_over(&resp.results);
+                if companion_types.is_empty() {
+                    // Companion produced nothing trustworthy → fail closed.
+                    (direct, false)
+                } else {
+                    let mut union = direct;
+                    union.extend(companion_types);
+                    (union, true)
+                }
+            }
+            Err(_) => (direct, false),
+        }
     }
 
     async fn produce(
@@ -601,11 +783,23 @@ impl ReportService {
             },
         ];
 
+        // F-31: manifest of the source_types feeding these artifacts. Use the
+        // ORIGINAL (not audit-stripped) query as the companion base; the
+        // companion runs owner-scoped so it reflects exactly what the owner saw.
+        let (mut source_types, complete) = self
+            .source_types_for_result(Some(query.as_str()), &rows, start, now, scope)
+            .await;
+        if !complete {
+            source_types.extend(self.restricted_registry().await);
+        }
+
         Ok(ExecutionOutput {
             artifacts,
             row_count: Some(rows.len() as i64),
             result_truncated,
             artifact_truncated: csv_trunc || html_trunc,
+            source_types: source_types.into_iter().collect(),
+            source_types_complete: complete,
         })
     }
 
@@ -629,8 +823,31 @@ impl ReportService {
 
         let panels = dashboard.panels.as_array().cloned().unwrap_or_default();
         let mut outputs = Vec::new();
+        // F-31: the dashboard artifact aggregates every panel, so its manifest is
+        // the UNION of the panels' source types, and it is COMPLETE only if every
+        // panel that produced rows had a trustworthy per-panel manifest.
+        let mut union: BTreeSet<String> = BTreeSet::new();
+        let mut all_complete = true;
         for panel in panels.iter().take(MAX_DASHBOARD_PANELS) {
-            outputs.push(self.run_panel(panel, start, now, scope).await);
+            let out = self.run_panel(panel, start, now, scope).await;
+            // Only piped-mode panels with a query are companionable; SQL panels
+            // (and query-less widgets) that dropped source_type force incomplete.
+            let mode = panel.get("queryMode").and_then(|v| v.as_str()).unwrap_or("piped");
+            let query = panel.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let companion = if mode != "sql" && !query.trim().is_empty() {
+                Some(query)
+            } else {
+                None
+            };
+            let (types, complete) = self
+                .source_types_for_result(companion, &out.rows, start, now, scope)
+                .await;
+            union.extend(types);
+            all_complete = all_complete && complete;
+            outputs.push(out);
+        }
+        if !all_complete {
+            union.extend(self.restricted_registry().await);
         }
 
         let (html_bytes, html_trunc) = render::render_dashboard_html(
@@ -656,6 +873,8 @@ impl ReportService {
             row_count: None,
             result_truncated: false,
             artifact_truncated: html_trunc,
+            source_types: union.into_iter().collect(),
+            source_types_complete: all_complete,
         })
     }
 
@@ -996,6 +1215,58 @@ fn stale_timeout_secs() -> i64 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_STALE_TIMEOUT_SECS)
         .max(floor)
+}
+
+/// F-31: DISTINCT normalized `source_type` values across a slice of event rows,
+/// reading both the per-event `source_type` column and the aggregate
+/// `_nano_source_types` stamp — the same two forms as
+/// [`crate::db::repository::alerts::distinct_source_types`], but over a `&[Value]`
+/// so a 50k-row search result is not deep-cloned into a `Value::Array` just to
+/// read its source types. Trim + lowercase (OCSF `source_type` is not
+/// ingest-lowercased), sorted-unique via `BTreeSet`.
+fn distinct_source_types_over(rows: &[Value]) -> BTreeSet<String> {
+    fn insert_normalized(raw: &str, set: &mut BTreeSet<String>) {
+        let norm = raw.trim().to_lowercase();
+        if !norm.is_empty() {
+            set.insert(norm);
+        }
+    }
+    let mut set = BTreeSet::new();
+    for event in rows {
+        if let Some(st) = event.get("source_type").and_then(|v| v.as_str()) {
+            insert_normalized(st, &mut set);
+        }
+        if let Some(arr) = event.get("_nano_source_types").and_then(|v| v.as_array()) {
+            for v in arr {
+                if let Some(st) = v.as_str() {
+                    insert_normalized(st, &mut set);
+                }
+            }
+        }
+    }
+    set
+}
+
+/// F-31: derive the companion query that lists the DISTINCT `source_type`
+/// values feeding an nPL query's BASE search over a window — mirrors the
+/// detection engine's `source_type_companion_query` (NAN-1800). Aggregate /
+/// projection commands collapse or drop the per-row `source_type`, so the base
+/// search is re-run piped into `stats count by source_type`. Dropping the
+/// intermediate commands is deliberately OVER-inclusive (pre-aggregation filters
+/// could only narrow the set) — over-stamping hides the artifact from MORE
+/// scoped viewers, never fewer (the fail-closed direction). `None` when the
+/// query cannot be parsed.
+fn report_companion_query(query: &str) -> Option<String> {
+    let parsed = parse_query(query).ok()?;
+    let mut node: &Query = &parsed;
+    loop {
+        match node {
+            Query::Piped { source, .. } => node = source,
+            Query::Search(expr) => {
+                return Some(format!("{} | stats count by source_type", expr.pretty_print()));
+            }
+        }
+    }
 }
 
 /// Build a filesystem-safe artifact basename: `<slug>-<YYYYmmdd-HHMMSS>`.

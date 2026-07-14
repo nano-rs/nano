@@ -910,6 +910,16 @@ impl SearchService {
             q
         };
 
+        // NAN-1848: the rows ClickHouse returns are grouped buckets keyed by the
+        // `by` fields, so the executor must not prune those keys when empty — an
+        // empty bucket would arrive as a bare `{"count": N}` that reads as a grand
+        // total, and a grouping field that exists nowhere yields exactly one such
+        // bucket. Decided from `query_for_sql`, NOT the original query: when
+        // prevalence/inputlookup/lateral/AI post-processing strips the aggregation
+        // out of the SQL, ClickHouse really does return raw events, and those must
+        // keep their pruning or a 1M-row fetch arrives with every empty UDM column.
+        let grouped_output = query_produces_grouped_rows(&query_for_sql);
+
         // The dataset this request targets (NAN-1534). Shared by the SQL-gen
         // block, the histogram spawn, and the field-stats gate below.
         let request_dataset =
@@ -1167,6 +1177,7 @@ impl SearchService {
                             None,
                             bounded_count,
                             self.active_execution_limits.as_ref(),
+                            grouped_output,
                         ),
                         ch_executor.execute_field_stats_query(
                             &field_stats_sql,
@@ -1203,6 +1214,7 @@ impl SearchService {
                             None,
                             bounded_count,
                             self.active_execution_limits.as_ref(),
+                            grouped_output,
                         )
                         .await?;
                 (results, total_count, None)

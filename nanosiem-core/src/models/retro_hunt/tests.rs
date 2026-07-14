@@ -79,6 +79,69 @@ fn invalid_artifact_type_rejected() {
 }
 
 #[test]
+fn feed_names_empty_means_all_feeds_and_is_valid() {
+    // F-36: no feeds selected = "ALL feeds"; must not require a catalog.
+    assert!(validate_feed_names(&[], &[]).is_ok());
+    assert!(validate_feed_names(&[], &["ThreatFox".into()]).is_ok());
+}
+
+#[test]
+fn feed_names_membership_enforced_when_catalog_known() {
+    let authorized = vec!["ThreatFox".to_string(), "URLhaus".to_string()];
+    // Case-folded membership (matches lower(enrichment_name)).
+    assert!(validate_feed_names(&["threatfox".into()], &authorized).is_ok());
+    assert!(validate_feed_names(&["URLHAUS".into(), "ThreatFox".into()], &authorized).is_ok());
+    // A typo is rejected as an unknown feed.
+    assert!(matches!(
+        validate_feed_names(&["threatfoxx".into()], &authorized),
+        Err(RetroHuntConfigValidationError::UnknownFeed(f)) if f == "threatfoxx"
+    ));
+}
+
+#[test]
+fn feed_names_membership_skipped_when_catalog_unconfirmed() {
+    // F-36: an empty catalog (CH unreachable or no feeds synced yet) must not
+    // hard-fail rule creation — only the format check applies.
+    assert!(validate_feed_names(&["AnythingGoes".into()], &[]).is_ok());
+    // ...but a structurally hostile name is still rejected even with no catalog.
+    assert!(matches!(
+        validate_feed_names(&["evil'|feed".into()], &[]),
+        Err(RetroHuntConfigValidationError::MalformedFeedName(_))
+    ));
+}
+
+#[test]
+fn feed_name_format_rejects_hostile_characters() {
+    // F-36: quotes, pipes, backslashes, control chars, and empties are rejected.
+    for bad in ["", "   ", "a'b", "a\"b", "a|b", "a\\b", "a\tb", "a\nb"] {
+        assert!(
+            matches!(
+                validate_feed_name_format(bad),
+                Err(RetroHuntConfigValidationError::MalformedFeedName(_))
+            ),
+            "expected {bad:?} to be rejected"
+        );
+    }
+    // Ordinary feed names pass.
+    for ok in ["ThreatFox", "URLhaus", "abuse.ch Feodo", "my-custom_feed.v2"] {
+        assert!(
+            validate_feed_name_format(ok).is_ok(),
+            "expected {ok:?} to be accepted"
+        );
+    }
+}
+
+#[test]
+fn feed_names_hostile_rejected_before_membership_when_catalog_known() {
+    // A malformed name is caught by the format check even when a catalog exists.
+    let authorized = vec!["ThreatFox".to_string()];
+    assert!(matches!(
+        validate_feed_names(&["Threat|Fox".into()], &authorized),
+        Err(RetroHuntConfigValidationError::MalformedFeedName(_))
+    ));
+}
+
+#[test]
 fn update_partial_only_validates_present_fields() {
     // An update touching only max_indicators must not fail on the absent
     // lookback/artifact fields.

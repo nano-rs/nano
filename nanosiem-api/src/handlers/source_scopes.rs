@@ -380,6 +380,15 @@ pub async fn remove_grant(
         .await
         .map_err(map_scope_err)?;
 
+    // F-35 (ACCEPTED LIMITATION): the `remove_grant` write above already bumped
+    // the `source_scope_version` counter; this call drops the caches on the LOCAL
+    // (api) process synchronously. Other processes (notably the search service)
+    // converge on their next `sync_version` poll — bounded to `VERSION_CHECK_SECS`
+    // (~3s), NOT an unbounded TTL leak. During that window a just-denied user may
+    // still see the revoked source on those remote processes. This bounded
+    // staleness is knowingly accepted; a synchronous cross-process invalidation
+    // (PG LISTEN/NOTIFY on the version bump, or an authenticated api→search push)
+    // is deferred. See `SourceScopeResolver::VERSION_CHECK_SECS`.
     state.source_scope_resolver.invalidate();
 
     state.emit_audit(

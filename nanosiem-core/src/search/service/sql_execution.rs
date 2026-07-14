@@ -306,15 +306,26 @@ impl SearchService {
         sql: &str,
         limit: usize,
         offset: usize,
+        preserve_columns: bool,
     ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
-        self.execute_clickhouse_sql_with_query_id(sql, limit, offset, None, None, None, None)
-            .await
+        self.execute_clickhouse_sql_with_query_id(
+            sql,
+            limit,
+            offset,
+            None,
+            None,
+            None,
+            None,
+            preserve_columns,
+        )
+        .await
     }
 
     /// Execute SQL against ClickHouse with optional query_id and per-query settings.
     ///
     /// `bounded_count` (NAN-1635, finding 2.3): caller-supplied bounded input
     /// for the raw-search count companion; `None` keeps the unbounded wrap.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_clickhouse_sql_with_query_id(
         &self,
         sql: &str,
@@ -324,6 +335,10 @@ impl SearchService {
         ch_settings: Option<&super::admission::ClickHouseQuerySettings>,
         bounded_count: Option<BoundedCountInput<'_>>,
         execution_limits: Option<&crate::search::SearchExecutionLimits>,
+        // `preserve_columns`: keep every selected column, even when empty.
+        // Grouped rows (`stats … by`, `top`, `rare`) require it — pruning an
+        // empty group-by key reports the bucket as a bare count (NAN-1848).
+        preserve_columns: bool,
     ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
@@ -345,6 +360,7 @@ impl SearchService {
                     settings,
                     bounded_count,
                     execution_limits,
+                    preserve_columns,
                 )
                 .await
         } else if let Some(id) = query_id {
@@ -356,10 +372,11 @@ impl SearchService {
                     id,
                     bounded_count,
                     execution_limits,
+                    preserve_columns,
                 )
                 .await
         } else {
-            ch_executor.execute_sql(sql, limit, offset).await
+            ch_executor.execute_sql(sql, limit, offset, preserve_columns).await
         }
     }
 

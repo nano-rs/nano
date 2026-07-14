@@ -17,9 +17,9 @@ mod tests;
 
 pub use render::PanelOutput;
 pub use repository::{ReportRepository, ReportRepositoryError};
-pub use service::{ReportError, ReportService};
+pub use service::{report_artifact_download_allowed, ReportError, ReportService};
 pub use types::{
-    ClaimedReportDefinition, NewReportDefinition, RenderedArtifact, ReportArtifactContent,
-    ReportArtifactMeta, ReportDefinition, ReportRun, ReportRunStatus, ReportSourceType,
-    UpdateReportDefinition,
+    ArtifactScope, ClaimedReportDefinition, NewReportDefinition, RenderedArtifact,
+    ReportArtifactContent, ReportArtifactMeta, ReportDefinition, ReportRun, ReportRunStatus,
+    ReportSourceType, UpdateReportDefinition,
 };

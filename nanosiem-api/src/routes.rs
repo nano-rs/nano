@@ -69,7 +69,12 @@ pub fn create_router(state: AppState) -> Router {
     // Per-source RBAC (NAN-1799): the middleware resolves each caller's
     // source-scope deny set into AuthContext::denied_sources, failing closed
     // (503) if the registry is unavailable.
-    .with_source_scope_resolver(state.source_scope_resolver.clone());
+    .with_source_scope_resolver(state.source_scope_resolver.clone())
+    // F-32: reject disabled/locked/deleted users and pre-revocation access
+    // tokens on every request (fail-closed 503 on lookup error).
+    .with_user_status_resolver(nanosiem_core::auth::UserStatusResolver::new(
+        state.pool.clone(),
+    ));
 
     // Rate-limited login route
     let login_route = Router::new()
@@ -2388,6 +2393,12 @@ pub fn create_router(state: AppState) -> Router {
             .route(
                 "/api/notebooks/{id}/entries",
                 post(handlers::notebooks::add_entry::<AppState>),
+            )
+            .route(
+                // NAN-1840: the ONLY endpoint that accepts AI-typed entries, and it
+                // stamps their provenance server-side. `/entries` still refuses them.
+                "/api/notebooks/{id}/agent-entries",
+                post(handlers::notebooks::add_agent_entry::<AppState>),
             )
             .route(
                 "/api/notebooks/{id}/entries/{entry_id}",

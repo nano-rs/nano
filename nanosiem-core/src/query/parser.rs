@@ -308,24 +308,42 @@ pub fn parse_query(input: &str) -> Result<Query, ParseError> {
 /// Parse a complete query (search with optional piped commands)
 /// Handles optional leading "search" keyword (PPL compatibility)
 /// Also handles generating commands that start with | (e.g., | inputlookup ...)
+/// and bare leading commands with no pipe (e.g., stats count by src_ip) — NAN-1843
 fn query(input: &str) -> ParseResult<'_, Query> {
     // Optionally consume leading "search" keyword (common in subsearches)
     // e.g., [search status=500] or just [status=500]
-    let (input, _) = opt(terminated(tag_no_case("search"), multispace1)).parse(input)?;
+    let (input, explicit_search) = opt(terminated(tag_no_case("search"), multispace1)).parse(input)?;
 
-    // Check if query starts with | (generating command like inputlookup)
-    let (input, search) = if input.trim_start().starts_with('|') {
-        // Use implicit wildcard for generating commands
-        (input, SearchExpr::Keyword("*".to_string()))
+    // Three entry shapes:
+    //   | stats ...   generating command, explicit leading pipe
+    //   stats ...     bare leading command (NAN-1843), implicit `* |`
+    //   status=500    search expression
+    // The first two share an implicit `*` source.
+    //
+    // An explicit `search` keyword means the user asked for a keyword search, so
+    // it suppresses bare-command recognition — `search top user` hunts for those
+    // words, it does not run `| top user`.
+    let leading = if explicit_search.is_some() {
+        None
     } else {
-        search_expr(input)?
+        leading_command(input).ok()
     };
 
-    let (input, commands) = many0(preceded(
+    let (input, search, mut commands) = if input.trim_start().starts_with('|') {
+        (input, SearchExpr::Keyword("*".to_string()), Vec::new())
+    } else if let Some((rest, cmd)) = leading {
+        (rest, SearchExpr::Keyword("*".to_string()), vec![cmd])
+    } else {
+        let (rest, search) = search_expr(input)?;
+        (rest, search, Vec::new())
+    };
+
+    let (input, piped) = many0(preceded(
         delimited(multispace0, char('|'), multispace0),
         command,
     ))
     .parse(input)?;
+    commands.extend(piped);
 
     let query = commands
         .into_iter()
@@ -335,6 +353,95 @@ fn query(input: &str) -> ParseResult<'_, Query> {
         });
 
     Ok((input, query))
+}
+
+/// Parse a query-opening command that was written without a leading pipe, so
+/// `stats count by src_ip` behaves like `* | stats count by src_ip` (NAN-1843).
+///
+/// Command names are ordinary English words, so this must not steal queries that
+/// are really free-text searches. A keyword search silently reinterpreted as a
+/// command is the same class of bug this change exists to kill, just pointed the
+/// other way — so recognition is deliberately narrow. Three guards, and any
+/// failure falls back to `search_expr`:
+///
+/// 1. **Only an aggregating or generating command may open a query**
+///    ([`opens_a_query`]). Those are the ones analysts actually type bare, and
+///    the ones with no sane keyword-search reading. Post-processors are excluded
+///    precisely because their names are common words with real fields as
+///    arguments: `sort timestamp`, `table message` and `head 10` are plausible
+///    keyword searches, and they would otherwise parse as commands and *pass*
+///    field validation — silently returning the wrong rows. Those still work one
+///    pipe away (`| sort timestamp`).
+/// 2. **The command must take arguments.** A lone command word is always a
+///    keyword search. No allowlisted command parses with zero arguments today,
+///    so this is belt-and-braces against one ever doing so and swallowing a
+///    one-word hunt.
+/// 3. **The command must consume the whole segment.** `top secret (classified)`
+///    leaves `(classified)` dangling, which means the words were search terms;
+///    falling back keeps the search working instead of hard-failing the parse.
+///
+/// What remains ambiguous is an allowlisted command whose arguments happen to be
+/// real fields — `top user` is both a reasonable aggregation and a conceivable
+/// keyword hunt, and no guard can tell them apart. It resolves to the command,
+/// because in a query bar that is overwhelmingly the intent, and an aggregation
+/// is unmistakably not a list of events, so a surprised user sees it instantly.
+/// Two escapes force the search reading: quote it (`"top user"`) or say so
+/// (`search top user`).
+fn leading_command(input: &str) -> ParseResult<'_, Command> {
+    let reject = || {
+        nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Verify,
+        ))
+    };
+
+    let (rest, cmd) = command(input)?;
+
+    // Guard 1: only aggregating/generating commands may open a query.
+    if !opens_a_query(&cmd) {
+        return Err(reject());
+    }
+
+    // Guard 2: the command must have consumed arguments, not just its own name.
+    // `rest` is always a suffix of `input` (nom borrows it), but do the
+    // arithmetic defensively — this parses untrusted input, and a panic here
+    // would take the query path down.
+    let consumed_len = input.len().checked_sub(rest.len()).ok_or_else(reject)?;
+    let consumed = input.get(..consumed_len).ok_or_else(reject)?;
+    if !consumed.trim().contains(char::is_whitespace) {
+        return Err(reject());
+    }
+
+    // Guard 3: nothing may dangle before the next pipe / end of query.
+    let remainder = rest.trim_start();
+    if !remainder.is_empty() && !remainder.starts_with('|') {
+        return Err(reject());
+    }
+
+    Ok((rest, cmd))
+}
+
+/// Whether a command is meaningful as the *first* thing in a query, and so may
+/// be written without a leading pipe (NAN-1843).
+///
+/// Aggregating and generating commands qualify: they produce their own result
+/// set, and `stats count by src_ip` reads as a complete query on its own.
+/// Everything else post-processes rows that some earlier stage produced, so as a
+/// query opener it is far more likely to be a keyword search that happens to
+/// start with a command word. Keep this list conservative — see
+/// [`leading_command`] for why widening it is dangerous.
+fn opens_a_query(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Stats { .. }
+            | Command::Chart { .. }
+            | Command::Timechart { .. }
+            | Command::StreamStats { .. }
+            | Command::EventStats { .. }
+            | Command::Top { .. }
+            | Command::Rare { .. }
+            | Command::InputLookup { .. }
+    )
 }
 
 /// Count the number of pipe commands in a parsed query tree.

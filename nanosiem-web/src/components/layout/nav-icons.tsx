@@ -10,7 +10,7 @@
  * Keep these in sync with design-ref/shadcn/icons.jsx when the kit updates.
  */
 
-import { SVGProps, ReactNode } from 'react';
+import type { SVGProps, ReactNode } from 'react';
 
 type IconProps = SVGProps<SVGSVGElement>;
 

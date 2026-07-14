@@ -100,9 +100,21 @@ impl SearchService {
             tracing::warn!("No WHERE clause found in generated prevalence SQL!");
         }
 
-        // Execute the query with timing
+        // Execute the query with timing.
+        //
+        // NAN-1848: the pushdown can carry an aggregation into SQL — either from
+        // the query itself or from the post-prevalence commands it pushed — and a
+        // grouped row's (possibly empty) key must not be pruned away into a bare
+        // count. Ask about exactly the commands that made it into this SQL.
+        let grouped_output = query_produces_grouped_rows(query)
+            || post_prevalence_commands
+                .iter()
+                .take(num_commands_pushed)
+                .any(command_groups_rows);
         let sql_start = Instant::now();
-        let (mut results, total_count) = self.execute_clickhouse_sql(&sql, limit, offset).await?;
+        let (mut results, total_count) = self
+            .execute_clickhouse_sql(&sql, limit, offset, grouped_output)
+            .await?;
         tracing::info!(
             duration_ms = sql_start.elapsed().as_millis() as u64,
             result_count = results.len(),
@@ -726,7 +738,7 @@ impl SearchService {
             spec.extra_summary_filter,
         );
         let probe_start = Instant::now();
-        match ch_executor.execute_dynamic_query(&probe_sql).await {
+        match ch_executor.execute_dynamic_query(&probe_sql, false).await {
             Ok(rows) => {
                 let rescued = super::prevalence_processing::filter_rescued_artifacts(rows, conds);
                 if !rescued.is_empty() {

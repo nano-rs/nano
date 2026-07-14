@@ -6,11 +6,11 @@
  */
 import {
   autocompletion,
-  CompletionContext,
-  CompletionResult,
-  Completion,
+  type CompletionContext,
+  type CompletionResult,
+  type Completion,
 } from '@codemirror/autocomplete';
-import { Extension } from '@codemirror/state';
+import { type Extension } from '@codemirror/state';
 import {
   getQueryAutocompleteSuggestions,
   type AutocompleteOption,

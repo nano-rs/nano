@@ -47,7 +47,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::db::repository::retro_hunt::RetroHuntRepository;
 use crate::models::retro_hunt::{
-    CreateRetroHuntRequest, RetroHuntConfig, RetroHuntRuleView, RetroHuntRun,
+    validate_feed_names, CreateRetroHuntRequest, RetroHuntConfig, RetroHuntRuleView, RetroHuntRun,
     UpdateRetroHuntConfigRequest, DEFAULT_RETRO_HUNT_CRON, DEFAULT_RETRO_HUNT_LOOKBACK_DAYS,
     DEFAULT_RETRO_HUNT_MAX_INDICATORS,
 };
@@ -414,6 +414,9 @@ impl DetectionService {
     ) -> Result<(DetectionRule, RetroHuntConfig), DetectionError> {
         req.validate()
             .map_err(|e| DetectionError::InvalidQuery(e.to_string()))?;
+        // F-36: reject feed names that aren't in the authorized live-feed catalog
+        // (a typo would otherwise silently make the rule hunt nothing).
+        self.validate_requested_feeds(&req.feeds).await?;
 
         let cron = req
             .schedule_cron
@@ -566,10 +569,30 @@ impl DetectionService {
         update
             .validate()
             .map_err(|e| DetectionError::InvalidQuery(e.to_string()))?;
+        // F-36: if this update rewrites the feed selection, validate the new feeds
+        // against the authorized catalog (same as create).
+        if let Some(feeds) = update.feeds.as_deref() {
+            self.validate_requested_feeds(feeds).await?;
+        }
         self.retro_hunt_repo()
             .update_config(rule_id, update)
             .await
             .map_err(|e| DetectionError::RepositoryError(e.to_string()))
+    }
+
+    /// F-36: validate requested retro-hunt `feeds` against the authorized live-feed
+    /// catalog. The catalog is reachable here via [`Self::list_retro_hunt_feeds`]
+    /// (best-effort; empty on a transient ClickHouse outage or before any feed has
+    /// synced — in which case membership is skipped but the format check still
+    /// applies, per [`validate_feed_names`]). Empty `feeds` means "ALL feeds" and
+    /// short-circuits without a catalog round-trip.
+    async fn validate_requested_feeds(&self, feeds: &[String]) -> Result<(), DetectionError> {
+        if feeds.is_empty() {
+            return Ok(());
+        }
+        let authorized = self.list_retro_hunt_feeds().await.unwrap_or_default();
+        validate_feed_names(feeds, &authorized)
+            .map_err(|e| DetectionError::InvalidQuery(e.to_string()))
     }
 
     /// Fetch a rule's retro-hunt config + current delta state.

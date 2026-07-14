@@ -24,6 +24,13 @@ fn rejects_unsafe_branch_names() {
         "",                     // empty
         "main`id`",             // backtick
         "main\nx",              // control char
+        // F-38: fully-qualified refs double-prefix to refs/heads/refs/heads/main.
+        "refs/heads/main",      // reserved refs/ namespace (base_branch)
+        "refs/tags/v1",         // reserved refs/ namespace (tag ref)
+        "refs/heads/",          // reserved refs/ namespace, bare
+        // F-38: git rejects a `.lock` suffix on ANY path component.
+        "feature.lock/x",       // `.lock` component (not the trailing segment)
+        "x/feature.lock",       // `.lock` trailing component
     ] {
         assert!(
             validate_git_ref(bad).is_err(),
@@ -44,6 +51,13 @@ fn ref_prefix_allows_trailing_slash_but_rejects_injection() {
         "/leading",
         "-leading",
         "a b",
+        // F-38: `.lock` component makes git reject the composed head branch (422).
+        "evil.lock/",       // `.lock` component followed by trailing slash
+        "evil.lock",        // `.lock` component, no trailing slash
+        "a/b.lock/",        // `.lock` on a non-terminal component
+        // F-38: a prefix in the reserved refs/ namespace composes a bad head ref.
+        "refs/heads/",      // reserved refs/ namespace
+        "refs/",            // reserved refs/ namespace, bare
     ] {
         assert!(
             validate_ref_prefix(bad).is_err(),

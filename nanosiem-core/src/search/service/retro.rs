@@ -1966,4 +1966,28 @@ mod tests {
         );
         assert!(sql.contains("lower(key_value) > 'o''brien'"), "got: {sql}");
     }
+
+    #[test]
+    fn retro_hunt_candidates_sql_escapes_hostile_feed_name() {
+        // F-36: the existing cursor-escaping test does NOT cover the feed name.
+        // A hostile feed name carrying a quote, pipe, backslash, and SQL keywords
+        // must be lowercased and emitted as a SINGLE well-formed escaped literal —
+        // no breakout. (`escape_sql_string`: `\` → `\\`, then `'` → `''`.)
+        let sql = SearchService::retro_hunt_candidates_sql(
+            "t",
+            &["drop'|\\table union".to_string()],
+            &[],
+            None,
+            10,
+        );
+        // `drop'|\table union` → lower → escape → 'drop''|\\table union'
+        // (each `\\` below is one real backslash after Rust unescaping).
+        assert!(
+            sql.contains("lower(enrichment_name) IN ('drop''|\\\\table union')"),
+            "got: {sql}"
+        );
+        // The literal closes only at the very end — the quote after `drop` is
+        // doubled, so no premature `'drop'|` breakout appears.
+        assert!(!sql.contains("'drop'|"), "unescaped breakout in: {sql}");
+    }
 }

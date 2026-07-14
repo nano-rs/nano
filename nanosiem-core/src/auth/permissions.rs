@@ -23,6 +23,13 @@ pub const NOTEBOOKS_CREATE: &str = "notebooks:create";
 pub const NOTEBOOKS_EDIT: &str = "notebooks:edit";
 pub const NOTEBOOKS_DELETE: &str = "notebooks:delete";
 pub const NOTEBOOKS_SHARE: &str = "notebooks:share";
+/// Record a CLIENT-HOSTED agent's transcript into a notebook (NAN-1840).
+///
+/// Distinct from `notebooks:edit` on purpose. It gates the one endpoint that
+/// accepts the AI-reserved entry types, which `POST /entries` refuses (NAN-686) —
+/// the server stamps the provenance itself, so an entry recorded by an analyst's
+/// local agent can never masquerade as one a trusted server flow produced.
+pub const NOTEBOOKS_AGENT_RECORD: &str = "notebooks:agent_record";
 
 // Detection permissions
 pub const DETECTIONS_VIEW: &str = "detections:view";
@@ -210,6 +217,7 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     DASHBOARDS_DELETE,
     // Notebooks
     NOTEBOOKS_VIEW,
+    NOTEBOOKS_AGENT_RECORD,
     NOTEBOOKS_CREATE,
     NOTEBOOKS_EDIT,
     NOTEBOOKS_DELETE,

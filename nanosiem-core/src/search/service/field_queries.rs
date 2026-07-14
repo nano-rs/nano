@@ -416,7 +416,9 @@ impl SearchService {
         let offset = request.offset.unwrap_or(0);
 
         // Execute the query
-        let (results, total_count) = self.execute_clickhouse_sql(&sql, limit, offset).await?;
+        let (results, total_count) = self
+            .execute_clickhouse_sql(&sql, limit, offset, false)
+            .await?;
 
         // Calculate field statistics
         let mut stats = FieldStatistics::new();

@@ -13,7 +13,10 @@ import { TimelineRangeSlider } from '@/components/ui/timeline-range-slider';
 import { cn } from '@/lib/utils';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { useViewPreference } from '@/hooks/use-view-preference';
-import { toApiTimeRange, type TimeRangeValue } from '@/hooks/use-api';
+// Import straight from the source module rather than the hooks barrel: the
+// desktop app reuses this picker, and hooks/use-api pulls in the whole API
+// client (fetch + localStorage), which a Tauri webview must never load.
+import { toApiTimeRange, TIME_RANGE_PRESETS, type TimeRangeValue } from '@/lib/time-range';
 
 interface DateTimeRangePickerProps {
   value: TimeRangeValue;
@@ -40,37 +43,10 @@ interface DateTimeRangePickerProps {
 }
 
 // Presets organized by category — mirrors mockup `CalendarPopover` grouping
-// (Relative = duration-from-now, Absolute = calendar-boundaried). Preset
-// labels preserved from the pre-redesign impl so the parser in time-range.ts
-// and saved searches keep working.
+// (Relative = duration-from-now, Absolute = calendar-boundaried). The list now
+// lives in lib/time-range.ts so the desktop app offers the same ranges.
 // `short` is the desktop chip-row label; mobile keeps the long form.
-const presetCategories = [
-  {
-    label: 'Relative',
-    presets: [
-      { label: 'Last 5 minutes', short: '5m', value: 'Last 5 minutes' },
-      { label: 'Last 15 minutes', short: '15m', value: 'Last 15 minutes' },
-      { label: 'Last 30 minutes', short: '30m', value: 'Last 30 minutes' },
-      { label: 'Last hour', short: '1h', value: 'Last hour' },
-      { label: 'Last 4 hours', short: '4h', value: 'Last 4 hours' },
-      { label: 'Last 12 hours', short: '12h', value: 'Last 12 hours' },
-      { label: 'Last 24 hours', short: '24h', value: 'Last 24 hours' },
-      { label: 'Last 7 days', short: '7d', value: 'Last 7 days' },
-      { label: 'Last 30 days', short: '30d', value: 'Last 30 days' },
-      { label: 'Last 90 days', short: '90d', value: 'Last 90 days' },
-    ],
-  },
-  {
-    label: 'Absolute',
-    presets: [
-      { label: 'Today', short: 'Today', value: 'Today' },
-      { label: 'Yesterday', short: 'Yesterday', value: 'Yesterday' },
-      { label: 'This week', short: 'This week', value: 'This week' },
-      { label: 'Previous week', short: 'Prev week', value: 'Previous week' },
-      { label: 'All time', short: 'All time', value: 'All time' },
-    ],
-  },
-];
+const presetCategories = TIME_RANGE_PRESETS;
 
 // Compute a preset's duration in days by running it through the same parser
 // the rest of the app uses. Runs on every render of the constrained picker

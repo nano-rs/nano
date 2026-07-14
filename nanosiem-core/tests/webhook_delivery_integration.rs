@@ -20,7 +20,9 @@ mod common;
 
 use common::migrated_pool;
 use hmac::{Hmac, KeyInit, Mac};
-use nanosiem_core::webhooks::{CreateWebhookRequest, WebhookRepository, WebhookService};
+use nanosiem_core::webhooks::{
+    CreateWebhookRequest, UpdateWebhookRequest, WebhookRepository, WebhookResponse, WebhookService,
+};
 use sha2::Sha256;
 use sqlx::PgPool;
 use std::time::Duration;
@@ -250,4 +252,112 @@ async fn delivery_retries_on_5xx_then_gives_up() {
     assert_eq!(logs.len(), 1, "single log row per logical delivery");
     assert!(!logs[0].success);
     assert_eq!(logs[0].status_code, Some(500));
+}
+
+/// F-39 regression: the FE no longer round-trips the (write-only) URL, so a
+/// PUT that omits `url` must LEAVE the stored destination unchanged — and the
+/// delivery read path must still decrypt it back to the original value.
+#[tokio::test]
+#[ignore = "requires Postgres; run with --test-threads=1"]
+async fn update_without_url_preserves_stored_url() {
+    set_env();
+    let pool = migrated_pool().await;
+    clean(&pool).await;
+
+    let repo = WebhookRepository::new(pool.clone());
+    let original_url = "https://hooks.slack.com/services/T/B/XXXSECRET?tenant=1";
+    let created = repo
+        .create(&CreateWebhookRequest {
+            name: "slack".into(),
+            url: original_url.into(),
+            headers: None,
+            secret: None,
+            severity_filter: None,
+            event_types: Some(vec!["siem_alert".into()]),
+            channel_type: Some("slack".into()),
+            channel_config: None,
+            rule_filter: None,
+            enabled: Some(true),
+        })
+        .await
+        .unwrap();
+
+    // The response DTO exposes only the non-secret host, never the raw URL.
+    let resp = WebhookResponse::from(&created);
+    assert_eq!(resp.url_host.as_deref(), Some("hooks.slack.com"));
+    let resp_json = serde_json::to_string(&resp).unwrap();
+    assert!(!resp_json.contains("XXXSECRET"), "response must not leak the URL secret");
+
+    // Update WITHOUT touching the URL (url: None = "keep").
+    let update = UpdateWebhookRequest {
+        name: Some("slack-renamed".into()),
+        url: None,
+        headers: None,
+        secret: None,
+        severity_filter: None,
+        event_types: None,
+        channel_type: None,
+        channel_config: None,
+        rule_filter: None,
+        enabled: None,
+    };
+    repo.update(created.id, &update).await.unwrap();
+
+    // The delivery read path decrypts url_encrypted back to the original URL.
+    let reloaded = repo.get(created.id).await.unwrap();
+    assert_eq!(reloaded.name, "slack-renamed", "name updated");
+    assert_eq!(
+        reloaded.url, original_url,
+        "url unchanged across a url:None update (catches the FE round-trip regression)"
+    );
+}
+
+/// F-39: an existing plaintext-only row (created before migration 254) is
+/// lazy-encrypted on its next delivery read, and the encrypted value decrypts
+/// back to the original URL.
+#[tokio::test]
+#[ignore = "requires Postgres; run with --test-threads=1"]
+async fn legacy_plaintext_url_is_lazy_encrypted_on_read() {
+    set_env();
+    let pool = migrated_pool().await;
+    clean(&pool).await;
+
+    // Simulate a pre-254 row: plaintext url, NULL url_encrypted / url_host.
+    let id = uuid::Uuid::now_v7();
+    let legacy_url = "https://hooks.slack.com/services/L/E/GACYSECRET";
+    sqlx::query(
+        "INSERT INTO webhooks (id, name, url, channel_type, enabled) \
+         VALUES ($1, $2, $3, 'slack', true)",
+    )
+    .bind(id)
+    .bind("legacy")
+    .bind(legacy_url)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let repo = WebhookRepository::new(pool.clone());
+    // get() is a delivery read path → hydrate + lazy-migrate.
+    let loaded = repo.get(id).await.unwrap();
+    assert_eq!(loaded.url, legacy_url, "delivery url available from plaintext");
+
+    // The row now has an encrypted column persisted.
+    let enc: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT url_encrypted FROM webhooks WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let enc = enc.expect("url_encrypted persisted by lazy migration");
+    assert_eq!(
+        repo.decrypt_string(&enc).unwrap(),
+        legacy_url,
+        "lazy-encrypted value decrypts to the original url"
+    );
+    let host: Option<String> = sqlx::query_scalar("SELECT url_host FROM webhooks WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(host.as_deref(), Some("hooks.slack.com"), "display host persisted");
 }

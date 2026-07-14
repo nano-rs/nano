@@ -15,6 +15,8 @@ fn webhook_with(event_types: Vec<String>) -> Webhook {
         id: Uuid::now_v7(),
         name: "test".to_string(),
         url: "https://example.com/hook".to_string(),
+        url_encrypted: None,
+        url_host: None,
         headers_encrypted: None,
         secret_encrypted: None,
         severity_filter: None,
@@ -416,4 +418,134 @@ fn payload_omits_none_optional_fields() {
     assert!(!obj.contains_key("entity"));
     assert!(!obj.contains_key("link_url"));
     assert!(!obj.contains_key("alert_id"));
+}
+
+// ---------------------------------------------------------------------------
+// F-39: the destination URL is a bearer credential (Slack/Teams) and must NEVER
+// be serialized to API consumers.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn webhook_response_never_contains_the_raw_url() {
+    // A Slack incoming-webhook URL: the `/services/T/B/XXXSECRET` path IS the
+    // credential. Build the response DTO from a Slack channel and serialize it.
+    let mut w = webhook_with(default_event_types());
+    w.channel_type = ChannelType::Slack.as_str().to_string();
+    w.url = "https://hooks.slack.com/services/T/B/XXXSECRET".to_string();
+    // url_host unset on the model → derived from the URL by the DTO builder.
+    w.url_host = None;
+
+    let resp = WebhookResponse::from(&w);
+    // The DTO carries only the non-secret host + a boolean.
+    assert_eq!(resp.url_host.as_deref(), Some("hooks.slack.com"));
+    assert!(resp.has_url, "a configured URL reports has_url");
+
+    let json = serde_json::to_string(&resp).unwrap();
+    assert!(
+        !json.contains("XXXSECRET"),
+        "the secret webhook path must never appear in the response: {json}"
+    );
+    assert!(
+        !json.contains("/services/"),
+        "no part of the secret URL path leaks: {json}"
+    );
+    // And there is no `url` key at all on the serialized shape.
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(v.get("url").is_none(), "WebhookResponse has no `url` field");
+    assert_eq!(v["url_host"], "hooks.slack.com");
+}
+
+#[tokio::test]
+async fn encrypted_url_roundtrips_through_repository() {
+    use crate::crypto::EncryptionService;
+    use super::repository::WebhookRepository;
+
+    // Lazy pool: never connects (encrypt/decrypt touch only the in-memory key),
+    // but building it spawns the pool's maintenance task, which needs a runtime.
+    let pool = sqlx::PgPool::connect_lazy("postgres://user:pass@127.0.0.1/nano")
+        .expect("lazy pool builds without connecting");
+    let enc = EncryptionService::new(b"0123456789abcdef0123456789abcdef");
+    let repo = WebhookRepository::with_encryption(pool, enc);
+
+    // Query params + a secret-looking path must survive verbatim.
+    let url = "https://hooks.slack.com/services/T/B/XXXSECRET?foo=bar&baz=1";
+    let ciphertext = repo.encrypt_string(url).expect("encrypts");
+    // The stored envelope is opaque — the plaintext secret is not in the bytes.
+    assert!(
+        !String::from_utf8_lossy(&ciphertext).contains("XXXSECRET"),
+        "ciphertext must not contain the plaintext secret"
+    );
+    let decrypted = repo.decrypt_string(&ciphertext).expect("decrypts");
+    assert_eq!(decrypted, url, "encrypt→decrypt is lossless incl. query params");
+}
+
+// ---------------------------------------------------------------------------
+// F-40: notification base_url must be a bare origin; deep links can't escape it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn validate_base_origin_rejects_deceptive_and_accepts_bare_origin() {
+    use super::service::validate_base_origin;
+
+    // Deceptive / non-origin forms are rejected.
+    for bad in [
+        "https://a@evil/x",  // userinfo + path
+        "https://u:p@h",     // userinfo (user:pass)
+        "https://h/path",    // non-root path
+        "https://h?q=1",     // query
+        "https://h#f",       // fragment
+        "ftp://h",           // non-http(s) scheme
+        "not a url",         // unparseable
+    ] {
+        assert!(
+            validate_base_origin(bad).is_err(),
+            "must reject deceptive/non-origin value: {bad}"
+        );
+    }
+
+    // Bare origins are accepted and canonicalized to scheme://host[:port].
+    assert_eq!(validate_base_origin("https://h").unwrap(), "https://h");
+    assert_eq!(
+        validate_base_origin("https://h:8443").unwrap(),
+        "https://h:8443"
+    );
+    assert_eq!(validate_base_origin("http://h").unwrap(), "http://h");
+    // A trailing-slash root path is still just the origin.
+    assert_eq!(validate_base_origin("https://h/").unwrap(), "https://h");
+}
+
+#[test]
+fn normalize_base_url_canonicalizes_hostile_legacy_value() {
+    use super::service::normalize_base_url;
+
+    // A legacy DB row holding a deceptive value is reduced to its TRUE origin on
+    // read (defense in depth) — the `nano.example.com@` userinfo and the
+    // path/query/fragment are all stripped, exposing `evil.example`.
+    assert_eq!(
+        normalize_base_url("https://nano.example.com@evil.example/phish?next=%2Falerts#nano"),
+        "https://evil.example"
+    );
+    // Bare host still gets an https scheme; http(s) URLs keep their scheme.
+    assert_eq!(normalize_base_url("nano.example.com"), "https://nano.example.com");
+    assert_eq!(normalize_base_url("http://host/"), "http://host");
+}
+
+#[test]
+fn ui_link_cannot_escape_the_configured_origin() {
+    use super::service::WebhookService;
+
+    // The happy path joins cleanly against the configured origin.
+    assert_eq!(
+        WebhookService::ui_link(Some("https://nano.example.com"), "alerts/alert_1"),
+        Some("https://nano.example.com/alerts/alert_1".to_string())
+    );
+    // No base → no link.
+    assert_eq!(WebhookService::ui_link(None, "alerts/alert_1"), None);
+    // The relative SPA route resolves against the origin's root, so it cannot
+    // reach a different host regardless of the path text.
+    let link = WebhookService::ui_link(Some("https://nano.example.com"), "cases/case_9").unwrap();
+    assert!(
+        link.starts_with("https://nano.example.com/"),
+        "link stays on the configured origin: {link}"
+    );
 }

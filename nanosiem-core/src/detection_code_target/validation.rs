@@ -35,6 +35,33 @@ fn is_ref_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-')
 }
 
+/// Reject a single `/`-separated ref component that git's `check-ref-format`
+/// refuses: an empty component, a bare `.` or `..` component, or any component
+/// ending in `.lock`. git enforces the `.lock` rule on EVERY path component (not
+/// only the whole ref), so `feature.lock/x` is invalid even though its trailing
+/// component (`x`) is not a `.lock` name.
+///
+/// Applied per-`/`-segment by both [`validate_git_ref`] and [`validate_ref_prefix`].
+fn reject_ref_component(seg: &str) -> Result<(), TargetValidationError> {
+    // F-38: reject git-invalid ref path components (empty, leading '.', '.lock' suffix).
+    if seg.is_empty() {
+        return Err(reject("branch ref must not contain an empty path segment"));
+    }
+    // git check-ref-format forbids any component that begins with '.' — this
+    // covers the '.' and '..' segments as well as hidden-style names like '.foo'.
+    if seg.starts_with('.') {
+        return Err(reject(format!(
+            "branch ref path segment must not begin with '.': {seg:?}"
+        )));
+    }
+    if seg.ends_with(".lock") {
+        return Err(reject(format!(
+            "branch ref path segment must not end with '.lock': {seg:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a complete git ref (branch) name, e.g. `base_branch`.
 ///
 /// A safe subset of `git check-ref-format`: restricted charset, no `..`, no
@@ -60,8 +87,24 @@ pub fn validate_git_ref(name: &str) -> Result<(), TargetValidationError> {
     if name.starts_with('-') || name.starts_with('/') {
         return Err(reject("branch name must not start with '-' or '/'"));
     }
+    // F-38: reject the reserved `refs/` namespace. A fully-qualified ref is
+    // double-prefixed by the GitHub write client (`git/ref/heads/{name}` and
+    // `"ref": "refs/heads/{name}"`), so `refs/heads/main` becomes
+    // `refs/heads/refs/heads/main` → 404 and `ensure_branch` fails. Require the
+    // short branch name (`main`), never a fully-qualified ref.
+    if name.starts_with("refs/") {
+        return Err(reject(format!(
+            "branch name must be a short ref (e.g. 'main'), not the fully-qualified '{name}'"
+        )));
+    }
     if name.ends_with('/') || name.ends_with('.') || name.ends_with(".lock") {
         return Err(reject("branch name must not end with '/', '.', or '.lock'"));
+    }
+    // F-38: git rejects an empty / `.` / `..` / `.lock` component on ANY path
+    // segment, so check each `/`-split segment. The trailing-`.lock` check above
+    // only inspects the whole name, letting `feature.lock/x` slip through.
+    for seg in name.split('/') {
+        reject_ref_component(seg)?;
     }
     Ok(())
 }
@@ -90,6 +133,23 @@ pub fn validate_ref_prefix(prefix: &str) -> Result<(), TargetValidationError> {
     }
     if prefix.starts_with('-') || prefix.starts_with('/') {
         return Err(reject("branch prefix must not start with '-' or '/'"));
+    }
+    // F-38: reject the reserved `refs/` namespace — a prefix that begins `refs/`
+    // composes a fully-qualified head branch (`refs/heads/...-<id>`) that the
+    // GitHub write client double-prefixes and GitHub's ref API rejects.
+    if prefix.starts_with("refs/") {
+        return Err(reject(format!(
+            "branch prefix must not begin with the reserved 'refs/' namespace: {prefix:?}"
+        )));
+    }
+    // F-38: apply the per-segment git-ref rules to each `/`-split component (a
+    // `.lock` component makes git reject the composed head branch with a 422).
+    // A prefix may legitimately end with '/' (the head branch appends more), so
+    // drop a single trailing slash before splitting; interior '//' is already
+    // rejected above, so no other empty segment can reach the loop.
+    let core = prefix.strip_suffix('/').unwrap_or(prefix);
+    for seg in core.split('/') {
+        reject_ref_component(seg)?;
     }
     Ok(())
 }

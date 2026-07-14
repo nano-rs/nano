@@ -58,6 +58,7 @@ impl ClickHouseExecutor {
     ///
     /// `bounded_count`: caller-supplied bounded input for the count companion
     /// (NAN-1635, finding 2.3) — `None` keeps the unbounded wrap.
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute_sql_with_query_id(
         &self,
         sql: &str,
@@ -66,6 +67,7 @@ impl ClickHouseExecutor {
         query_id: &str,
         bounded_count: Option<BoundedCountInput<'_>>,
         execution_limits: Option<&crate::search::SearchExecutionLimits>,
+        preserve_columns: bool,
     ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
         // Check if this is an aggregation query that needs all data
         if is_aggregation_query(sql) {
@@ -85,10 +87,11 @@ impl ClickHouseExecutor {
                     query_id,
                     None,
                     limits,
+                    preserve_columns,
                 )
                 .await?
             } else {
-                self.execute_dynamic_query_with_query_id(&combined_sql, query_id)
+                self.execute_dynamic_query_with_query_id(&combined_sql, query_id, preserve_columns)
                     .await?
             };
 
@@ -120,6 +123,7 @@ impl ClickHouseExecutor {
                         query_id,
                         None,
                         limits,
+                        preserve_columns,
                     )
                     .await?;
                 let total_count = results.len() as u64;
@@ -130,7 +134,7 @@ impl ClickHouseExecutor {
             // exact total was already delivered with page 1.
             if !is_first_page(offset) {
                 let results = self
-                    .execute_dynamic_query_with_query_id(&paginated_sql, query_id)
+                    .execute_dynamic_query_with_query_id(&paginated_sql, query_id, preserve_columns)
                     .await?;
                 let total_count = paged_total_estimate(offset, results.len(), limit);
                 return Ok((results, total_count));
@@ -147,7 +151,7 @@ impl ClickHouseExecutor {
             let count_sql = build_count_query(sql, bounded_count);
             let count_qid = format!("{query_id}-count");
             let (results, count_result) = tokio::join!(
-                self.execute_dynamic_query_with_query_id(&paginated_sql, query_id),
+                self.execute_dynamic_query_with_query_id(&paginated_sql, query_id, preserve_columns),
                 self.execute_count_query_with_options(&count_sql, Some(&count_qid), None)
             );
             let results = results?;
@@ -165,6 +169,7 @@ impl ClickHouseExecutor {
     ///
     /// `bounded_count`: caller-supplied bounded input for the count companion
     /// (NAN-1635, finding 2.3) — `None` keeps the unbounded wrap.
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute_sql_with_settings(
         &self,
         sql: &str,
@@ -174,6 +179,7 @@ impl ClickHouseExecutor {
         settings: &crate::search::admission::ClickHouseQuerySettings,
         bounded_count: Option<BoundedCountInput<'_>>,
         execution_limits: Option<&crate::search::SearchExecutionLimits>,
+        preserve_columns: bool,
     ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
         if is_aggregation_query(sql) {
             debug!("Detected aggregation query with settings, using full scan");
@@ -189,10 +195,11 @@ impl ClickHouseExecutor {
                     query_id,
                     Some(settings),
                     limits,
+                    preserve_columns,
                 )
                 .await?
             } else {
-                self.execute_dynamic_query_with_settings(&combined_sql, query_id, settings)
+                self.execute_dynamic_query_with_settings(&combined_sql, query_id, settings, preserve_columns)
                     .await?
             };
 
@@ -221,6 +228,7 @@ impl ClickHouseExecutor {
                         query_id,
                         Some(settings),
                         limits,
+                        preserve_columns,
                     )
                     .await?;
                 let total_count = results.len() as u64;
@@ -231,7 +239,7 @@ impl ClickHouseExecutor {
             // exact total was already delivered with page 1.
             if !is_first_page(offset) {
                 let results = self
-                    .execute_dynamic_query_with_settings(&paginated_sql, query_id, settings)
+                    .execute_dynamic_query_with_settings(&paginated_sql, query_id, settings, preserve_columns)
                     .await?;
                 let total_count = paged_total_estimate(offset, results.len(), limit);
                 return Ok((results, total_count));
@@ -243,7 +251,7 @@ impl ClickHouseExecutor {
             let count_sql = build_count_query(sql, bounded_count);
             let count_qid = format!("{query_id}-count");
             let (results, count_result) = tokio::join!(
-                self.execute_dynamic_query_with_settings(&paginated_sql, query_id, settings),
+                self.execute_dynamic_query_with_settings(&paginated_sql, query_id, settings, preserve_columns),
                 self.execute_count_query_with_options(&count_sql, Some(&count_qid), Some(settings))
             );
             let results = results?;
@@ -270,8 +278,12 @@ impl ClickHouseExecutor {
         query_id: &str,
         settings: Option<&crate::search::admission::ClickHouseQuerySettings>,
         chunk_tx: mpsc::Sender<StreamingChunk>,
+        preserve_columns: bool,
     ) -> Result<(), SearchError> {
         let escaped_sql = escape_question_marks_in_strings(sql);
+        // A grouped query's columns are its answer — keep its empty group-by keys
+        // instead of pruning them into a bare count (NAN-1848).
+        let strip_empties = !preserve_columns;
         debug!(
             "Executing streaming ClickHouse query with query_id {}: {}",
             query_id,
@@ -350,7 +362,7 @@ impl ClickHouseExecutor {
                     while let Some(newline_pos) = line_buffer.find('\n') {
                         let line = &line_buffer[..newline_pos];
                         if !line.is_empty() {
-                            if let Some(row) = Self::parse_and_postprocess_row(line) {
+                            if let Some(row) = Self::parse_and_postprocess_row(line, strip_empties) {
                                 row_batch.push(row);
                             }
                         }
@@ -376,7 +388,7 @@ impl ClickHouseExecutor {
                     if !line_buffer.is_empty() {
                         let line = line_buffer.trim();
                         if !line.is_empty() {
-                            if let Some(row) = Self::parse_and_postprocess_row(line) {
+                            if let Some(row) = Self::parse_and_postprocess_row(line, strip_empties) {
                                 row_batch.push(row);
                             }
                         }
@@ -402,6 +414,25 @@ impl ClickHouseExecutor {
         debug!("Streaming query complete: {} bytes total", total_bytes);
         Ok(())
     }
+
+    /// Fetch rows for a data query, honoring the caller's column-preservation
+    /// contract.
+    ///
+    /// `execute_sql_to_json` always prunes empty columns — right for the wide raw
+    /// event rows its many callers fetch. A grouped query's rows are buckets whose
+    /// (possibly empty) group-by key is their identity, so those parse through the
+    /// dynamic path with pruning off (NAN-1848).
+    async fn fetch_rows(
+        &self,
+        sql: &str,
+        preserve_columns: bool,
+    ) -> Result<Vec<serde_json::Value>, SearchError> {
+        if preserve_columns {
+            self.execute_dynamic_query(sql, true).await
+        } else {
+            self.execute_sql_to_json(sql).await
+        }
+    }
 }
 
 #[cfg(test)]
@@ -413,6 +444,7 @@ impl SqlExecutor for ClickHouseExecutor {
         sql: &str,
         limit: usize,
         offset: usize,
+        preserve_columns: bool,
     ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
         // Check if this is an aggregation query that needs all data
         if is_aggregation_query(sql) {
@@ -425,7 +457,7 @@ impl SqlExecutor for ClickHouseExecutor {
                 sql, limit, offset
             );
 
-            let mut results = self.execute_sql_to_json(&combined_sql).await?;
+            let mut results = self.fetch_rows(&combined_sql, preserve_columns).await?;
 
             let total_count = results
                 .first()
@@ -455,7 +487,7 @@ impl SqlExecutor for ClickHouseExecutor {
                 debug!("Count SQL: {}", count_sql);
 
                 let (data_result, count_result) = tokio::join!(
-                    self.execute_sql_to_json(&paginated_sql),
+                    self.fetch_rows(&paginated_sql, preserve_columns),
                     self.execute_count_query(&count_sql)
                 );
 
@@ -472,7 +504,7 @@ impl SqlExecutor for ClickHouseExecutor {
                 // Subsequent pages: just get data
                 // The UI already has the total count from the first page
                 // Return a high estimate to signal "there might be more"
-                let results = self.execute_sql_to_json(&paginated_sql).await?;
+                let results = self.fetch_rows(&paginated_sql, preserve_columns).await?;
                 let estimated_total = paged_total_estimate(offset, results.len(), limit);
 
                 debug!(
@@ -524,7 +556,14 @@ impl SqlExecutor for ClickHouseExecutor {
             // For aggregation queries, prevalence JOIN queries, or queries with date/time functions,
             // use dynamic JSON parsing to ensure all fields are properly available
             // Date/time function queries need access to all fields including those in ext JSON
-            self.execute_dynamic_query(sql).await
+            //
+            // NAN-1848: callers here hand over raw SQL (the /search/sql API, OTEL
+            // rollups), so there is no AST to ask — `GROUP BY` is the signal that
+            // rows are keyed buckets whose (possibly empty) key must survive
+            // pruning. A prevalence JOIN decorates raw events rather than grouping
+            // them, so those keep the payload pruning.
+            let grouped_rows = sql_upper.contains("GROUP BY") && !is_prevalence_join;
+            self.execute_dynamic_query(sql, grouped_rows).await
         } else {
             // For full log queries, try the typed struct first, fall back to dynamic
             match self.execute_typed_query(sql).await {
@@ -533,7 +572,7 @@ impl SqlExecutor for ClickHouseExecutor {
                     // Fall back to dynamic query if typed query fails
                     // This handles cases like table command with subset of columns
                     tracing::debug!("Typed query failed, falling back to dynamic: {}", e);
-                    self.execute_dynamic_query(sql).await
+                    self.execute_dynamic_query(sql, false).await
                 }
             }
         }

@@ -566,10 +566,24 @@ pub async fn disable_user(
     check_permission(&auth, permissions::USERS_EDIT)
         .map_err(|(s, j)| (s, Json(UserApiError::new(&j.error, &j.message))))?;
 
+    // F-32: `disable_user` stamps `status='disabled'` + `tokens_valid_from=NOW()`
+    // atomically, so outstanding access tokens are rejected by the middleware
+    // status gate and refresh already rejects disabled users.
     state.user_repo.disable_user(*id).await.map_err(|e| {
         let (status, err) = UserApiError::from_repo_error(&e);
         (status, Json(err))
     })?;
+
+    // F-32: also revoke every active session so refresh tokens die immediately.
+    // Best-effort — the status gate + refresh disabled-check are the primary
+    // controls, so a session-delete hiccup must not fail the disable itself.
+    if let Err(e) = state
+        .session_service
+        .terminate_all_user_sessions(*id, auth.user_id(), true, None, None)
+        .await
+    {
+        tracing::warn!(user_id = %*id, error = %e, "failed to revoke sessions on user disable");
+    }
 
     let user = state.user_repo.get_user_by_id(*id).await.map_err(|e| {
         let (status, err) = UserApiError::from_repo_error(&e);

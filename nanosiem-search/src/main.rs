@@ -105,9 +105,13 @@ async fn main() -> Result<()> {
         // PG pool as the permission resolver; the search AuthContext carries the
         // resolved deny set so every logs-touching handler can scope its query.
         let source_scope_resolver = SourceScopeResolver::new(dual_pool.postgres().clone());
+        // F-32: fail-closed per-user status/revocation gate for the JWT path.
+        let user_status_resolver =
+            nanosiem_core::auth::UserStatusResolver::new(dual_pool.postgres().clone());
         AuthState::new(token_service, Some(api_key_service), true)
             .with_permission_resolver(permission_resolver)
             .with_source_scope_resolver(source_scope_resolver)
+            .with_user_status_resolver(user_status_resolver)
     } else {
         tracing::warn!("Authentication DISABLED - all requests will be allowed");
         AuthState::disabled()

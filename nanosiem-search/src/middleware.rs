@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use nanosiem_core::auth::{
     ApiKeyInfo, ApiKeyService, ApiKeyServiceError, PermissionResolver, SourceScopeResolver,
-    TokenClaims, TokenConfig, TokenService,
+    TokenClaims, TokenConfig, TokenService, UserStatusResolver,
 };
 use nanosiem_core::ip_allowlist::{IpAllowlistScope, IpAllowlistService};
 
@@ -225,6 +225,10 @@ pub struct AuthState {
     /// Resolves the per-user source-scope deny set (fail-closed). Mirrors
     /// `permission_resolver`; attached via `with_source_scope_resolver`.
     pub source_scope_resolver: Option<Arc<SourceScopeResolver>>,
+    /// F-32: resolves the caller's `status` + `tokens_valid_from` watermark
+    /// (fail-closed, short-TTL cache) so the JWT path rejects disabled/locked/
+    /// deleted users and pre-revocation tokens. `None` disables the gate.
+    pub user_status_resolver: Option<Arc<UserStatusResolver>>,
 }
 
 impl AuthState {
@@ -240,6 +244,7 @@ impl AuthState {
             auth_enabled,
             permission_resolver: None,
             source_scope_resolver: None,
+            user_status_resolver: None,
         }
     }
 
@@ -254,6 +259,7 @@ impl AuthState {
             auth_enabled: true,
             permission_resolver: None,
             source_scope_resolver: None,
+            user_status_resolver: None,
         }
     }
 
@@ -276,6 +282,13 @@ impl AuthState {
         self
     }
 
+    /// F-32: set the user-status resolver so the JWT path rejects disabled/
+    /// locked/deleted users and pre-revocation access tokens.
+    pub fn with_user_status_resolver(mut self, resolver: UserStatusResolver) -> Self {
+        self.user_status_resolver = Some(Arc::new(resolver));
+        self
+    }
+
     /// Disable authentication (for development/testing)
     pub fn disabled() -> Self {
         let token_config = TokenConfig::new("disabled".to_string());
@@ -287,6 +300,7 @@ impl AuthState {
             auth_enabled: false,
             permission_resolver: None,
             source_scope_resolver: None,
+            user_status_resolver: None,
         }
     }
 }
@@ -323,6 +337,58 @@ async fn resolve_denied_sources(
                 Json(AuthErrorResponse {
                     error: "source_scope_unavailable".to_string(),
                     message: "Source-scope authorization is temporarily unavailable".to_string(),
+                }),
+            )
+                .into_response())
+        }
+    }
+}
+
+/// F-32: enforce that the JWT principal is still `active` and that the token was
+/// issued after any forced-revocation watermark.
+///
+/// FAIL-CLOSED (mirrors [`resolve_denied_sources`]): a resolver error returns the
+/// 503 [`Response`] the caller MUST return — never proceeds as if active. A
+/// non-active status or pre-revocation token returns 401. No resolver configured
+/// → gate skipped (back-compat). ONLY the JWT path calls this; the API-key path
+/// checks the owner's status inside `ApiKeyService::validate_key`.
+async fn enforce_user_status(
+    auth_state: &AuthState,
+    user_id: Uuid,
+    token_iat: i64,
+) -> Result<(), Response> {
+    let Some(resolver) = auth_state.user_status_resolver.as_ref() else {
+        return Ok(());
+    };
+    match resolver.resolve(user_id).await {
+        Ok(snapshot) => {
+            if !snapshot.is_active() || snapshot.token_predates_revocation(token_iat) {
+                tracing::warn!(
+                    user_id = %user_id,
+                    status = %snapshot.status,
+                    "rejecting request: account not active or token revoked"
+                );
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(AuthErrorResponse::unauthorized(
+                        "Account is not active or the session has been revoked",
+                    )),
+                )
+                    .into_response());
+            }
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                user_id = %user_id,
+                "user-status resolution failed — failing closed (503)"
+            );
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(AuthErrorResponse {
+                    error: "user_status_unavailable".to_string(),
+                    message: "Account status is temporarily unavailable".to_string(),
                 }),
             )
                 .into_response())
@@ -379,6 +445,13 @@ pub async fn auth_middleware(
                         Json(AuthErrorResponse::unauthorized("Invalid token purpose")),
                     )
                         .into_response());
+                }
+                // F-32: reject disabled/locked/deleted users and pre-revocation
+                // tokens (fail-closed 503 on lookup error).
+                if let Err(response) =
+                    enforce_user_status(&auth_state, claims.sub, claims.iat).await
+                {
+                    return Err(response);
                 }
                 // Resolve permissions server-side (not stored in JWT)
                 if let Some(ref resolver) = auth_state.permission_resolver {

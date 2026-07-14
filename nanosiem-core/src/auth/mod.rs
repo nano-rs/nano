@@ -25,6 +25,7 @@ pub mod session;
 pub mod source_scope_resolver;
 pub mod token;
 pub mod types;
+pub mod user_status_cache;
 
 #[cfg(test)]
 mod group_membership_tests;
@@ -43,3 +44,4 @@ pub use session::*;
 pub use source_scope_resolver::*;
 pub use token::*;
 pub use types::*;
+pub use user_status_cache::*;

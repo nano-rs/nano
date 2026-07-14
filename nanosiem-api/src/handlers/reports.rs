@@ -491,6 +491,20 @@ pub async fn trigger_report(
     let service = report_service(&state);
     let def = load_owned_definition(&service, &auth, *id).await?;
 
+    // F-32: reports execute AS THE OWNER. Refuse to (re)run one whose owner is
+    // no longer active — this blocks the admin-triggered path too, matching the
+    // scheduler's owner-active guard on the claim set.
+    let owner = state
+        .user_repo
+        .get_user_by_id(def.owner_id)
+        .await
+        .map_err(|e| ApiError::InternalError(e.to_string()))?;
+    if owner.status != "active" {
+        return Err(ApiError::Forbidden(
+            "the report owner's account is not active; the report cannot be run".to_string(),
+        ));
+    }
+
     let run_id = service.trigger_now(*id).await.map_err(map_report_err)?;
 
     state.emit_audit(
@@ -531,7 +545,23 @@ pub async fn list_report_runs(
     ensure_permission(&auth, permissions::SEARCH_VIEW)?;
     let service = report_service(&state);
     load_owned_definition(&service, &auth, *id).await?;
-    let runs = service.list_runs(*id, 100).await.map_err(map_report_err)?;
+    let mut runs = service.list_runs(*id, 100).await.map_err(map_report_err)?;
+    // F-31: redact (rather than 403) artifact metadata of runs the requester is
+    // source-denied, so a restricted viewer cannot obtain the artifact ids to
+    // download. Ownership is not an exemption. (List rows never populate
+    // `artifacts` today, so this is also a forward guard.)
+    let deny = auth.denied_sources.deny_set();
+    if !deny.is_empty() {
+        for run in runs.iter_mut() {
+            if !nanosiem_core::reports::report_artifact_download_allowed(
+                deny,
+                &run.source_types,
+                run.source_types_complete,
+            ) {
+                run.artifacts.clear();
+            }
+        }
+    }
     Ok(Json(ReportRunListResponse { runs }))
 }
 
@@ -556,8 +586,25 @@ pub async fn get_report_run(
     ensure_permission(&auth, permissions::SEARCH_VIEW)?;
     let service = report_service(&state);
     let run = service.get_run(*run_id).await.map_err(map_report_err)?;
-    // Ownership via the owning definition.
+    // Ownership via the owning definition (owner-or-admin).
     load_owned_definition(&service, &auth, run.definition_id).await?;
+    // F-31: apply the same source-scope predicate as download — ownership is not
+    // an exemption. A restricted requester whose deny set intersects (or cannot
+    // be cleared against) the run's manifest is refused the run detail (which
+    // carries the downloadable artifact ids). Runs with NO artifacts
+    // (failed/running) carry nothing to protect, so a scoped user can still see
+    // their status.
+    if !run.artifacts.is_empty()
+        && !nanosiem_core::reports::report_artifact_download_allowed(
+            auth.denied_sources.deny_set(),
+            &run.source_types,
+            run.source_types_complete,
+        )
+    {
+        return Err(ApiError::Forbidden(
+            "this report run draws on a source your account may not access".to_string(),
+        ));
+    }
     Ok(Json(ReportRunResponse { run }))
 }
 
@@ -581,22 +628,26 @@ pub async fn download_report_artifact(
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_permission(&auth, permissions::SEARCH_VIEW)?;
     let service = report_service(&state);
-    let (artifact, definition_id) = service
+    let (artifact, scope) = service
         .get_artifact(*artifact_id)
         .await
         .map_err(map_report_err)?;
-    // Ownership via the owning definition.
-    let def = load_owned_definition(&service, &auth, definition_id).await?;
+    // Ownership via the owning definition (owner-or-admin).
+    load_owned_definition(&service, &auth, scope.definition_id).await?;
 
-    // NAN-1809: artifacts were rendered under the OWNER's per-source scope and
-    // carry no per-row source attribution, so a restricted non-owner viewer
-    // (i.e. a source-scoped admin) cannot be row-filtered here. FAIL-CLOSED:
-    // refuse the download rather than hand over rows from sources the viewer
-    // is denied. The owner always passes — the content is already their scope.
-    if def.owner_id != auth.user_id() && auth.denied_sources.is_restricted() {
+    // F-31: OWNERSHIP IS NOT AN EXEMPTION. Stored artifacts are frozen bytes
+    // with no per-row source attribution, so a source-restricted requester
+    // (including the owner, or a source-scoped admin) cannot be row-filtered
+    // here — gate the whole download on the run's stored source_type manifest.
+    // Every pre-feature run has an incomplete manifest, which denies any
+    // restricted requester (fail-closed).
+    if !nanosiem_core::reports::report_artifact_download_allowed(
+        auth.denied_sources.deny_set(),
+        &scope.source_types,
+        scope.source_types_complete,
+    ) {
         return Err(ApiError::Forbidden(
-            "your account has per-source access restrictions; report artifacts \
-             can only be downloaded by their owner"
+            "this report artifact draws on a source your account may not access"
                 .to_string(),
         ));
     }

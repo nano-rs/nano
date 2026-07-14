@@ -5,7 +5,7 @@
 //! Functions to check whether a parsed query contains aggregations or joins,
 //! which determines whether a detection rule can run in real-time mode.
 
-use crate::query::ast::{Command, Query};
+use crate::query::ast::{Command, Query, SearchExpr};
 
 #[allow(unused_imports)]
 use crate::query::pretty_print::PrettyPrint;
@@ -93,12 +93,124 @@ pub fn pre_aggregation_subquery(query: &Query) -> Option<&Query> {
 /// stamping risk scores would feed its own input (feedback loop). Rule
 /// validation rejects such queries at save time; execution rejects them again
 /// as belt-and-suspenders.
+///
+/// F-37: this is a COMPLETE recursive AST visitor, not just an outer-spine walk.
+/// A `| risk` nested inside a `join`/`append` subsearch, inside a `where … IN
+/// [subsearch]`, or inside a `transaction`/`sequence`/`funnel` condition would
+/// otherwise persist AND execute, silently bypassing the feedback-loop guard.
+/// The `Query::Search(_)` arm therefore walks its expression for `InSubsearch`
+/// rather than short-circuiting to `false`, and `risk_in_command` /
+/// `risk_in_search_expr` traverse every nesting node. Mirrors the fail-closed
+/// `gate_command` / `gate_search_expr` visitor in
+/// `search/query_processing/query_manipulation.rs`.
 pub fn contains_risk_command(query: &Query) -> bool {
     match query {
-        Query::Search(_) => false,
+        // F-37: a bare `Query::Search` is NOT automatically risk-free — a
+        // subsearch (`field IN [ … | risk … ]`) can hide `| risk` inside it, so
+        // walk the expression instead of returning `false`.
+        Query::Search(expr) => risk_in_search_expr(expr),
         Query::Piped { source, command } => {
-            matches!(command, Command::Risk { .. }) || contains_risk_command(source)
+            risk_in_command(command) || contains_risk_command(source)
         }
+    }
+}
+
+/// F-37: does this single `Command` (or anything nested inside it) carry `| risk`?
+///
+/// EXHAUSTIVE match with NO `_` wildcard arm: a future `Command` variant that
+/// nests a `Query`/`SearchExpr` becomes a compile error here rather than a
+/// silent feedback-loop-guard bypass. Structure mirrors `gate_command`.
+fn risk_in_command(command: &Command) -> bool {
+    match command {
+        // The target itself.
+        Command::Risk { .. } => true,
+        // Subsearch-bearing commands: recurse into the nested `Query`.
+        Command::Join { subsearch, .. } | Command::Append { subsearch, .. } => {
+            contains_risk_command(subsearch)
+        }
+        // `SearchExpr`-bearing commands: walk the condition(s) for `IN [subsearch]`.
+        Command::Where { condition } => risk_in_search_expr(condition),
+        Command::Transaction {
+            startswith,
+            endswith,
+            ..
+        } => {
+            startswith.as_ref().is_some_and(risk_in_search_expr)
+                || endswith.as_ref().is_some_and(risk_in_search_expr)
+        }
+        Command::Sequence { conditions, .. } => conditions.iter().any(risk_in_search_expr),
+        Command::Funnel { steps, .. } => {
+            steps.iter().any(|(_, condition)| risk_in_search_expr(condition))
+        }
+        // Commands carrying no nested `Query`/`SearchExpr`. Listed explicitly
+        // (no `_` arm) so the fail-closed property above holds.
+        Command::Stats { .. }
+        | Command::Chart { .. }
+        | Command::StreamStats { .. }
+        | Command::Sort { .. }
+        | Command::Head { .. }
+        | Command::Tail { .. }
+        | Command::Timechart { .. }
+        | Command::Table { .. }
+        | Command::Rename { .. }
+        | Command::Lookup { .. }
+        | Command::Eval { .. }
+        | Command::Dedup { .. }
+        | Command::Bin { .. }
+        | Command::Rex { .. }
+        | Command::Fields { .. }
+        | Command::Top { .. }
+        | Command::Rare { .. }
+        | Command::Fillnull { .. }
+        | Command::Mvexpand { .. }
+        | Command::Spath { .. }
+        | Command::Format { .. }
+        | Command::Return { .. }
+        | Command::Prevalence { .. }
+        | Command::Sample { .. }
+        | Command::Reverse
+        | Command::EventStats { .. }
+        | Command::Anomaly { .. }
+        | Command::InputLookup { .. }
+        | Command::Tree { .. }
+        | Command::ResolveIdentity { .. }
+        | Command::Asset { .. }
+        | Command::Cloud { .. }
+        | Command::Lateral { .. }
+        | Command::Ai { .. }
+        | Command::Output { .. }
+        | Command::Services
+        | Command::Service { .. }
+        | Command::Trace { .. }
+        | Command::Metric { .. }
+        | Command::Retro { .. } => false,
+    }
+}
+
+/// F-37: does this `SearchExpr` (or any subsearch nested inside it) carry
+/// `| risk`?
+///
+/// EXHAUSTIVE match with NO `_` wildcard arm — same fail-closed rationale as
+/// `risk_in_command`. Structure mirrors `gate_search_expr`. `EvalExpression`
+/// (carried by the function/boolean-function leaves) holds no `Query`/
+/// `SearchExpr`, so those are genuine leaves here.
+fn risk_in_search_expr(expr: &SearchExpr) -> bool {
+    match expr {
+        // The nesting node: `field IN [ <subsearch> ]` — walk the subsearch.
+        SearchExpr::InSubsearch { subsearch, .. } => contains_risk_command(subsearch),
+        SearchExpr::And(left, right) | SearchExpr::Or(left, right) => {
+            risk_in_search_expr(left) || risk_in_search_expr(right)
+        }
+        SearchExpr::Not(inner) | SearchExpr::Group(inner) => risk_in_search_expr(inner),
+        // Leaves — carry no nested `Query`. Listed explicitly (no `_` arm).
+        SearchExpr::Keyword(_)
+        | SearchExpr::FieldFilter { .. }
+        | SearchExpr::FunctionFilter { .. }
+        | SearchExpr::FieldFunctionFilter { .. }
+        | SearchExpr::InList { .. }
+        | SearchExpr::BooleanFunction(_)
+        | SearchExpr::LiteralComparison { .. }
+        | SearchExpr::IocMatch { .. } => false,
     }
 }
 
@@ -262,5 +374,59 @@ mod tests {
         // A field merely NAMED risk_score is not the command.
         let field_ref = parse_query("* | where risk_score > 10").unwrap();
         assert!(!contains_risk_command(&field_ref));
+    }
+
+    #[test]
+    fn test_contains_risk_command_nested_subsearches() {
+        // F-37: `| risk` hidden inside a nested subsearch must NOT bypass the
+        // feedback-loop guard. The old outer-spine-only walk returned false for
+        // every one of these, so the rule persisted and even executed.
+
+        // Buried inside a `join` subsearch.
+        let joined =
+            parse_query("* | join entity [* | risk score=50 entity=entity]").unwrap();
+        assert!(contains_risk_command(&joined));
+
+        // Buried inside an `append` subsearch.
+        let appended =
+            parse_query("* | append [* | risk score=50 entity=src_ip]").unwrap();
+        assert!(contains_risk_command(&appended));
+
+        // Buried inside a `where … IN [subsearch]`.
+        let where_in =
+            parse_query("* | where src_ip IN [* | risk score=50 entity=src_ip]").unwrap();
+        assert!(contains_risk_command(&where_in));
+
+        // Root, non-piped `field IN [subsearch]` — the `Query::Search` arm must
+        // walk the expression, not short-circuit to false.
+        let root_in =
+            parse_query("src_ip IN [* | risk score=50 entity=src_ip]").unwrap();
+        assert!(contains_risk_command(&root_in));
+
+        // Two levels of subsearch nesting.
+        let two_level =
+            parse_query("* | join entity [* | append [* | risk score=50 entity=src_ip]]")
+                .unwrap();
+        assert!(contains_risk_command(&two_level));
+    }
+
+    #[test]
+    fn test_contains_risk_command_nested_negative_controls() {
+        // F-37: the recursive visitor must stay FALSE for benign nested shapes.
+
+        // A subsearch that merely references a field named `risk_score`.
+        let nested_field_ref =
+            parse_query("* | where src_ip IN [* | where risk_score > 10 | return src_ip]")
+                .unwrap();
+        assert!(!contains_risk_command(&nested_field_ref));
+
+        // A join subsearch with no `| risk` anywhere.
+        let benign_join =
+            parse_query("* | join src_ip [* | stats count by src_ip]").unwrap();
+        assert!(!contains_risk_command(&benign_join));
+
+        // A plain aggregation.
+        let plain = parse_query("* | stats count").unwrap();
+        assert!(!contains_risk_command(&plain));
     }
 }

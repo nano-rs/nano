@@ -56,7 +56,19 @@ pub fn alert_kind_to_event_type(kind: &str) -> &'static str {
 pub struct Webhook {
     pub id: Uuid,
     pub name: String,
+    /// The internal delivery URL. On the API read paths this may carry the raw
+    /// value of the legacy plaintext `url` column; on the delivery read paths
+    /// (`list_enabled` / `get`) it is hydrated from `url_encrypted`. It is NEVER
+    /// serialized to API consumers — see [`WebhookResponse`] (F-39).
     pub url: String,
+    /// F-39: encrypted destination URL (AES-256-GCM, same envelope as
+    /// `headers_encrypted`). `None` only for legacy rows not yet lazy-migrated.
+    #[sqlx(default)]
+    pub url_encrypted: Option<Vec<u8>>,
+    /// F-39: non-secret host label (e.g. `hooks.slack.com`) for UI display. The
+    /// full URL — a bearer credential for Slack/Teams — is never exposed.
+    #[sqlx(default)]
+    pub url_host: Option<String>,
     /// Encrypted JSON headers (AES-256-GCM via EncryptionService)
     pub headers_encrypted: Option<Vec<u8>>,
     /// Encrypted HMAC secret
@@ -132,7 +144,13 @@ pub struct WebhookResponse {
     #[schema(value_type = String)]
     pub id: Uuid,
     pub name: String,
-    pub url: String,
+    /// F-39: non-secret display host of the destination (e.g. `hooks.slack.com`).
+    /// The full URL is NEVER returned — for a Slack/Teams incoming webhook the
+    /// URL itself is the bearer credential. `None` for legacy rows without a
+    /// parsed host label yet.
+    pub url_host: Option<String>,
+    /// F-39: whether a destination URL is configured (the URL is write-only).
+    pub has_url: bool,
     /// Whether custom headers are configured (actual values never exposed)
     pub has_headers: bool,
     /// Whether an HMAC secret is configured
@@ -161,7 +179,12 @@ impl From<&Webhook> for WebhookResponse {
         Self {
             id: w.id,
             name: w.name.clone(),
-            url: w.url.clone(),
+            // F-39: expose only the non-secret host label, never the full URL.
+            // Fall back to parsing the internal `url` for legacy rows whose
+            // `url_host` column hasn't been populated by a delivery-path hydrate.
+            url_host: w.url_host.clone().or_else(|| url_host(&w.url)),
+            has_url: w.url_encrypted.as_ref().map_or(false, |u| !u.is_empty())
+                || !w.url.is_empty(),
             has_headers: w
                 .headers_encrypted
                 .as_ref()
@@ -268,6 +291,19 @@ impl UpdateWebhookRequest {
 /// Encode a detection-rule UUID as a `rule_…` typeid for the API surface.
 pub fn encode_rule_id(id: &Uuid) -> String {
     typeid::encode(typeid::rule::PREFIX, id)
+}
+
+/// F-39: parse the non-secret display host (e.g. `hooks.slack.com`) from a
+/// destination URL. Returns `None` when the value is empty or has no host, so
+/// callers never surface a malformed/partial URL as a "host". Never returns the
+/// path/token portion — that is the secret for a Slack/Teams webhook.
+pub(crate) fn url_host(url: &str) -> Option<String> {
+    if url.trim().is_empty() {
+        return None;
+    }
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
 }
 
 /// Decode an API `rule_filter` list (typeids or bare UUIDs) to raw UUIDs.

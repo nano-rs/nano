@@ -178,6 +178,12 @@ pub enum RetroHuntConfigValidationError {
     MaxIndicatorsOutOfBounds(i32),
     /// An artifact type is not one of ip/domain/hash/url.
     InvalidArtifactType(String),
+    /// F-36: a requested feed name is not in the authorized live-feed catalog
+    /// (a typo would silently make the rule hunt nothing).
+    UnknownFeed(String),
+    /// F-36: a feed name is structurally malformed (empty, or contains quotes /
+    /// pipes / backslashes / control characters). Defense in depth.
+    MalformedFeedName(String),
 }
 
 impl std::fmt::Display for RetroHuntConfigValidationError {
@@ -195,11 +201,72 @@ impl std::fmt::Display for RetroHuntConfigValidationError {
                 f,
                 "invalid artifact_type '{t}' (must be one of ip/domain/hash/url)"
             ),
+            Self::UnknownFeed(name) => write!(
+                f,
+                "unknown feed '{name}' — not an available IOC feed (see GET /api/rules/retro-hunt/feeds)"
+            ),
+            Self::MalformedFeedName(name) => write!(
+                f,
+                "malformed feed name '{name}' (must not be empty or contain quotes, pipes, backslashes, or control characters)"
+            ),
         }
     }
 }
 
 impl std::error::Error for RetroHuntConfigValidationError {}
+
+/// F-36: reject a structurally hostile feed name (defense in depth).
+///
+/// A feed name is a bare `enrichment_name` token; it never legitimately contains
+/// quotes, pipes, backslashes, or control characters. This is NOT the SQL-injection
+/// boundary — the feed name is emitted into ClickHouse via `escape_sql_string` as a
+/// single well-formed literal — but keeping obviously bogus names out of the stored
+/// config and the catalog membership check is cheap belt-and-braces.
+pub fn validate_feed_name_format(name: &str) -> Result<(), RetroHuntConfigValidationError> {
+    if name.trim().is_empty()
+        || name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\'' | '"' | '|' | '\\'))
+    {
+        return Err(RetroHuntConfigValidationError::MalformedFeedName(
+            name.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// F-36: validate a retro-hunt rule's requested `feeds` against the authorized
+/// live-feed catalog.
+///
+/// `authorized` is the distinct `enrichment_name` set from `list_ioc_feed_names`
+/// (case may vary; compared case-folded to match `lower(enrichment_name)`).
+///
+/// - Empty `requested` ⇒ OK (means "ALL feeds").
+/// - Every requested feed is FORMAT-checked regardless of catalog availability.
+/// - When the catalog is KNOWN (non-empty), each requested feed must be a member,
+///   else [`RetroHuntConfigValidationError::UnknownFeed`].
+/// - When the catalog could NOT be confirmed (`authorized` empty — either no feeds
+///   synced yet or ClickHouse was unreachable, since that lookup is best-effort),
+///   the membership check is skipped so a transient catalog outage cannot block
+///   rule creation. The format check still applies.
+pub fn validate_feed_names(
+    requested: &[String],
+    authorized: &[String],
+) -> Result<(), RetroHuntConfigValidationError> {
+    if requested.is_empty() {
+        return Ok(());
+    }
+    let catalog_known = !authorized.is_empty();
+    let authorized_lc: std::collections::HashSet<String> =
+        authorized.iter().map(|f| f.to_lowercase()).collect();
+    for feed in requested {
+        validate_feed_name_format(feed)?;
+        if catalog_known && !authorized_lc.contains(&feed.to_lowercase()) {
+            return Err(RetroHuntConfigValidationError::UnknownFeed(feed.clone()));
+        }
+    }
+    Ok(())
+}
 
 /// Validate a lookback/cap/artifact-type triple against the shared bounds.
 /// `None` fields (a partial update) are skipped.

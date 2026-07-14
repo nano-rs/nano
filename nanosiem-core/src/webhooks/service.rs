@@ -69,13 +69,66 @@ pub(crate) fn parse_egress_allowlist(raw: &str) -> Vec<IpCidr> {
 /// Normalize a configured/env base into a scheme-qualified origin with no
 /// trailing slash: `nano.example.com` → `https://nano.example.com`,
 /// `http://host/` → `http://host`. Pure (no env read) for testability.
+///
+/// F-40: canonicalizes to a bare origin (`scheme://host[:port]`), stripping any
+/// userinfo / path / query / fragment. This is the defense-in-depth read side:
+/// a legacy DB row already holding a hostile value (e.g.
+/// `https://nano.example.com@evil.example/phish?next=x#y`) is reduced to its
+/// true origin here so it can't build first-party-looking deep links.
 pub(crate) fn normalize_base_url(raw: &str) -> String {
     let trimmed = raw.trim().trim_end_matches('/');
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         trimmed.to_string()
     } else {
         format!("https://{trimmed}")
+    };
+    // On a parse failure keep the scheme-qualified string; `ui_link` then
+    // fails safe (returns None) rather than concatenating an unvalidated base.
+    canonical_origin(&with_scheme).unwrap_or(with_scheme)
+}
+
+/// F-40: reduce a parsed http(s) URL to a bare origin string
+/// (`scheme://host[:port]`), or `None` if it can't be parsed, uses a non-http(s)
+/// scheme, or has no host. Inherently DROPS any userinfo, path, query, and
+/// fragment — it only re-serializes scheme + host + explicit port.
+pub(crate) fn canonical_origin(raw: &str) -> Option<String> {
+    let url = url::Url::parse(raw.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
     }
+    let host = url.host_str()?;
+    let mut origin = format!("{}://{}", url.scheme(), host);
+    if let Some(port) = url.port() {
+        origin.push_str(&format!(":{port}"));
+    }
+    Some(origin)
+}
+
+/// F-40: validate a notification base URL is a *bare origin* and return its
+/// canonical `scheme://host[:port]` form. Unlike [`canonical_origin`] (which
+/// silently strips), this REJECTS (Err) a deceptive value — userinfo, a
+/// non-root path, a query, or a fragment — so the write path can 400 instead of
+/// storing a caller string that would build first-party-looking links resolving
+/// to another host. Also rejects non-http(s) schemes and host-less URLs.
+pub fn validate_base_origin(raw: &str) -> Result<String, String> {
+    let url = url::Url::parse(raw.trim())
+        .map_err(|_| "base_url must be a valid URL".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("base_url must use http or https".to_string());
+    }
+    if !url.username().is_empty()
+        || url.password().map(|p| !p.is_empty()).unwrap_or(false)
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.port() == Some(0)
+    {
+        return Err(
+            "base_url must be a bare origin (scheme://host[:port]) with no user, path, query, or fragment"
+                .to_string(),
+        );
+    }
+    canonical_origin(&url.to_string()).ok_or_else(|| "base_url must include a host".to_string())
 }
 
 /// Hard cap on how many bytes of a receiver's response we read before dropping
@@ -274,8 +327,18 @@ impl WebhookService {
     /// Build a deep link back to a resource in the nano UI from a resolved
     /// `base` (see [`resolve_base_url`]), or `None` when no base is configured.
     /// `path` is the SPA route without a leading slash, e.g. `alerts/alert_…`.
-    fn ui_link(base: Option<&str>, path: &str) -> Option<String> {
-        base.map(|b| format!("{b}/{path}"))
+    ///
+    /// F-40: resolve `path` against `base` with proper URL joining instead of
+    /// string concatenation, and return `None` on any parse error. Combined with
+    /// the origin canonicalization in [`normalize_base_url`]/`validate_base_origin`,
+    /// a hostile stored base can no longer produce first-party-looking links that
+    /// resolve to an attacker host. `pub(crate)` so the join is unit-testable.
+    pub(crate) fn ui_link(base: Option<&str>, path: &str) -> Option<String> {
+        let base = base?;
+        reqwest::Url::parse(base)
+            .ok()
+            .and_then(|u| u.join(path).ok())
+            .map(|u| u.to_string())
     }
 
     /// Should this alert's payload be redacted because it derives from a
@@ -904,7 +967,12 @@ impl WebhookService {
                     return;
                 }
                 Err(e) => {
-                    let error_msg = e.to_string();
+                    // F-39: strip the URL from the transport error — reqwest
+                    // formats it as "… for url (<full-url>)", and for a
+                    // Slack/Teams webhook the URL path IS the bearer credential.
+                    // This string is persisted to the delivery log and emitted
+                    // to tracing, so it must never carry the secret.
+                    let error_msg = e.without_url().to_string();
 
                     if attempt < MAX_DELIVERY_ATTEMPTS {
                         let delay = RETRY_BASE_DELAY_MS << (attempt - 1);
@@ -1116,7 +1184,10 @@ impl WebhookService {
                 })
             }
             Err(e) => {
-                let error_msg = e.to_string();
+                // F-39: strip the URL from the transport error — it is returned
+                // directly in the test-endpoint API response and logged, and a
+                // Slack/Teams webhook URL path is a bearer credential.
+                let error_msg = e.without_url().to_string();
 
                 let _ = self
                     .repo

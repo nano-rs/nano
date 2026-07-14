@@ -110,15 +110,22 @@ pub async fn get_system_overview(
         0.0
     };
 
+    // F-33: scope the headline alert counts to the caller's effective source
+    // deny set — an unscoped COUNT(*) here leaked existence/volume of
+    // restricted-source alerts on the dashboard tiles.
+    let alert_deny = alert_count_deny_vec(&auth);
+
     // Get alert counts
-    let alerts_current = get_alert_count(&state, start_time, now).await?;
+    let alerts_current = get_alert_count(&state, start_time, now, alert_deny.as_ref()).await?;
     let alerts_previous = get_alert_count(
         &state,
         start_time - Duration::hours(hours as i64),
         start_time,
+        alert_deny.as_ref(),
     )
     .await?;
-    let alerts_1h = get_alert_count(&state, now - Duration::hours(1), now).await?;
+    let alerts_1h =
+        get_alert_count(&state, now - Duration::hours(1), now, alert_deny.as_ref()).await?;
 
     let alerts_trend = if alerts_previous > 0 {
         ((alerts_current as f64 - alerts_previous as f64) / alerts_previous as f64) * 100.0
@@ -129,11 +136,13 @@ pub async fn get_system_overview(
     };
 
     // Get critical alert counts
-    let critical_alerts_current = get_critical_alert_count(&state, start_time, now).await?;
+    let critical_alerts_current =
+        get_critical_alert_count(&state, start_time, now, alert_deny.as_ref()).await?;
     let critical_alerts_previous = get_critical_alert_count(
         &state,
         start_time - Duration::hours(hours as i64),
         start_time,
+        alert_deny.as_ref(),
     )
     .await?;
 
@@ -264,21 +273,58 @@ async fn get_event_count_clickhouse(
     Ok(count as i64)
 }
 
+/// F-33: normalize the caller's EFFECTIVE per-source deny set (per-source RBAC
+/// deny set unioned with `audit` unless the caller holds `audit:view`) into the
+/// `Option<Vec<String>>` the overview count queries bind. `None` (unrestricted
+/// caller with `audit:view`) keeps the emitted SQL byte-identical to the
+/// pre-scoping form. Mirrors the composition `/api/alerts/counts` performs so
+/// the dashboard's headline alert tiles can't count restricted-source alerts a
+/// denied viewer must never see.
+fn alert_count_deny_vec(auth: &AuthContext) -> Option<Vec<String>> {
+    let deny = auth.effective_source_deny_set();
+    if deny.is_empty() {
+        None
+    } else {
+        Some(
+            deny.iter()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        )
+    }
+}
+
 /// Get alert count for a time range
+///
+/// F-33: `deny` carries the caller's normalized effective source deny set; when
+/// present, rows whose `source_types` overlap it are excluded (rows stamped
+/// `'{}'` — non-source-derived observability/risk alerts — stay counted).
 async fn get_alert_count(
     state: &AppState,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
+    deny: Option<&Vec<String>>,
 ) -> Result<i64, ApiError> {
-    let sql = r#"
+    // F-33: append the same per-source deny predicate the alerts handlers use;
+    // omitted entirely for an unrestricted caller so the SQL is unchanged.
+    let scope_sql = if deny.is_some() {
+        " AND ($3::text[] = '{}' OR NOT (source_types && $3::text[]))"
+    } else {
+        ""
+    };
+    let sql = format!(
+        r#"
         SELECT COUNT(*) as count
-        FROM alerts 
-        WHERE created_at >= $1 AND created_at < $2
-    "#;
+        FROM alerts
+        WHERE created_at >= $1 AND created_at < $2{scope_sql}
+    "#
+    );
 
-    let row = sqlx::query(sql)
-        .bind(start)
-        .bind(end)
+    let mut query = sqlx::query(&sql).bind(start).bind(end);
+    if let Some(denied) = deny {
+        query = query.bind(denied);
+    }
+    let row = query
         .fetch_one(&state.pool)
         .await
         .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
@@ -288,20 +334,32 @@ async fn get_alert_count(
 }
 
 /// Get critical alert count for a time range
+///
+/// F-33: `deny` applies the same per-source scope filter as [`get_alert_count`].
 async fn get_critical_alert_count(
     state: &AppState,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
+    deny: Option<&Vec<String>>,
 ) -> Result<i64, ApiError> {
-    let sql = r#"
+    let scope_sql = if deny.is_some() {
+        " AND ($3::text[] = '{}' OR NOT (source_types && $3::text[]))"
+    } else {
+        ""
+    };
+    let sql = format!(
+        r#"
         SELECT COUNT(*) as count
-        FROM alerts 
-        WHERE created_at >= $1 AND created_at < $2 AND severity = 'critical'
-    "#;
+        FROM alerts
+        WHERE created_at >= $1 AND created_at < $2 AND severity = 'critical'{scope_sql}
+    "#
+    );
 
-    let row = sqlx::query(sql)
-        .bind(start)
-        .bind(end)
+    let mut query = sqlx::query(&sql).bind(start).bind(end);
+    if let Some(denied) = deny {
+        query = query.bind(denied);
+    }
+    let row = query
         .fetch_one(&state.pool)
         .await
         .map_err(|e| ApiError::DatabaseError(e.to_string()))?;

@@ -202,6 +202,15 @@ impl ReportRepository {
                 WHERE enabled = true
                   AND next_run_at IS NOT NULL AND next_run_at <= NOW()
                   AND (claimed_by IS NULL OR claimed_at < NOW() - make_interval(secs => $3))
+                  -- F-32: never schedule a run for a definition whose OWNER is
+                  -- no longer active — a disabled user's reports must not keep
+                  -- executing (and producing downloadable artifacts) under the
+                  -- owner's identity.
+                  AND EXISTS (
+                      SELECT 1 FROM users u
+                      WHERE u.id = report_definitions.owner_id
+                        AND u.status = 'active'
+                  )
                 ORDER BY next_run_at ASC
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
@@ -372,6 +381,9 @@ impl ReportRepository {
         result_truncated: bool,
         artifact_truncated: bool,
         artifacts: &[RenderedArtifact],
+        // F-31: source_type manifest of the produced artifacts + completeness.
+        source_types: &[String],
+        source_types_complete: bool,
     ) -> Result<bool, ReportRepositoryError> {
         let mut tx = self.pool.begin().await?;
 
@@ -415,6 +427,8 @@ impl ReportRepository {
                 row_count = $3,
                 truncated = $4,
                 artifact_truncated = $5,
+                source_types = $6,
+                source_types_complete = $7,
                 error = NULL
             WHERE id = $1
             "#,
@@ -424,6 +438,8 @@ impl ReportRepository {
         .bind(row_count)
         .bind(result_truncated)
         .bind(artifact_truncated)
+        .bind(source_types)
+        .bind(source_types_complete)
         .execute(&mut *tx)
         .await?;
 
@@ -549,15 +565,17 @@ impl ReportRepository {
         Ok(rows)
     }
 
-    /// Fetch artifact bytes for download. Returns the artifact and its owning
-    /// definition id (so the handler can enforce ownership).
+    /// Fetch artifact bytes for download. Returns the artifact plus the
+    /// [`ArtifactScope`] of its owning run (definition id + source_type manifest)
+    /// so the handler can enforce BOTH ownership and F-31 source-scope access.
     pub async fn get_artifact_content(
         &self,
         artifact_id: Uuid,
-    ) -> Result<(ReportArtifactContent, Uuid), ReportRepositoryError> {
+    ) -> Result<(ReportArtifactContent, ArtifactScope), ReportRepositoryError> {
         let row = sqlx::query_as::<_, ArtifactContentRow>(
             r#"
-            SELECT a.filename, a.content_type, a.content, r.definition_id
+            SELECT a.filename, a.content_type, a.content,
+                   r.definition_id, r.source_types, r.source_types_complete
             FROM report_run_artifacts a
             JOIN report_runs r ON r.id = a.run_id
             WHERE a.id = $1
@@ -574,7 +592,11 @@ impl ReportRepository {
                 content_type: row.content_type,
                 content: row.content,
             },
-            row.definition_id,
+            ArtifactScope {
+                definition_id: row.definition_id,
+                source_types: row.source_types,
+                source_types_complete: row.source_types_complete,
+            },
         ))
     }
 }
@@ -585,4 +607,8 @@ struct ArtifactContentRow {
     content_type: String,
     content: Vec<u8>,
     definition_id: Uuid,
+    #[sqlx(default)]
+    source_types: Vec<String>,
+    #[sqlx(default)]
+    source_types_complete: bool,
 }

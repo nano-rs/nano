@@ -58,6 +58,7 @@ impl ClickHouseExecutor {
     pub(crate) async fn execute_dynamic_query(
         &self,
         sql: &str,
+        preserve_columns: bool,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
         // Escape ? characters in string literals to prevent clickhouse-rs from
         // interpreting them as parameter placeholders (e.g., in regex patterns)
@@ -143,8 +144,12 @@ impl ClickHouseExecutor {
                     // We need to append 'Z' to indicate UTC
                     convert_timestamps_to_iso8601(obj);
 
-                    // Strip empty/default values to reduce response size
-                    strip_empty_values(obj);
+                    // Strip empty/default values to reduce response size —
+                    // unless the rows are grouped buckets, whose (possibly empty)
+                    // group-by key is their identity (NAN-1848).
+                    if !preserve_columns {
+                        strip_empty_values(obj);
+                    }
                 }
 
                 Some(json)
@@ -235,6 +240,7 @@ impl ClickHouseExecutor {
         &self,
         sql: &str,
         query_id: &str,
+        preserve_columns: bool,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
         let escaped_sql = escape_question_marks_in_strings(sql);
         debug!(
@@ -297,8 +303,12 @@ impl ClickHouseExecutor {
 
                     convert_timestamps_to_iso8601(obj);
 
-                    // Strip empty/default values to reduce response size
-                    strip_empty_values(obj);
+                    // Strip empty/default values to reduce response size.
+                    // A grouped query's columns are its answer, so its (possibly
+                    // empty) group-by key must survive — see NAN-1848.
+                    if !preserve_columns {
+                        strip_empty_values(obj);
+                    }
                 }
 
                 Some(json)
@@ -317,6 +327,7 @@ impl ClickHouseExecutor {
         sql: &str,
         query_id: &str,
         settings: &crate::search::admission::ClickHouseQuerySettings,
+        preserve_columns: bool,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
         let escaped_sql = escape_question_marks_in_strings(sql);
         debug!(
@@ -390,7 +401,11 @@ impl ClickHouseExecutor {
                     flatten_ext_field_in_place(obj);
 
                     convert_timestamps_to_iso8601(obj);
-                    strip_empty_values(obj);
+                    // A grouped query's columns are its answer — an empty
+                    // group-by key pruned away leaves a bare count (NAN-1848).
+                    if !preserve_columns {
+                        strip_empty_values(obj);
+                    }
                 }
 
                 Some(json)
@@ -409,6 +424,7 @@ impl ClickHouseExecutor {
         query_id: &str,
         settings: Option<&crate::search::admission::ClickHouseQuerySettings>,
         limits: &crate::search::SearchExecutionLimits,
+        preserve_columns: bool,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
         let escaped_sql = escape_question_marks_in_strings(sql);
         let mut query = self
@@ -462,7 +478,7 @@ impl ClickHouseExecutor {
         })?;
         let mut results = Vec::new();
         for line in response.lines().filter(|line| !line.is_empty()) {
-            let row = Self::parse_and_postprocess_row(line).ok_or_else(|| {
+            let row = Self::parse_and_postprocess_row(line, !preserve_columns).ok_or_else(|| {
                 SearchError::DatabaseError(sqlx::Error::Protocol(
                     "Invalid JSONEachRow value in bounded ClickHouse response".to_string(),
                 ))
@@ -480,7 +496,17 @@ impl ClickHouseExecutor {
     }
 
     /// Parse a single JSONEachRow line and apply post-processing (shared by streaming path).
-    pub(crate) fn parse_and_postprocess_row(line: &str) -> Option<serde_json::Value> {
+    ///
+    /// `strip_empties` shrinks the payload by dropping empty columns — right for
+    /// a raw event, where most of the 75+ UDM columns are empty. Callers pass
+    /// `false` for a grouped query, whose columns are the answer rather than a
+    /// wide row: an empty group-by key pruned away leaves a bare `{"count": N}`
+    /// that reads as a grand total (NAN-1848). The search service decides, from
+    /// the AST — see `query_produces_grouped_rows`.
+    pub(crate) fn parse_and_postprocess_row(
+        line: &str,
+        strip_empties: bool,
+    ) -> Option<serde_json::Value> {
         let mut json: serde_json::Value = serde_json::from_str(line).ok()?;
 
         if let Some(obj) = json.as_object_mut() {
@@ -500,7 +526,9 @@ impl ClickHouseExecutor {
             flatten_ext_field_in_place(obj);
 
             convert_timestamps_to_iso8601(obj);
-            strip_empty_values(obj);
+            if strip_empties {
+                strip_empty_values(obj);
+            }
         }
 
         Some(json)

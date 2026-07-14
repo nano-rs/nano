@@ -1,0 +1,351 @@
+@import 'tailwindcss';
+/* Radix popover enter/exit animations (`animate-in`, `fade-in-0`, …). The web
+   app imports this too; without it the reused picker snaps rather than fades. */
+@import 'tw-animate-css';
+
+/*
+ * Tailwind only emits the utilities it finds in files it scans, and its scan root
+ * is this app — it has no idea nanosiem-web exists. Every class used ONLY inside
+ * a reused component was therefore never generated, and those components rendered
+ * with no styling at all (a transparent, unsized time picker; invisible keyword
+ * highlights). Nothing errors — the classes just aren't in the stylesheet.
+ *
+ * Name the reused files explicitly rather than scanning all of nanosiem-web, so
+ * the desktop's stylesheet carries only what it actually renders.
+ */
+@source '../../nanosiem-web/src/components/ui/date-time-range-picker.tsx';
+@source '../../nanosiem-web/src/components/ui/timeline-range-slider.tsx';
+@source '../../nanosiem-web/src/components/ui/calendar.tsx';
+@source '../../nanosiem-web/src/components/ui/button.tsx';
+@source '../../nanosiem-web/src/components/ui/input.tsx';
+@source '../../nanosiem-web/src/components/ui/popover.tsx';
+@source '../../nanosiem-web/src/components/search/keyword-highlight.tsx';
+@source '../../nanosiem-web/src/components/layout/nav-icons.tsx';
+
+/*
+ * Design tokens from the nano Desktop handoff. This is deliberately NOT the web
+ * app's shadcn kit: roomier radii, glass surfaces, macOS system font, and the
+ * hot-pink accent variant.
+ *
+ * Everything accent-derived is a color-mix off --color-accent, so switching the
+ * accent (the handoff ships five) is a one-line change.
+ */
+@theme {
+  /* The brand pink under its own name. `--color-accent` is derived from it so
+     that the picker subtree can re-point `accent` (shadcn's hover tint) without
+     dragging the brand colour with it. */
+  --brand: #ff5ca8;
+  --color-accent: var(--brand);
+  /* Ink on top of a filled accent surface. */
+  --color-accent-ink: #08090c;
+  --color-accent-soft: color-mix(in srgb, var(--color-accent) 14%, transparent);
+  --color-accent-fill: color-mix(in srgb, var(--color-accent) 16%, transparent);
+  --color-accent-line: color-mix(in srgb, var(--color-accent) 30%, transparent);
+
+  /* Surfaces */
+  --color-window: rgba(26, 29, 36, 0.9);
+  --color-sidebar: rgba(255, 255, 255, 0.028);
+  --color-panel: rgba(255, 255, 255, 0.022);
+  --color-inset: rgba(0, 0, 0, 0.18);
+  --color-input: rgba(0, 0, 0, 0.28);
+  --color-raised: rgba(255, 255, 255, 0.06);
+  --color-hover: rgba(255, 255, 255, 0.03);
+
+  /* Text */
+  --color-t1: #f2f4f7;
+  --color-t2: rgba(235, 240, 246, 0.72);
+  --color-t3: rgba(235, 240, 246, 0.5);
+  --color-t4: rgba(235, 240, 246, 0.35);
+
+  /* Lines */
+  --color-line: rgba(255, 255, 255, 0.07);
+  --color-line-strong: rgba(255, 255, 255, 0.12);
+
+  /* Semantic */
+  --color-danger: #ff7a76;
+  --color-danger-soft: rgba(255, 122, 118, 0.16);
+  --color-warn: #ffb454;
+  --color-warn-soft: rgba(255, 180, 84, 0.16);
+  --color-info: #7fb8ff;
+  --color-violet: #e8b4f8;
+
+  /* nPL syntax colours. The web app's query-language.ts is reused verbatim and
+     themes against these same --syntax-* names, so only the values differ. */
+  --syntax-field: var(--color-accent);
+  --syntax-udm-field: var(--color-accent);
+  --syntax-keyword: #7fb8ff;
+  --syntax-function: #5ee7f0;
+  --syntax-string: #e8b4f8;
+  --syntax-regex: #e8b4f8;
+  --syntax-number: #ffb454;
+  --syntax-operator: rgba(235, 240, 246, 0.5);
+  --syntax-pipe: rgba(235, 240, 246, 0.6);
+  --syntax-comment: rgba(235, 240, 246, 0.35);
+
+  /*
+   * Compatibility shim for the ONE reused surface: the web app's time-range
+   * picker (`DateTimeRangePicker` + its slider, calendar, popover, button and
+   * input). Reusing it wholesale means the desktop's picker is the same picker —
+   * same gestures, same presets, same behaviour — instead of a lookalike that
+   * drifts.
+   *
+   * It speaks shadcn's colour vocabulary; these map that vocabulary onto the
+   * desktop palette so it renders in our glass-and-pink language without a line
+   * of its code changing.
+   *
+   * This is NOT an invitation to build in shadcn. Everything else in this app
+   * uses the tokens above. If you find yourself reaching for `bg-muted` in new
+   * desktop code, you want `bg-raised`.
+   */
+  --color-background: var(--color-window);
+  --color-foreground: var(--color-t1);
+  --color-card: var(--color-inset);
+  --color-card-foreground: var(--color-t1);
+  --color-popover: rgba(36, 39, 46, 0.96);
+  --color-popover-foreground: var(--color-t1);
+  --color-primary: var(--brand);
+  --color-primary-foreground: var(--color-accent-ink);
+  --color-secondary: var(--color-raised);
+  --color-secondary-foreground: var(--color-t1);
+  --color-muted: var(--color-raised);
+  --color-muted-foreground: var(--color-t3);
+  --color-accent-foreground: var(--color-t1);
+  --color-destructive: var(--color-danger);
+  --color-destructive-foreground: var(--color-t1);
+  --color-border: var(--color-line-strong);
+  --color-input: var(--color-line-strong);
+  --color-ring: var(--color-accent);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', Menlo, monospace;
+
+  --radius-window: 14px;
+  --radius-panel: 10px;
+  --radius-control: 9px;
+  --radius-chip: 20px;
+}
+
+/*
+ * Light appearance follows System Settings (handoff 6a). Utilities compile to
+ * var(--color-*), so redefining the variables re-themes the whole app.
+ */
+@media (prefers-color-scheme: light) {
+  :root {
+    /* The mint accent deepens to #0E9464 in the handoff; this is the same move
+       applied to hot pink, so filled accents carry white ink at AA contrast. */
+    --brand: #c81e6e;
+    --color-accent-ink: #ffffff;
+
+    --color-window: rgba(248, 250, 252, 0.9);
+    --color-sidebar: rgba(255, 255, 255, 0.4);
+    --color-panel: rgba(255, 255, 255, 0.35);
+    --color-inset: rgba(255, 255, 255, 0.5);
+    --color-input: rgba(255, 255, 255, 0.75);
+    --color-raised: rgba(255, 255, 255, 0.6);
+    --color-hover: rgba(20, 30, 40, 0.03);
+
+    --color-t1: #1a2028;
+    --color-t2: rgba(26, 32, 40, 0.8);
+    --color-t3: rgba(26, 32, 40, 0.55);
+    --color-t4: rgba(26, 32, 40, 0.4);
+
+    --color-line: rgba(20, 30, 40, 0.09);
+    --color-line-strong: rgba(20, 30, 40, 0.14);
+
+    --color-danger: #c93f38;
+    --color-danger-soft: rgba(201, 63, 56, 0.12);
+    --color-warn: #b26a00;
+    --color-warn-soft: rgba(178, 106, 0, 0.12);
+
+    --syntax-keyword: #1f6feb;
+    --syntax-function: #0b7285;
+    --syntax-string: #8e44ad;
+    --syntax-regex: #8e44ad;
+    --syntax-number: #b26a00;
+    --syntax-operator: rgba(26, 32, 40, 0.55);
+    --syntax-pipe: rgba(26, 32, 40, 0.65);
+    --syntax-comment: rgba(26, 32, 40, 0.45);
+  }
+}
+
+@layer base {
+  /*
+   * The reused shadcn components write a bare `border` (width only) and rely on
+   * a default border COLOUR being set — the web app does it with
+   * `@layer base { * { @apply border-border } }`. Without it, Tailwind v4 falls
+   * back to `currentColor`, i.e. the near-white text colour: a hard white cage
+   * around the picker that no `--color-border` change can touch, because the
+   * border never referenced that variable.
+   *
+   * Scoped to the reused subtrees (including the portaled popover), and in the
+   * base layer so any explicit `border-*` utility still wins.
+   */
+  .picker-scope *,
+  [data-radix-popper-content-wrapper] * {
+    border-color: var(--color-border);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  /* Transparent so the native macOS vibrancy layer (underWindowBackground,
+     configured in tauri.conf.json) is what actually blurs the desktop behind
+     the window — we are not faking it with backdrop-filter. */
+  body {
+    margin: 0;
+    background: transparent;
+    color: var(--color-t1);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+    cursor: default;
+    user-select: none;
+  }
+
+  input {
+    user-select: text;
+  }
+
+  ::placeholder {
+    color: var(--color-t4);
+  }
+
+  ::-webkit-scrollbar {
+    width: 9px;
+    height: 9px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(140, 150, 165, 0.32);
+    border-radius: 5px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+/*
+ * Autocomplete popup. Global rather than scoped into the CodeMirror theme: the
+ * tooltip is parented to document.body so the query bar's rounded overflow (and
+ * the window's) can't clip it, which also puts it outside the reach of the
+ * editor's theme class.
+ */
+.cm-tooltip.cm-tooltip-autocomplete {
+  z-index: 500;
+  margin-top: 6px;
+  overflow: hidden;
+  border: 1px solid var(--color-line-strong);
+  border-radius: 9px;
+  background: rgba(36, 39, 46, 0.96);
+  backdrop-filter: blur(40px);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.5);
+}
+
+.cm-tooltip.cm-tooltip-autocomplete > ul {
+  max-height: 260px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.cm-tooltip.cm-tooltip-autocomplete > ul > li {
+  padding: 5px 12px;
+  color: var(--color-t2);
+}
+
+.cm-tooltip.cm-tooltip-autocomplete > ul > li[aria-selected] {
+  background: color-mix(in srgb, var(--color-accent) 18%, transparent);
+  color: var(--color-t1);
+}
+
+.cm-completionMatchedText {
+  color: var(--color-accent);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.cm-completionDetail {
+  margin-left: 8px;
+  color: var(--color-t4);
+  font-size: 10.5px;
+  font-style: normal;
+}
+
+.cm-completionIcon {
+  margin-right: 6px;
+  opacity: 0.55;
+}
+
+.cm-tooltip.cm-completionInfo {
+  max-width: 280px;
+  padding: 7px 10px;
+  border: 1px solid var(--color-line-strong);
+  border-radius: 8px;
+  background: rgba(36, 39, 46, 0.96);
+  color: var(--color-t2);
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+}
+
+@media (prefers-color-scheme: light) {
+  .cm-tooltip.cm-tooltip-autocomplete,
+  .cm-tooltip.cm-completionInfo {
+    background: rgba(252, 253, 255, 0.97);
+    box-shadow: 0 18px 44px rgba(20, 30, 40, 0.18);
+  }
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.pulse {
+  animation: pulse 2s infinite;
+}
+
+/*
+ * The reused time-range picker's subtree.
+ *
+ * shadcn's `accent` is a neutral hover/surface tint; ours is the brand pink.
+ * Same name, opposite meaning — left alone, every hover inside the picker would
+ * fill solid pink. Re-point it here only. `primary` still resolves to --brand,
+ * so selected days and Apply keep the brand colour.
+ */
+/*
+ * `[data-radix-popper-content-wrapper]` is not optional here: Radix PORTALS the
+ * popover to document.body, so it is not a descendant of .picker-scope and none
+ * of these variables would reach the thing they are meant to style. The wrapper
+ * is the only handle we get. The picker is the app's only Radix popover, so
+ * targeting it globally is safe.
+ */
+.picker-scope,
+[data-radix-popper-content-wrapper] {
+  /* shadcn's `accent` is a neutral hover tint; ours is the brand pink. Left
+     alone, every hover inside the picker fills solid pink. */
+  --color-accent: rgba(255, 255, 255, 0.07);
+  --color-accent-foreground: var(--color-t1);
+  /* The picker outlines a lot of surfaces (popover, inputs, slider track). At
+     the strong line weight that reads as a hard white cage around it — use the
+     quiet hairline instead. */
+  --color-border: rgba(255, 255, 255, 0.06);
+  --color-input: rgba(255, 255, 255, 0.08);
+}
+
+@media (prefers-color-scheme: light) {
+  .picker-scope,
+  [data-radix-popper-content-wrapper] {
+    --color-accent: rgba(20, 30, 40, 0.05);
+    --color-border: rgba(20, 30, 40, 0.08);
+    --color-input: rgba(20, 30, 40, 0.1);
+  }
+}

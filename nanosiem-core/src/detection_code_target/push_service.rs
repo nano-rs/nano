@@ -48,6 +48,11 @@ pub enum PushError {
     Serialize(#[from] SerializeError),
     #[error("push target has no GitHub token configured")]
     NoToken,
+    // F-38: the composed head branch failed git-ref validation before any
+    // GitHub call, so a malformed ref (e.g. one with a `.lock` path component)
+    // is refused instead of producing a doomed 404/422 mid-flight.
+    #[error("invalid branch ref: {0}")]
+    InvalidBranch(#[from] validation::TargetValidationError),
 }
 
 #[derive(Debug, Error)]
@@ -85,10 +90,15 @@ impl PrExecutionError {
                     GitHubWriteError::NotGitHub(_)
                     | GitHubWriteError::InvalidUrl(_)
                     | GitHubWriteError::BlockedEndpoint(_)
-                    | GitHubWriteError::RemoteConflict(_),
+                    | GitHubWriteError::RemoteConflict(_)
+                    // F-38: a malformed ref persisted in the target row will
+                    // never succeed on retry — surface it to analyst review.
+                    | GitHubWriteError::InvalidRef(_),
                 )
                 | PushError::Serialize(_)
-                | PushError::NoToken,
+                | PushError::NoToken
+                // F-38: same for a composed branch that fails ref validation.
+                | PushError::InvalidBranch(_),
             )
             | Self::InvalidState(_) => false,
         }
@@ -414,16 +424,30 @@ impl DetectionCodePushService {
     }
 
     /// Deterministic idempotency key for a proposal's GitHub side effect.
+    ///
+    /// F-38: validates the FINAL composed head branch as a complete git ref, so
+    /// a `pr_branch_prefix` persisted before per-segment validation existed
+    /// cannot compose a doomed ref (e.g. a `refs/`-qualified or `.lock` branch).
     pub fn branch_for_proposal(
         target: &DetectionCodeTarget,
         rule: &DetectionRule,
         proposal: &TuningProposal,
-    ) -> String {
+    ) -> Result<String, validation::TargetValidationError> {
         Self::branch_for_identity(&target.pr_branch_prefix, &rule.name, proposal.id)
     }
 
-    pub fn branch_for_identity(prefix: &str, rule_name: &str, proposal_id: Uuid) -> String {
-        proposal_branch(prefix, rule_name, proposal_id)
+    pub fn branch_for_identity(
+        prefix: &str,
+        rule_name: &str,
+        proposal_id: Uuid,
+    ) -> Result<String, validation::TargetValidationError> {
+        let branch = proposal_branch(prefix, rule_name, proposal_id);
+        // F-38: validate the composed branch, not just the stored prefix — the
+        // segment validator is the same one the manage endpoint applies, so a
+        // legal prefix always yields a legal branch and a stale/hostile prefix
+        // is rejected here rather than shipped to GitHub as a bad ref.
+        validation::validate_git_ref(&branch)?;
+        Ok(branch)
     }
 
     /// Open a Pull Request in `target`'s repo carrying `proposal`'s tuned query
@@ -438,7 +462,7 @@ impl DetectionCodePushService {
         rule: &DetectionRule,
         proposal: &TuningProposal,
     ) -> Result<OpenedPr, PushError> {
-        let branch = Self::branch_for_proposal(target, rule, proposal);
+        let branch = Self::branch_for_proposal(target, rule, proposal)?;
         self.open_pr_for_proposal_on_branch(target, rule, proposal, &branch)
             .await
     }

@@ -111,17 +111,13 @@ const SEVERITY_COLOR: Record<string, string> = {
   informational: 'bg-muted/40 text-muted-foreground border-border',
 };
 
-/** A readable, secret-safe destination label for the channel list. */
+/** A readable, secret-safe destination label for the channel list.
+ *  F-39: the full URL is never returned — render the non-secret `url_host`. */
 function destinationLabel(w: WebhookConfig): string {
   if (w.channel_type === 'pagerduty') return 'PagerDuty Events API';
-  if (w.channel_type === 'slack' || w.channel_type === 'teams') {
-    try {
-      return new URL(w.url).host;
-    } catch {
-      return w.channel_type;
-    }
-  }
-  return w.url;
+  if (w.url_host) return w.url_host;
+  if (usesUrl(w.channel_type)) return w.has_url ? 'configured' : '—';
+  return CHANNEL_LABEL[w.channel_type];
 }
 
 /** Whether the channel type collects a user-supplied destination URL. */
@@ -219,7 +215,9 @@ function NotificationSettings() {
     setEditing(c);
     setFormType(c.channel_type);
     setFormName(c.name);
-    setFormUrl(usesUrl(c.channel_type) ? c.url : '');
+    // F-39: the destination URL is write-only (never returned). Start blank like
+    // the secret field; blank on save keeps the stored destination.
+    setFormUrl('');
     setFormHeaders([]);
     setFormSecret('');
     setFormSeverityFilter(c.severity_filter || []);
@@ -235,17 +233,22 @@ function NotificationSettings() {
       return;
     }
     if (usesUrl(formType)) {
-      if (!formUrl.trim()) {
+      // F-39: on edit the URL is write-only — blank means "keep the current
+      // destination", so it's only required at create time. Validate format only
+      // when the user actually typed a new value.
+      if (!editing && !formUrl.trim()) {
         toast({ title: 'Validation Error', description: 'A destination URL is required', variant: 'destructive' });
         return;
       }
-      try { new URL(formUrl); } catch {
-        toast({ title: 'Validation Error', description: 'URL must be a valid HTTP or HTTPS URL', variant: 'destructive' });
-        return;
-      }
-      if (!/^https?:\/\//i.test(formUrl)) {
-        toast({ title: 'Validation Error', description: 'URL must start with http:// or https://', variant: 'destructive' });
-        return;
+      if (formUrl.trim()) {
+        try { new URL(formUrl); } catch {
+          toast({ title: 'Validation Error', description: 'URL must be a valid HTTP or HTTPS URL', variant: 'destructive' });
+          return;
+        }
+        if (!/^https?:\/\//i.test(formUrl)) {
+          toast({ title: 'Validation Error', description: 'URL must start with http:// or https://', variant: 'destructive' });
+          return;
+        }
       }
     }
     if (formType === 'pagerduty' && !editing && !formSecret.trim()) {
@@ -281,7 +284,9 @@ function NotificationSettings() {
           rule_filter: ruleFilter,
           enabled: formEnabled,
         };
-        if (usesUrl(formType)) request.url = formUrl;
+        // F-39: only send the URL when the user typed a new one; blank keeps the
+        // stored destination (like the secret field).
+        if (usesUrl(formType) && formUrl.trim()) request.url = formUrl;
         if (formType === 'generic' && formHeaders.length > 0) request.headers = headersMap;
         if (formSecret) request.secret = formSecret;
         await api.webhooks.updateWebhook(editing.id, request);
@@ -680,9 +685,14 @@ function NotificationSettings() {
                 <Input
                   value={formUrl}
                   onChange={e => setFormUrl(e.target.value)}
-                  placeholder={urlPlaceholder(formType)}
+                  placeholder={editing ? '(configured — enter new to replace)' : urlPlaceholder(formType)}
                   className="h-8 text-[12px] font-mono"
                 />
+                {editing && (
+                  <p className="text-[10.5px] text-muted-foreground mt-1">
+                    Leave blank to keep the current destination{editing.url_host ? ` (${editing.url_host})` : ''}.
+                  </p>
+                )}
               </div>
             )}
 

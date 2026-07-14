@@ -184,6 +184,17 @@ pub struct ReportRun {
     /// Artifact metadata (never bytes); populated on run-detail reads.
     #[serde(default)]
     pub artifacts: Vec<ReportArtifactMeta>,
+    /// F-31: DISTINCT `source_type` manifest of this run's artifacts. Internal —
+    /// the download/metadata authorization predicate reads it; never serialized
+    /// (would leak restricted-source names to a scoped viewer).
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub source_types: Vec<String>,
+    /// F-31: whether [`source_types`](Self::source_types) is a complete,
+    /// trustworthy account of the artifact's provenance. Internal (see above).
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub source_types_complete: bool,
 }
 
 /// Database row for a run (no artifacts joined).
@@ -200,6 +211,12 @@ pub struct ReportRunRow {
     pub truncated: bool,
     pub artifact_truncated: bool,
     pub error: Option<String>,
+    /// F-31: source_type manifest columns (migration 252). Default `'{}'` /
+    /// `false` on every pre-feature run (deny-by-default for restricted viewers).
+    #[sqlx(default)]
+    pub source_types: Vec<String>,
+    #[sqlx(default)]
+    pub source_types_complete: bool,
 }
 
 impl From<ReportRunRow> for ReportRun {
@@ -217,8 +234,23 @@ impl From<ReportRunRow> for ReportRun {
             artifact_truncated: row.artifact_truncated,
             error: row.error,
             artifacts: Vec::new(),
+            source_types: row.source_types,
+            source_types_complete: row.source_types_complete,
         }
     }
+}
+
+/// F-31: the download-authorization facts about the run that owns an artifact —
+/// returned alongside the bytes so the handler can apply
+/// [`crate::reports::report_artifact_download_allowed`].
+#[derive(Debug, Clone)]
+pub struct ArtifactScope {
+    /// The definition that owns the artifact's run (for the ownership check).
+    pub definition_id: Uuid,
+    /// The owning run's stored source_type manifest.
+    pub source_types: Vec<String>,
+    /// Whether the manifest is complete/trustworthy.
+    pub source_types_complete: bool,
 }
 
 /// Artifact metadata (excludes the `content` bytea).

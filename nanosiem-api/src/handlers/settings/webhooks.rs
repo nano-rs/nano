@@ -447,23 +447,22 @@ pub async fn update_notification_config(
 ) -> Result<Json<NotificationConfigResponse>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_WEBHOOKS)?;
 
-    // Validate a non-empty base URL is a well-formed http(s) origin before
-    // storing it (a malformed value would silently break every deep link).
-    if let Some(raw) = request.base_url.as_deref() {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            let url = reqwest::Url::parse(trimmed)
-                .map_err(|_| ApiError::BadRequest("base_url must be a valid URL".to_string()))?;
-            if !matches!(url.scheme(), "http" | "https") {
-                return Err(ApiError::BadRequest(
-                    "base_url must use http or https".to_string(),
-                ));
-            }
-        }
-    }
+    // F-40: a non-empty base URL must be a BARE http(s) origin. Reject any
+    // userinfo / path / query / fragment (a value like
+    // `https://nano.example.com@evil.example/phish?next=x#y` parses fine and uses
+    // http(s), but resolves to the attacker host and would build first-party-
+    // looking deep links). Store the reconstructed `scheme://host[:port]` origin,
+    // never the caller's raw string.
+    let base_url_to_store: Option<String> = match request.base_url.as_deref() {
+        Some(raw) if !raw.trim().is_empty() => Some(
+            nanosiem_core::webhooks::service::validate_base_origin(raw.trim())
+                .map_err(ApiError::BadRequest)?,
+        ),
+        _ => None, // null / blank clears the setting (env fallback)
+    };
 
     let repo = nanosiem_core::webhooks::WebhookRepository::new(state.pool.clone());
-    repo.set_notification_base_url(request.base_url.as_deref())
+    repo.set_notification_base_url(base_url_to_store.as_deref())
         .await
         .map_err(|e| ApiError::InternalError(e.to_string()))?;
 

@@ -56,9 +56,11 @@ impl WebhookRepository {
 
     #[instrument(skip(self))]
     pub async fn list(&self) -> Result<Vec<Webhook>, WebhookRepositoryError> {
+        // API read path: builds `WebhookResponse` (url_host + has_url) — it does
+        // NOT need the decrypted delivery URL, so no hydrate here (F-39).
         let webhooks = sqlx::query_as::<_, Webhook>(
             r#"
-            SELECT id, name, url, headers_encrypted, secret_encrypted,
+            SELECT id, name, url, url_encrypted, url_host, headers_encrypted, secret_encrypted,
                    severity_filter, event_types, channel_type, channel_config,
                    rule_filter, enabled, created_at, updated_at
             FROM webhooks
@@ -73,9 +75,9 @@ impl WebhookRepository {
 
     #[instrument(skip(self))]
     pub async fn list_enabled(&self) -> Result<Vec<Webhook>, WebhookRepositoryError> {
-        let webhooks = sqlx::query_as::<_, Webhook>(
+        let mut webhooks = sqlx::query_as::<_, Webhook>(
             r#"
-            SELECT id, name, url, headers_encrypted, secret_encrypted,
+            SELECT id, name, url, url_encrypted, url_host, headers_encrypted, secret_encrypted,
                    severity_filter, event_types, channel_type, channel_config,
                    rule_filter, enabled, created_at, updated_at
             FROM webhooks
@@ -86,14 +88,21 @@ impl WebhookRepository {
         .fetch_all(&self.pool)
         .await?;
 
+        // F-39: delivery read path — hydrate `Webhook.url` from `url_encrypted`
+        // (lazy-encrypting any legacy plaintext row) so `service.rs` delivery is
+        // unchanged and never depends on the plaintext column.
+        for webhook in webhooks.iter_mut() {
+            self.hydrate_delivery_url(webhook).await;
+        }
+
         Ok(webhooks)
     }
 
     #[instrument(skip(self))]
     pub async fn get(&self, id: Uuid) -> Result<Webhook, WebhookRepositoryError> {
-        sqlx::query_as::<_, Webhook>(
+        let mut webhook = sqlx::query_as::<_, Webhook>(
             r#"
-            SELECT id, name, url, headers_encrypted, secret_encrypted,
+            SELECT id, name, url, url_encrypted, url_host, headers_encrypted, secret_encrypted,
                    severity_filter, event_types, channel_type, channel_config,
                    rule_filter, enabled, created_at, updated_at
             FROM webhooks
@@ -103,7 +112,13 @@ impl WebhookRepository {
         .bind(id)
         .fetch_optional(&self.pool)
         .await?
-        .ok_or(WebhookRepositoryError::NotFound(id))
+        .ok_or(WebhookRepositoryError::NotFound(id))?;
+
+        // F-39: `get` backs the single-webhook delivery path (`send_test`), so
+        // hydrate the delivery URL here too. Harmless for the API read path,
+        // which only reads url_host/has_url off the same struct.
+        self.hydrate_delivery_url(&mut webhook).await;
+        Ok(webhook)
     }
 
     #[instrument(skip(self, request))]
@@ -152,17 +167,26 @@ impl WebhookRepository {
             .decoded_rule_filter()
             .map_err(WebhookRepositoryError::SerializationError)?;
 
+        // F-39: store the URL encrypted (bearer credential for Slack/Teams) plus
+        // a non-secret host label. The plaintext `url` column is still written as
+        // a transitional rollback seam (it is NOT NULL, and an older binary reads
+        // it); the API never returns it.
+        let url_encrypted = self.encrypt_string(&request.url)?;
+        let url_host_label = url_host(&request.url);
+
         let webhook = sqlx::query_as::<_, Webhook>(
             r#"
-            INSERT INTO webhooks (name, url, headers_encrypted, secret_encrypted, severity_filter, event_types, channel_type, channel_config, rule_filter, enabled)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            RETURNING id, name, url, headers_encrypted, secret_encrypted,
+            INSERT INTO webhooks (name, url, url_encrypted, url_host, headers_encrypted, secret_encrypted, severity_filter, event_types, channel_type, channel_config, rule_filter, enabled)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            RETURNING id, name, url, url_encrypted, url_host, headers_encrypted, secret_encrypted,
                       severity_filter, event_types, channel_type, channel_config,
                       rule_filter, enabled, created_at, updated_at
             "#
         )
         .bind(&request.name)
         .bind(&request.url)
+        .bind(url_encrypted.as_slice())
+        .bind(url_host_label.as_deref())
         .bind(headers_encrypted.as_deref())
         .bind(secret_encrypted.as_deref())
         .bind(&request.severity_filter)
@@ -217,6 +241,20 @@ impl WebhookRepository {
             other => other,
         };
 
+        // F-39: when the caller supplies a new URL, re-encrypt it and refresh the
+        // display host together; otherwise leave both encrypted-URL columns
+        // untouched. Modeled with a should-update flag like secrets/headers.
+        // (`request.url` = None still means "keep" — the COALESCE on the legacy
+        // plaintext column, and this CASE, both no-op.)
+        let (url_should_update, url_encrypted_value, url_host_value): (
+            bool,
+            Option<Vec<u8>>,
+            Option<String>,
+        ) = match request.url.as_deref() {
+            Some(u) => (true, Some(self.encrypt_string(u)?), url_host(u)),
+            None => (false, None, None),
+        };
+
         // Build dynamic update - use raw SQL to handle optional fields
         let webhook = sqlx::query_as::<_, Webhook>(
             r#"
@@ -233,9 +271,12 @@ impl WebhookRepository {
                 channel_type = COALESCE($11::text, channel_type),
                 channel_config = COALESCE($12::jsonb, channel_config),
                 rule_filter = CASE WHEN $13 THEN $14::uuid[] ELSE rule_filter END,
+                -- F-39: encrypted URL + display host move together with the URL.
+                url_encrypted = CASE WHEN $15 THEN $16::bytea ELSE url_encrypted END,
+                url_host = CASE WHEN $15 THEN $17::text ELSE url_host END,
                 updated_at = NOW()
             WHERE id = $1
-            RETURNING id, name, url, headers_encrypted, secret_encrypted,
+            RETURNING id, name, url, url_encrypted, url_host, headers_encrypted, secret_encrypted,
                       severity_filter, event_types, channel_type, channel_config,
                       rule_filter, enabled, created_at, updated_at
             "#,
@@ -254,6 +295,9 @@ impl WebhookRepository {
         .bind(&request.channel_config) // $12: provider config (None = no change)
         .bind(rule_filter_should_update) // $13: should update rule filter?
         .bind(rule_filter_value.as_deref()) // $14: new rule filter (NULL = clear)
+        .bind(url_should_update) // $15: should update the URL columns?
+        .bind(url_encrypted_value.as_deref()) // $16: new encrypted URL
+        .bind(url_host_value) // $17: new display host
         .fetch_optional(&self.pool)
         .await?
         .ok_or(WebhookRepositoryError::NotFound(id))?;
@@ -332,7 +376,10 @@ impl WebhookRepository {
             .map_err(|e| WebhookRepositoryError::SerializationError(e.to_string()))
     }
 
-    fn encrypt_string(&self, value: &str) -> Result<Vec<u8>, WebhookRepositoryError> {
+    /// Encrypt a string into the `{ciphertext, nonce}` envelope stored in the
+    /// `*_encrypted` BYTEA columns. `pub(crate)` (mirroring the public
+    /// `decrypt_string`) so the encrypt→decrypt round-trip is unit-testable.
+    pub(crate) fn encrypt_string(&self, value: &str) -> Result<Vec<u8>, WebhookRepositoryError> {
         let encrypted = self.encryption.encrypt(value.as_bytes())?;
         let storage = serde_json::json!({
             "ciphertext": encrypted.ciphertext,
@@ -340,6 +387,83 @@ impl WebhookRepository {
         });
         serde_json::to_vec(&storage)
             .map_err(|e| WebhookRepositoryError::SerializationError(e.to_string()))
+    }
+
+    /// F-39: populate a loaded webhook's internal delivery `url` from the
+    /// encrypted column, lazy-encrypting legacy plaintext rows on read.
+    ///
+    /// - `url_encrypted` present → decrypt into `Webhook.url` (authoritative
+    ///   delivery URL). A decrypt failure is logged and leaves the plaintext
+    ///   fallback in place rather than sending to a wrong/empty target.
+    /// - `url_encrypted` NULL but plaintext `url` present (a pre-migration-254
+    ///   row) → encrypt-and-persist it so the next read uses the encrypted
+    ///   column, and keep using the plaintext meanwhile.
+    ///
+    /// Called only on the delivery read paths (`list_enabled` / `get`), never on
+    /// the API `list` path (which needs only `url_host` / `has_url`).
+    async fn hydrate_delivery_url(&self, webhook: &mut Webhook) {
+        // Prefer the encrypted column (authoritative delivery URL). Clone the
+        // small envelope first so the immutable borrow is released before we
+        // mutate `webhook.url`.
+        if let Some(enc) = webhook.url_encrypted.clone().filter(|e| !e.is_empty()) {
+            match self.decrypt_string(&enc) {
+                Ok(url) => webhook.url = url,
+                Err(e) => tracing::error!(
+                    webhook_id = %webhook.id,
+                    "F-39: url_encrypted could not be decrypted, falling back to stored plaintext: {e}"
+                ),
+            }
+            return;
+        }
+
+        // Legacy plaintext row (pre-254): lazy-migrate to the encrypted column
+        // and keep using the plaintext meanwhile.
+        if webhook.url.is_empty() {
+            return;
+        }
+        match self.encrypt_string(&webhook.url) {
+            Ok(enc) => {
+                let host = url_host(&webhook.url);
+                if let Err(e) = self
+                    .persist_lazy_url_encryption(webhook.id, &enc, host.as_deref())
+                    .await
+                {
+                    tracing::warn!(
+                        webhook_id = %webhook.id,
+                        "F-39: lazy URL encryption persist failed: {e}"
+                    );
+                }
+                webhook.url_encrypted = Some(enc);
+                if webhook.url_host.is_none() {
+                    webhook.url_host = host;
+                }
+            }
+            Err(e) => tracing::warn!(
+                webhook_id = %webhook.id,
+                "F-39: lazy URL encryption failed: {e}"
+            ),
+        }
+    }
+
+    /// F-39: persist a lazily-encrypted URL for a legacy plaintext row. Guarded
+    /// by `url_encrypted IS NULL` so a concurrent hydrate can't clobber an
+    /// already-migrated value; idempotent (same plaintext → valid ciphertext).
+    async fn persist_lazy_url_encryption(
+        &self,
+        id: Uuid,
+        url_encrypted: &[u8],
+        url_host: Option<&str>,
+    ) -> Result<(), WebhookRepositoryError> {
+        sqlx::query(
+            "UPDATE webhooks SET url_encrypted = $2, url_host = $3 \
+             WHERE id = $1 AND url_encrypted IS NULL",
+        )
+        .bind(id)
+        .bind(url_encrypted)
+        .bind(url_host)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub fn decrypt_json<T: serde::de::DeserializeOwned>(

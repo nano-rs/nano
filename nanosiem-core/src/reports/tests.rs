@@ -263,3 +263,76 @@ fn dashboard_html_handles_empty_panel() {
     let html = String::from_utf8(bytes).unwrap();
     assert!(html.contains("No data in the window"));
 }
+
+// ==========================================================================
+// F-31: download-authorization predicate (report_artifact_download_allowed)
+// ==========================================================================
+
+mod download_predicate {
+    use crate::reports::report_artifact_download_allowed;
+    use std::collections::BTreeSet;
+
+    fn deny(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+    fn manifest(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn unrestricted_requester_always_allowed() {
+        // Empty deny set → allow regardless of manifest/completeness.
+        assert!(report_artifact_download_allowed(&deny(&[]), &manifest(&["insider_threat"]), true));
+        assert!(report_artifact_download_allowed(&deny(&[]), &manifest(&[]), false));
+    }
+
+    #[test]
+    fn complete_and_disjoint_is_allowed() {
+        // Restricted requester, complete manifest that does NOT overlap → allow.
+        assert!(report_artifact_download_allowed(
+            &deny(&["insider_threat"]),
+            &manifest(&["syslog", "apache"]),
+            true,
+        ));
+    }
+
+    #[test]
+    fn complete_but_overlapping_is_denied() {
+        assert!(!report_artifact_download_allowed(
+            &deny(&["insider_threat"]),
+            &manifest(&["syslog", "insider_threat"]),
+            true,
+        ));
+    }
+
+    #[test]
+    fn incomplete_manifest_denies_every_restricted_requester() {
+        // The pre-feature default ('{}' + complete=false): a restricted requester
+        // is denied even though the manifest is empty (bytes may contain anything).
+        assert!(!report_artifact_download_allowed(&deny(&["insider_threat"]), &manifest(&[]), false));
+        // Even a non-overlapping incomplete manifest denies.
+        assert!(!report_artifact_download_allowed(
+            &deny(&["insider_threat"]),
+            &manifest(&["syslog"]),
+            false,
+        ));
+    }
+
+    #[test]
+    fn manifest_is_normalized_before_disjointness() {
+        // Deny sets are normalized lowercase; the stored manifest is normalized
+        // here too, so mixed-case / whitespace still overlaps.
+        assert!(!report_artifact_download_allowed(
+            &deny(&["insider_threat"]),
+            &manifest(&["  Insider_Threat "]),
+            true,
+        ));
+    }
+
+    #[test]
+    fn complete_empty_manifest_allows_restricted_requester() {
+        // A COMPLETE empty manifest means a genuinely empty artifact (0 rows) —
+        // nothing to protect, so even a restricted requester may download.
+        assert!(report_artifact_download_allowed(&deny(&["insider_threat"]), &manifest(&[]), true));
+    }
+}

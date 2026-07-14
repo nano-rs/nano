@@ -44,6 +44,11 @@ pub enum GitHubWriteError {
 
     #[error("Existing GitHub state conflicts with this PR operation: {0}")]
     RemoteConflict(String),
+
+    // F-38: a `base_branch` / composed head branch failed git-ref validation at
+    // execution time (a row persisted before per-segment validation existed).
+    #[error("Invalid git ref: {0}")]
+    InvalidRef(String),
 }
 
 /// The PR that was opened.
@@ -513,6 +518,15 @@ impl GitHubWriteClient {
         base_branch: &str,
         head_branch: &str,
     ) -> Result<String, GitHubWriteError> {
+        // F-38: re-validate both refs at execution time so a target row persisted
+        // before per-segment ref validation existed cannot push a malformed ref
+        // (e.g. a `refs/heads/`-qualified base that double-prefixes into a 404, or
+        // a `.lock` head branch that GitHub 422s). Reuses the boundary validator
+        // — no duplicated logic — and runs before any GitHub round-trip.
+        super::validation::validate_git_ref(base_branch)
+            .map_err(|error| GitHubWriteError::InvalidRef(format!("base branch: {error}")))?;
+        super::validation::validate_git_ref(head_branch)
+            .map_err(|error| GitHubWriteError::InvalidRef(format!("head branch: {error}")))?;
         Self::validate_endpoint(GITHUB_API).await?;
         let (owner, repo) = Self::parse_github_repo(repo_url)?;
         if let Some(sha) = self.get_branch_ref(&owner, &repo, head_branch).await? {

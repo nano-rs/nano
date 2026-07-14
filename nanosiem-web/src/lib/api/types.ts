@@ -6022,7 +6022,14 @@ export type ChannelType = 'generic' | 'slack' | 'teams' | 'pagerduty' | 'email';
 export interface WebhookConfig {
   id: string;
   name: string;
-  url: string;
+  /**
+   * Non-secret display host of the destination (e.g. `hooks.slack.com`). The
+   * full URL is write-only and never returned — for a Slack/Teams incoming
+   * webhook the URL itself is the bearer credential (F-39).
+   */
+  url_host?: string;
+  /** Whether a destination URL is configured (the URL itself is write-only). */
+  has_url: boolean;
   has_headers: boolean;
   has_secret: boolean;
   severity_filter: string[] | null;

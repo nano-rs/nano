@@ -70,6 +70,22 @@ impl ApiKeyRepository {
         Ok(api_key)
     }
 
+    /// F-32: read the `status` of the user who owns an API key, so
+    /// [`crate::auth::ApiKeyService::validate_key`] can reject keys whose owner
+    /// is no longer active. Returns `Ok(None)` when the owner row is gone
+    /// (deleted user) — the caller treats that as "not active" and fails closed.
+    pub async fn owner_status(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<String>, ApiKeyRepositoryError> {
+        let status: Option<String> =
+            sqlx::query_scalar::<_, String>("SELECT status FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(status)
+    }
+
     /// Get an API key by its hash
     pub async fn get_key_by_hash(&self, key_hash: &str) -> Result<ApiKey, ApiKeyRepositoryError> {
         let api_key = sqlx::query_as::<_, ApiKey>("SELECT * FROM api_keys WHERE key_hash = $1")
