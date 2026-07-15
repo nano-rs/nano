@@ -496,7 +496,8 @@ fn gate_command(command: &Command, deny_set: &BTreeSet<String>) -> Command {
         | Command::Service { .. }
         | Command::Trace { .. }
         | Command::Metric { .. }
-        | Command::Retro { .. } => {}
+        | Command::Retro { .. }
+        | Command::Baseline { .. } => {}
     }
     gated
 }

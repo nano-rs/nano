@@ -183,7 +183,8 @@ fn risk_in_command(command: &Command) -> bool {
         | Command::Service { .. }
         | Command::Trace { .. }
         | Command::Metric { .. }
-        | Command::Retro { .. } => false,
+        | Command::Retro { .. }
+        | Command::Baseline { .. } => false,
     }
 }
 

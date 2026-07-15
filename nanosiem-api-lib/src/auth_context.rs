@@ -115,6 +115,12 @@ impl AuthContext {
     ///
     /// An unrestricted caller with `audit:view` yields an EMPTY deny set,
     /// keeping downstream SQL byte-identical to the pre-scoping form.
+    ///
+    /// The ADMIN / full-visibility bypass (NAN-1841, `source_scopes:view_all`) is
+    /// applied UPSTREAM in `SourceScopeResolver::resolve`, so a bypass caller
+    /// already arrives with an empty `denied_sources`. The `audit` gate here is
+    /// intentionally SEPARATE: it stays keyed on `audit:view` (which the Admin
+    /// role also holds), so it is not weakened by the source-scope bypass.
     pub fn effective_source_deny_set(&self) -> std::collections::BTreeSet<String> {
         let mut deny = self.denied_sources.deny_set().clone();
         if !self.has_permission(nanosiem_core::auth::permissions::AUDIT_VIEW) {

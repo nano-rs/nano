@@ -738,6 +738,12 @@ fn collect_fields_from_command(
             // Need all fields for facets, events, and resource analysis
             *needs_all = true;
         }
+        Command::Baseline { .. } => {
+            // Baseline (NAN-1868) re-queries ClickHouse in post-processing
+            // (build_baseline_view); the throwaway initial fetch just needs the
+            // entity-bearing columns, so keep the wide projection available.
+            *needs_all = true;
+        }
         Command::Lateral { .. } => {
             // Lateral command re-queries ClickHouse in post-processing for movement tracing
             *needs_all = true;

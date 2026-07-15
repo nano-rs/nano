@@ -321,11 +321,12 @@ async fn resolve_denied_sources(
     auth_state: &AuthState,
     user_id: Uuid,
     roles: &[String],
+    permissions: &[String],
 ) -> Result<nanosiem_core::auth::ScopeSet, Response> {
     let Some(resolver) = auth_state.source_scope_resolver.as_ref() else {
         return Ok(nanosiem_core::auth::ScopeSet::default());
     };
-    match resolver.resolve(user_id, roles).await {
+    match resolver.resolve(user_id, roles, permissions).await {
         Ok(scope) => Ok(scope),
         Err(e) => {
             tracing::error!(
@@ -458,11 +459,17 @@ pub async fn auth_middleware(
                     claims.permissions = resolver.resolve_with_roles(claims.sub, &claims.roles).await;
                 }
                 // Resolve the per-user source-scope deny set (fail closed → 503).
-                let denied_sources =
-                    match resolve_denied_sources(&auth_state, claims.sub, &claims.roles).await {
-                        Ok(scope) => scope,
-                        Err(response) => return Err(response),
-                    };
+                let denied_sources = match resolve_denied_sources(
+                    &auth_state,
+                    claims.sub,
+                    &claims.roles,
+                    &claims.permissions,
+                )
+                .await
+                {
+                    Ok(scope) => scope,
+                    Err(response) => return Err(response),
+                };
                 let mut auth_context = AuthContext::from_jwt(claims.clone());
                 auth_context.denied_sources = denied_sources;
                 request.extensions_mut().insert(auth_context);
@@ -489,10 +496,14 @@ pub async fn auth_middleware(
                     // NOTE: the API-key principal's `sub` is the KEY id (not the
                     // owner), so it resolves to empty groups => deny-all-restricted.
                     // That fail-closed default for API keys is intended — keep it.
+                    // A key that itself carries `source_scopes:view_all` bypasses
+                    // (NAN-1841): the bypass is a POSITIVE permission check on the
+                    // key's own permission set, applied inside `resolve`.
                     let denied_sources = match resolve_denied_sources(
                         &auth_state,
                         auth_context.claims.sub,
                         &auth_context.claims.roles,
+                        &auth_context.claims.permissions,
                     )
                     .await
                     {

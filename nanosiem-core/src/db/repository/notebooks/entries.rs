@@ -34,6 +34,7 @@ impl NotebookRepository {
             crate::models::notebook::NotebookEntryType::AiSuggestion => "ai_suggestion",
             crate::models::notebook::NotebookEntryType::AiSummary => "ai_summary",
             crate::models::notebook::NotebookEntryType::EntityReference => "entity_reference",
+            crate::models::notebook::NotebookEntryType::EntityBaseline => "entity_baseline",
             crate::models::notebook::NotebookEntryType::IocMarker => "ioc_marker",
             crate::models::notebook::NotebookEntryType::TimelineMarker => "timeline_marker",
             crate::models::notebook::NotebookEntryType::LinkedAlert => "linked_alert",

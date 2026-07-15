@@ -9,7 +9,7 @@ pub mod query_manipulation;
 // Re-export commonly used items
 pub use command_extraction::{
     check_prevalence_pushdown_eligible, classify_query_cost, detect_oom_risk, extract_ai_command,
-    extract_asset_command,
+    extract_asset_command, extract_baseline_command, resolve_baseline_entity, BaselineCommandInfo,
     extract_asset_identifier_from_query, extract_base_query, extract_cloud_command,
     extract_inputlookup_commands, extract_lateral_command, extract_lookup_commands,
     extract_post_ai_commands, extract_post_inputlookup_commands, extract_post_lateral_commands,

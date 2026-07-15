@@ -131,6 +131,9 @@ impl SearchService {
         let ai_command = extract_ai_command(&query);
         let lateral_command = extract_lateral_command(&query);
         let funnel_command = extract_funnel_command(&query);
+        // NAN-1868: `| baseline` re-queries in post-processing like asset/cloud —
+        // must route through the buffered path or it streams the throwaway fetch.
+        let baseline_command = extract_baseline_command(&query);
 
         // Command-page directives (NAN-1560) short-circuit to a synthetic marker
         // in core_search — force them onto the non-streaming (buffered) path.
@@ -148,6 +151,7 @@ impl SearchService {
             ai_command.is_some(),
             lateral_command.is_some(),
             funnel_command.is_some(),
+            baseline_command.is_some(),
             is_command_page,
         )
             // NAN-1798 P2: the risk dataset is a derived entity grain whose

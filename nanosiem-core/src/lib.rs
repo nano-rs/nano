@@ -28,6 +28,7 @@
 pub mod airgap;
 pub mod audit;
 pub mod auth;
+pub mod baseline;
 pub(crate) mod config_safety;
 pub mod crypto;
 pub mod db;

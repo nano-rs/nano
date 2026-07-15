@@ -1139,6 +1139,68 @@ fn extract_eq_field_value(
     }
 }
 
+/// Extracted `| baseline` command params (NAN-1868).
+#[derive(Debug, Clone)]
+pub struct BaselineCommandInfo {
+    /// Explicit entity type (`host`|`user`|`ip`), or `None` to infer.
+    pub entity_type: Option<String>,
+    /// Explicit entity value, or `None` to infer from the search filter.
+    pub entity_value: Option<String>,
+    /// New-to-entity lookback window before the search range.
+    pub window: std::time::Duration,
+    /// Dimension fields to scan (`None` = all dimensions for the entity type).
+    pub dims: Option<Vec<String>>,
+}
+
+/// Extract the `| baseline` command from a parsed query (one per query).
+pub fn extract_baseline_command(query: &Query) -> Option<BaselineCommandInfo> {
+    match query {
+        Query::Search(_) => None,
+        Query::Piped { source, command } => {
+            if let Some(info) = extract_baseline_command(source) {
+                return Some(info);
+            }
+            if let Command::Baseline {
+                entity_type,
+                entity_value,
+                window,
+                dims,
+            } = command
+            {
+                return Some(BaselineCommandInfo {
+                    entity_type: entity_type.clone(),
+                    entity_value: entity_value.clone(),
+                    window: *window,
+                    dims: dims.clone(),
+                });
+            }
+            None
+        }
+    }
+}
+
+/// Resolve `(entity_type, value)` for a baseline command: explicit args win,
+/// otherwise infer from a leading equality filter — `src_host`/`dest_host` → host,
+/// `src_ip`/`dest_ip` → ip, `user`/`src_user`/`dest_user` → user (`| asset`'s
+/// literal-entity detection). Returns `None` when nothing baselineable is present.
+pub fn resolve_baseline_entity(
+    query: &Query,
+    info: &BaselineCommandInfo,
+) -> Option<(String, String)> {
+    if let (Some(t), Some(v)) = (&info.entity_type, &info.entity_value) {
+        return Some((t.clone(), v.clone()));
+    }
+    let expr = get_root_search_expr(query)?;
+    let (field, value) = extract_eq_field_value(expr, None)?;
+    let entity_type = match field.as_str() {
+        "src_host" | "dest_host" => "host",
+        "src_ip" | "dest_ip" => "ip",
+        "user" | "src_user" | "dest_user" => "user",
+        _ => return None,
+    };
+    Some((entity_type.to_string(), value))
+}
+
 /// Threshold at which a time range alone is considered heavy enough to warrant
 /// the slow lane. Picked to match the existing "wide range" intuition — most
 /// dashboards default to 24h or 7d, anything beyond that scans many partitions
@@ -1240,6 +1302,7 @@ pub enum PanelBlockedCommand {
     Ai,
     Lateral,
     Funnel,
+    Baseline,
 }
 
 impl PanelBlockedCommand {
@@ -1252,6 +1315,7 @@ impl PanelBlockedCommand {
             Self::Ai => "ai",
             Self::Lateral => "lateral",
             Self::Funnel => "funnel",
+            Self::Baseline => "baseline",
         }
     }
 
@@ -1264,6 +1328,7 @@ impl PanelBlockedCommand {
             Self::Ai => "AI inline classification isn't supported in dashboards",
             Self::Lateral => "use the lateral-movement graph from the search page",
             Self::Funnel => "use the funnel view from the search page",
+            Self::Baseline => "run `| baseline` from the search page, not a dashboard panel",
         }
     }
 }
@@ -1295,6 +1360,12 @@ pub fn validate_panel_query_commands(query: &Query) -> Result<(), PanelBlockedCo
     }
     if extract_funnel_command(query).is_some() {
         return Err(PanelBlockedCommand::Funnel);
+    }
+    // NAN-1868: baseline is a surface-bound view-builder like asset/cloud/lateral —
+    // it re-queries in post-processing and emits a custom row shape, so it doesn't
+    // render in a generic panel.
+    if extract_baseline_command(query).is_some() {
+        return Err(PanelBlockedCommand::Baseline);
     }
     Ok(())
 }
@@ -1982,6 +2053,10 @@ mod tests {
             (
                 "* | funnel by user window=1h step1=(action=\"login\") step2=(action=\"file_access\")",
                 PanelBlockedCommand::Funnel,
+            ),
+            (
+                "src_host=\"ws-1\" | baseline",
+                PanelBlockedCommand::Baseline,
             ),
         ];
         for (query_str, want) in &cases {

@@ -680,6 +680,26 @@ impl PrettyPrint for Command {
                 RetroAxis::Indicator => "retro".to_string(),
                 other => format!("retro by {}", other.as_str()),
             },
+            // NAN-1868: `baseline [host=|user=|ip="X"] [window=Nd] [dims=a,b]`.
+            Command::Baseline {
+                entity_type,
+                entity_value,
+                window,
+                dims,
+            } => {
+                let mut parts = vec!["baseline".to_string()];
+                if let (Some(t), Some(v)) = (entity_type, entity_value) {
+                    parts.push(format!("{}=\"{}\"", t, v));
+                }
+                let default_window = std::time::Duration::from_secs(7 * 24 * 3600);
+                if *window != default_window {
+                    parts.push(format!("window={}", format_duration(*window)));
+                }
+                if let Some(d) = dims {
+                    parts.push(format!("dims={}", d.join(",")));
+                }
+                parts.join(" ")
+            }
         }
     }
 }

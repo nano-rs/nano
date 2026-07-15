@@ -38,7 +38,8 @@ use super::processing::{
 };
 use super::query_processing::{
     apply_auto_sort, detect_oom_risk, extract_ai_command, extract_asset_command,
-    extract_asset_identifier_from_query, extract_base_query, extract_cloud_command,
+    extract_baseline_command, extract_asset_identifier_from_query, extract_base_query,
+    extract_cloud_command,
     extract_inputlookup_commands, extract_lateral_command, extract_lookup_commands,
     extract_post_ai_commands, extract_post_inputlookup_commands, extract_post_lateral_commands,
     extract_funnel_command, extract_post_prevalence_commands, extract_prevalence_commands,
@@ -60,6 +61,8 @@ pub(super) use super::execution;
 pub(super) use super::jobs;
 
 mod asset;
+pub use asset::{DimensionFirst, EntityActivityBucket};
+mod baseline;
 pub mod asset_dossier;
 mod cloud;
 pub mod cloud_dossier;
@@ -125,6 +128,7 @@ fn determine_display_type(query: &Query) -> DisplayType {
         Some(Command::Trace { .. }) => DisplayType::Trace,
         Some(Command::Metric { .. }) => DisplayType::Metric,
         Some(Command::Retro { .. }) => DisplayType::Retro,
+        Some(Command::Baseline { .. }) => DisplayType::Baseline,
         Some(Command::Stats { .. })
         | Some(Command::Chart { .. })
         | Some(Command::EventStats { .. })

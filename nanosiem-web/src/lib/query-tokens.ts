@@ -20,7 +20,7 @@ export const PIPE_COMMANDS = [
   'inputlookup', 'eval', 'dedup', 'uniq', 'output', 'prevalence', 'rex', 'extract', 'regex', 'fields', 'rename', 'top', 'rare',
   'transaction', 'fillnull', 'mvexpand', 'spath', 'append', 'join', 'bin', 'bucket', 'risk', 'sample',
   'reverse', 'anomaly', 'funnel', 'sequence', 'chart', 'format', 'return', 'tree', 'resolve_identity',
-  'asset', 'cloud', 'lateral', 'ai',
+  'asset', 'cloud', 'lateral', 'ai', 'baseline',
 ] as const;
 
 // Command parameters
@@ -32,6 +32,7 @@ export const COMMAND_PARAMS = [
   'principal', 'account', 'provider',
   'prompt', 'max_rows', 'seed', 'maxhops', 'methods',
   'url', 'format', 'key', 'timeout', 'cache_ttl', 'value', 'type', 'sliding',
+  'dims',  // baseline command — comma-separated dimension filter
 ] as const;
 
 // Eval functions (string, math, date, IP, encoding, etc.)

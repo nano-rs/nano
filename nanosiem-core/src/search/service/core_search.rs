@@ -725,6 +725,11 @@ impl SearchService {
         let asset_command = extract_asset_command(&query);
         let is_asset_query = asset_command.is_some();
 
+        // Check if this is a baseline query (NAN-1868). Like asset, the initial
+        // fetch is a throwaway (entity detection); build_baseline_view re-queries.
+        let baseline_command = extract_baseline_command(&query);
+        let is_baseline_query = baseline_command.is_some();
+
         // Check if this is a cloud investigation query
         // Cloud queries re-query ClickHouse for facets, resources, and paginated events
         let cloud_command = extract_cloud_command(&query);
@@ -767,7 +772,7 @@ impl SearchService {
             // Tree visualizations cap at 10k events - more than this makes the tree unusable anyway
             // and causes performance issues with tree building algorithm
             10_000
-        } else if is_asset_query || is_cloud_query || is_lateral_query {
+        } else if is_asset_query || is_cloud_query || is_lateral_query || is_baseline_query {
             // Asset/cloud/lateral initial fetch is only used for identifier detection (first 10 rows).
             // build_*_view re-queries ClickHouse for the actual data.
             10
@@ -803,6 +808,7 @@ impl SearchService {
         let is_raw_event_query = !is_aggregation_query
             && !is_tree_query
             && !is_asset_query
+            && !is_baseline_query
             && !is_cloud_query
             && !is_lateral_query
             && !has_prevalence_filtering;
@@ -1062,6 +1068,7 @@ impl SearchService {
             && crate::search::execution::clickhouse_executor::is_first_page(offset)
             && !is_tree_query
             && !is_asset_query
+            && !is_baseline_query
             && display_type_renders_timeline(display_type)
         {
             let search_service = self.clone();
@@ -1113,6 +1120,7 @@ impl SearchService {
             && !is_aggregation_query
             && !is_tree_query
             && !is_asset_query
+            && !is_baseline_query
             && !request.skip_field_stats
             && request_dataset != crate::query::Dataset::Risk
             && self.ch_sql_generator.pipeline_output_is_wide(&query_for_sql);
@@ -1372,6 +1380,27 @@ impl SearchService {
             tracing::debug!("After asset view building: {} results", results.len());
         }
 
+        // Build baseline view if this is a baseline query (NAN-1868). The entity
+        // is explicit (`host=…`) or inferred from the leading filter
+        // (`src_host="X" | baseline`); the initial `results` fetch is discarded.
+        if let Some(ref baseline_info) = baseline_command {
+            let entity = crate::search::query_processing::resolve_baseline_entity(
+                &query,
+                baseline_info,
+            )
+            .ok_or_else(|| {
+                SearchError::SqlValidationError(
+                    "| baseline could not determine the entity — add host=/user=/ip=\"…\" or a \
+                     src_host / src_ip / user filter to the search."
+                        .to_string(),
+                )
+            })?;
+            results = self
+                .build_baseline_view(baseline_info, entity, &time_range, scope)
+                .await?;
+            tracing::debug!("After baseline view building: {} results", results.len());
+        }
+
         // Build cloud investigation view if this is a cloud query
         if let Some(ref cloud_info) = cloud_command {
             tracing::debug!(
@@ -1485,6 +1514,7 @@ impl SearchService {
         let fields = if request.skip_field_stats
             || is_tree_query
             || is_asset_query
+            || is_baseline_query
             || is_cloud_query
             || is_lateral_query
         {

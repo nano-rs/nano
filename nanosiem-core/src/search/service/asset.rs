@@ -1829,6 +1829,417 @@ impl SearchService {
             _ => s("message").or_else(|| s("action")).unwrap_or("Event").to_string(),
         }
     }
+
+    /// Hourly activity for one entity from `entity_time_range_agg` (NAN-1864).
+    ///
+    /// This is the cheap path that makes entity baselining viable at scale. The
+    /// raw `logs` table is `ORDER BY (source_type, timestamp, src_host, …)`, so a
+    /// per-entity query over it is a time-range SCAN — measured on a 2B-row Saturn
+    /// tenant, a single 30-day baseline query for an ordinary workstation read
+    /// 5.5 GiB in 32s, because the entity value is the third sort key and prunes
+    /// nothing across time. `entity_time_range_agg` is `ORDER BY (entity_type,
+    /// entity_value, time_bucket)`, so the same window is a keyed lookup: ~2.5 MiB
+    /// in tens of milliseconds. The shadow investigator derives an entity's
+    /// coverage, hour-of-day rhythm, and volume distribution from these buckets
+    /// instead of scanning raw logs for them.
+    ///
+    /// `entity_type` is the BASELINE type (`host` / `ip` / `user`); it is mapped
+    /// to the agg's own vocabulary (`src_host` / `src_ip` / `user`) here. Returns
+    /// buckets in ascending time order, or an empty vec when the entity has no
+    /// history in the window (which the caller MUST treat as "unknown", never as
+    /// "clean" — see `baseline::BaselineCoverage`). Unsupported entity types and a
+    /// missing ClickHouse client both yield an empty vec.
+    ///
+    /// `entity_value` is bound (it originates in log data); the timestamps and the
+    /// mapped `entity_type` literal are our own and are inlined. The mapped type
+    /// is matched exactly so the `(entity_type, entity_value)` sort-key prefix
+    /// prunes — wrapping either side in `lower()` would defeat that and turn the
+    /// lookup back into the scan this method exists to avoid.
+    pub async fn entity_activity_buckets(
+        &self,
+        entity_type: &str,
+        entity_value: &str,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<EntityActivityBucket>, SearchError> {
+        let agg_entity_type = match entity_type {
+            "host" => "src_host",
+            "ip" => "src_ip",
+            "user" => "user",
+            // Artifacts (hash/domain/file) are not keyed in this table; the
+            // artifact-prevalence stack covers them. Nothing to look up.
+            _ => return Ok(Vec::new()),
+        };
+
+        // Match the agg's stored casing exactly — the lookup is an EQUALITY bind
+        // (so the sort-key prefix prunes), not a case-insensitive `lower()`
+        // compare. ALL THREE entity branches of `entity_time_range_agg` populate
+        // `entity_value` through `lower(...)`: `lower(src_host)`, `lower(src_ip)`,
+        // and `lower(user)` / `lower(user_unified)` (clickhouse/init.sql:1574-1609,
+        // 128_entity_mv_split_and_ocsf_aggregation_mvs.sql). So a value extracted
+        // with any other casing — `WS-FIN-001`, `Administrator`, `CORP\JSmith` —
+        // must be lowered here or it silently misses its own lowercase row and the
+        // entity is falsely reported as having NO history (a heavily-active
+        // privileged account reads as dark). Verified on Saturn: 0 mixed-case rows
+        // across all three entity types.
+        let normalized_value = entity_value.to_lowercase();
+
+        let clickhouse = match &self.ch_client {
+            Some(ch) => ch,
+            None => return Ok(Vec::new()),
+        };
+
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct BucketRow {
+            hour_start: String,
+            event_count: u64,
+        }
+
+        // Timestamps are ours → inlined as DateTime64 literals so the comparison
+        // stays on the `time_bucket` sort key and prunes. `entity_value` is
+        // log-derived → bound.
+        let sql = format!(
+            "SELECT \
+                formatDateTime(toStartOfHour(time_bucket), '%Y-%m-%dT%H:%i:%sZ') AS hour_start, \
+                toUInt64(sum(event_count)) AS event_count \
+             FROM {tbl} \
+             WHERE entity_type = '{etype}' \
+               AND entity_value = ? \
+               AND time_bucket >= toDateTime64('{start}', 6) \
+               AND time_bucket <  toDateTime64('{end}', 6) \
+             GROUP BY hour_start \
+             ORDER BY hour_start",
+            tbl = self.table_names.read("entity_time_range_agg"),
+            etype = agg_entity_type,
+            start = start.format("%Y-%m-%d %H:%M:%S%.6f"),
+            end = end.format("%Y-%m-%d %H:%M:%S%.6f"),
+        );
+
+        match clickhouse
+            .query(&sql)
+            .bind(&normalized_value)
+            .fetch_all::<BucketRow>()
+            .await
+        {
+            Ok(rows) => Ok(rows
+                .into_iter()
+                .filter_map(|r| {
+                    parse_asset_timestamp(&r.hour_start).map(|hour_start| EntityActivityBucket {
+                        hour_start,
+                        event_count: r.event_count,
+                    })
+                })
+                .collect()),
+            Err(e) => {
+                tracing::warn!(
+                    entity_type = entity_type,
+                    "entity_time_range_agg lookup failed: {}",
+                    e
+                );
+                Err(parse_clickhouse_error(&e.to_string()))
+            }
+        }
+    }
+
+    /// Per-`(dimension, value)` first-seen for one entity over a window, in ONE
+    /// scoped scan of the raw `logs` table (NAN-1864 follow-up).
+    ///
+    /// This replaces N separate per-dimension scans. `logs` has no entity
+    /// pruning, so each per-dimension scan re-read the same ~767 MiB of granules;
+    /// folding the dimensions into a single `ARRAY JOIN` reads those granules
+    /// ONCE and groups every dimension in one pass (`LIMIT n BY dim` keeps each
+    /// dimension's own top-n by first-seen, so the new-value guarantee survives
+    /// per dimension). Measured on Saturn: ~1.1 GiB for three dimensions in one
+    /// scan vs ~2.3 GiB for three separate.
+    ///
+    /// SECURITY (NAN-1801): this bypasses the nPL scope gate, so the caller's
+    /// `ScopeSet` deny-set is ANDed into the WHERE directly via
+    /// [`source_scope_sql_predicate`] — byte-identical to unscoped SQL when the
+    /// deny set is empty. This is the SAME mechanism the asset artifact scans use.
+    ///
+    /// `source_side_only` picks the entity filter: `true` pins the entity to the
+    /// actor (source) side — required for "what did X DO" dimensions so another
+    /// host's actions aren't credited to it (see `baseline::DimScope`); `false`
+    /// is bi-directional. `entity_value` is bound (log-derived); timestamps, the
+    /// resolved columns, and the dimension labels are ours and inlined. Fields the
+    /// active profile does not map are skipped.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn entity_dimension_firsts(
+        &self,
+        scope: &ScopeSet,
+        entity_type: &str,
+        entity_value: &str,
+        source_side_only: bool,
+        dim_udm_fields: &[&str],
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+        per_dim_limit: usize,
+    ) -> Result<Vec<DimensionFirst>, SearchError> {
+        use crate::sql_hygiene::escape_sql_string;
+
+        let clickhouse = match &self.ch_client {
+            Some(ch) => ch,
+            None => return Ok(Vec::new()),
+        };
+        let profile = self.active_profile.as_ref();
+
+        // Entity value is matched case-insensitively (`lower(col) = ?`, mirroring
+        // the nPL path), so bind the lowercased value.
+        let value_lower = entity_value.to_lowercase();
+        // NEW-TO-ENTITY: match the account's whole footprint (not agg-aligned), so
+        // a user's src_user/dest_user activity is not missed.
+        let (entity_pred, entity_binds) = match baseline_entity_predicate(
+            profile,
+            entity_type,
+            &value_lower,
+            source_side_only,
+            false,
+        ) {
+            Some(p) => p,
+            None => return Ok(Vec::new()),
+        };
+
+        // Resolve each dimension field to its physical column; skip unmapped.
+        // `toString(...)` unifies the tuple element type (dest_port is numeric).
+        let tuples: Vec<String> = dim_udm_fields
+            .iter()
+            .filter_map(|f| {
+                profile
+                    .udm_column_sql(f)
+                    .map(|col| format!("('{}', toString({}))", escape_sql_string(f), col))
+            })
+            .collect();
+        if tuples.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let logs_table = self
+            .table_names
+            .read(Self::logs_table_key(profile));
+
+        let scope_pred = source_scope_sql_predicate("source_type", scope.deny_set())
+            .map(|p| format!(" AND {p}"))
+            .unwrap_or_default();
+
+        let sql = format!(
+            "SELECT dim, val, toUInt64(count()) AS cnt, \
+                    formatDateTime(min(timestamp), '%Y-%m-%dT%H:%i:%sZ') AS first_seen \
+             FROM ( \
+               SELECT timestamp, d.1 AS dim, d.2 AS val \
+               FROM {logs_table} \
+               ARRAY JOIN [{tuples}] AS d \
+               WHERE timestamp >= toDateTime64('{start}', 6) \
+                 AND timestamp <  toDateTime64('{end}', 6) \
+                 AND {entity_pred} \
+                 AND lower(source_type) != 'audit'{scope_pred} \
+             ) \
+             WHERE trimBoth(val) != '' AND val != '-' AND val != '0' AND lower(val) != 'null' \
+             GROUP BY dim, val \
+             ORDER BY first_seen DESC \
+             LIMIT {per_dim_limit} BY dim",
+            tuples = tuples.join(", "),
+            start = start.format("%Y-%m-%d %H:%M:%S%.6f"),
+            end = end.format("%Y-%m-%d %H:%M:%S%.6f"),
+        );
+
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct FirstRow {
+            dim: String,
+            val: String,
+            cnt: u64,
+            first_seen: String,
+        }
+
+        let mut query = clickhouse.query(&sql);
+        for b in &entity_binds {
+            query = query.bind(b);
+        }
+        match query.fetch_all::<FirstRow>().await {
+            Ok(rows) => Ok(rows
+                .into_iter()
+                .filter_map(|r| {
+                    parse_asset_timestamp(&r.first_seen).map(|first_seen| DimensionFirst {
+                        dimension: r.dim,
+                        value: r.val,
+                        count: r.cnt,
+                        first_seen,
+                    })
+                })
+                .collect()),
+            Err(e) => {
+                tracing::warn!(entity_type, "entity_dimension_firsts scan failed: {}", e);
+                Err(parse_clickhouse_error(&e.to_string()))
+            }
+        }
+    }
+
+    /// Hourly activity for one entity from a SCOPED scan of raw `logs` — the
+    /// fallback coverage/rhythm/volume source for source-restricted
+    /// investigations, where the agg (`entity_time_range_agg`, no source_type
+    /// column) cannot be scoped and is off-limits (NAN-1864 follow-up).
+    ///
+    /// Deliberately source-side only (`source_side_only=true` semantics baked in
+    /// via the actor predicate) so the counts are comparable to the agg's
+    /// source-keyed distribution and to the agg-aligned incident volume. Scoped
+    /// via [`source_scope_sql_predicate`]. Kept to a SHORT window by the caller —
+    /// a scoped raw hourly scan over 30 days is the multi-GiB cost the agg exists
+    /// to avoid, so restricted tenants get a bounded (7-day) baseline.
+    pub async fn entity_hourly_activity_scoped(
+        &self,
+        scope: &ScopeSet,
+        entity_type: &str,
+        entity_value: &str,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<EntityActivityBucket>, SearchError> {
+        let clickhouse = match &self.ch_client {
+            Some(ch) => ch,
+            None => return Ok(Vec::new()),
+        };
+        let profile = self.active_profile.as_ref();
+        let value_lower = entity_value.to_lowercase();
+        // ACTIVITY/VOLUME: agg-aligned (bare `user`, source-side host/ip) so these
+        // counts are comparable to the incident-volume count and, for the
+        // unrestricted path, to the agg's own source-keyed distribution.
+        let (entity_pred, entity_binds) =
+            match baseline_entity_predicate(profile, entity_type, &value_lower, true, true) {
+                Some(p) => p,
+                None => return Ok(Vec::new()),
+            };
+        let logs_table = self
+            .table_names
+            .read(Self::logs_table_key(profile));
+        let scope_pred = source_scope_sql_predicate("source_type", scope.deny_set())
+            .map(|p| format!(" AND {p}"))
+            .unwrap_or_default();
+
+        let sql = format!(
+            "SELECT formatDateTime(toStartOfHour(timestamp), '%Y-%m-%dT%H:%i:%sZ') AS hour_start, \
+                    toUInt64(count()) AS event_count \
+             FROM {logs_table} \
+             WHERE timestamp >= toDateTime64('{start}', 6) \
+               AND timestamp <  toDateTime64('{end}', 6) \
+               AND {entity_pred} \
+               AND lower(source_type) != 'audit'{scope_pred} \
+             GROUP BY hour_start \
+             ORDER BY hour_start",
+            start = start.format("%Y-%m-%d %H:%M:%S%.6f"),
+            end = end.format("%Y-%m-%d %H:%M:%S%.6f"),
+        );
+
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct BucketRow {
+            hour_start: String,
+            event_count: u64,
+        }
+
+        let mut query = clickhouse.query(&sql);
+        for b in &entity_binds {
+            query = query.bind(b);
+        }
+        match query.fetch_all::<BucketRow>().await {
+            Ok(rows) => Ok(rows
+                .into_iter()
+                .filter_map(|r| {
+                    parse_asset_timestamp(&r.hour_start).map(|hour_start| EntityActivityBucket {
+                        hour_start,
+                        event_count: r.event_count,
+                    })
+                })
+                .collect()),
+            Err(e) => {
+                tracing::warn!(entity_type, "entity_hourly_activity_scoped scan failed: {}", e);
+                Err(parse_clickhouse_error(&e.to_string()))
+            }
+        }
+    }
+}
+
+/// Build the case-insensitive entity WHERE predicate + its binds for the raw
+/// baseline scans, resolving physical columns through the active profile
+/// (NAN-1864). Returns `(predicate, binds)` where each `?` in the predicate is
+/// paired with one bind — `value_lower` repeated per surviving term — or `None`
+/// when no field resolves under this profile. Pass an already-lowercased value;
+/// the compare is `lower(col) = ?`.
+///
+/// `source_side_only` drops the `dest_*` terms so a dimension can be pinned to
+/// the actor side (see `baseline::DimScope`).
+///
+/// `agg_aligned` decides how a `user` entity is matched, and getting it wrong is
+/// a real bug (NAN-1864 review): `entity_time_range_agg`'s user MV and
+/// `baseline::agg_aligned_filter` (the incident-volume count) both key on the
+/// BARE `user` field. So the activity/volume scan must match bare `user` too
+/// (`agg_aligned = true`) or the historical distribution and the incident count
+/// count different event sets and the z-score is biased. The NEW-TO-ENTITY scan,
+/// by contrast, wants the account's whole footprint (`agg_aligned = false` →
+/// `user`/`src_user`/`dest_user`), or a `dest_user`-only account is falsely blind.
+/// `agg_aligned` has no effect on `host`/`ip`, whose source side is already the
+/// bare `src_*` column under `source_side_only`.
+fn baseline_entity_predicate(
+    profile: &dyn crate::schema::SchemaProfile,
+    entity_type: &str,
+    value_lower: &str,
+    source_side_only: bool,
+    agg_aligned: bool,
+) -> Option<(String, Vec<String>)> {
+    let mut fields: Vec<&str> = Vec::new();
+    match entity_type {
+        "host" => {
+            fields.push("src_host");
+            if !source_side_only {
+                fields.push("dest_host");
+            }
+        }
+        "ip" => {
+            fields.push("src_ip");
+            if !source_side_only {
+                fields.push("dest_ip");
+            }
+        }
+        "user" => {
+            fields.push("user");
+            if !agg_aligned {
+                fields.push("src_user");
+                fields.push("dest_user");
+            }
+        }
+        _ => return None,
+    }
+
+    let mut terms: Vec<String> = Vec::new();
+    let mut binds: Vec<String> = Vec::new();
+    for f in fields {
+        if let Some(col) = profile.udm_column_sql(f) {
+            terms.push(format!("lower({col}) = ?"));
+            binds.push(value_lower.to_string());
+        }
+    }
+    if terms.is_empty() {
+        return None;
+    }
+    Some((format!("({})", terms.join(" OR ")), binds))
+}
+
+/// One hourly activity bucket for an entity (NAN-1864). Returned by
+/// [`SearchService::entity_activity_buckets`] (from `entity_time_range_agg`) and
+/// [`SearchService::entity_hourly_activity_scoped`] (from a scoped raw scan);
+/// `event_count` is the summed activity in that clock hour.
+#[derive(Debug, Clone)]
+pub struct EntityActivityBucket {
+    pub hour_start: chrono::DateTime<chrono::Utc>,
+    pub event_count: u64,
+}
+
+/// One `(dimension, value)` first-seen row from
+/// [`SearchService::entity_dimension_firsts`] (NAN-1864). `dimension` echoes the
+/// UDM field name the caller passed; `first_seen` is the entity's earliest
+/// sighting of `value` in that dimension within the scanned window.
+#[derive(Debug, Clone)]
+pub struct DimensionFirst {
+    pub dimension: String,
+    pub value: String,
+    pub count: u64,
+    pub first_seen: chrono::DateTime<chrono::Utc>,
 }
 
 /// Build the WHERE clause shared by the asset events-page and filtered-count
@@ -2091,5 +2502,107 @@ mod nan1300_tests {
         assert_eq!(hosts, vec!["ws-eng-001".to_string()]);
         let (_, _, users) = SearchService::collect_asset_identifiers(&[], "user", "MSanchez", &p);
         assert_eq!(users, vec!["msanchez".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod baseline_predicate_tests {
+    use super::*;
+    use crate::schema::UdmProfile;
+    use std::collections::BTreeSet;
+
+    // The entity-filter guarantees the shadow baseline depends on (NAN-1864),
+    // now that the nPL string builders were removed with the per-dimension path.
+    // Under UDM the physical columns are the UDM names themselves.
+
+    #[test]
+    fn actor_scope_pins_host_and_ip_to_the_source_side() {
+        let p = UdmProfile::new();
+        // A host process/dest dimension MUST match src_host only — a remote host's
+        // tooling must not be credited to (or poison the baseline of) its target.
+        let (pred, binds) = baseline_entity_predicate(&p, "host", "ws-1", true, false).unwrap();
+        assert_eq!(pred, "(lower(src_host) = ?)");
+        assert!(!pred.contains("dest_host"));
+        assert_eq!(binds, vec!["ws-1".to_string()]);
+
+        let (pred, _) = baseline_entity_predicate(&p, "ip", "10.0.0.1", true, false).unwrap();
+        assert_eq!(pred, "(lower(src_ip) = ?)");
+        assert!(!pred.contains("dest_ip"));
+    }
+
+    #[test]
+    fn association_scope_is_bidirectional_for_host_and_ip() {
+        let p = UdmProfile::new();
+        let (pred, binds) = baseline_entity_predicate(&p, "host", "ws-1", false, false).unwrap();
+        assert_eq!(pred, "(lower(src_host) = ? OR lower(dest_host) = ?)");
+        assert_eq!(binds.len(), 2, "one bind per OR term");
+
+        let (pred, _) = baseline_entity_predicate(&p, "ip", "10.0.0.1", false, false).unwrap();
+        assert_eq!(pred, "(lower(src_ip) = ? OR lower(dest_ip) = ?)");
+    }
+
+    #[test]
+    fn new_to_entity_user_matches_all_three_fields() {
+        let p = UdmProfile::new();
+        // `agg_aligned = false` (the new-to-entity scan): match the account's whole
+        // footprint. Omitting dest_user would give a dest_user-only account a false
+        // NoHistory. Direction doesn't matter for a user.
+        for source_side_only in [true, false] {
+            let (pred, binds) =
+                baseline_entity_predicate(&p, "user", "bob", source_side_only, false).unwrap();
+            // `user` is a SQL reserved word, so the profile quotes it.
+            assert_eq!(
+                pred,
+                "(lower(\"user\") = ? OR lower(src_user) = ? OR lower(dest_user) = ?)"
+            );
+            assert_eq!(binds, vec!["bob".to_string(); 3]);
+        }
+    }
+
+    #[test]
+    fn agg_aligned_user_matches_bare_user_only() {
+        let p = UdmProfile::new();
+        // `agg_aligned = true` (the activity/volume scan): match bare `user` only,
+        // so the historical distribution counts the SAME events as the incident
+        // volume (`agg_aligned_filter`, bare `user`) and the agg MV. Matching
+        // src_user/dest_user here would bias the volume z-score (NAN-1864 review).
+        let (pred, binds) = baseline_entity_predicate(&p, "user", "bob", true, true).unwrap();
+        assert_eq!(pred, "(lower(\"user\") = ?)");
+        assert!(!pred.contains("src_user"));
+        assert!(!pred.contains("dest_user"));
+        assert_eq!(binds, vec!["bob".to_string()]);
+    }
+
+    #[test]
+    fn value_is_bound_never_inlined_so_it_cannot_break_out() {
+        let p = UdmProfile::new();
+        // An attacker-shaped value stays a bind — the predicate has only `?`, and
+        // the value rides in the binds vec.
+        // The caller passes an already-lowercased value; the predicate carries
+        // only `?`, and the value rides in the binds vec (parameterized).
+        let evil = "x' or '1'='1";
+        let (pred, binds) = baseline_entity_predicate(&p, "host", evil, true, false).unwrap();
+        assert!(!pred.contains(evil), "value must not be inlined into SQL");
+        assert!(pred.contains('?'));
+        assert_eq!(binds, vec![evil.to_string()]);
+    }
+
+    #[test]
+    fn unsupported_entity_types_yield_no_predicate() {
+        let p = UdmProfile::new();
+        assert!(baseline_entity_predicate(&p, "hash", "abc", true, false).is_none());
+        assert!(baseline_entity_predicate(&p, "domain", "x.com", true, true).is_none());
+    }
+
+    #[test]
+    fn scope_predicate_is_anded_when_the_deny_set_is_nonempty() {
+        // The NAN-1801 gate the scoped scans rely on. Empty deny → no predicate
+        // (byte-identical unscoped SQL); nonempty → an exclusion to AND in.
+        assert!(source_scope_sql_predicate("source_type", &BTreeSet::new()).is_none());
+        let deny: BTreeSet<String> = ["insider_threat".to_string()].into_iter().collect();
+        assert_eq!(
+            source_scope_sql_predicate("source_type", &deny).unwrap(),
+            "lower(source_type) != 'insider_threat'"
+        );
     }
 }

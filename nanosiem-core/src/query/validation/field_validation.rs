@@ -900,6 +900,9 @@ fn validate_command_fields(
         // NAN-1580: retro references no UDM fields directly (its observable
         // expansion targets the base columns).
         | Command::Retro { .. }
+        // NAN-1868: baseline's `dims=`/`entity=` args are validated in its own
+        // executor against the profile, not here.
+        | Command::Baseline { .. }
         | Command::Output { .. } => {
             // These commands don't reference UDM fields directly or are handled in post-processing
         }

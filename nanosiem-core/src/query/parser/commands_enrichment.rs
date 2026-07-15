@@ -567,6 +567,84 @@ pub(super) fn asset_command(input: &str) -> ParseResult<'_, Command> {
     ))
 }
 
+/// Parse baseline command (NAN-1868):
+///   `baseline [host=|user=|ip="value"] [window=7d] [dims=process_name,dest_ip]`
+///
+/// The entity may be given explicitly (`host="X"`) or inferred from the preceding
+/// search filter (`src_host="X" | baseline`, resolved in the executor). Args in
+/// any order; unrecognized tokens end the command.
+pub(super) fn baseline_command(input: &str) -> ParseResult<'_, Command> {
+    let (input, _) = tag_no_case("baseline").parse(input)?;
+    // Must be followed by whitespace, pipe, or end — not `baseline_foo`.
+    if !input.is_empty() && !input.starts_with(|c: char| c.is_whitespace() || c == '|') {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    }
+
+    let mut remaining = input;
+    let mut entity_type: Option<String> = None;
+    let mut entity_value: Option<String> = None;
+    let mut window: Option<Duration> = None;
+    let mut dims: Option<Vec<String>> = None;
+
+    loop {
+        if let Ok((input, _)) = multispace1::<_, nom::error::Error<&str>>(remaining) {
+            remaining = input;
+        } else {
+            break;
+        }
+        if remaining.is_empty() || remaining.starts_with('|') {
+            break;
+        }
+
+        // `host=` / `user=` / `ip=` shorthand sets both the entity type and value.
+        let entity_kw = [("host=", "host"), ("user=", "user"), ("ip=", "ip")]
+            .into_iter()
+            .find_map(|(kw, ty)| {
+                tag_no_case::<_, _, nom::error::Error<&str>>(kw)
+                    .parse(remaining)
+                    .ok()
+                    .map(|(rest, _)| (rest, ty))
+            });
+        if let Some((rest, ty)) = entity_kw {
+            let (rest, val) = alt((quoted_string, unquoted_string)).parse(rest)?;
+            if entity_value.is_none() && !val.is_empty() {
+                entity_type = Some(ty.to_string());
+                entity_value = Some(val.to_string());
+            }
+            remaining = rest;
+        } else if let Ok((input, _)) =
+            tag_no_case::<_, _, nom::error::Error<&str>>("window=").parse(remaining)
+        {
+            let (input, dur) = duration(input)?;
+            window = Some(dur);
+            remaining = input;
+        } else if let Ok((input, _)) =
+            tag_no_case::<_, _, nom::error::Error<&str>>("dims=").parse(remaining)
+        {
+            let (input, fields) = separated_list1(char(','), field_name).parse(input)?;
+            if !fields.is_empty() {
+                dims = Some(fields);
+            }
+            remaining = input;
+        } else {
+            break; // unrecognized token — end of command
+        }
+    }
+
+    Ok((
+        remaining,
+        Command::Baseline {
+            entity_type,
+            entity_value,
+            window: window.unwrap_or(Duration::from_secs(7 * 24 * 3600)), // 7d default
+            dims,
+        },
+    ))
+}
+
 /// Parse cloud command: cloud [by=provider|account|region|service|resource] [show_mfa=true]
 ///                       cloud service          -- positional grouping
 ///                       cloud region           -- positional grouping

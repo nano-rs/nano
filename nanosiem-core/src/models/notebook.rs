@@ -74,6 +74,10 @@ pub enum NotebookEntryType {
     AiSummary,
     // @ command entry types
     EntityReference,
+    /// Per-entity behavioural baseline computed by the shadow investigator
+    /// (NAN-1864) — what is normal for this user/host/ip, and what in the alert
+    /// window is new to them. Admitted by migration 255.
+    EntityBaseline,
     IocMarker,
     TimelineMarker,
     LinkedAlert,

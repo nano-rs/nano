@@ -819,6 +819,9 @@ pub enum DisplayType {
     /// IOC retro-hunt view (`ioc=… | retro`) — summary / list / pivot surface
     /// fetched from the companion `/api/search/retro` endpoint (NAN-1580).
     Retro,
+    /// Entity-baseline view (`… | baseline`) — new-to-entity rows built by
+    /// `build_baseline_view` from the shadow-investigator's primitives (NAN-1868).
+    Baseline,
 }
 
 // ============================================================================

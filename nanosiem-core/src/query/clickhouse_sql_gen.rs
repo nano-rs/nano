@@ -2158,15 +2158,17 @@ impl ClickHouseSqlGenerator {
         // MATERIALIZED columns are excluded from SELECT * so they must be
         // explicitly named in the base CTE for downstream CTEs to reference them.
         let mut materialized_cols: Vec<String> = Vec::new();
-        // Check if downstream commands re-query ClickHouse themselves (asset/tree),
-        // meaning the initial query is only for identifier detection / small sample.
-        // In that case, push ctx.limit into the base CTE to avoid unbounded scans.
+        // Check if downstream commands re-query ClickHouse themselves (asset/tree/
+        // cloud/baseline), meaning the initial query is only for identifier
+        // detection / small sample. In that case, push ctx.limit into the base CTE
+        // to avoid unbounded scans.
         let has_requery_command = stages.iter().any(|s| {
             matches!(
                 s,
                 QueryStage::Command(Command::Asset { .. })
                     | QueryStage::Command(Command::Tree { .. })
                     | QueryStage::Command(Command::Cloud { .. })
+                    | QueryStage::Command(Command::Baseline { .. })
             )
         });
         for stage in stages.iter() {

@@ -31,6 +31,7 @@ use dashmap::DashMap;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use super::permissions::SOURCE_SCOPES_VIEW_ALL;
 use super::scope::ScopeSet;
 
 /// Errors from source-scope resolution.
@@ -134,12 +135,36 @@ impl SourceScopeResolver {
     /// is known (even stale), errors degrade to deny-all-restricted; if it has
     /// never loaded, returns [`SourceScopeError::Unavailable`].
     ///
-    /// Demo users (`demo_analyst` role) are always deny-all-restricted.
+    /// ADMIN / full-visibility bypass (NAN-1841 / F-34): a caller whose
+    /// `permissions` include [`SOURCE_SCOPES_VIEW_ALL`] resolves to an EMPTY
+    /// (unrestricted) deny set — it sees every source. This is a POSITIVE
+    /// permission check on the already-resolved permission set; it short-circuits
+    /// BEFORE any PostgreSQL access, so it neither depends on nor weakens the
+    /// fail-closed paths below for non-bypass callers, and it is never a
+    /// fail-OPEN path (only an explicit grant reaches it). It is applied here —
+    /// the single chokepoint every consumer reads `denied_sources` from — so the
+    /// bypass is consistent across search, alerts, fields, dashboards, detection
+    /// stats, and cases without patching each handler.
+    ///
+    /// Demo users (`demo_analyst` role) are always deny-all-restricted. They are
+    /// granted [`DEMO_PERMISSIONS`](crate::auth::permissions::DEMO_PERMISSIONS),
+    /// which never includes [`SOURCE_SCOPES_VIEW_ALL`], so they can never reach
+    /// the bypass.
     pub async fn resolve(
         &self,
         user_id: Uuid,
         roles: &[String],
+        permissions: &[String],
     ) -> Result<ScopeSet, SourceScopeError> {
+        // ADMIN / full-visibility bypass — POSITIVE permission check, evaluated
+        // FIRST and WITHOUT any PostgreSQL access. An admin is therefore never
+        // locked out by a scope-registry outage, and the fail-closed posture for
+        // everyone else (below) is untouched. Demo users never hold this
+        // permission (see DEMO_PERMISSIONS), so they cannot bypass here.
+        if grants_unrestricted_source_visibility(permissions) {
+            return Ok(ScopeSet::unrestricted());
+        }
+
         // Cross-process: if another process mutated the registry/grants, drop
         // our caches so the change is reflected here within VERSION_CHECK_SECS
         // rather than only at the longer per-cache TTLs (NAN-1807).
@@ -392,6 +417,14 @@ fn normalize_source_type(raw: String) -> String {
     raw.trim().to_lowercase()
 }
 
+/// True if `permissions` grant the ADMIN / full-visibility bypass
+/// ([`SOURCE_SCOPES_VIEW_ALL`]) — the caller sees every source regardless of the
+/// restricted registry. Pure so the bypass decision is unit-testable without a
+/// database, and so it can be asserted to be a POSITIVE check (never fail-open).
+fn grants_unrestricted_source_visibility(permissions: &[String]) -> bool {
+    permissions.iter().any(|p| p == SOURCE_SCOPES_VIEW_ALL)
+}
+
 /// `denied = restricted − granted`, computed in Rust. Pure so it is unit-testable
 /// without a database. Grants for sources that are not (or no longer)
 /// restricted are inert.
@@ -516,5 +549,91 @@ mod tests {
         // must still match a (normalized) restricted entry.
         let restricted = set(&["insider_threat"]);
         assert!(any_in_restricted(&strs(&["  Insider_Threat "]), &restricted));
+    }
+
+    // --- ADMIN / full-visibility bypass (NAN-1841 / F-34) ---------------------
+
+    #[test]
+    fn bypass_permission_grants_unrestricted_visibility() {
+        // (a) A caller holding `source_scopes:view_all` bypasses per-source RBAC.
+        assert!(grants_unrestricted_source_visibility(&strs(&[
+            "search:view",
+            SOURCE_SCOPES_VIEW_ALL,
+            "cases:view",
+        ])));
+    }
+
+    #[test]
+    fn non_bypass_permissions_do_not_grant_visibility() {
+        // (b) A non-bypass caller is unchanged. Notably `source_scopes:manage`
+        // (config administration) does NOT confer data visibility — the bypass
+        // is a distinct, positive grant.
+        assert!(!grants_unrestricted_source_visibility(&strs(&[
+            "search:view",
+            "source_scopes:view",
+            "source_scopes:manage",
+        ])));
+        // No permissions at all => no bypass (fail-closed for the empty set).
+        assert!(!grants_unrestricted_source_visibility(&[]));
+    }
+
+    #[test]
+    fn bypass_yields_empty_deny_set_that_gates_nothing() {
+        // (a)+(c) The bypass resolves to `unrestricted()`: an EMPTY deny set that
+        // is NOT restricted. Downstream, an empty deny set is the byte-identical
+        // "no gate" path (`enforce_source_scope` returns the query verbatim; the
+        // cases F-34 404 block is `!deny.is_empty()`-guarded), so a bypass caller
+        // sees everything and pays no query-rewrite cost — same as a SYSTEM caller.
+        assert!(grants_unrestricted_source_visibility(&strs(&[SOURCE_SCOPES_VIEW_ALL])));
+        let scope = ScopeSet::unrestricted();
+        assert!(!scope.is_restricted());
+        assert!(scope.deny_set().is_empty());
+    }
+
+    /// A pool that can NEVER connect (nothing listens on the TCP discard port).
+    /// Mirrors the fail-closed pool pattern in the integration suite and
+    /// `leader.rs`; used to prove the bypass needs no PG and that non-bypass
+    /// callers still fail closed when PG is unreachable.
+    fn unreachable_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(3))
+            .connect_lazy("postgres://nanosiem:nanosiem@127.0.0.1:9/nanosiem")
+            .expect("build lazy pool")
+    }
+
+    #[tokio::test]
+    async fn resolve_bypasses_without_touching_postgres() {
+        // (a) A bypass caller resolves to an EMPTY deny set even when the registry
+        // and grants could never load — the bypass short-circuits BEFORE any PG
+        // access, so "sources are restricted" and "holds no grant" are moot: the
+        // resolver never even reads them. Proven by a pool that can't connect.
+        let resolver = SourceScopeResolver::new(unreachable_pool());
+        let scope = resolver
+            .resolve(
+                Uuid::now_v7(),
+                &[],
+                &[SOURCE_SCOPES_VIEW_ALL.to_string()],
+            )
+            .await
+            .expect("bypass caller must resolve with no PG access");
+        assert!(!scope.is_restricted(), "bypass caller must be unrestricted");
+        assert!(scope.deny_set().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_fails_closed_for_non_bypass_when_registry_never_loaded() {
+        // (b) A NON-bypass caller is unchanged: with the registry never loaded and
+        // PG unreachable, resolve() must Err(Unavailable) — NEVER an empty
+        // (fail-open) scope. Confirms the bypass is a POSITIVE check, not a
+        // fail-open path that a permission-less caller could ride through.
+        let resolver = SourceScopeResolver::new(unreachable_pool());
+        let err = resolver
+            .resolve(Uuid::now_v7(), &[], &["search:view".to_string()])
+            .await
+            .expect_err("non-bypass caller must fail closed, not return a scope");
+        assert!(
+            matches!(err, SourceScopeError::Unavailable),
+            "non-bypass + never-loaded registry + PG down must be Unavailable, got {err:?}"
+        );
     }
 }

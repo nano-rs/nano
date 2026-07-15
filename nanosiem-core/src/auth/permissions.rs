@@ -180,6 +180,21 @@ pub const DETECTION_CODE_TARGETS_MANAGE: &str = "detection_code_targets:manage";
 // Per-source RBAC scoping permissions (NAN-1797)
 pub const SOURCE_SCOPES_VIEW: &str = "source_scopes:view";
 pub const SOURCE_SCOPES_MANAGE: &str = "source_scopes:manage";
+/// ADMIN / full-visibility bypass for per-source RBAC (NAN-1841 / F-34).
+///
+/// A caller holding this permission sees EVERY `source_type` regardless of the
+/// restricted-source registry — `SourceScopeResolver::resolve` short-circuits to
+/// an empty (unrestricted) deny set for them. Without such a bypass, any source
+/// marked restricted without a matching grant is invisible to EVERYONE, admins
+/// included (a restricted source with no grant is `denied` for all), which made
+/// `GET /api/cases/{id}` 404 for admins on cases whose alerts were all from
+/// denied sources.
+///
+/// DELIBERATELY DISTINCT from [`SOURCE_SCOPES_MANAGE`]: administering the
+/// restriction registry/grants (config control) must not silently also confer
+/// the right to READ every restricted compartment. This is a POSITIVE
+/// data-visibility grant, held by the Admin role only (see migration 255).
+pub const SOURCE_SCOPES_VIEW_ALL: &str = "source_scopes:view_all";
 
 // Parser Repository permissions
 pub const PARSER_REPOSITORIES_VIEW: &str = "parser_repositories:view";
@@ -346,6 +361,7 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     // Per-source RBAC scoping
     SOURCE_SCOPES_VIEW,
     SOURCE_SCOPES_MANAGE,
+    SOURCE_SCOPES_VIEW_ALL,
     // Parser Repositories
     PARSER_REPOSITORIES_VIEW,
     PARSER_REPOSITORIES_MANAGE,

@@ -63,6 +63,7 @@ const CloudOverviewView = lazy(() => import('./cloud-overview').then(m => ({ def
 const CloudPrincipalDossier = lazy(() => import('./cloud-dossier').then(m => ({ default: m.CloudPrincipalDossier })));
 const LateralView = lazy(() => import('./lateral').then(m => ({ default: m.LateralView })));
 const RetroView = lazy(() => import('./retro').then(m => ({ default: m.RetroView })));
+const BaselineView = lazy(() => import('./baseline').then(m => ({ default: m.BaselineView })));
 const StatsView = lazy(() => import('./StatsView').then(m => ({ default: m.StatsView })));
 // Command-page views (NAN-1560) — reuse the curated observability surfaces.
 const ServicePageView = lazy(() => import('./service-page').then(m => ({ default: m.ServicePageView })));
@@ -1449,6 +1450,19 @@ export function SearchResults({
               onSetQuery={onSetQuery}
               onSetQueryWithTime={onSetQueryWithTime}
               onAddToQuery={onAddToQuery}
+            />
+          ) : effectiveDisplayType === 'baseline' || results[0]?.fields?._display_type === 'baseline' ? (
+            // Entity baseline for `… | baseline` (NAN-1868/1873). Unlike the marker
+            // views above, build_baseline_view returns the new-to-entity rows
+            // inline, so BaselineView renders `results` directly (grouped by
+            // dimension, coverage-flagged, with a clean empty state).
+            <BaselineView
+              results={results}
+              query={executedQuery ?? query}
+              onAddToQuery={onAddToQuery}
+              fieldsCollapsed={fieldsCollapsed}
+              fieldsCount={fieldsCount}
+              onExpandFields={onExpandFields}
             />
           ) : effectiveDisplayType === 'services' || results[0]?.fields?._display_type === 'services' ? (
             // Observability services overview for `| services`. Marker row carries

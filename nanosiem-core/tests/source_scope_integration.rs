@@ -106,7 +106,10 @@ async fn grant_to_users_group_unrestricts_a_source() {
     assert_eq!(stored.source_type, source);
 
     // With no grant, the user is denied the restricted source.
-    let scope = resolver.resolve(user, &[]).await.expect("resolve pre-grant");
+    let scope = resolver
+        .resolve(user, &[], &[])
+        .await
+        .expect("resolve pre-grant");
     assert!(
         scope.deny_set().contains(&source),
         "restricted source with no grant must be denied; deny_set = {:?}",
@@ -130,7 +133,10 @@ async fn grant_to_users_group_unrestricts_a_source() {
     // invalidate() (the admin handler does this after every CRUD).
     resolver.invalidate();
 
-    let scope = resolver.resolve(user, &[]).await.expect("resolve post-grant");
+    let scope = resolver
+        .resolve(user, &[], &[])
+        .await
+        .expect("resolve post-grant");
     assert!(
         !scope.deny_set().contains(&source),
         "granting the source to the user's group must un-restrict it; deny_set = {:?}",
@@ -165,7 +171,7 @@ async fn resolver_fails_closed_when_registry_never_loaded_and_pg_down() {
     let resolver = SourceScopeResolver::new(bad);
 
     let err = resolver
-        .resolve(Uuid::now_v7(), &[])
+        .resolve(Uuid::now_v7(), &[], &[])
         .await
         .expect_err("resolve against a down PG must fail closed, not return a scope");
     assert!(
@@ -176,7 +182,7 @@ async fn resolver_fails_closed_when_registry_never_loaded_and_pg_down() {
     // A second call must ALSO fail — the resolver must not have cached a
     // fail-open empty deny-set that would leak on the next request.
     let err2 = resolver
-        .resolve(Uuid::now_v7(), &[])
+        .resolve(Uuid::now_v7(), &[], &[])
         .await
         .expect_err("second resolve must still fail closed (no cached fail-open value)");
     assert!(
@@ -204,7 +210,7 @@ async fn demo_user_is_deny_all_restricted() {
     // The demo user id need not exist — the demo bypass returns
     // deny-all-restricted before any group lookup.
     let scope = resolver
-        .resolve(Uuid::now_v7(), &["demo_analyst".to_string()])
+        .resolve(Uuid::now_v7(), &["demo_analyst".to_string()], &[])
         .await
         .expect("resolve demo user");
     assert!(
@@ -214,6 +220,48 @@ async fn demo_user_is_deny_all_restricted() {
     assert!(
         scope.deny_set().contains(&source),
         "demo user must be denied every restricted source; deny_set = {:?}",
+        scope.deny_set()
+    );
+
+    let _ = repo.remove_restricted(&source).await;
+}
+
+/// (3b) ADMIN / full-visibility bypass (NAN-1841 / F-34): a caller holding
+/// `source_scopes:view_all` resolves to an EMPTY deny set even when a source is
+/// restricted and they hold no grant — the inverse of the ungranted-user case.
+/// Without this, a restricted-without-grant source is denied to everyone, admins
+/// included, which 404'd `GET /api/cases/{id}` for admins.
+#[tokio::test]
+#[ignore = "db-backed; runs in pg-integration CI (cargo test -- --ignored)"]
+async fn view_all_permission_bypasses_restriction() {
+    let pool = common::migrated_pool().await;
+    let repo = SourceScopeRepository::new(pool.clone());
+    let resolver = SourceScopeResolver::new(pool.clone());
+
+    let sfx = suffix();
+    let source = format!("bypass_{sfx}");
+    repo.add_restricted(&source, None, None)
+        .await
+        .expect("register restricted source");
+
+    // Same random (grant-less) user as the ungranted case, but now holding the
+    // bypass permission: the deny set must be empty (sees everything).
+    let scope = resolver
+        .resolve(
+            Uuid::now_v7(),
+            &[],
+            &[nanosiem_core::auth::permissions::SOURCE_SCOPES_VIEW_ALL.to_string()],
+        )
+        .await
+        .expect("resolve bypass user");
+    assert!(
+        !scope.is_restricted(),
+        "bypass user must be unrestricted; deny_set = {:?}",
+        scope.deny_set()
+    );
+    assert!(
+        !scope.deny_set().contains(&source),
+        "bypass user must NOT be denied a restricted source; deny_set = {:?}",
         scope.deny_set()
     );
 
@@ -238,7 +286,7 @@ async fn resolved_scope_injects_source_type_not_in() {
 
     // A user with no grants (random id => no group rows) is denied the source.
     let scope = resolver
-        .resolve(Uuid::now_v7(), &[])
+        .resolve(Uuid::now_v7(), &[], &[])
         .await
         .expect("resolve");
     assert!(

@@ -99,6 +99,9 @@ pub enum StreamingChunk {
 ///   - Lookup enrichment: `| lookup threats ...`
 ///   - Prevalence filtering: `| prevalence host_count < 5`
 ///   - Tree/Asset/Cloud views: `| tree`, `| asset`, `| cloud`
+///   - Baseline view: `| baseline` — `build_baseline_view` discards the initial
+///     fetch and re-queries the entity-keyed agg + a bounded raw scan. Streaming
+///     would deliver the throwaway raw events instead of the baseline rows.
 ///   - Funnel dropper attribution: `| funnel by ...` emits `_droppers_<field>`
 ///     sample arrays that `build_funnel_view` folds into a compact
 ///     `dropper_top_attrs` JSON structure. Streaming would deliver the raw
@@ -118,6 +121,7 @@ pub fn is_query_streamable(
     has_ai: bool,
     has_lateral: bool,
     has_funnel: bool,
+    has_baseline: bool,
     has_command_page: bool,
 ) -> bool {
     // Post-processing stages that require the full result set in Rust
@@ -131,6 +135,7 @@ pub fn is_query_streamable(
         || has_ai
         || has_lateral
         || has_funnel
+        || has_baseline
         || has_command_page
     {
         return false;
@@ -196,6 +201,27 @@ mod tests {
 
     fn utc(y: i32, m: u32, d: u32, h: u32, min: u32, s: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, m, d, h, min, s).unwrap()
+    }
+
+    /// NAN-1868: `| baseline` re-queries in post-processing (`build_baseline_view`
+    /// only runs on the buffered path), so it must NOT stream — otherwise the
+    /// throwaway initial fetch's raw events are delivered instead of the baseline
+    /// rows. Mirrors the asset/cloud/lateral force-buffered contract; this is the
+    /// exact class of bug the `is_command_page_marker` comment records for retro.
+    #[test]
+    fn baseline_flag_forces_buffered_path() {
+        let q = crate::query::parse_query("src_host=\"ws-1\" | baseline").unwrap();
+        // has_baseline=true forces false regardless of every other flag being false.
+        assert!(
+            !is_query_streamable(
+                &q, false, false, false, false, false, false, false, false, false, true, false,
+            ),
+            "| baseline must route to the buffered path"
+        );
+        // Control: a plain non-aggregate query with all flags false IS streamable.
+        assert!(is_query_streamable(
+            &q, false, false, false, false, false, false, false, false, false, false, false,
+        ));
     }
 
     #[test]

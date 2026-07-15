@@ -503,6 +503,26 @@ pub enum Command {
         /// asset|host|ip|entity|account`), or `User` (`by user`).
         axis: RetroAxis,
     },
+    /// baseline command: what is NEW/normal for an entity vs its OWN recent history
+    /// (NAN-1868). Reuses the shadow-investigator's entity-baseline primitives
+    /// (`nanosiem_core::baseline`). The search's TIME RANGE is the current window
+    /// under examination; baseline looks back `window` days BEFORE it (excluding
+    /// it) and reports the values the entity has NOT done in that window, per
+    /// dimension, with a coverage flag.
+    /// Syntax: | baseline [host=|user=|ip="<value>"] [window=7d] [dims=process_name,dest_ip]
+    /// Example: src_host="ws-fin-001" | baseline          -- entity inferred from filter
+    /// Example: | baseline host="ws-fin-001" window=14d
+    Baseline {
+        /// Entity type (`host`|`user`|`ip`) when given explicitly; `None` = infer
+        /// from the search filter (like `| asset`).
+        entity_type: Option<String>,
+        /// Entity value when given explicitly; `None` = infer.
+        entity_value: Option<String>,
+        /// New-to-entity lookback window before the search range (default 7d).
+        window: Duration,
+        /// Dimension fields to scan (`None` = all dimensions for the entity type).
+        dims: Option<Vec<String>>,
+    },
 }
 
 /// Pivot axis for the retro-hunt command (NAN-1580).

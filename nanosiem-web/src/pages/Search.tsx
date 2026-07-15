@@ -4275,7 +4275,7 @@ export function Search() {
             or don't benefit from a histogram (lateral DAG has no per-bucket
             event density to show; cloud overview/dossier ship their own
             activity timeline). */}
-        {!isTreeView && displayType !== 'timechart' && displayType !== 'ranked_bar' && displayType !== 'flow' && displayType !== 'asset' && displayType !== 'cloud' && displayType !== 'lateral' && displayType !== 'services' && displayType !== 'service' && displayType !== 'trace' && displayType !== 'metric' && displayType !== 'retro' && (
+        {!isTreeView && displayType !== 'timechart' && displayType !== 'ranked_bar' && displayType !== 'flow' && displayType !== 'asset' && displayType !== 'cloud' && displayType !== 'lateral' && displayType !== 'services' && displayType !== 'service' && displayType !== 'trace' && displayType !== 'metric' && displayType !== 'retro' && displayType !== 'baseline' && (
         <TimelineVisualization
           timelineData={timelineData}
           eventCount={histogramEventCount}
@@ -4323,7 +4323,7 @@ export function Search() {
             Results header via SearchResults' fieldsCollapsed prop. */}
 
         {/* Mobile Fields button - always visible on mobile when field data available */}
-        {isMobile && fieldsPanelVisible && !isTreeView && displayType !== 'timechart' && displayType !== 'ranked_bar' && displayType !== 'flow' && displayType !== 'cloud' && displayType !== 'lateral' && displayType !== 'services' && displayType !== 'service' && displayType !== 'trace' && displayType !== 'metric' && displayType !== 'retro' && (
+        {isMobile && fieldsPanelVisible && !isTreeView && displayType !== 'timechart' && displayType !== 'ranked_bar' && displayType !== 'flow' && displayType !== 'cloud' && displayType !== 'lateral' && displayType !== 'services' && displayType !== 'service' && displayType !== 'trace' && displayType !== 'metric' && displayType !== 'retro' && displayType !== 'baseline' && (
           <div className="animate-in fade-in slide-in-from-top-1 duration-300 px-4 py-3">
             <button
               onClick={() => setMobileFieldsOpen(true)}
@@ -4364,7 +4364,7 @@ export function Search() {
         {/* Fields panel + Results area - Fields panel hidden for full-width visualizations */}
         {!analyzeActive && (() => {
           const showFieldsPanel = fieldsPanelVisible && !isTreeView &&
-            displayType !== 'timechart' && displayType !== 'ranked_bar' && displayType !== 'flow' && displayType !== 'asset' && displayType !== 'cloud' && displayType !== 'lateral' && displayType !== 'services' && displayType !== 'service' && displayType !== 'trace' && displayType !== 'metric';
+            displayType !== 'timechart' && displayType !== 'ranked_bar' && displayType !== 'flow' && displayType !== 'asset' && displayType !== 'cloud' && displayType !== 'lateral' && displayType !== 'services' && displayType !== 'service' && displayType !== 'trace' && displayType !== 'metric' && displayType !== 'baseline';
           return (
             <div className={`flex w-full min-w-0 ${showFieldsPanel && fieldsPanelExpanded ? 'gap-2.5' : ''}`} style={{ minHeight: 0 }}>
               {/* Fields Panel - hidden on mobile */}

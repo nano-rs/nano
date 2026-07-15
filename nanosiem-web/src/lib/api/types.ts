@@ -214,7 +214,8 @@ export type DisplayType =
   | 'service'     // OTLP service RED drill-in (service command) — reuses ServiceDetail
   | 'trace'       // OTLP distributed-trace waterfall (trace command) — reuses TraceWaterfall
   | 'metric'      // OTLP metrics explorer (metric command) — reuses MetricsExplorer
-  | 'retro';      // IOC retro-hunt view (`ioc=… | retro`, NAN-1580) — reuses RetroView
+  | 'retro'       // IOC retro-hunt view (`ioc=… | retro`, NAN-1580) — reuses RetroView
+  | 'baseline';   // Entity-baseline view (`… | baseline`, NAN-1868) — new-to-entity rows, default table render
 
 // ============================================================================
 // IOC retro-hunt (NAN-1580)
@@ -4689,6 +4690,8 @@ export type NotebookEntryType =
   | 'ai_suggestion'
   | 'ai_summary'
   | 'entity_reference'
+  // Per-entity behavioural baseline written by the shadow investigator (NAN-1864)
+  | 'entity_baseline'
   | 'ioc_marker'
   | 'timeline_marker'
   | 'linked_alert'

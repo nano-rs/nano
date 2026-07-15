@@ -267,11 +267,12 @@ async fn resolve_source_scope(
     auth_state: &AuthState,
     user_id: uuid::Uuid,
     roles: &[String],
+    permissions: &[String],
 ) -> Result<nanosiem_core::auth::ScopeSet, Response> {
     let Some(ref resolver) = auth_state.source_scope_resolver else {
         return Ok(nanosiem_core::auth::ScopeSet::default());
     };
-    match resolver.resolve(user_id, roles).await {
+    match resolver.resolve(user_id, roles, permissions).await {
         Ok(scope) => Ok(scope),
         Err(e) => {
             tracing::error!(
@@ -418,7 +419,9 @@ pub async fn auth_middleware(
                 }
                 // Resolve the caller's source-scope deny set (fail-closed 503).
                 let scope =
-                    match resolve_source_scope(&auth_state, claims.sub, &claims.roles).await {
+                    match resolve_source_scope(&auth_state, claims.sub, &claims.roles, &claims.permissions)
+                        .await
+                    {
                         Ok(scope) => scope,
                         Err(response) => return Err(response),
                     };
@@ -448,7 +451,9 @@ pub async fn auth_middleware(
                     // The api-key subject is the key OWNER's user_id, so grants
                     // resolve the owner's group memberships here (correct).
                     let scope =
-                        match resolve_source_scope(&auth_state, claims.sub, &claims.roles).await {
+                        match resolve_source_scope(&auth_state, claims.sub, &claims.roles, &claims.permissions)
+                        .await
+                    {
                             Ok(scope) => scope,
                             Err(response) => return Err(response),
                         };
@@ -532,7 +537,9 @@ pub async fn auth_middleware(
                 }
                 // Resolve the caller's source-scope deny set (fail-closed 503).
                 let scope =
-                    match resolve_source_scope(&auth_state, claims.sub, &claims.roles).await {
+                    match resolve_source_scope(&auth_state, claims.sub, &claims.roles, &claims.permissions)
+                        .await
+                    {
                         Ok(scope) => scope,
                         Err(response) => return Err(response),
                     };

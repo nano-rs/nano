@@ -1227,6 +1227,12 @@ impl ClickHouseSqlGenerator {
                 // Cloud command: pass through all data, cloud view building happens in post-processing
                 Ok(format!("  SELECT * FROM {}", source))
             }
+            Command::Baseline { .. } => {
+                // Baseline command (NAN-1868): pass through; the initial fetch is
+                // only for entity detection (the literal-entity fast-path skips it
+                // entirely). `build_baseline_view` re-queries in post-processing.
+                Ok(format!("  SELECT * FROM {}", source))
+            }
             Command::Lateral { .. } => {
                 // Lateral command: pass through, lateral movement tracing happens in post-processing
                 Ok(format!("  SELECT * FROM {}", source))
