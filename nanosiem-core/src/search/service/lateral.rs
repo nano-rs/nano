@@ -47,17 +47,21 @@ impl SearchService {
     /// byte-equivalent to the old const (modulo the seam's uniform reserved-word
     /// quoting) and the rows are byte-identical. Fields the schema does not map
     /// (`udm_column_sql` → `None`) are skipped so no unknown column is referenced.
+    ///
+    /// NAN-1892: `source_type` is the one exception. The hop WHERE (auth predicate
+    /// + per-source RBAC gate) references `lower(source_type)` against the
+    /// OPERATIONAL String column ([`LateralPredicateColumns::resolve`], NAN-1887).
+    /// If we project `udm_column_sql("source_type") AS source_type` — which under
+    /// OCSF is `class_uid AS source_type` (a `UInt32`) — ClickHouse binds the WHERE's
+    /// bare `source_type` to that SELECT ALIAS, not the physical column, so
+    /// `lower(class_uid)` errors (Code 43). Resolve it via `column_sql` (the physical
+    /// `resolve()` path → operational `source_type` String) so projection and
+    /// predicate agree on ONE column and the alias no longer shadows a different
+    /// type. This also makes OCSF's lateral output `source_type` the operational
+    /// log-type name (parity with UDM) instead of a bare class number. UDM: both
+    /// resolvers return `source_type`, so byte-identical.
     fn lateral_columns(&self) -> String {
-        let profile = self.active_profile.as_ref();
-        LATERAL_FIELDS
-            .iter()
-            .filter_map(|field| {
-                profile
-                    .udm_column_sql(field)
-                    .map(|col| format!("{col} AS {field}"))
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
+        build_lateral_columns(self.active_profile.as_ref())
     }
 
     /// Build lateral movement view by tracing hop-by-hop movement paths.
@@ -811,7 +815,21 @@ impl LateralPredicateColumns {
             auth_type: profile.udm_column_sql("auth_type"),
             auth_result: profile.udm_column_sql("auth_result"),
             action: profile.udm_column_sql("action"),
-            source_type: req("source_type"),
+            // NAN-1887: `source_type` is consumed ONLY by string ops against the
+            // OPERATIONAL provenance/routing column — the auth predicate's
+            // `lower(source_type) LIKE '%auth%'` and the per-source RBAC deny-set
+            // gate's `lower(source_type) NOT IN (…)` (`resolve()` at line 124). It
+            // must therefore resolve via the profile's field resolution
+            // (`column_sql` → `resolve()`), NOT `udm_column_sql` (the UDM→OCSF
+            // *taxonomy* map). Under OCSF the taxonomy map sends the UDM `source_type`
+            // concept to `class_uid` (a `UInt32`), and `lower(class_uid)` is a
+            // ClickHouse type error (Code 43, Illegal type UInt32 of argument of
+            // function lower) — it broke every `| lateral` run on OCSF, and (latently)
+            // the RBAC gate for any per-source-scoped caller. `resolve("source_type")`
+            // returns the operational String `source_type` column under both UDM and
+            // OCSF; for UDM this is byte-identical to `req` (the default
+            // `udm_column_sql` IS `column_sql`).
+            source_type: profile.column_sql("source_type"),
             process_name: profile.udm_column_sql("process_name"),
         }
     }
@@ -872,8 +890,10 @@ impl LateralPredicateColumns {
         if let Some(ref c) = self.auth_result {
             terms.push(format!("{c} != 0"));
         }
-        // source_type is a String operational column under OCSF too, so the
-        // case-insensitive LIKE is valid here.
+        // NAN-1887: `self.source_type` is the OPERATIONAL String column under OCSF
+        // (`resolve("source_type")`, LowCardinality(String)) — NOT the taxonomy
+        // `class_uid`. The case-insensitive LIKE is a valid secondary signal (some
+        // producers name the source `*_auth`); the primary recall is `category_uid = 3`.
         terms.push(format!("lower({}) LIKE '%auth%'", self.source_type));
         terms.join(" OR ")
     }
@@ -968,6 +988,32 @@ fn build_host_clause(
     }
 
     (sql, bind_values)
+}
+
+/// Build the lateral-movement SELECT projection for `profile`. Free function so
+/// the projection is unit-testable without constructing a `SearchService`; see
+/// [`SearchService::lateral_columns`] for the resolution rules (and the NAN-1892
+/// `source_type` exception that keeps the SELECT alias from shadowing the WHERE).
+fn build_lateral_columns(profile: &dyn crate::schema::SchemaProfile) -> String {
+    LATERAL_FIELDS
+        .iter()
+        .filter_map(|field| {
+            // NAN-1892: `source_type` resolves to the OPERATIONAL String column
+            // (`column_sql`), NOT the UDM→OCSF taxonomy `class_uid`
+            // (`udm_column_sql`), so the projected `… AS source_type` alias matches
+            // the physical column the hop WHERE filters on. Every other field uses
+            // the taxonomy/unified resolution (class-split concepts need the unified
+            // column; NAN-1348) and its WHERE references the physical name, not the
+            // alias, so no shadow occurs.
+            let col = if *field == "source_type" {
+                Some(profile.column_sql(field))
+            } else {
+                profile.udm_column_sql(field)
+            };
+            col.map(|col| format!("{col} AS {field}"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Build one lateral-hop secondary query (auth / network / process — all three
@@ -1207,6 +1253,25 @@ mod source_scope_tests {
         );
     }
 
+    /// NAN-1887: the per-source RBAC deny-set gate is built from
+    /// `cols.source_type`, so under OCSF it must reference the OPERATIONAL String
+    /// `source_type` column — NOT the `class_uid` UInt32 the UDM→OCSF taxonomy map
+    /// resolves `source_type` to. `lower(class_uid) NOT IN (…)` is a ClickHouse type
+    /// error (Code 43) that would break `| lateral` for any per-source-scoped caller
+    /// on an OCSF tenant. Empirically confirmed against local `nanosiem.ocsf_logs`.
+    #[test]
+    fn ocsf_scope_gate_uses_operational_source_type_not_class_uid() {
+        let profile = crate::schema::OcsfProfile::new();
+        let cols = LateralPredicateColumns::resolve(&profile);
+        let pred = source_scope_sql_predicate(&cols.source_type, &deny(&["audit"]))
+            .expect("nonempty deny set must render");
+        assert_eq!(pred, "lower(source_type) != 'audit'");
+        assert!(
+            !pred.contains("class_uid"),
+            "OCSF scope gate must not reference the class_uid UInt32 column: {pred}"
+        );
+    }
+
     /// The empty-predicate hop SQL is byte-identical to the legacy inline
     /// `format!` block (whitespace and all) — regression guard for the
     /// extraction into `build_hop_sql`.
@@ -1261,5 +1326,115 @@ mod lateral_seed_tests {
         for f in ["src_host", "dest_host", "src_ip", "dest_ip", "user"] {
             assert_eq!(lateral_seed_keys(&p, f), vec![f.to_string()]);
         }
+    }
+}
+
+#[cfg(test)]
+mod auth_predicate_tests {
+    use super::*;
+
+    /// NAN-1887: on OCSF the auth predicate's `source_type` term must LIKE the
+    /// OPERATIONAL String `source_type` column — NOT `class_uid`. The UDM
+    /// `source_type` concept maps to the `class_uid` UInt32 taxonomy column via the
+    /// manifest, so resolving it through `udm_column_sql` produced
+    /// `lower(class_uid) LIKE '%auth%'`, a ClickHouse type error (Code 43, Illegal
+    /// type UInt32 of argument of function lower) that broke every `| lateral` run
+    /// on an OCSF tenant (web + desktop). Empirically reproduced against local
+    /// `nanosiem.ocsf_logs` (class_uid = UInt32, source_type = LowCardinality(String)).
+    #[test]
+    fn ocsf_auth_where_likes_operational_source_type_not_class_uid() {
+        let p = crate::schema::OcsfProfile::new();
+        let sql = LateralPredicateColumns::resolve(&p).auth_where();
+        // The fix: LIKE the operational String column.
+        assert!(
+            sql.contains("lower(source_type) LIKE '%auth%'"),
+            "OCSF auth predicate must LIKE the operational source_type column: {sql}"
+        );
+        // The bug: never wrap the UInt32 taxonomy column in lower().
+        assert!(
+            !sql.contains("lower(class_uid)"),
+            "OCSF auth predicate must not lower() the class_uid UInt32 column: {sql}"
+        );
+        // Primary recall is still the IAM category taxonomy.
+        assert!(
+            sql.contains(crate::search::classification::OCSF_AUTH_PREDICATE),
+            "OCSF auth predicate must retain the category_uid=3 primary signal: {sql}"
+        );
+    }
+
+    /// UDM stays byte-identical: `source_type` IS the operational String column, so
+    /// the fix (routing through `column_sql` instead of `udm_column_sql`) is a no-op
+    /// — the default `udm_column_sql` already delegates to `column_sql`.
+    #[test]
+    fn udm_auth_where_unchanged() {
+        let p = crate::schema::UdmProfile::new();
+        let sql = LateralPredicateColumns::resolve(&p).auth_where();
+        assert!(
+            sql.contains("lower(source_type) LIKE '%auth%'"),
+            "UDM auth predicate must be byte-identical to the legacy form: {sql}"
+        );
+        assert!(
+            sql.contains("auth_type != ''") && sql.contains("auth_result != ''"),
+            "UDM auth predicate must keep the STRING `!= ''` axes: {sql}"
+        );
+    }
+
+    /// NAN-1892: the SELECT projection must alias the OPERATIONAL `source_type`
+    /// String column, NOT `class_uid`. Projecting `class_uid AS source_type` makes
+    /// ClickHouse bind the hop WHERE's bare `source_type` to that UInt32 alias →
+    /// `lower(class_uid)` → Code 43, even though the predicate (NAN-1887) already
+    /// says `lower(source_type)`. Projection and predicate must resolve to ONE
+    /// column.
+    #[test]
+    fn ocsf_projection_aliases_operational_source_type_not_class_uid() {
+        let p = crate::schema::OcsfProfile::new();
+        let projection = build_lateral_columns(&p);
+        assert!(
+            projection.contains("source_type AS source_type"),
+            "OCSF projection must alias the operational source_type column: {projection}"
+        );
+        assert!(
+            !projection.contains("class_uid"),
+            "OCSF projection must not alias class_uid AS source_type: {projection}"
+        );
+    }
+
+    /// End-to-end assembled auth hop query (projection + auth WHERE + RBAC gate) —
+    /// the exact shape `build_lateral_view` runs. Guards the whole NAN-1887/1892
+    /// chain: the assembled SQL must carry the operational `source_type` alias and
+    /// contain NO `class_uid` anywhere (projection or predicate), so no `lower()`
+    /// ever sees a `UInt32`. Empirically confirmed to execute against local
+    /// `nanosiem.ocsf_logs`.
+    #[test]
+    fn ocsf_full_auth_hop_sql_has_no_class_uid_shadow() {
+        let p = crate::schema::OcsfProfile::new();
+        let cols = LateralPredicateColumns::resolve(&p);
+        let sql = build_hop_sql(
+            &build_lateral_columns(&p),
+            "ocsf_logs",
+            "1=1",
+            &cols.auth_where(),
+            Some("lower(source_type) != 'audit'"),
+        );
+        assert!(
+            sql.contains("source_type AS source_type"),
+            "assembled hop SQL must project the operational source_type: {sql}"
+        );
+        assert!(
+            !sql.contains("class_uid"),
+            "assembled hop SQL must not reference class_uid (would shadow → Code 43): {sql}"
+        );
+    }
+
+    /// UDM projection is byte-identical: `source_type` resolves to itself under
+    /// both resolvers, so the NAN-1892 exception is a no-op.
+    #[test]
+    fn udm_projection_unchanged() {
+        let p = crate::schema::UdmProfile::new();
+        let projection = build_lateral_columns(&p);
+        assert!(
+            projection.contains("source_type AS source_type"),
+            "UDM projection must be byte-identical: {projection}"
+        );
     }
 }

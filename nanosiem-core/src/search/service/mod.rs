@@ -730,6 +730,15 @@ pub struct SearchService {
     /// to the shipped defaults) so risk-dataset scores equal the Risk page /
     /// leaderboard numbers.
     risk_query_config: std::sync::Arc<crate::risk::config_provider::RiskQueryConfigProvider>,
+    /// Process-lifetime memo of the baseline-agg MV activation watermark
+    /// (`baseline_agg_meta.active_since`, NAN-1895). Migration 167 writes it
+    /// ONCE and it never changes, so it is read lazily on the first `| baseline`
+    /// query and cached for the life of the service. A CH read ERROR is NOT
+    /// cached (the next query retries); a missing row caches `None` (the agg
+    /// fast path stays off — fail-safe to the raw scan). Shared across clones
+    /// via `Arc` so the memo survives the per-request service clones.
+    baseline_agg_active_since:
+        std::sync::Arc<tokio::sync::OnceCell<Option<chrono::DateTime<chrono::Utc>>>>,
 }
 
 impl SearchService {
@@ -747,6 +756,37 @@ impl SearchService {
             | crate::schema::SchemaId::Spans
             | crate::schema::SchemaId::Metrics
             | crate::schema::SchemaId::Risk => "logs",
+        }
+    }
+
+    /// Registry key for the active profile's `| baseline` first-seen day agg
+    /// (NAN-1888). TWIN tables, one per schema lane, keyed exactly like
+    /// [`logs_table_key`](Self::logs_table_key): the agg-served
+    /// `entity_dimension_firsts` must see precisely what the profile's raw scan
+    /// over its logs table would see — a shared target (the
+    /// `entity_time_range_agg` pattern) would double-count every event under
+    /// Vector's transitional dual-write and break raw/agg parity.
+    fn dimension_agg_table_key(profile: &dyn crate::schema::SchemaProfile) -> &'static str {
+        match profile.id() {
+            crate::schema::SchemaId::Ocsf => "ocsf_entity_dimension_day_agg",
+            crate::schema::SchemaId::Udm
+            | crate::schema::SchemaId::Spans
+            | crate::schema::SchemaId::Metrics
+            | crate::schema::SchemaId::Risk => "entity_dimension_day_agg",
+        }
+    }
+
+    /// The active profile's lane label in
+    /// `entity_dimension_day_agg_backfill_progress` (`'udm'` | `'ocsf'`,
+    /// NAN-1895). Matches the `lane` the backfill script writes; used by the
+    /// baseline agg's backfill-extension gate to check pre-activation days.
+    fn dimension_agg_lane(profile: &dyn crate::schema::SchemaProfile) -> &'static str {
+        match profile.id() {
+            crate::schema::SchemaId::Ocsf => "ocsf",
+            crate::schema::SchemaId::Udm
+            | crate::schema::SchemaId::Spans
+            | crate::schema::SchemaId::Metrics
+            | crate::schema::SchemaId::Risk => "udm",
         }
     }
 
@@ -910,6 +950,7 @@ impl SearchService {
                     dual_pool.postgres().clone(),
                 ),
             ),
+            baseline_agg_active_since: std::sync::Arc::new(tokio::sync::OnceCell::new()),
         }
     }
     /// Create a new search service with DualPool, lookup, and prevalence support.
@@ -969,6 +1010,7 @@ impl SearchService {
                     dual_pool.postgres().clone(),
                 ),
             ),
+            baseline_agg_active_since: std::sync::Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 

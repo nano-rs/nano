@@ -1906,6 +1906,200 @@ FROM nanosiem.ocsf_logs
 WHERE user_unified != ''
 GROUP BY entity_type, entity_value, time_bucket;
 
+-- Table: ocsf_entity_dimension_day_agg (NAN-1888)
+-- OCSF twin of nanosiem.entity_dimension_day_agg (clickhouse/init.sql) —
+-- per-(entity, dimension, value, day) first-seen + count backing the fast path
+-- of `| baseline`'s new-to-entity check. A SEPARATE table (not a shared
+-- target like entity_time_range_agg) because the reader is PROFILE-KEYED:
+-- each lane must see exactly what its raw scan over logs/ocsf_logs sees, and
+-- a shared target would double-count under Vector dual-write. MV anchoring
+-- mirrors `baseline::dimensions_for`; keep in lockstep with
+-- clickhouse/166_baseline_first_seen_agg.sql and
+-- scripts/backfill-entity-dimension-day-agg.sh.
+--
+-- ⚠ INGEST-CREDENTIAL COUPLING (NAN-1384): these MVs read
+-- `process_name_unified` and `dst_endpoint.port` (plus already-granted
+-- columns) — mirrored into the nanosiem_ingest SELECT grant, see the warning
+-- above ocsf_entity_time_range_src_ip_mv.
+CREATE TABLE IF NOT EXISTS nanosiem.ocsf_entity_dimension_day_agg
+(
+    `entity_type` LowCardinality(String),  -- 'host' | 'user' | 'ip'
+    `entity_value` String,                  -- lower()ed (ips are ingest-lowercased)
+    `dim` LowCardinality(String),           -- UDM-SEMANTIC field name of the dimension
+    `val` String,                            -- dimension value, VERBATIM
+    `day` Date,
+    `first_seen` SimpleAggregateFunction(min, DateTime64(6, 'UTC')),
+    `event_count` SimpleAggregateFunction(sum, UInt64),
+    INDEX idx_entity_value entity_value TYPE bloom_filter GRANULARITY 4
+)
+ENGINE = AggregatingMergeTree()
+PARTITION BY toYYYYMM(day)
+ORDER BY (entity_type, entity_value, dim, val, day)
+TTL day + toIntervalDay(120)
+SETTINGS index_granularity = 8192;
+
+-- ONE MV PER ENTITY BRANCH (NAN-1386 — never merge into a UNION ALL view).
+-- src_host_unified / dst_endpoint.hostname / user_unified / both ips are
+-- already lower()'d at ingest — no extra lower() except the defensive one on
+-- user_unified, matching ocsf_entity_time_range_user_mv. ip branches are
+-- gated to PRIVATE (RFC1918) entities with throw-free match() regexes
+-- (isIPAddressInRange THROWS on malformed values and would fail ingest from
+-- inside the MV); the read path routes public-IP entities to the raw scan.
+
+-- host: actor dims (process_name / dest_ip) + src side of the bi-directional
+-- user dim.
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_entity_dimension_day_host_src_mv
+TO nanosiem.ocsf_entity_dimension_day_agg
+(
+    `entity_type` String,
+    `entity_value` String,
+    `dim` String,
+    `val` String,
+    `day` Date,
+    `first_seen` DateTime64(6, 'UTC'),
+    `event_count` UInt64
+)
+AS SELECT
+    'host' AS entity_type,
+    src_host_unified AS entity_value,
+    d.1 AS dim,
+    d.2 AS val,
+    toDate(timestamp) AS day,
+    min(timestamp) AS first_seen,
+    count() AS event_count
+FROM nanosiem.ocsf_logs
+ARRAY JOIN
+    [('process_name', toString(process_name_unified)),
+     ('dest_ip', toString(`dst_endpoint.ip`)),
+     ('user', toString(user_unified))] AS d
+WHERE src_host_unified != ''
+  AND lower(source_type) != 'audit'
+  AND trimBoth(d.2) != '' AND d.2 != '-' AND d.2 != '0' AND lower(d.2) != 'null'
+GROUP BY entity_type, entity_value, dim, val, day;
+
+-- host: dest side of the user dim; skips dst == src rows (the src-side MV
+-- counted those — the raw OR predicate matches such a row ONCE).
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_entity_dimension_day_host_dest_user_mv
+TO nanosiem.ocsf_entity_dimension_day_agg
+(
+    `entity_type` String,
+    `entity_value` String,
+    `dim` String,
+    `val` String,
+    `day` Date,
+    `first_seen` DateTime64(6, 'UTC'),
+    `event_count` UInt64
+)
+AS SELECT
+    'host' AS entity_type,
+    `dst_endpoint.hostname` AS entity_value,
+    'user' AS dim,
+    toString(user_unified) AS val,
+    toDate(timestamp) AS day,
+    min(timestamp) AS first_seen,
+    count() AS event_count
+FROM nanosiem.ocsf_logs
+WHERE `dst_endpoint.hostname` != ''
+  AND `dst_endpoint.hostname` != src_host_unified
+  AND lower(source_type) != 'audit'
+  AND trimBoth(user_unified) != '' AND user_unified != '-' AND user_unified != '0' AND lower(user_unified) != 'null'
+GROUP BY entity_type, entity_value, dim, val, day;
+
+-- user: OCSF has no src_user/dest_user mapping, so the whole account
+-- footprint IS user_unified — one branch, matching what the raw scan's
+-- profile-resolved predicate collapses to under OCSF.
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_entity_dimension_day_user_mv
+TO nanosiem.ocsf_entity_dimension_day_agg
+(
+    `entity_type` String,
+    `entity_value` String,
+    `dim` String,
+    `val` String,
+    `day` Date,
+    `first_seen` DateTime64(6, 'UTC'),
+    `event_count` UInt64
+)
+AS SELECT
+    'user' AS entity_type,
+    lower(user_unified) AS entity_value,
+    d.1 AS dim,
+    d.2 AS val,
+    toDate(timestamp) AS day,
+    min(timestamp) AS first_seen,
+    count() AS event_count
+FROM nanosiem.ocsf_logs
+ARRAY JOIN
+    [('src_host', toString(src_host_unified)),
+     ('src_ip', toString(`src_endpoint.ip`)),
+     ('process_name', toString(process_name_unified))] AS d
+WHERE user_unified != ''
+  AND lower(source_type) != 'audit'
+  AND trimBoth(d.2) != '' AND d.2 != '-' AND d.2 != '0' AND lower(d.2) != 'null'
+GROUP BY entity_type, entity_value, dim, val, day;
+
+-- ip: association dims from the src side (PRIVATE entities only).
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_entity_dimension_day_ip_src_mv
+TO nanosiem.ocsf_entity_dimension_day_agg
+(
+    `entity_type` String,
+    `entity_value` String,
+    `dim` String,
+    `val` String,
+    `day` Date,
+    `first_seen` DateTime64(6, 'UTC'),
+    `event_count` UInt64
+)
+AS SELECT
+    'ip' AS entity_type,
+    `src_endpoint.ip` AS entity_value,
+    d.1 AS dim,
+    d.2 AS val,
+    toDate(timestamp) AS day,
+    min(timestamp) AS first_seen,
+    count() AS event_count
+FROM nanosiem.ocsf_logs
+ARRAY JOIN
+    [('src_host', toString(src_host_unified)),
+     ('dest_port', toString(`dst_endpoint.port`)),
+     ('user', toString(user_unified))] AS d
+WHERE `src_endpoint.ip` != ''
+  AND (match(`src_endpoint.ip`, '^10\\.') OR match(`src_endpoint.ip`, '^192\\.168\\.') OR match(`src_endpoint.ip`, '^172\\.(1[6-9]|2[0-9]|3[01])\\.'))
+  AND lower(source_type) != 'audit'
+  AND trimBoth(d.2) != '' AND d.2 != '-' AND d.2 != '0' AND lower(d.2) != 'null'
+GROUP BY entity_type, entity_value, dim, val, day;
+
+-- ip: dest side; skips dst == src rows (the src-side MV counted those).
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_entity_dimension_day_ip_dest_mv
+TO nanosiem.ocsf_entity_dimension_day_agg
+(
+    `entity_type` String,
+    `entity_value` String,
+    `dim` String,
+    `val` String,
+    `day` Date,
+    `first_seen` DateTime64(6, 'UTC'),
+    `event_count` UInt64
+)
+AS SELECT
+    'ip' AS entity_type,
+    `dst_endpoint.ip` AS entity_value,
+    d.1 AS dim,
+    d.2 AS val,
+    toDate(timestamp) AS day,
+    min(timestamp) AS first_seen,
+    count() AS event_count
+FROM nanosiem.ocsf_logs
+ARRAY JOIN
+    [('src_host', toString(src_host_unified)),
+     ('dest_port', toString(`dst_endpoint.port`)),
+     ('user', toString(user_unified))] AS d
+WHERE `dst_endpoint.ip` != ''
+  AND `dst_endpoint.ip` != `src_endpoint.ip`
+  AND (match(`dst_endpoint.ip`, '^10\\.') OR match(`dst_endpoint.ip`, '^192\\.168\\.') OR match(`dst_endpoint.ip`, '^172\\.(1[6-9]|2[0-9]|3[01])\\.'))
+  AND lower(source_type) != 'audit'
+  AND trimBoth(d.2) != '' AND d.2 != '-' AND d.2 != '0' AND lower(d.2) != 'null'
+GROUP BY entity_type, entity_value, dim, val, day;
+
 -- Identity observations (resolve_identity / lateral movement / NAT via the
 -- chained nat_detection_mv). Filters and derivations mirror
 -- identity_observations_mv (clickhouse/init.sql): private src IPs only, junk

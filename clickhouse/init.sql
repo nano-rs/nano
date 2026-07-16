@@ -1608,6 +1608,239 @@ FROM nanosiem.logs
 WHERE user != ''
 GROUP BY entity_type, entity_value, time_bucket;
 
+-- Table: entity_dimension_day_agg_backfill_progress (NAN-1888 P1-3)
+-- One row per (lane, day) the out-of-band backfill has COMPLETED. The backfill
+-- skips a (lane, day) only when its marker exists, and re-clears + rebuilds any
+-- unmarked day, so a rerun after a mid-day crash produces a complete,
+-- non-double-counted day. Lane-agnostic (tracks both udm + ocsf); lives on
+-- every deployment. Keep in lockstep with clickhouse/166_baseline_first_seen_agg.sql.
+CREATE TABLE IF NOT EXISTS nanosiem.entity_dimension_day_agg_backfill_progress
+(
+    `lane` LowCardinality(String),   -- 'udm' | 'ocsf'
+    `day` Date,
+    `completed_at` DateTime('UTC') DEFAULT now()
+)
+ENGINE = ReplacingMergeTree(completed_at)
+ORDER BY (lane, day);
+
+-- Table: entity_dimension_day_agg (NAN-1888)
+-- Per-(entity, dimension, value, day) first-seen + count backing the fast path
+-- of `| baseline`'s new-to-entity check (`entity_dimension_firsts`). Day grain,
+-- exact min timestamp. UDM lane only — the OCSF twin
+-- (ocsf_entity_dimension_day_agg) lives in clickhouse/ocsf/init.sql because the
+-- reader is PROFILE-KEYED (each lane must see exactly what its raw scan over
+-- logs/ocsf_logs sees; a shared target would double-count under Vector
+-- dual-write). MV anchoring mirrors `baseline::dimensions_for` — the read path
+-- (`agg_dimension_set()` in search/service/asset.rs) relies on it. The fast
+-- path self-enables off the MV activation-TIME watermark (baseline_agg_meta,
+-- stamped AFTER these MVs below; no flag): it serves only when a query's whole
+-- lookback is at/after active_since, else raw. Keep in lockstep with
+-- clickhouse/166_baseline_first_seen_agg.sql and
+-- scripts/backfill-entity-dimension-day-agg.sh.
+CREATE TABLE IF NOT EXISTS nanosiem.entity_dimension_day_agg
+(
+    `entity_type` LowCardinality(String),  -- 'host' | 'user' | 'ip'
+    `entity_value` String,                  -- lower()ed (ips are ingest-lowercased)
+    `dim` LowCardinality(String),           -- UDM field name of the dimension
+    `val` String,                            -- dimension value, VERBATIM casing
+    `day` Date,
+    `first_seen` SimpleAggregateFunction(min, DateTime64(6, 'UTC')),
+    `event_count` SimpleAggregateFunction(sum, UInt64),
+    INDEX idx_entity_value entity_value TYPE bloom_filter GRANULARITY 4
+)
+ENGINE = AggregatingMergeTree()
+PARTITION BY toYYYYMM(day)
+ORDER BY (entity_type, entity_value, dim, val, day)
+TTL day + toIntervalDay(120)
+SETTINGS index_granularity = 8192;
+
+-- ONE MV PER ENTITY BRANCH (NAN-1386 — never merge into a UNION ALL view).
+-- All bake in the raw scan's `lower(source_type) != 'audit'` + val hygiene so
+-- the agg never stores junk peers. ip branches are gated to PRIVATE (RFC1918)
+-- entities with throw-free match() regexes (isIPAddressInRange THROWS on
+-- malformed values and would fail ingest from inside the MV); the read path
+-- routes public-IP entities to the raw scan.
+
+-- host: actor dims (process_name / dest_ip) + src side of the bi-directional
+-- user dim.
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.entity_dimension_day_host_src_mv
+TO nanosiem.entity_dimension_day_agg AS
+SELECT
+    'host' AS entity_type,
+    lower(src_host) AS entity_value,
+    d.1 AS dim,
+    d.2 AS val,
+    toDate(timestamp) AS day,
+    min(timestamp) AS first_seen,
+    count() AS event_count
+FROM nanosiem.logs
+ARRAY JOIN
+    [('process_name', toString(process_name)),
+     ('dest_ip', toString(dest_ip)),
+     ('user', toString(user))] AS d
+WHERE src_host != ''
+  AND lower(source_type) != 'audit'
+  AND trimBoth(d.2) != '' AND d.2 != '-' AND d.2 != '0' AND lower(d.2) != 'null'
+GROUP BY entity_type, entity_value, dim, val, day;
+
+-- host: dest side of the user dim; skips dest_host == src_host rows (the
+-- src-side MV counted those — the raw OR predicate matches such a row ONCE).
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.entity_dimension_day_host_dest_user_mv
+TO nanosiem.entity_dimension_day_agg AS
+SELECT
+    'host' AS entity_type,
+    lower(dest_host) AS entity_value,
+    'user' AS dim,
+    toString(user) AS val,
+    toDate(timestamp) AS day,
+    min(timestamp) AS first_seen,
+    count() AS event_count
+FROM nanosiem.logs
+WHERE dest_host != ''
+  AND lower(dest_host) != lower(src_host)
+  AND lower(source_type) != 'audit'
+  AND trimBoth(user) != '' AND user != '-' AND user != '0' AND lower(user) != 'null'
+GROUP BY entity_type, entity_value, dim, val, day;
+
+-- user: whole account footprint (user / src_user / dest_user), later branches
+-- deduped against earlier columns so a row matching several columns with the
+-- SAME value counts once, like the raw OR predicate.
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.entity_dimension_day_user_mv
+TO nanosiem.entity_dimension_day_agg AS
+SELECT
+    'user' AS entity_type,
+    lower(user) AS entity_value,
+    d.1 AS dim,
+    d.2 AS val,
+    toDate(timestamp) AS day,
+    min(timestamp) AS first_seen,
+    count() AS event_count
+FROM nanosiem.logs
+ARRAY JOIN
+    [('src_host', toString(src_host)),
+     ('src_ip', toString(src_ip)),
+     ('process_name', toString(process_name))] AS d
+WHERE user != ''
+  AND lower(source_type) != 'audit'
+  AND trimBoth(d.2) != '' AND d.2 != '-' AND d.2 != '0' AND lower(d.2) != 'null'
+GROUP BY entity_type, entity_value, dim, val, day;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.entity_dimension_day_src_user_mv
+TO nanosiem.entity_dimension_day_agg AS
+SELECT
+    'user' AS entity_type,
+    lower(src_user) AS entity_value,
+    d.1 AS dim,
+    d.2 AS val,
+    toDate(timestamp) AS day,
+    min(timestamp) AS first_seen,
+    count() AS event_count
+FROM nanosiem.logs
+ARRAY JOIN
+    [('src_host', toString(src_host)),
+     ('src_ip', toString(src_ip)),
+     ('process_name', toString(process_name))] AS d
+WHERE src_user != ''
+  AND lower(src_user) != lower(user)
+  AND lower(source_type) != 'audit'
+  AND trimBoth(d.2) != '' AND d.2 != '-' AND d.2 != '0' AND lower(d.2) != 'null'
+GROUP BY entity_type, entity_value, dim, val, day;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.entity_dimension_day_dest_user_mv
+TO nanosiem.entity_dimension_day_agg AS
+SELECT
+    'user' AS entity_type,
+    lower(dest_user) AS entity_value,
+    d.1 AS dim,
+    d.2 AS val,
+    toDate(timestamp) AS day,
+    min(timestamp) AS first_seen,
+    count() AS event_count
+FROM nanosiem.logs
+ARRAY JOIN
+    [('src_host', toString(src_host)),
+     ('src_ip', toString(src_ip)),
+     ('process_name', toString(process_name))] AS d
+WHERE dest_user != ''
+  AND lower(dest_user) != lower(user)
+  AND lower(dest_user) != lower(src_user)
+  AND lower(source_type) != 'audit'
+  AND trimBoth(d.2) != '' AND d.2 != '-' AND d.2 != '0' AND lower(d.2) != 'null'
+GROUP BY entity_type, entity_value, dim, val, day;
+
+-- ip: association dims from the src side (PRIVATE entities only).
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.entity_dimension_day_ip_src_mv
+TO nanosiem.entity_dimension_day_agg AS
+SELECT
+    'ip' AS entity_type,
+    src_ip AS entity_value,
+    d.1 AS dim,
+    d.2 AS val,
+    toDate(timestamp) AS day,
+    min(timestamp) AS first_seen,
+    count() AS event_count
+FROM nanosiem.logs
+ARRAY JOIN
+    [('src_host', toString(src_host)),
+     ('dest_port', toString(dest_port)),
+     ('user', toString(user))] AS d
+WHERE src_ip != ''
+  AND (match(src_ip, '^10\\.') OR match(src_ip, '^192\\.168\\.') OR match(src_ip, '^172\\.(1[6-9]|2[0-9]|3[01])\\.'))
+  AND lower(source_type) != 'audit'
+  AND trimBoth(d.2) != '' AND d.2 != '-' AND d.2 != '0' AND lower(d.2) != 'null'
+GROUP BY entity_type, entity_value, dim, val, day;
+
+-- ip: dest side; skips dest_ip == src_ip rows (the src-side MV counted those).
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.entity_dimension_day_ip_dest_mv
+TO nanosiem.entity_dimension_day_agg AS
+SELECT
+    'ip' AS entity_type,
+    dest_ip AS entity_value,
+    d.1 AS dim,
+    d.2 AS val,
+    toDate(timestamp) AS day,
+    min(timestamp) AS first_seen,
+    count() AS event_count
+FROM nanosiem.logs
+ARRAY JOIN
+    [('src_host', toString(src_host)),
+     ('dest_port', toString(dest_port)),
+     ('user', toString(user))] AS d
+WHERE dest_ip != ''
+  AND dest_ip != src_ip
+  AND (match(dest_ip, '^10\\.') OR match(dest_ip, '^192\\.168\\.') OR match(dest_ip, '^172\\.(1[6-9]|2[0-9]|3[01])\\.'))
+  AND lower(source_type) != 'audit'
+  AND trimBoth(d.2) != '' AND d.2 != '-' AND d.2 != '0' AND lower(d.2) != 'null'
+GROUP BY entity_type, entity_value, dim, val, day;
+
+-- Table: baseline_agg_meta (NAN-1895) — MV-active-since watermark for the
+-- `| baseline` day agg. The read-path gate serves from the agg only when a
+-- query's whole lookback is at/after active_since (every event flowed through a
+-- LIVE MV), or — for a lookback reaching earlier — when the marker table shows
+-- the pre-activation days were backfilled. Data-INDEPENDENT: replaces the old
+-- count(DISTINCT day) presence proxy, which a lone late-arriving event could
+-- satisfy for a partial day. ONE active_since for both lanes (166's UDM + OCSF
+-- MVs activate together). INSERT-ONCE (guarded) so migrator replays never reset
+-- it. Keep in lockstep with clickhouse/167_baseline_agg_meta.sql.
+--
+-- ⚠ STAMP ORDER: the insert-once is emitted AFTER the UDM baseline MVs above so
+-- active_since can never predate the MVs it vouches for (a watermark stamped
+-- before the MVs exist would trust a window the MVs weren't yet capturing). No
+-- ingest occurs during bootstrap, so the OCSF-overlay MVs (clickhouse/ocsf/
+-- init.sql, created after this base-init stamp) being later is harmless —
+-- there is nothing to miss between the stamp and their creation.
+CREATE TABLE IF NOT EXISTS nanosiem.baseline_agg_meta
+(
+    `k` LowCardinality(String),              -- 'active_since'
+    `active_since` DateTime64(6, 'UTC')
+)
+ENGINE = ReplacingMergeTree()
+ORDER BY k;
+
+INSERT INTO nanosiem.baseline_agg_meta (k, active_since)
+SELECT 'active_since', now64(6)
+WHERE (SELECT count() FROM nanosiem.baseline_agg_meta WHERE k = 'active_since') = 0;
+
 -- ============================================================================
 -- Cloud User Activity Aggregation (for cloud investigation Users tab)
 -- ============================================================================

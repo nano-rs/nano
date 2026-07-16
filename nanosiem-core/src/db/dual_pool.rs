@@ -383,6 +383,11 @@ pub(crate) const DISTRIBUTED_TABLES: &[&str] = &[
     "user_registry",
     "lookup_rows",
     "entity_time_range_agg",
+    // Per-day first-seen aggregates behind `| baseline`'s new-to-entity fast
+    // path (NAN-1888). One per schema lane — the reader is profile-keyed
+    // (`dimension_agg_table_key`), mirroring logs/ocsf_logs.
+    "entity_dimension_day_agg",
+    "ocsf_entity_dimension_day_agg",
     "cloud_user_activity_agg",
     "ingestion_errors",
     "identity_observations",

@@ -133,7 +133,7 @@
         <query>GRANT INSERT ON nanosiem.ocsf_logs_native_raw</query>
         <query>GRANT SELECT ON nanosiem.ocsf_logs_native_raw</query>
         <query>GRANT INSERT ON nanosiem.ocsf_logs</query>
-        <query>GRANT SELECT(`timestamp`, `src_endpoint.ip`, `dst_endpoint.ip`, `src_endpoint.hostname`, `dst_endpoint.hostname`, `query.hostname`, `url.hostname`, `file.hashes.sha256`, `process.file.hashes.sha256`, `actor.process.file.hashes.sha256`, `src_host_unified`, `user_unified`, `src_endpoint.mac`, `source_type`, `metadata.product.name`, `event_bytes`, `http_response.code`, `status_id`, `activity_id`, `class_uid`, `is_mfa`, `api.service.name`, `cloud.region`, `cloud.provider`) ON nanosiem.ocsf_logs</query>
+        <query>GRANT SELECT(`timestamp`, `src_endpoint.ip`, `dst_endpoint.ip`, `dst_endpoint.port`, `src_endpoint.hostname`, `dst_endpoint.hostname`, `query.hostname`, `url.hostname`, `file.hashes.sha256`, `process.file.hashes.sha256`, `actor.process.file.hashes.sha256`, `src_host_unified`, `user_unified`, `process_name_unified`, `src_endpoint.mac`, `source_type`, `metadata.product.name`, `event_bytes`, `http_response.code`, `status_id`, `activity_id`, `class_uid`, `is_mfa`, `api.service.name`, `cloud.region`, `cloud.provider`) ON nanosiem.ocsf_logs</query>
         <!-- NAN-1400: nat_detection_mv chains off identity_observations (which
              ocsf_identity_observations_mv writes into); CH checks the INSERTING
              user's SELECT on the chained MV's source columns too. Without this,

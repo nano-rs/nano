@@ -1963,12 +1963,99 @@ impl SearchService {
     /// is bi-directional. `entity_value` is bound (log-derived); timestamps, the
     /// resolved columns, and the dimension labels are ours and inlined. Fields the
     /// active profile does not map are skipped.
+    ///
+    /// FAST PATH (NAN-1888): when the request matches what the
+    /// `entity_dimension_day_agg` MVs bake in ([`agg_dimension_set`];
+    /// private-RFC1918-only for `ip` entities) AND the caller's source scope is
+    /// compatible ([`scope_within_agg_exclusions`], NAN-1895), the same answer
+    /// is served from the day-grain first-seen aggregate — a sort-key-prefix
+    /// lookup instead of a lookback-sized raw scan (~33.5s cold on a 2B-row
+    /// tenant). The path SELF-ENABLES off the MV activation TIME: no env flag,
+    /// no backfill required. The MVs accumulate from deploy-time forward, and
+    /// `entity_dimension_firsts_from_agg` serves only when this query's whole
+    /// lookback is at/after `baseline_agg_meta.active_since` (or the
+    /// pre-activation days are backfill-markered); otherwise it returns None and
+    /// this method transparently falls back to the raw scan — so a
+    /// freshly-migrated tenant is correct from the first query, recent-window
+    /// queries auto-speed-up ~max-lookback after deploy, and queries reaching
+    /// before deploy-time stay on raw. Backfill is an OPTIONAL accelerator that
+    /// only buys immediate historical-window speedup.
     #[allow(clippy::too_many_arguments)]
     pub async fn entity_dimension_firsts(
         &self,
         scope: &ScopeSet,
         entity_type: &str,
         entity_value: &str,
+        source_side_only: bool,
+        dim_udm_fields: &[&str],
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+        per_dim_limit: usize,
+    ) -> Result<Vec<DimensionFirst>, SearchError> {
+        // Entity value is matched case-insensitively (`lower(col) = ?` on the
+        // raw path, stored-lowercase equality on the agg path), so bind the
+        // lowercased value.
+        let value_lower = entity_value.to_lowercase();
+
+        // FAST PATH (NAN-1888) — see the doc comment. Self-enabling off the MV
+        // activation TIME: no env flag, no manual step, no backfill required.
+        // The MVs accumulate from deploy-time forward, and
+        // `entity_dimension_firsts_from_agg` serves only when this query's whole
+        // lookback is at/after `baseline_agg_meta.active_since` (or the
+        // pre-activation days are backfill-markered); otherwise it returns None
+        // and we fall through to raw. So ~max-lookback after deploy, recent
+        // baseline queries auto-speed-up while queries reaching before
+        // deploy-time transparently use raw. The scope check
+        // ([`scope_within_agg_exclusions`], NAN-1895) keeps the agg off-limits
+        // to callers denied any source the agg still includes.
+        // Fields the profile does not map are skipped, mirroring the raw path's
+        // tuple filter, so both paths answer for the same dimension set.
+        let mapped_fields: Vec<&str> = dim_udm_fields
+            .iter()
+            .copied()
+            .filter(|f| self.active_profile.udm_column_sql(f).is_some())
+            .collect();
+        if scope_within_agg_exclusions(scope)
+            && baseline_agg_can_serve(entity_type, &value_lower, source_side_only, &mapped_fields)
+        {
+            if let Some(rows) = self
+                .entity_dimension_firsts_from_agg(
+                    entity_type,
+                    &value_lower,
+                    &mapped_fields,
+                    start,
+                    end,
+                    per_dim_limit,
+                )
+                .await
+            {
+                return Ok(rows);
+            }
+        }
+        self.entity_dimension_firsts_raw(
+            scope,
+            entity_type,
+            &value_lower,
+            source_side_only,
+            dim_udm_fields,
+            start,
+            end,
+            per_dim_limit,
+        )
+        .await
+    }
+
+    /// The raw-logs lookback scan behind [`entity_dimension_firsts`] — the
+    /// path every request took before NAN-1888, byte-identical SQL. Kept as
+    /// its own method so the agg fast path can fall back to it and the local
+    /// parity test can drive both paths independently. `value_lower` is the
+    /// already-lowercased entity value.
+    #[allow(clippy::too_many_arguments)]
+    async fn entity_dimension_firsts_raw(
+        &self,
+        scope: &ScopeSet,
+        entity_type: &str,
+        value_lower: &str,
         source_side_only: bool,
         dim_udm_fields: &[&str],
         start: chrono::DateTime<chrono::Utc>,
@@ -1983,15 +2070,12 @@ impl SearchService {
         };
         let profile = self.active_profile.as_ref();
 
-        // Entity value is matched case-insensitively (`lower(col) = ?`, mirroring
-        // the nPL path), so bind the lowercased value.
-        let value_lower = entity_value.to_lowercase();
         // NEW-TO-ENTITY: match the account's whole footprint (not agg-aligned), so
         // a user's src_user/dest_user activity is not missed.
         let (entity_pred, entity_binds) = match baseline_entity_predicate(
             profile,
             entity_type,
-            &value_lower,
+            value_lower,
             source_side_only,
             false,
         ) {
@@ -2071,6 +2155,260 @@ impl SearchService {
                 Err(parse_clickhouse_error(&e.to_string()))
             }
         }
+    }
+
+    /// Serve `entity_dimension_firsts` from the day-grain first-seen aggregate
+    /// (`entity_dimension_day_agg` / its OCSF twin, NAN-1888) instead of the
+    /// raw lookback scan. Returns `None` whenever the raw path must answer — the
+    /// lookback isn't fully within the MV-active period and isn't backfill-
+    /// markered (the activation-time gate below), or the watermark / agg read
+    /// fails (raw is a correct superset, so a degraded agg NEVER surfaces as an
+    /// error or an empty "confidently nothing new") — and the caller falls
+    /// through to the raw scan.
+    ///
+    /// Semantics match the raw scan: the FULL known+new (dim, val) set over
+    /// `[start, end)` with the exact min first-seen and summed count, newest
+    /// first, `LIMIT n BY dim` — the known/new split stays downstream in
+    /// `baseline::parse_dimension_firsts`.
+    ///
+    /// Day-grain edge handling (P1-1). The scan reads whole days
+    /// `[toDate(start), toDate(end - 1µs)]`, then a `HAVING min(first_seen) <
+    /// end` DROPS any value whose earliest sighting is at/after `end` — without
+    /// it, a `12:00–14:00` search would surface a value first-seen at 15:00 the
+    /// same day as "new", i.e. genuinely outside the window. The HAVING is safe
+    /// for the downstream known/new split: a known peer has `first_seen <
+    /// incident_start < end`, so it always survives; only pure-after-window
+    /// values are removed. Two accepted residuals of keeping day grain (the
+    /// storage win; baseline is a heuristic): (a) no `>= start` lower HAVING —
+    /// a value whose true min is just before `start` is left returned with a
+    /// later `first_seen`, matching the raw scan and erring conservative
+    /// (reads as known); (b) `cnt`/`event_count` on the two boundary days can
+    /// include a few occurrences just outside `[start, end)` — first_seen (the
+    /// only field the new/known split keys on) is exact, only the volume count
+    /// is approximate at the edges.
+    ///
+    /// The caller pre-validates `entity_type` against [`agg_dimension_set`]
+    /// (so it is one of host/user/ip) and lowercases + (for ip) RFC1918-gates
+    /// `value_lower`; dates are ours — all inlined. `value_lower` is
+    /// log-derived and bound. The keyed `(entity_type, entity_value)` prefix
+    /// is why this is fast: match the agg's stored lowercase form exactly, no
+    /// `lower()` wrapper (same reasoning as `entity_activity_buckets`).
+    async fn entity_dimension_firsts_from_agg(
+        &self,
+        entity_type: &str,
+        value_lower: &str,
+        dim_fields: &[&str],
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+        per_dim_limit: usize,
+    ) -> Option<Vec<DimensionFirst>> {
+        use crate::sql_hygiene::escape_sql_string;
+
+        let clickhouse = self.ch_client.as_ref()?;
+        let agg_table = self
+            .table_names
+            .read(Self::dimension_agg_table_key(self.active_profile.as_ref()));
+
+        // `end` is exclusive in the raw path; the last day the agg may touch is
+        // the date of the instant just before it, so a midnight `end` does not
+        // drag in a whole extra day.
+        let start_naive = start.date_naive();
+        let end_naive = (end - chrono::Duration::microseconds(1)).date_naive();
+        let start_day = start_naive.format("%Y-%m-%d");
+        let end_day = end_naive.format("%Y-%m-%d");
+
+        // MV-ACTIVATION-TIME GATE (NAN-1895). Day-presence can't tell a FULL day
+        // from a PARTIAL one: because `day = toDate(timestamp)`, a single
+        // late-arriving event (old timestamp) or a partial backfill makes a day
+        // "present" while it is actually incomplete, so a value could read as
+        // false-"new". No data-presence check can answer this. Instead gate on
+        // WHEN the baseline-agg MVs went live — `baseline_agg_meta.active_since`,
+        // which is data-INDEPENDENT. The comparison is at TIMESTAMP granularity,
+        // not day: the activation day is itself PARTIAL (if the MVs went live at
+        // noon, that morning's events are uncaptured), so a day-level check
+        // would trust it wrongly.
+        //   * lookback entirely within the MV-active period (`start >=
+        //     active_since`, full DateTime) → every event of the lookback,
+        //     including late arrivals, flowed through a LIVE MV → serve.
+        //   * lookback reaches before activation (`start < active_since`) → the
+        //     pre-activation portion `[start, active_since)` touches days
+        //     `[start_day, active_day]` INCLUSIVE — active_day too, because its
+        //     pre-`active_since` morning is uncaptured by the MVs and only a
+        //     full-day backfill covers it. So require a completion marker for
+        //     EVERY day in `[start_day, active_day]` inclusive for this lane →
+        //     serve, else raw. (Safe re: double-count — the backfill is
+        //     closed-days-only and clears-then-rescans, so a marker on active_day
+        //     means it was fully re-scanned as a closed day, no live-MV overlap.)
+        // A missing/unreadable watermark ⇒ `None` ⇒ raw scan (fail-safe).
+        let active_since = self.baseline_agg_active_since(clickhouse).await?;
+        if start < active_since {
+            let active_day = active_since.date_naive();
+            let marker_table = self
+                .table_names
+                .read("entity_dimension_day_agg_backfill_progress");
+            let lane = Self::dimension_agg_lane(self.active_profile.as_ref());
+            // Days in the INCLUSIVE pre-activation window [start_day, active_day].
+            let needed = (active_day - start_naive).num_days() + 1;
+            let marker_sql = format!(
+                "SELECT toUInt64(count(DISTINCT day)) AS covered_days FROM {marker_table} \
+                 WHERE lane = '{lane}' \
+                   AND day >= toDate('{start_day}') AND day <= toDate('{active_day_s}')",
+                active_day_s = active_day.format("%Y-%m-%d"),
+            );
+
+            #[derive(clickhouse::Row, serde::Deserialize)]
+            struct CoverageRow {
+                covered_days: u64,
+            }
+
+            match clickhouse.query(&marker_sql).fetch_all::<CoverageRow>().await {
+                Ok(rows) if rows.first().is_some_and(|r| r.covered_days >= needed as u64) => {}
+                Ok(_) => {
+                    tracing::debug!(
+                        entity_type,
+                        "baseline agg lookback predates activation and the pre-activation \
+                         window is not fully backfilled; using raw scan"
+                    );
+                    return None;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        entity_type,
+                        "baseline agg backfill-marker probe failed; using raw scan: {}",
+                        e
+                    );
+                    return None;
+                }
+            }
+        }
+
+        let dim_list = dim_fields
+            .iter()
+            .map(|f| format!("'{}'", escape_sql_string(f)))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // HAVING drops values whose earliest sighting is at/after the exclusive
+        // `end` — same instant the raw path bounds `timestamp <` — so a value
+        // first-seen later on the same boundary day is not surfaced as new
+        // (P1-1). Timestamps are ours → inlined. The formatted output column is
+        // aliased `fs`, NOT `first_seen`: aliasing it `first_seen` would SHADOW
+        // the `first_seen` agg column, so `min(first_seen)` in HAVING/ORDER
+        // would bind the formatted String instead of the timestamp (the
+        // "alias shadows column" trap). The result struct maps by POSITION, so
+        // the alias name is irrelevant to deserialization.
+        let sql = format!(
+            "SELECT dim, val, toUInt64(sum(event_count)) AS cnt, \
+                    formatDateTime(min(first_seen), '%Y-%m-%dT%H:%i:%sZ') AS fs \
+             FROM {agg_table} \
+             WHERE entity_type = '{entity_type}' \
+               AND entity_value = ? \
+               AND day >= toDate('{start_day}') AND day <= toDate('{end_day}') \
+               AND dim IN ({dim_list}) \
+             GROUP BY dim, val \
+             HAVING min(first_seen) < toDateTime64('{end_ts}', 6) \
+             ORDER BY min(first_seen) DESC \
+             LIMIT {per_dim_limit} BY dim",
+            end_ts = end.format("%Y-%m-%d %H:%M:%S%.6f"),
+        );
+
+        // Field name matches the `fs` SQL alias — the clickhouse crate maps
+        // result columns to struct fields BY NAME (not position).
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct FirstRow {
+            dim: String,
+            val: String,
+            cnt: u64,
+            fs: String,
+        }
+
+        match clickhouse
+            .query(&sql)
+            .bind(value_lower)
+            .fetch_all::<FirstRow>()
+            .await
+        {
+            Ok(rows) => Some(
+                rows.into_iter()
+                    .filter_map(|r| {
+                        parse_asset_timestamp(&r.fs).map(|first_seen| DimensionFirst {
+                            dimension: r.dim,
+                            value: r.val,
+                            count: r.cnt,
+                            first_seen,
+                        })
+                    })
+                    .collect(),
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    entity_type,
+                    "baseline day agg read failed; using raw scan: {}",
+                    e
+                );
+                None
+            }
+        }
+    }
+
+    /// Read + memoize the baseline-agg MV activation watermark
+    /// (`baseline_agg_meta.active_since`, NAN-1895) — the data-independent gate
+    /// on the day agg's fast path. Written ONCE by migration 167 and immutable,
+    /// so it is read lazily on the first `| baseline` query and cached for the
+    /// life of the service (shared across the per-request clones via the `Arc`
+    /// OnceCell). A CH READ ERROR is NOT cached (`get_or_try_init` retries next
+    /// call); a MISSING/empty row caches `None`. `None` ⇒ the caller can't
+    /// prove coverage ⇒ it returns the raw scan (fail-safe).
+    async fn baseline_agg_active_since(
+        &self,
+        clickhouse: &clickhouse::Client,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        let meta_table = self.table_names.read("baseline_agg_meta");
+        self.baseline_agg_active_since
+            .get_or_try_init(|| async {
+                #[derive(clickhouse::Row, serde::Deserialize)]
+                struct MetaRow {
+                    active_us: i64,
+                    n: u64,
+                }
+                // MAX, not LIMIT 1 (NAN-1895 P2): the insert-once guard is not
+                // atomic, so two concurrent migrators could race and leave TWO
+                // rows with different timestamps (ReplacingMergeTree collapses
+                // them only eventually). MAX is deterministic AND conservative —
+                // the LATER activation trusts LESS of the lookback. `count()`
+                // distinguishes an EMPTY table (n = 0 → None → raw) from a real
+                // row, since `max()` over no rows returns the epoch default (not
+                // NULL), which must NOT be read as "active since 1970".
+                //
+                // Read the FULL microsecond precision (P1, sub-second): the gate
+                // compares `start >= active_since` at DateTime granularity, so
+                // truncating to the second (via formatDateTime %s) would round the
+                // watermark DOWN and let a `start` in the same second but before
+                // the true activation serve the agg. `toUnixTimestamp64Micro`
+                // preserves the DateTime64(6) exactly.
+                let sql = format!(
+                    "SELECT toInt64(toUnixTimestamp64Micro(max(active_since))) AS active_us, \
+                            toUInt64(count()) AS n \
+                     FROM {meta_table} WHERE k = 'active_since'"
+                );
+                match clickhouse.query(&sql).fetch_all::<MetaRow>().await {
+                    Ok(rows) => Ok(rows
+                        .first()
+                        .filter(|r| r.n > 0)
+                        .and_then(|r| chrono::DateTime::<chrono::Utc>::from_timestamp_micros(r.active_us))),
+                    Err(e) => {
+                        tracing::warn!(
+                            "baseline_agg_meta read failed; agg fast path off this call: {}",
+                            e
+                        );
+                        Err(())
+                    }
+                }
+            })
+            .await
+            .ok()
+            .copied()
+            .flatten()
     }
 
     /// Hourly activity for one entity from a SCOPED scan of raw `logs` — the
@@ -2153,6 +2491,95 @@ impl SearchService {
             }
         }
     }
+}
+
+/// The dimension set the `entity_dimension_day_agg` MVs bake in for one
+/// `(entity_type, actor-anchoring)` pair — MUST mirror
+/// `baseline::dimensions_for` + the MV bodies in
+/// clickhouse/166_baseline_first_seen_agg.sql. The agg has no anchoring
+/// column; each dim name is only ever WRITTEN with one anchoring (actor dims
+/// by the src-side MVs, association dims by both sides), so the dim set IS
+/// the anchoring contract. A request outside these sets must take the raw
+/// scan, never a silently mis-anchored agg answer.
+fn agg_dimension_set(entity_type: &str, source_side_only: bool) -> Option<&'static [&'static str]> {
+    match (entity_type, source_side_only) {
+        ("host", true) => Some(&["process_name", "dest_ip"]),
+        ("host", false) => Some(&["user"]),
+        ("user", true) => Some(&["src_host", "src_ip", "process_name"]),
+        ("ip", false) => Some(&["src_host", "dest_port", "user"]),
+        _ => None,
+    }
+}
+
+/// True when `value_lower` is an RFC1918 IPv4 the day agg's ip MVs store.
+/// MUST mirror the MV gate's regexes (`^10\.` / `^192\.168\.` /
+/// `^172\.(1[6-9]|2[0-9]|3[01])\.`) EXACTLY — a value the MVs skip that this
+/// admits would read as no-history and every peer would look new. Public,
+/// loopback, link-local and IPv6 entities all route to the raw scan.
+fn agg_covers_private_ip(value_lower: &str) -> bool {
+    if value_lower.starts_with("10.") || value_lower.starts_with("192.168.") {
+        return true;
+    }
+    if let Some(rest) = value_lower.strip_prefix("172.") {
+        if let Some((octet, _)) = rest.split_once('.') {
+            // Two digits, 16..=31 — anything else (incl. "016") the regex skips.
+            if octet.len() == 2 {
+                if let Ok(n) = octet.parse::<u8>() {
+                    return (16..=31).contains(&n);
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Source types the baseline day agg's MVs already exclude at ingest
+/// (`lower(source_type) != 'audit'`) — matching the raw new-to-entity scan's
+/// unconditional audit exclusion. MUST stay in lockstep with the MV WHERE
+/// clauses in `clickhouse/166_baseline_first_seen_agg.sql`.
+const BASELINE_AGG_EXCLUDED_SOURCES: &[&str] = &["audit"];
+
+/// Whether the caller's source deny-set is compatible with reading the agg
+/// (NAN-1895). The agg has no `source_type` column, so it can only serve a
+/// caller whose denied sources are ALL already excluded by the agg itself —
+/// otherwise it would leak sources the caller must not see.
+///
+/// Crucially this is NOT `!scope.is_restricted()`: per-source RBAC (NAN-1801)
+/// unions `audit` into the deny-set of every caller without `audit:view`, so an
+/// empty-deny-set check would send ~every real query to the raw scan and the
+/// fast path would never fire. Since the agg already excludes exactly `audit`, a
+/// deny-set of `{audit}` sees precisely the agg's content and is safe; a deny-set
+/// naming any OTHER source (which the agg includes) correctly falls back to raw.
+fn scope_within_agg_exclusions(scope: &ScopeSet) -> bool {
+    scope.deny_set().iter().all(|denied| {
+        BASELINE_AGG_EXCLUDED_SOURCES
+            .iter()
+            .any(|excluded| denied.eq_ignore_ascii_case(excluded))
+    })
+}
+
+/// Whether the day agg can answer this `entity_dimension_firsts` request
+/// (NAN-1888): every profile-mapped dimension must be one the MVs bake in for
+/// this `(entity_type, anchoring)` pair, and an `ip` entity must be RFC1918
+/// (public IPs are not aggregated — unbounded cardinality). The source-scope
+/// check ([`scope_within_agg_exclusions`]) and the coverage gate live at the
+/// call sites. Pure so routing is unit-testable.
+fn baseline_agg_can_serve(
+    entity_type: &str,
+    value_lower: &str,
+    source_side_only: bool,
+    mapped_fields: &[&str],
+) -> bool {
+    if mapped_fields.is_empty() {
+        return false;
+    }
+    let Some(supported) = agg_dimension_set(entity_type, source_side_only) else {
+        return false;
+    };
+    if !mapped_fields.iter().all(|f| supported.contains(f)) {
+        return false;
+    }
+    entity_type != "ip" || agg_covers_private_ip(value_lower)
 }
 
 /// Build the case-insensitive entity WHERE predicate + its binds for the raw
@@ -2606,3 +3033,7 @@ mod baseline_predicate_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "asset_baseline_agg_tests.rs"]
+mod asset_baseline_agg_tests;

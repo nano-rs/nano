@@ -814,7 +814,9 @@ pub(super) fn build_add_column_clause(
 ///     shard by `trace_id` → `cityHash64(trace_id)` (no per-row `id`; trace_id is
 ///     the natural affinity key for trace-assembly reads).
 ///   - Everything else — the MV-fed aggregate/rollup targets (all `*_prevalence_*`,
-///     `entity_time_range_agg`, `cloud_user_activity_agg`, `logs_per_source_5m`,
+///     `entity_time_range_agg`, `entity_dimension_day_agg` +
+///     `ocsf_entity_dimension_day_agg`, `cloud_user_activity_agg`,
+///     `logs_per_source_5m`,
 ///     `identity_observations`, `otel_metrics{,_1m,_1h}`, `otel_service_red_1m`)
 ///     and the `synthetic_check_results` sample stream — is written to the LOCAL
 ///     table (by a materialized view or a single-writer scheduler), never through
