@@ -696,6 +696,10 @@ export function AddFeed() {
         timezone,
         source_type: 'routed',
         source_config: {},
+        // NAN-1906: carry the picked transport into the draft too, so a feed
+        // later deployed from this draft still shows its real transport. May be
+        // unset while the source config hasn't been chosen yet.
+        dispatch_source_config_id: sourceConfigId || undefined,
         parser_vrl: vrl,
         category: category || undefined,
         vendor: vendor || undefined,
@@ -718,7 +722,7 @@ export function AddFeed() {
     } finally {
       setSavingDraft(false);
     }
-  }, [category, description, draftId, feedId, name, namespaceFull, product, timezone, toast, vendor, vrl]);
+  }, [category, description, draftId, feedId, name, namespaceFull, product, sourceConfigId, timezone, toast, vendor, vrl]);
 
   // ------------ Deploy ------------
   const handleDeploy = useCallback(async () => {
@@ -748,6 +752,11 @@ export function AddFeed() {
       // 2. Create (or update) the log source. `source_type: 'routed'` is the
       //    sentinel value that tells the backend this parser receives traffic
       //    via the central source_router; `match_values` drives that router.
+      //    NAN-1906: also record the picked source config as the dispatch link
+      //    so Log Sources renders the real transport (GCP Pub/Sub, Kafka, …) via
+      //    the NAN-1084 JOIN instead of falling back to `source_type` → "HTTP".
+      //    Inert for routing: source/router codegen keys on `source_type`
+      //    ('routed'), never the dispatch id, for a routed parser.
       const payload = {
         name,
         description: description || undefined,
@@ -755,6 +764,7 @@ export function AddFeed() {
         timezone,
         source_type: 'routed',
         source_config: {},
+        dispatch_source_config_id: sourceConfigId,
         parser_vrl: vrl,
         category: category || undefined,
         vendor: vendor || undefined,

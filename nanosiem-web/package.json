@@ -1,7 +1,7 @@
 {
   "name": "vite-react-typescript-starter",
   "private": true,
-  "version": "0.1.670",
+  "version": "0.1.671",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -12,6 +12,7 @@
     "preview": "vite preview",
     "test:tuning-contract": "node --test src/enterprise/api/tuning-response.test.mjs",
     "test:mitre-readiness": "node --test src/components/mitre/types.test.ts",
+    "test:log-source-transports": "node --test src/lib/log-source-transports.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.app.json"
   },
   "dependencies": {

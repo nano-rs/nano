@@ -5035,6 +5035,13 @@ export interface NewLogSource {
   source_type: string;
   source_config: Record<string, unknown>;
   credential_id?: string;
+  /**
+   * NAN-928 dispatch link. NAN-1906: set on onboarding so the Log Sources
+   * list/detail render the real transport (via the NAN-1084 JOIN →
+   * dispatch_source_config_type) instead of falling back to `source_type`.
+   * Inert for routing — router codegen keys on `source_type` ('routed').
+   */
+  dispatch_source_config_id?: string | null;
   parser_vrl: string;
   output_fields?: Record<string, unknown>;
   category?: string;
@@ -5061,6 +5068,8 @@ export interface UpdateLogSource {
   source_type?: string;
   source_config?: Record<string, unknown>;
   credential_id?: string;
+  /** NAN-928/NAN-1906 dispatch link — see NewLogSource. */
+  dispatch_source_config_id?: string | null;
   parser_vrl?: string;
   output_fields?: Record<string, unknown>;
   category?: string;
