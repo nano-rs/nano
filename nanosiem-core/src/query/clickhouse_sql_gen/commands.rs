@@ -93,6 +93,23 @@ impl ClickHouseSqlGenerator {
                             // aggregation (NAN-1339): the output column is the bare
                             // func name — sort by it.
                             escape_identifier(&target)
+                        } else if !self.is_upstream_computed_field(&sf.field)
+                            && !self.is_computed_field(&sf.field)
+                            && self.resolves_to_json_path(&sf.field)
+                        {
+                            // NAN-1911: an OCSF unmapped-tail field the base scan does
+                            // NOT materialize as a bare column (e.g. `risk_score` on a
+                            // wide `SELECT *` projection) must ORDER BY its extraction
+                            // expression — a bare alias 500s with Code 47 "Unknown
+                            // identifier". A numeric tail field extracts as `Float64`,
+                            // so the sort is by value, not lexicographic. `unmapped` is
+                            // projected in every OCSF stage, so the re-extraction always
+                            // binds. Guarded on `resolves_to_json_path` (OCSF-only) and
+                            // on NOT being a computed / prior-stage column (those are
+                            // real in-scope columns, e.g. `… | stats … by risk_score |
+                            // sort -risk_score`) → UDM and OCSF promoted/computed sorts
+                            // stay byte-identical.
+                            field_to_sql_expr(&sf.field, self).0
                         } else {
                             // Regular field - normalize (e.g., _time -> timestamp),
                             // except an upstream value-computed field, which keeps

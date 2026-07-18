@@ -240,7 +240,9 @@ services:
       # parsing is owned by your external pipeline). Kept so parser CRUD doesn't
       # error on a missing path.
       VECTOR_CONFIG_DIR: /app/config/vector
-      VECTOR_SOURCES_RUNTIME_PATH: /etc/vector/dynamic
+      # NAN-1913: sources root as Vector would see it (inert here — no Vector
+      # container — but kept consistent with docker-compose.opensource.yml).
+      VECTOR_SOURCES_RUNTIME_PATH: /etc/vector/dynamic/sources
       VECTOR_CONTAINER_NAME: nano-vector
       # Skip docker-exec'd `vector validate` (the api image has no docker CLI;
       # and there is no Vector container here anyway).
@@ -311,7 +313,8 @@ services:
       NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-udm}
       RUST_LOG: ${RUST_LOG:-info}
       VECTOR_CONFIG_DIR: /app/config/vector
-      VECTOR_SOURCES_RUNTIME_PATH: /etc/vector/dynamic
+      # NAN-1913: see nano-api note above.
+      VECTOR_SOURCES_RUNTIME_PATH: /etc/vector/dynamic/sources
       VECTOR_CONTAINER_NAME: nano-vector
       SKIP_VECTOR_VALIDATION: "true"
       NANOSIEM_DATA_DIR: /app/data

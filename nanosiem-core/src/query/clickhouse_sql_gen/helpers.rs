@@ -271,7 +271,19 @@ pub(crate) fn field_to_sql_expr(field: &str, gen: &ClickHouseSqlGenerator) -> (S
     // renamed / previous-stage column) is preserved byte-identically. Computed
     // pipeline fields were already returned above (is_computed_field). (NAN-1248)
     if gen.resolves_to_json_path(field) {
-        return (gen.field_access_expr(field, "String"), true);
+        // NAN-1911: a JSON-tail field the profile types as numeric
+        // (OCSF's unmapped `risk_score` / `raw_risk_score`) must extract as
+        // `Float64`, not `String` — otherwise `| stats sum(risk_score)` sums a
+        // `toString(...)` and CH rejects it ("Illegal type String … for sum").
+        // `json_tail_access_sql` emits the numeric subcolumn extractor for
+        // `"Float"`. UDM never resolves numerics to JsonPath, so this is
+        // byte-identical there.
+        let json_type = if gen.is_numeric_field(field) {
+            "Float"
+        } else {
+            "String"
+        };
+        return (gen.field_access_expr(field, json_type), true);
     }
     // For unknown fields without metadata_ prefix and no dots:
     // Treat as a direct column reference (could be a computed column from eval,
@@ -327,7 +339,16 @@ pub(crate) fn by_field_sql(field: &str, gen: &ClickHouseSqlGenerator) -> String 
         // PARTITION BY. Computed
         // pipeline fields are excluded — they are real in-scope columns and stay
         // bare. UDM never hits this (resolve never yields JsonPath). (NAN-1248)
-        gen.field_access_expr(field, "String")
+        // NAN-1911: a numeric tail field (OCSF `risk_score`) partitions / dedups
+        // / groups on its Float64 value so the window-command key matches the
+        // Float64 projection the base scan emits; else lexicographic. UDM never
+        // reaches this branch, so it stays byte-identical.
+        let json_type = if gen.is_numeric_field(field) {
+            "Float"
+        } else {
+            "String"
+        };
+        gen.field_access_expr(field, json_type)
     } else {
         escape_identifier(field)
     }

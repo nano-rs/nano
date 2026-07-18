@@ -1473,6 +1473,17 @@ impl ClickHouseSqlGenerator {
         matches!(self.profile.resolve(field), FieldResolution::JsonPath { .. })
     }
 
+    /// Whether the active profile types `field` as numeric (Integer/Long/Float).
+    /// Used by the value seam to pick the `json_tail_access_sql` extractor for a
+    /// JSON-tail field: a numeric type emits the `Float64` subcolumn extractor
+    /// (summable/averagable) instead of the default `String` one. UDM never
+    /// resolves a numeric concept to a JSON path, so UDM callers stay
+    /// byte-identical; this only re-types OCSF's unmapped-tail numerics
+    /// (`risk_score`/`raw_risk_score`, NAN-1911). (NAN-1911)
+    pub(crate) fn is_numeric_field(&self, field: &str) -> bool {
+        self.profile.is_numeric_field(field)
+    }
+
     /// Whether `field` resolves to a `Map`-tail attribute lookup under the active
     /// profile — only true for the spans/metrics datasets (NAN-1555). UDM/OCSF
     /// never return `MapKey`, so logs callers that branch on it stay
@@ -3440,6 +3451,23 @@ impl ClickHouseSqlGenerator {
                             // alias no stage ever bound.
                             needs_metadata_tail = true;
                             None
+                        } else if self.resolves_to_json_path(field)
+                            && self.is_numeric_field(field)
+                        {
+                            // NAN-1911: a numeric OCSF unmapped-tail field (`risk_score`)
+                            // projects as a concrete `Float64` (the coalesce/accurateCastOrNull
+                            // extractor), NOT `toString(...)`. The `toString` below exists
+                            // only to keep a `Dynamic`-typed JSON value out of GROUP BY;
+                            // `Float64` is already concrete, so it groups/sorts fine — and
+                            // numerically, so `sort -risk_score` / `stats by risk_score` order
+                            // by value rather than lexicographically. Matches the value seam
+                            // (`field_to_sql_expr`) and the window-key seam (`by_field_sql`).
+                            // UDM never resolves to JsonPath → byte-identical.
+                            Some(format!(
+                                "{} AS {}",
+                                self.field_access_expr(field, "Float"),
+                                escape_identifier(field)
+                            ))
                         } else {
                             // Spill field — cast to String to avoid Dynamic type in
                             // GROUP BY. Profile-aware: UDM Unknown → `ext.{field}`

@@ -283,7 +283,13 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
       # Parser config delivery — api writes here, vector reads from same volume.
       VECTOR_CONFIG_DIR: /app/config/vector
-      VECTOR_SOURCES_RUNTIME_PATH: /etc/vector/dynamic
+      # NAN-1913: must be the sources ROOT as Vector sees it. The api writes
+      # parser credential files (GCP service-account JSON, Kafka CA, TLS certs)
+      # to <VECTOR_CONFIG_DIR>/sources/parsers__*, which this volume exposes at
+      # /etc/vector/dynamic/sources/. One level short (/etc/vector/dynamic)
+      # makes generated credentials_path values point at nonexistent files and
+      # Vector fails topology reload with "No such file or directory".
+      VECTOR_SOURCES_RUNTIME_PATH: /etc/vector/dynamic/sources
       VECTOR_CONTAINER_NAME: nano-vector
       # Skip docker-exec'd `vector validate` (the api image has no docker CLI).
       SKIP_VECTOR_VALIDATION: "true"
@@ -353,7 +359,9 @@ services:
       NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-udm}
       RUST_LOG: ${RUST_LOG:-info}
       VECTOR_CONFIG_DIR: /app/config/vector
-      VECTOR_SOURCES_RUNTIME_PATH: /etc/vector/dynamic
+      # NAN-1913: see nano-api — sources root as Vector sees it, not the
+      # dynamic-config root.
+      VECTOR_SOURCES_RUNTIME_PATH: /etc/vector/dynamic/sources
       VECTOR_CONTAINER_NAME: nano-vector
       SKIP_VECTOR_VALIDATION: "true"
       NANOSIEM_DATA_DIR: /app/data

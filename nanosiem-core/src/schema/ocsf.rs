@@ -820,6 +820,16 @@ impl SchemaProfile for OcsfProfile {
         if field == OCSF_SOURCE_TYPE_COLUMN {
             return Some(FieldType::String);
         }
+        // NAN-1911: the RBA risk fields have no promoted OCSF column — they spill
+        // into `unmapped` (the risk engine writes numeric `risk_score`/
+        // `raw_risk_score` there). Without a type they extract as String, so
+        // `| stats sum(risk_score)` fails ("Illegal type String for sum"). Type
+        // the numeric ones as Float so `json_tail_access_sql` emits the numeric
+        // subcolumn extractor. `risk_entity`/`risk_level` stay String (their
+        // group-by/filter use is already correct as strings).
+        if matches!(field, "risk_score" | "raw_risk_score") {
+            return Some(FieldType::Float);
+        }
         registry()
             .fields
             .iter()

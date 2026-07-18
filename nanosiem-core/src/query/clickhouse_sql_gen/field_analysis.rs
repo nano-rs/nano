@@ -792,16 +792,17 @@ fn collect_fields_from_eval_expr(
     }
 }
 
-/// Check if a field is produced by post-processing commands (ai, anomaly, risk, etc.)
-/// and does not exist in the database. These must be excluded from SQL SELECT clauses.
+/// Delegates to the canonical [`crate::search::field_utils::is_post_processing_field`]
+/// so the projection analysis and the rest of the search layer agree on which
+/// fields are runtime-only (never physical columns).
+///
+/// NAN-1909: this was a hand-copied duplicate that drifted from the canonical
+/// version — it still matched `starts_with("risk_")`, so the real `logs` columns
+/// `risk_score`/`risk_entity`/`risk_level` were pruned from the base projection
+/// (`… | stats sum(risk_score)` then referenced a column absent from the inner
+/// scan). Delegating keeps the two in lockstep.
 fn is_post_processing_field(field: &str) -> bool {
-    field.starts_with("ai_")
-        || field.starts_with("anomaly_")
-        || field.starts_with("risk_")
-        || matches!(
-            field,
-            "is_anomaly" | "is_rare" | "host_count" | "total_occurrences"
-        )
+    crate::search::field_utils::is_post_processing_field(field)
 }
 
 /// Analyze query to find fields that live in the `ext` JSON column.
