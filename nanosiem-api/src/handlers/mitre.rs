@@ -16,9 +16,9 @@ use crate::state::AppState;
 use nanosiem_core::audit::{AuditEvent, AuditSource, ClientContext, MITRE_CATALOG_SYNCED};
 use nanosiem_core::auth::permissions;
 use nanosiem_core::mitre::{
-    DataSource, DataSourceReadiness, MitreCoverageResponse, MitreRepository, MitreSync,
-    MitreSyncMetadata, MitreSyncOutcome, MitreSyncState, MitreTactic, MitreTechnique,
-    TelemetryReadinessSnapshot, TELEMETRY_READINESS_LOOKBACK_HOURS,
+    DataSource, DataSourceReadiness, MitreCoverageResponse, MitreQuarantinedMapping,
+    MitreRepository, MitreSync, MitreSyncMetadata, MitreSyncOutcome, MitreSyncState, MitreTactic,
+    MitreTechnique, TelemetryReadinessSnapshot, TELEMETRY_READINESS_LOOKBACK_HOURS,
 };
 
 const TELEMETRY_READINESS_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -383,6 +383,74 @@ pub async fn get_mitre_coverage(
     Ok(Json(coverage))
 }
 
+/// Query parameters for the quarantined-mapping listing.
+#[derive(Deserialize, utoipa::IntoParams)]
+pub struct QuarantineQuery {
+    /// Include mappings a later sync already restored. Defaults to false, so
+    /// the listing shows only rules whose mapping is still missing.
+    #[serde(default)]
+    pub include_repaired: bool,
+    /// Maximum rows to return (1-500, default 100).
+    pub limit: Option<i64>,
+}
+
+/// Detection-rule MITRE mappings a catalog sync could not resolve.
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct QuarantineResponse {
+    pub mappings: Vec<MitreQuarantinedMapping>,
+    /// Mappings still missing a resolution — the number worth acting on.
+    pub unrepaired_count: usize,
+}
+
+/// List detection-rule MITRE mappings dropped by a catalog sync.
+///
+/// NAN-1918: before this endpoint existed the quarantine table had no reader at
+/// all, so a sync that renumbered techniques destroyed rule mappings with no
+/// operator-visible trace beyond a log line carrying a bare count.
+#[utoipa::path(
+    get,
+    path = "/api/mitre/quarantine",
+    tag = "mitre",
+    params(QuarantineQuery),
+    responses(
+        (status = 200, description = "Quarantined MITRE mappings", body = QuarantineResponse),
+        (status = 403, description = "Forbidden - Missing permission: mitre:view"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
+pub async fn get_quarantined_mappings(
+    Extension(auth): Extension<AuthContext>,
+    State(state): State<AppState>,
+    Query(params): Query<QuarantineQuery>,
+) -> Result<Json<QuarantineResponse>, (StatusCode, String)> {
+    check_permission(&auth, permissions::MITRE_VIEW)
+        .map_err(|(status, json)| (status, json.0.message))?;
+
+    let limit = params.limit.unwrap_or(100).clamp(1, 500);
+    let repo = MitreRepository::new(state.pool.clone());
+    let mappings = repo
+        .list_quarantined_mappings(params.include_repaired, limit)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "Failed to list quarantined MITRE mappings");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to list quarantined MITRE mappings".to_string(),
+            )
+        })?;
+
+    let unrepaired_count = mappings
+        .iter()
+        .filter(|mapping| mapping.repaired_at.is_none())
+        .count();
+
+    Ok(Json(QuarantineResponse {
+        mappings,
+        unrepaired_count,
+    }))
+}
+
 /// OpenAPI documentation for MITRE ATT&CK endpoints
 pub struct MitreApiDoc;
 
@@ -396,6 +464,7 @@ impl utoipa::OpenApi for MitreApiDoc {
                 get_mitre_data,
                 get_mitre_coverage,
                 sync_mitre_data,
+                get_quarantined_mappings,
             ),
             components(schemas(
                 MitreDataResponse,
@@ -403,6 +472,8 @@ impl utoipa::OpenApi for MitreApiDoc {
                 SyncResponse,
                 DataSource,
                 DataSourceReadiness,
+                QuarantineResponse,
+                MitreQuarantinedMapping,
             )),
             tags(
                 (name = "mitre", description = "MITRE ATT&CK framework integration endpoints")

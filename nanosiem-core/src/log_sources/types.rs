@@ -251,6 +251,13 @@ pub struct LogSource {
     // Status
     pub enabled: bool,
 
+    // Lifecycle (NAN-1920): "draft" = created via the AddFeed wizard but not yet
+    // deployed (survives navigation, shown as a Draft in the Log Sources list);
+    // "active" = a normal, fully-owned feed. Flips draft → active on deploy.
+    // Distinct from the parser working-copy "draft" (log_source_versions).
+    #[serde(default = "default_lifecycle_status")]
+    pub lifecycle_status: String,
+
     // Staleness monitoring
     pub stale_alert_enabled: bool,
     pub stale_threshold_minutes: i32,
@@ -341,6 +348,11 @@ pub struct NewLogSource {
     pub sampling_ratio: Option<f64>,
     /// VRL condition for events that are NEVER sampled.
     pub sampling_exclude_condition: Option<String>,
+    /// NAN-1920 lifecycle: "draft" | "active". Omitted → defaults to "active"
+    /// in the repository INSERT, so pre-NAN-1920 callers are unaffected. The
+    /// AddFeed wizard sends "draft" for its auto-persisted in-progress feed.
+    #[serde(default)]
+    pub lifecycle_status: Option<String>,
 }
 
 fn default_namespace() -> String {
@@ -353,6 +365,10 @@ fn default_utc() -> String {
 
 fn default_log_source_kind() -> String {
     "log".to_string()
+}
+
+fn default_lifecycle_status() -> String {
+    "active".to_string()
 }
 
 /// Request to update a log source (all fields optional)
@@ -390,6 +406,11 @@ pub struct UpdateLogSource {
     pub match_pattern: Option<String>,
     pub match_values: Option<Vec<String>>,
     pub enabled: Option<bool>,
+    // NAN-1920: lifecycle_status is intentionally NOT updatable via this generic
+    // update path. It is server-controlled — set to 'draft'/'active' at create
+    // and flipped to 'active' only by the deploy path (which enforces the tier
+    // cap at the draft→active transition). Exposing it here would let a client
+    // pre-flip a draft to 'active' and bypass that cap check.
     pub stale_alert_enabled: Option<bool>,
     pub stale_threshold_minutes: Option<i32>,
     /// Sample ratio 0.0-1.0 (e.g., 0.1 = keep 10%). None = no change.

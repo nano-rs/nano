@@ -14,6 +14,11 @@ import {
 } from '@/components/ui/command';
 import { cn } from '@/lib/utils';
 import type { LogSource } from '@/lib/api';
+import {
+  buildSourceTypeOptions,
+  findSelectedOption,
+  optionMatchesSearch,
+} from './source-type-options';
 
 interface SourceTypeComboboxProps {
   value: string;
@@ -33,31 +38,13 @@ export function SourceTypeCombobox({
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState('');
 
-  // Build options from log sources: each source_type and match_value becomes an option
-  const options = useMemo(() => {
-    const seen = new Set<string>();
-    const result: { sourceType: string; parserName: string; isMatchValue: boolean }[] = [];
+  // NAN-1916: one option per parser (log source). match_values are routing
+  // aliases, not distinct choices, so they no longer each get their own row —
+  // they're kept for search + resolving an already-stored value.
+  const options = useMemo(() => buildSourceTypeOptions(logSources), [logSources]);
 
-    for (const ls of logSources) {
-      // Primary: the log source's source_type
-      if (ls.source_type && !seen.has(ls.source_type)) {
-        seen.add(ls.source_type);
-        result.push({ sourceType: ls.source_type, parserName: ls.name, isMatchValue: false });
-      }
-      // Also include match_values (these are what the router actually matches on)
-      for (const mv of ls.match_values ?? []) {
-        if (!seen.has(mv)) {
-          seen.add(mv);
-          result.push({ sourceType: mv, parserName: ls.name, isMatchValue: true });
-        }
-      }
-    }
-
-    return result.sort((a, b) => a.sourceType.localeCompare(b.sourceType));
-  }, [logSources]);
-
-  // Find the matching option for display
-  const selectedOption = options.find((o) => o.sourceType === value);
+  // Find the matching option for display (canonical source_type OR any alias).
+  const selectedOption = findSelectedOption(options, value);
   const isUnmatched = value && !selectedOption;
 
   return (
@@ -131,11 +118,7 @@ export function SourceTypeCombobox({
               className="[&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-mono [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-[0.12em]"
             >
               {options
-                .filter((o) =>
-                  !search ||
-                  o.sourceType.toLowerCase().includes(search.toLowerCase()) ||
-                  o.parserName.toLowerCase().includes(search.toLowerCase())
-                )
+                .filter((o) => optionMatchesSearch(o, search))
                 .map((option) => (
                   <CommandItem
                     key={option.sourceType}

@@ -350,6 +350,18 @@ mod tests {
     }
 
     #[test]
+    /// NAN-1918: the quarantine listing is the only operator-visible surface
+    /// for mappings a catalog sync dropped. If it silently falls out of the
+    /// spec it also falls out of the generated client.
+    #[test]
+    fn verify_mitre_quarantine_path_is_documented() {
+        let spec = build_openapi();
+        assert!(
+            spec.paths.paths.contains_key("/api/mitre/quarantine"),
+            "GET /api/mitre/quarantine must be registered in MitreApiDoc"
+        );
+    }
+
     fn verify_openapi_has_security_schemes() {
         let spec = build_openapi();
         let components = spec.components.expect("spec should have components");

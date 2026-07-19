@@ -1831,6 +1831,12 @@ pub fn create_router(state: AppState) -> Router {
         )
         // MITRE ATT&CK framework
         .route("/api/mitre/sync", post(handlers::mitre::sync_mitre_data))
+        // NAN-1918: uncached — an operator checking this has just been told a
+        // sync dropped mappings, and a stale answer would be worse than none.
+        .route(
+            "/api/mitre/quarantine",
+            get(handlers::mitre::get_quarantined_mappings),
+        )
         // Detection-as-code push targets: AI tuning opens PRs here (NAN-1745).
         .route(
             "/api/detection-code-targets",

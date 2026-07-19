@@ -436,6 +436,13 @@ pub struct SourceConfiguration {
     pub deployed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// NAN-1919: fallback `source_type` for unmatched events on pull-transport
+    /// configs (Kafka / AWS S3 / GCP Pub/Sub). When no routing rule fires the
+    /// generated routing transform stamps this value instead of `"unknown"`.
+    /// Seeded from the onboarded feed's name when the first routing rule is
+    /// created. `None`/empty falls back to `"unknown"` as before.
+    #[serde(default)]
+    pub default_source_type: Option<String>,
     /// Best-effort sum of `events_last_24h` across log sources targeted by
     /// this config's routing rules. `None` when ClickHouse is unavailable
     /// or when enrichment is otherwise skipped.
@@ -475,6 +482,11 @@ pub struct NewSourceConfiguration {
     #[serde(default, with = "typeid::cloud_credential::opt")]
     #[schema(value_type = Option<String>)]
     pub credential_id: Option<Uuid>,
+    /// NAN-1919: optional fallback `source_type` for unmatched pull-source
+    /// events. Usually left unset — it is auto-seeded from the first routing
+    /// rule's target when a feed is onboarded.
+    #[serde(default)]
+    pub default_source_type: Option<String>,
     /// Optional initial routing rules
     pub routing_rules: Option<Vec<NewRoutingRule>>,
 }
@@ -490,6 +502,9 @@ pub struct UpdateSourceConfiguration {
     #[schema(value_type = Option<String>)]
     pub credential_id: Option<Uuid>,
     pub enabled: Option<bool>,
+    /// NAN-1919: fallback `source_type` for unmatched pull-source events.
+    #[serde(default)]
+    pub default_source_type: Option<String>,
 }
 
 // ============================================================================

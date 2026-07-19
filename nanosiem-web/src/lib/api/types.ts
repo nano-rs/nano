@@ -5007,6 +5007,13 @@ export interface LogSource {
   deployed: boolean;
   deployed_at?: string;
   enabled: boolean;
+  /**
+   * NAN-1920 lifecycle: 'draft' = onboarded via the AddFeed wizard but not yet
+   * deployed (survives navigation, shown as Draft in the list); 'active' = a
+   * normal feed. Flips draft → active on deploy. Distinct from the parser
+   * working-copy "draft" (LogSourceWithDraftStatus.has_draft_changes).
+   */
+  lifecycle_status?: 'draft' | 'active' | string;
   stale_alert_enabled: boolean;
   stale_threshold_minutes: number;
   /** Sample ratio 0.0-1.0 (e.g., 0.1 = keep 10%). null = no sampling. */
@@ -5056,6 +5063,9 @@ export interface NewLogSource {
   sampling_ratio?: number | null;
   /** VRL condition for events that are NEVER sampled. */
   sampling_exclude_condition?: string | null;
+  /** NAN-1920 lifecycle. Omit → backend defaults to 'active'. The AddFeed
+   *  wizard sends 'draft' for its auto-persisted in-progress feed. */
+  lifecycle_status?: 'draft' | 'active';
 }
 
 export interface UpdateLogSource {
@@ -5086,6 +5096,9 @@ export interface UpdateLogSource {
   sampling_ratio?: number | null;
   /** VRL condition for events that are NEVER sampled. */
   sampling_exclude_condition?: string | null;
+  // NAN-1920: lifecycle_status is intentionally NOT updatable — it is
+  // server-controlled (set at create, flipped to 'active' only by the deploy
+  // path). Exposing it on update would let a client bypass the tier cap.
   /** Parser extension VRL (NAN-874). Empty string clears the extension; undefined leaves unchanged. */
   extension_vrl?: string;
   /** Toggle whether extension_vrl is included in deploys (NAN-874). */

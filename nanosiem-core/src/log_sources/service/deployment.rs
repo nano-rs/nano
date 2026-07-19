@@ -303,6 +303,13 @@ impl LogSourceService {
         if let Err(e) = self.repository().mark_enabled_deployed().await {
             tracing::warn!(error = %e, "deploy succeeded but failed to mark sibling enabled sources deployed");
         }
+        // NAN-1920: a feed onboarded via the AddFeed wizard persists as a
+        // lifecycle 'draft' while it's built. Deploying it makes it a real,
+        // live feed — flip it out of draft. Idempotent (no-op for active
+        // feeds) and best-effort: a bookkeeping miss must not fail the deploy.
+        if let Err(e) = self.repository().mark_lifecycle_active(id).await {
+            tracing::warn!(error = %e, "deploy succeeded but failed to flip lifecycle_status to active");
+        }
 
         let deployment_id = self
             .repository()

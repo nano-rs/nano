@@ -19,6 +19,7 @@ impl LogSourceRepository {
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values,
                 validated, validation_error, deployed, deployed_at, enabled,
+                lifecycle_status,
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
                 parser_only,
@@ -45,6 +46,7 @@ impl LogSourceRepository {
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values,
                 validated, validation_error, deployed, deployed_at, enabled,
+                lifecycle_status,
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
                 parser_only,
@@ -111,6 +113,22 @@ impl LogSourceRepository {
             "UPDATE log_sources SET deployed = true, deployed_at = NOW() \
              WHERE enabled = true AND deployed = false",
         )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// NAN-1920: flip a draft feed to active. Only touches rows currently in
+    /// 'draft' (idempotent for already-active feeds), so re-deploying an active
+    /// source is a no-op here. Called from the deploy success path so a feed
+    /// onboarded via the AddFeed wizard leaves the Draft state once it's live.
+    /// Returns the number of rows flipped (0 when the feed was already active).
+    pub async fn mark_lifecycle_active(&self, id: Uuid) -> Result<u64, LogSourceRepositoryError> {
+        let result = sqlx::query(
+            "UPDATE log_sources SET lifecycle_status = 'active' \
+             WHERE id = $1 AND lifecycle_status = 'draft'",
+        )
+        .bind(id)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())

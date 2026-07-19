@@ -11,7 +11,9 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 use crate::mitre::repository::MitreRepository;
-use crate::mitre::types::{MitreTactic, MitreTechnique, StixBundle, StixObject};
+use crate::mitre::types::{
+    MitreTactic, MitreTechnique, MitreTechniqueAlias, StixBundle, StixObject,
+};
 
 const MITRE_SYNC_LOCK_ID: i64 = 0x4d49_5452_455f_5359;
 const MITRE_RELEASE: &str = "v19.1";
@@ -30,6 +32,7 @@ struct SyncSource {
     min_objects: usize,
     min_tactics: usize,
     min_techniques: usize,
+    min_aliases: usize,
 }
 
 impl SyncSource {
@@ -43,6 +46,13 @@ impl SyncSource {
             min_objects: 20_000,
             min_tactics: 15,
             min_techniques: 650,
+            // v19.1 yields 149 after live IDs are filtered out, and ATT&CK does
+            // not retire historical revocations, so this only trips on a real
+            // parse regression. NAN-1923 made catalog currency depend on the
+            // alias count, which means an empty harvest would be self-consistent
+            // — recorded as 0, matching an empty table, reporting current, never
+            // retried. A floor turns that silent sticky failure into a loud one.
+            min_aliases: 100,
         }
     }
 }
@@ -185,27 +195,46 @@ impl MitreSync {
             "Fetching pinned MITRE ATT&CK catalog"
         );
         let bundle = self.fetch_bundle().await?;
-        let (tactics, techniques) = self.parse_catalog(&bundle)?;
+        let (tactics, techniques, aliases) = self.parse_catalog(&bundle)?;
 
         // NAN-1774 / NAN-1766 (D3): `replace_catalog_on` writes the catalog,
         // reconciles existing detection-rule mappings against it, and flips the
         // sync state to `succeeded` — all inside one transaction. Reconciliation
         // is no longer a separate pool round-trip after the commit, so a crash
         // can never leave state `succeeded` with stale rule mappings still live.
-        let quarantined = MitreRepository::replace_catalog_on(
+        let reconcile = MitreRepository::replace_catalog_on(
             connection,
             &tactics,
             &techniques,
+            &aliases,
             &self.source.release,
             &self.source.url,
             &self.source.sha256,
         )
         .await?;
 
-        if quarantined > 0 {
+        if reconcile.remapped > 0 || reconcile.repaired > 0 {
+            info!(
+                remapped = reconcile.remapped,
+                repaired = reconcile.repaired,
+                aliases = aliases.len(),
+                "Migrated detection-rule MITRE mappings onto the synced ATT&CK catalog"
+            );
+        }
+        if reconcile.quarantined > 0 {
+            // NAN-1918: this is now the genuinely unresolvable remainder — the
+            // alias map has already carried forward everything it could.
+            // Enumerate the rules, since a bare count left operators with no
+            // way to find what lost its mapping.
             warn!(
-                quarantined,
-                "Quarantined legacy detection-rule mappings that are invalid in the synced ATT&CK catalog"
+                quarantined = reconcile.quarantined,
+                rules = %reconcile
+                    .quarantined_rule_ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                "Cleared detection-rule MITRE mappings that the synced ATT&CK catalog cannot resolve; see GET /api/mitre/quarantine"
             );
         }
 
@@ -291,7 +320,8 @@ impl MitreSync {
     fn parse_catalog(
         &self,
         bundle: &StixBundle,
-    ) -> Result<(Vec<MitreTactic>, Vec<MitreTechnique>), MitreSyncError> {
+    ) -> Result<(Vec<MitreTactic>, Vec<MitreTechnique>, Vec<MitreTechniqueAlias>), MitreSyncError>
+    {
         let mut tactic_map = HashMap::new();
         let mut tactic_ids = HashSet::new();
         let mut tactics = Vec::new();
@@ -375,7 +405,16 @@ impl MitreSync {
 
         tactics.sort_by(|left, right| left.id.cmp(&right.id));
         techniques.sort_by_key(|technique| (technique.is_subtechnique, technique.id.clone()));
-        Ok((tactics, techniques))
+
+        let aliases = resolve_technique_aliases(bundle, &technique_ids);
+        if aliases.len() < self.source.min_aliases {
+            return Err(MitreSyncError::InvalidBundle(format!(
+                "only {} technique aliases (minimum {})",
+                aliases.len(),
+                self.source.min_aliases
+            )));
+        }
+        Ok((tactics, techniques, aliases))
     }
 
     fn parse_tactic(&self, object: &StixObject) -> Result<MitreTactic, MitreSyncError> {
@@ -454,6 +493,9 @@ impl MitreSync {
             is_subtechnique,
             parent_id,
             tactic_ids,
+            // Not a placeholder: the filter in `parse_catalog` already excluded
+            // every revoked/deprecated object, so anything parsed here is
+            // current. See the field docs on MitreTechnique (NAN-1921).
             deprecated: false,
             data_sources,
         })
@@ -549,6 +591,70 @@ fn resolve_data_source_labels(bundle: &StixBundle) -> HashMap<String, Vec<String
         .filter(|(_, set)| !set.is_empty())
         .map(|(technique_id, set)| (technique_id, set.into_iter().collect()))
         .collect()
+}
+
+/// Harvest `old technique ID -> replacement` edges from the bundle's
+/// `revoked-by` relationships.
+///
+/// `parse_catalog` filters revoked attack-patterns out of the catalog, and
+/// `replace_catalog_on` then deletes any technique row the bundle no longer
+/// contains. Before NAN-1918 that silently orphaned every rule mapped to a
+/// renumbered technique. The bundle already carries the forwarding address, so
+/// walk it here: v19.1 ships 157 of these edges spanning the whole renumbering
+/// history (`T1143` -> `T1564.003`, `T1042` -> `T1546.001`, ...).
+///
+/// Both endpoints are looked up across *all* attack-patterns, revoked included,
+/// because chains can pass through an ID that is itself revoked; resolution to
+/// a live technique is transitive and happens in SQL. Edges whose target is
+/// unknown to this bundle are dropped — a dangling alias would resolve to NULL
+/// anyway, and keeping it out means the table only holds usable forwardings.
+fn resolve_technique_aliases(
+    bundle: &StixBundle,
+    live_technique_ids: &HashSet<String>,
+) -> Vec<MitreTechniqueAlias> {
+    let mut attack_ids: HashMap<&str, &str> = HashMap::new();
+    for object in &bundle.objects {
+        if object.object_type != "attack-pattern" {
+            continue;
+        }
+        let attack_id = object
+            .external_references
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|reference| reference.source_name.as_deref() == Some("mitre-attack"))
+            .and_then(|reference| reference.external_id.as_deref())
+            .filter(|id| id.starts_with('T'));
+        if let Some(attack_id) = attack_id {
+            attack_ids.insert(object.id.as_str(), attack_id);
+        }
+    }
+
+    let mut aliases: Vec<MitreTechniqueAlias> = bundle
+        .objects
+        .iter()
+        .filter(|object| {
+            object.object_type == "relationship"
+                && object.relationship_type.as_deref() == Some("revoked-by")
+        })
+        .filter_map(|object| {
+            let old_id = attack_ids.get(object.source_ref.as_deref()?)?;
+            let new_id = attack_ids.get(object.target_ref.as_deref()?)?;
+            // A live ID is not an alias; self-edges would violate the table's
+            // CHECK constraint.
+            if old_id == new_id || live_technique_ids.contains(*old_id) {
+                return None;
+            }
+            Some(MitreTechniqueAlias {
+                old_id: (*old_id).to_string(),
+                new_id: (*new_id).to_string(),
+            })
+        })
+        .collect();
+
+    aliases.sort_by(|left, right| left.old_id.cmp(&right.old_id));
+    aliases.dedup_by(|left, right| left.old_id == right.old_id);
+    aliases
 }
 
 fn mitre_external_id(object: &StixObject, prefix: &str) -> Result<String, MitreSyncError> {
@@ -690,8 +796,119 @@ mod tests {
                 min_objects: 2,
                 min_tactics: 1,
                 min_techniques: 1,
+                min_aliases: 0,
             },
         }
+    }
+
+    /// Mirrors the v19 shape: `T1562.001` is revoked in favour of `T1685`, and
+    /// `T1562.006` collapses into the same successor. `T1059` stays live.
+    const ALIAS_BUNDLE: &str = r#"{
+        "type": "bundle",
+        "id": "bundle--alias",
+        "objects": [
+            {
+                "type": "attack-pattern",
+                "id": "attack-pattern--live",
+                "name": "Command and Scripting Interpreter",
+                "external_references": [{"source_name": "mitre-attack", "external_id": "T1059"}]
+            },
+            {
+                "type": "attack-pattern",
+                "id": "attack-pattern--successor",
+                "name": "Disable or Modify Tools",
+                "external_references": [{"source_name": "mitre-attack", "external_id": "T1685"}]
+            },
+            {
+                "type": "attack-pattern",
+                "id": "attack-pattern--revoked-a",
+                "name": "Disable or Modify Tools (old)",
+                "revoked": true,
+                "external_references": [{"source_name": "mitre-attack", "external_id": "T1562.001"}]
+            },
+            {
+                "type": "attack-pattern",
+                "id": "attack-pattern--revoked-b",
+                "name": "Indicator Blocking",
+                "revoked": true,
+                "external_references": [{"source_name": "mitre-attack", "external_id": "T1562.006"}]
+            },
+            {
+                "type": "relationship",
+                "id": "relationship--a",
+                "relationship_type": "revoked-by",
+                "source_ref": "attack-pattern--revoked-a",
+                "target_ref": "attack-pattern--successor"
+            },
+            {
+                "type": "relationship",
+                "id": "relationship--b",
+                "relationship_type": "revoked-by",
+                "source_ref": "attack-pattern--revoked-b",
+                "target_ref": "attack-pattern--successor"
+            },
+            {
+                "type": "relationship",
+                "id": "relationship--unrelated",
+                "relationship_type": "detects",
+                "source_ref": "attack-pattern--revoked-a",
+                "target_ref": "attack-pattern--live"
+            },
+            {
+                "type": "relationship",
+                "id": "relationship--dangling",
+                "relationship_type": "revoked-by",
+                "source_ref": "attack-pattern--revoked-a",
+                "target_ref": "attack-pattern--not-in-bundle"
+            }
+        ]
+    }"#;
+
+    #[test]
+    fn harvests_revoked_by_edges_as_technique_aliases() {
+        let bundle: StixBundle = serde_json::from_str(ALIAS_BUNDLE).expect("bundle parses");
+        let live: HashSet<String> = ["T1059".to_string(), "T1685".to_string()].into_iter().collect();
+
+        let aliases = resolve_technique_aliases(&bundle, &live);
+
+        assert_eq!(
+            aliases,
+            vec![
+                MitreTechniqueAlias {
+                    old_id: "T1562.001".to_string(),
+                    new_id: "T1685".to_string(),
+                },
+                MitreTechniqueAlias {
+                    old_id: "T1562.006".to_string(),
+                    new_id: "T1685".to_string(),
+                },
+            ],
+            "both revoked techniques must forward to their successor"
+        );
+    }
+
+    #[test]
+    fn alias_harvest_ignores_live_ids_and_non_revocation_edges() {
+        let bundle: StixBundle = serde_json::from_str(ALIAS_BUNDLE).expect("bundle parses");
+        // Pretend T1562.001 is still live: it must not be recorded as an alias,
+        // or resolve_mitre_technique_alias would forward a current technique.
+        let live: HashSet<String> = ["T1059".to_string(), "T1685".to_string(), "T1562.001".to_string()]
+            .into_iter()
+            .collect();
+
+        let aliases = resolve_technique_aliases(&bundle, &live);
+
+        assert_eq!(
+            aliases,
+            vec![MitreTechniqueAlias {
+                old_id: "T1562.006".to_string(),
+                new_id: "T1685".to_string(),
+            }],
+            "live IDs and `detects` relationships must not produce aliases"
+        );
+        // The dangling revoked-by (target absent from the bundle) is dropped by
+        // the same pass, so no alias can point at an unknown technique.
+        assert!(aliases.iter().all(|alias| alias.new_id == "T1685"));
     }
 
     #[test]
@@ -739,7 +956,8 @@ mod tests {
         .expect("bundle parses");
 
         let sync = test_sync("http://x".to_string(), b"x", "bundle--ds", 1_048_576);
-        let (_tactics, techniques) = sync.parse_catalog(&bundle).expect("catalog parses");
+        let (_tactics, techniques, _aliases) =
+            sync.parse_catalog(&bundle).expect("catalog parses");
         let technique = techniques
             .iter()
             .find(|t| t.id == "T1059")
@@ -777,7 +995,7 @@ mod tests {
         );
 
         let bundle = sync.fetch_bundle().await.expect("valid bundle");
-        let (tactics, techniques) = sync.parse_catalog(&bundle).expect("valid catalog");
+        let (tactics, techniques, _aliases) = sync.parse_catalog(&bundle).expect("valid catalog");
         assert_eq!(tactics.len(), 1);
         assert_eq!(techniques.len(), 1);
         assert_eq!(techniques[0].tactic_ids, vec!["TA0002"]);
@@ -855,8 +1073,15 @@ mod tests {
         let sync = MitreSync::new(MitreRepository::new(pool));
 
         let bundle = sync.fetch_bundle().await.expect("pinned bundle");
-        let (tactics, techniques) = sync.parse_catalog(&bundle).expect("pinned catalog");
+        let (tactics, techniques, aliases) = sync.parse_catalog(&bundle).expect("pinned catalog");
         assert_eq!(tactics.len(), 15);
         assert_eq!(techniques.len(), 697);
+        // Pins the revoked-by harvest against the real upstream. NAN-1923 made
+        // catalog currency depend on this count, so a silently-empty harvest
+        // would look self-consistent forever.
+        assert_eq!(aliases.len(), 149);
+        assert!(aliases
+            .iter()
+            .any(|alias| alias.old_id == "T1562.001" && alias.new_id == "T1685"));
     }
 }

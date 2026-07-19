@@ -162,7 +162,7 @@ impl SourceConfigRepository {
 
         let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
             "SELECT id, name, description, config_type, connection_config, credential_id, \
-             enabled, deployed, deployed_at, created_at, updated_at \
+             enabled, deployed, deployed_at, created_at, updated_at, default_source_type \
              FROM source_configurations WHERE 1=1",
         );
 
@@ -215,7 +215,7 @@ impl SourceConfigRepository {
     pub async fn get(&self, id: Uuid) -> Result<SourceConfiguration, SourceConfigRepositoryError> {
         let config = sqlx::query_as::<_, SourceConfigRow>(
             "SELECT id, name, description, config_type, connection_config, credential_id, \
-             enabled, deployed, deployed_at, created_at, updated_at \
+             enabled, deployed, deployed_at, created_at, updated_at, default_source_type \
              FROM source_configurations WHERE id = $1",
         )
         .bind(id)
@@ -233,7 +233,7 @@ impl SourceConfigRepository {
     ) -> Result<SourceConfiguration, SourceConfigRepositoryError> {
         let config = sqlx::query_as::<_, SourceConfigRow>(
             "SELECT id, name, description, config_type, connection_config, credential_id, \
-             enabled, deployed, deployed_at, created_at, updated_at \
+             enabled, deployed, deployed_at, created_at, updated_at, default_source_type \
              FROM source_configurations WHERE name = $1",
         )
         .bind(name)
@@ -304,26 +304,34 @@ impl SourceConfigRepository {
 
         let config = sqlx::query_as::<_, SourceConfigRow>(
             "INSERT INTO source_configurations \
-             (name, description, config_type, connection_config, credential_id) \
-             VALUES ($1, $2, $3, $4, $5) \
+             (name, description, config_type, connection_config, credential_id, default_source_type) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
              RETURNING id, name, description, config_type, connection_config, credential_id, \
-             enabled, deployed, deployed_at, created_at, updated_at",
+             enabled, deployed, deployed_at, created_at, updated_at, default_source_type",
         )
         .bind(&request.name)
         .bind(&request.description)
         .bind(&request.config_type)
         .bind(&request.connection_config)
         .bind(&request.credential_id)
+        .bind(&request.default_source_type)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| Self::map_create_insert_error(e, &request))?;
 
         let config: SourceConfiguration = config.into();
 
-        // Create initial routing rules if provided
+        // Create initial routing rules if provided. Each rule may seed the
+        // config's default_source_type (NAN-1919) via create_rule, so once any
+        // rule is created we re-fetch and return the current row instead of the
+        // pre-seed INSERT-RETURNING snapshot (which would report a stale NULL
+        // default_source_type).
         if let Some(rules) = request.routing_rules {
-            for rule in rules {
-                self.create_rule(config.id, rule).await?;
+            if !rules.is_empty() {
+                for rule in rules {
+                    self.create_rule(config.id, rule).await?;
+                }
+                return self.get(config.id).await;
             }
         }
 
@@ -364,6 +372,10 @@ impl SourceConfigRepository {
             param_idx += 1;
             updates.push(format!("enabled = ${}", param_idx));
         }
+        if request.default_source_type.is_some() {
+            param_idx += 1;
+            updates.push(format!("default_source_type = ${}", param_idx));
+        }
 
         if updates.is_empty() {
             return self.get(id).await;
@@ -372,7 +384,7 @@ impl SourceConfigRepository {
         let query = format!(
             "UPDATE source_configurations SET {} WHERE id = $1 \
              RETURNING id, name, description, config_type, connection_config, credential_id, \
-             enabled, deployed, deployed_at, created_at, updated_at",
+             enabled, deployed, deployed_at, created_at, updated_at, default_source_type",
             updates.join(", ")
         );
 
@@ -396,6 +408,9 @@ impl SourceConfigRepository {
         }
         if let Some(enabled) = request.enabled {
             query_builder = query_builder.bind(enabled);
+        }
+        if let Some(ref default_source_type) = request.default_source_type {
+            query_builder = query_builder.bind(default_source_type);
         }
 
         let config = query_builder
@@ -428,7 +443,7 @@ impl SourceConfigRepository {
         let config = sqlx::query_as::<_, SourceConfigRow>(
             "UPDATE source_configurations SET deployed = true, deployed_at = NOW() WHERE id = $1 \
              RETURNING id, name, description, config_type, connection_config, credential_id, \
-             enabled, deployed, deployed_at, created_at, updated_at",
+             enabled, deployed, deployed_at, created_at, updated_at, default_source_type",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -446,7 +461,7 @@ impl SourceConfigRepository {
         let config = sqlx::query_as::<_, SourceConfigRow>(
             "UPDATE source_configurations SET deployed = false, deployed_at = NULL WHERE id = $1 \
              RETURNING id, name, description, config_type, connection_config, credential_id, \
-             enabled, deployed, deployed_at, created_at, updated_at",
+             enabled, deployed, deployed_at, created_at, updated_at, default_source_type",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -465,7 +480,7 @@ impl SourceConfigRepository {
         let config = sqlx::query_as::<_, SourceConfigRow>(
             "UPDATE source_configurations SET enabled = $2 WHERE id = $1 \
              RETURNING id, name, description, config_type, connection_config, credential_id, \
-             enabled, deployed, deployed_at, created_at, updated_at",
+             enabled, deployed, deployed_at, created_at, updated_at, default_source_type",
         )
         .bind(id)
         .bind(enabled)
@@ -482,7 +497,7 @@ impl SourceConfigRepository {
     ) -> Result<Vec<SourceConfiguration>, SourceConfigRepositoryError> {
         let configs = sqlx::query_as::<_, SourceConfigRow>(
             "SELECT id, name, description, config_type, connection_config, credential_id, \
-             enabled, deployed, deployed_at, created_at, updated_at \
+             enabled, deployed, deployed_at, created_at, updated_at, default_source_type \
              FROM source_configurations WHERE enabled = true ORDER BY name ASC",
         )
         .fetch_all(&self.pool)
@@ -502,7 +517,7 @@ impl SourceConfigRepository {
     ) -> Result<Vec<SourceConfiguration>, SourceConfigRepositoryError> {
         let configs = sqlx::query_as::<_, SourceConfigRow>(
             "SELECT id, name, description, config_type, connection_config, credential_id, \
-             enabled, deployed, deployed_at, created_at, updated_at \
+             enabled, deployed, deployed_at, created_at, updated_at, default_source_type \
              FROM source_configurations WHERE deployed = true ORDER BY name ASC",
         )
         .fetch_all(&self.pool)
@@ -633,7 +648,39 @@ impl SourceConfigRepository {
         .fetch_one(&self.pool)
         .await?;
 
-        Ok(rule.into())
+        let rule: RoutingRule = rule.into();
+
+        // NAN-1919: seed the parent config's default_source_type from the first
+        // routing rule's target so unmatched pull-source events fall back to a
+        // real source type instead of "unknown". Conditional UPDATE — a no-op
+        // once a value is established, so later rules never overwrite it. Done
+        // here (not in the service layer) so both the service `create_rule`
+        // path and the initial-rules loop in `create` seed identically.
+        self.set_default_source_type_if_unset(source_configuration_id, &rule.target_source_type)
+            .await?;
+
+        Ok(rule)
+    }
+
+    /// NAN-1919: set `default_source_type` only when it is currently unset
+    /// (NULL or empty string). Seeded from the first routing rule's target so
+    /// unmatched pull-transport events fall back to a real source type instead
+    /// of `"unknown"`. Idempotent — an already-set value is left untouched.
+    pub async fn set_default_source_type_if_unset(
+        &self,
+        source_configuration_id: Uuid,
+        value: &str,
+    ) -> Result<(), SourceConfigRepositoryError> {
+        sqlx::query(
+            "UPDATE source_configurations SET default_source_type = $1 \
+             WHERE id = $2 AND (default_source_type IS NULL OR default_source_type = '')",
+        )
+        .bind(value)
+        .bind(source_configuration_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
     }
 
     /// Update a routing rule
@@ -927,6 +974,7 @@ struct SourceConfigRow {
     deployed_at: Option<chrono::DateTime<chrono::Utc>>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
+    default_source_type: Option<String>,
 }
 
 impl From<SourceConfigRow> for SourceConfiguration {
@@ -943,6 +991,7 @@ impl From<SourceConfigRow> for SourceConfiguration {
             deployed_at: row.deployed_at,
             created_at: row.created_at,
             updated_at: row.updated_at,
+            default_source_type: row.default_source_type,
             events_24h: None,
             bytes_per_day_24h: None,
             last_event_at: None,

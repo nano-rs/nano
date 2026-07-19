@@ -39,6 +39,7 @@ export const mitreQueryKeys = {
   catalog: (authScope: string) => [...mitreQueryKeys.all, 'catalog', authScope] as const,
   coverage: (authScope: string, severity: string, mode: string) =>
     [...mitreQueryKeys.all, 'coverage', authScope, severity, mode] as const,
+  quarantine: (authScope: string) => [...mitreQueryKeys.all, 'quarantine', authScope] as const,
 };
 
 interface MitreQueryInvalidator {

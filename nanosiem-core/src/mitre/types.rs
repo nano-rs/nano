@@ -47,13 +47,69 @@ pub struct MitreTechnique {
     pub parent_id: Option<String>,
     /// Associated tactic IDs
     pub tactic_ids: Vec<String>,
-    /// Whether the technique is deprecated
+    /// Whether the technique is deprecated.
+    ///
+    /// Always `false` on anything the sync produces: `parse_catalog` drops
+    /// `revoked` and `x_mitre_deprecated` objects, so a technique that reaches
+    /// this struct is current by construction (NAN-1921). The field and its
+    /// database column exist for rows written before catalog enforcement, which
+    /// the validation trigger still screens. Do not "simplify" it away.
     pub deprecated: bool,
     /// MITRE-declared required data sources for this technique
     /// (e.g. `["Process: Process Creation", "Network Traffic: Flow"]`).
     /// Used by the coverage API to derive `connected` data sources.
     #[serde(default)]
     pub data_sources: Vec<String>,
+}
+
+/// A technique ID that ATT&CK revoked in favour of another, harvested from the
+/// bundle's `revoked-by` relationships.
+///
+/// ATT&CK renumbers techniques across releases (v19 moved `T1562.001` to
+/// `T1685` when it split Impair Defenses into its own tactic). Without these
+/// edges a sync deletes the old ID and every rule referencing it loses its
+/// mapping, so they are persisted and used to migrate mappings forward.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct MitreTechniqueAlias {
+    /// The revoked technique ID (e.g. `T1562.001`).
+    pub old_id: String,
+    /// The technique that replaced it (e.g. `T1685`).
+    pub new_id: String,
+}
+
+/// What a catalog sync did to existing detection-rule mappings.
+///
+/// Before NAN-1918 this was a single quarantine count, which conflated "we
+/// carried the mapping forward" with "we deleted it".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MitreReconcileOutcome {
+    /// Mappings migrated onto the new catalog via the alias map.
+    pub remapped: u64,
+    /// Mappings restored from quarantine that an earlier sync had destroyed.
+    pub repaired: u64,
+    /// Mappings cleared because no alias path resolves them.
+    pub quarantined: u64,
+    /// Exactly which rules lost their mapping. Reported by the reconcile pass
+    /// itself rather than inferred from a timestamp window, so the sync log can
+    /// name them without guessing.
+    pub quarantined_rule_ids: Vec<uuid::Uuid>,
+}
+
+/// A rule mapping that a catalog sync could not resolve, plus the repair
+/// outcome if a later sync managed to restore it.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct MitreQuarantinedMapping {
+    pub id: i64,
+    pub rule_id: uuid::Uuid,
+    /// `None` when the rule has since been deleted.
+    pub rule_name: Option<String>,
+    pub original_tactics: Vec<String>,
+    pub original_techniques: Vec<String>,
+    pub reason: String,
+    pub quarantined_at: DateTime<Utc>,
+    pub repaired_at: Option<DateTime<Utc>>,
+    pub repaired_tactics: Option<Vec<String>>,
+    pub repaired_techniques: Option<Vec<String>>,
 }
 
 /// Metadata about the last MITRE sync

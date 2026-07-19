@@ -712,6 +712,9 @@ impl ParserRepositoryService {
             match_values: Some(match_values),
             sampling_ratio: None,
             sampling_exclude_condition: None,
+            // NAN-1920: repo imports create real, immediately-usable feeds —
+            // not wizard drafts — so they stay 'active' (the INSERT default).
+            lifecycle_status: None,
         };
 
         // NAN-950: do the three writes (log_sources INSERT, log_sources

@@ -278,4 +278,62 @@ mod tests {
 
         transaction.rollback().await.unwrap();
     }
+
+    /// NAN-1918 regression guard.
+    ///
+    /// Migration 230 ran the ID *shape* checks before the empty-catalog guard on
+    /// purpose: an air-gapped install never syncs a catalog, but `'BANANA'` is
+    /// still not a tactic ID. While adding alias remapping I folded those checks
+    /// into the catalog-aware validation, which sits *after* that guard — so
+    /// every malformed ID silently became valid on air-gapped deployments, and
+    /// the whole suite stayed green. Pin the ordering.
+    #[tokio::test]
+    #[ignore = "requires migrated PostgreSQL"]
+    async fn malformed_ids_are_rejected_even_without_a_catalog() {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://nanosiem:nanosiem@localhost:5432/nanosiem".into());
+        let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+        let mut transaction = pool.begin().await.unwrap();
+
+        // Simulate the air-gapped shape: catalog tables empty, rolled back after.
+        for table in [
+            "mitre_technique_tactics",
+            "mitre_techniques",
+            "mitre_tactics",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table}"))
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+        }
+
+        assert_database_rejects(
+            &mut transaction,
+            &["BANANA"],
+            &["T1059"],
+            "Invalid MITRE tactic ID 'BANANA'; expected TA followed by four digits",
+        )
+        .await;
+        assert_database_rejects(
+            &mut transaction,
+            &["TA0002"],
+            &["not-a-technique"],
+            "Invalid MITRE technique ID 'NOT-A-TECHNIQUE'; expected T followed by four digits and an optional three-digit sub-technique",
+        )
+        .await;
+
+        // The degrade itself must survive: a well-formed mapping still writes,
+        // otherwise an air-gapped install could not create rules at all.
+        sqlx::query(
+            "INSERT INTO detection_rules \
+             (name, query, severity, mitre_tactics, mitre_techniques) \
+             VALUES ($1, '*', 'medium', ARRAY['TA0002'], ARRAY['T1059'])",
+        )
+        .bind(format!("NAN-1918 airgap ok {}", uuid::Uuid::now_v7()))
+        .execute(&mut *transaction)
+        .await
+        .expect("well-formed mapping must still write without a catalog");
+
+        transaction.rollback().await.unwrap();
+    }
 }

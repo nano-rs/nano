@@ -9,7 +9,13 @@ import { useMemo, useState } from 'react';
 import { AlertTriangle, Loader2, Search as SearchIcon, Shield } from 'lucide-react';
 
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
-import { useMitreCoverage, useMitreData, type MitreSyncState } from '@/hooks/useMitreData';
+import {
+  useMitreCoverage,
+  useMitreData,
+  useMitreQuarantine,
+  type MitreQuarantinedMapping,
+  type MitreSyncState,
+} from '@/hooks/useMitreData';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { cn } from '@/lib/utils';
@@ -74,6 +80,62 @@ function TierPill({ tier, count }: { tier: CoverageTier; count: number }) {
       <span className="opacity-70">·</span>
       <span className="font-semibold tabular-nums">{count}</span>
     </span>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// Unmapped-rules banner (NAN-1918).
+//
+// Coverage counts only live mappings, so a rule whose mapping a catalog sync
+// dropped stops contributing — and the percentage rises. Without this the
+// number on this page looks better precisely because detection got worse.
+// ----------------------------------------------------------------------------
+
+function DroppedMappingsBanner({ mappings }: { mappings: MitreQuarantinedMapping[] }) {
+  const [expanded, setExpanded] = useState(false);
+  if (mappings.length === 0) return null;
+
+  return (
+    <div className="mx-3 mt-3 border border-amber-500/30 bg-amber-500/10 rounded-md">
+      <div className="flex items-start gap-2 px-3 py-2">
+        <AlertTriangle className="w-4 h-4 mt-[1px] shrink-0 text-amber-500" strokeWidth={1.5} />
+        <div className="min-w-0 flex-1">
+          <p className="text-[12px] leading-snug">
+            <span className="font-medium">
+              {mappings.length} {mappings.length === 1 ? 'rule has' : 'rules have'} no ATT&amp;CK
+              mapping
+            </span>
+            <span className="text-muted-foreground">
+              {' '}— an ATT&amp;CK catalog update dropped {mappings.length === 1 ? 'it' : 'them'}.
+              The coverage figure below excludes {mappings.length === 1 ? 'this rule' : 'these rules'}.
+            </span>
+          </p>
+          <button
+            type="button"
+            onClick={() => setExpanded((open) => !open)}
+            className="mt-1 text-[11px] text-muted-foreground hover:text-foreground underline underline-offset-2"
+          >
+            {expanded ? 'Hide' : 'Show'} affected rules
+          </button>
+          {expanded && (
+            <ul className="mt-2 space-y-1 border-t border-amber-500/20 pt-2">
+              {mappings.map((mapping) => (
+                <li key={mapping.id} className="flex flex-wrap items-baseline gap-x-2 text-[11px]">
+                  <span className="font-mono text-[10.5px]">
+                    {mapping.rule_name ?? mapping.rule_id}
+                  </span>
+                  <span className="text-muted-foreground">was</span>
+                  <span className="font-mono text-[10.5px] text-muted-foreground">
+                    {[...mapping.original_tactics, ...mapping.original_techniques].join(' ') || '—'}
+                  </span>
+                  <span className="text-muted-foreground">· {mapping.reason}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -398,6 +460,13 @@ export function MitreCoverage() {
   // Only used to distinguish an empty catalog that is still syncing from a
   // genuine no-data state; the coverage endpoint itself carries no sync state.
   const { data: catalogData } = useMitreData();
+  // Only rules still missing a mapping — anything a later sync repaired is
+  // already back in the coverage figure and would be noise here.
+  const { mappings: quarantined } = useMitreQuarantine();
+  const droppedMappings = useMemo(
+    () => quarantined.filter((mapping) => mapping.repaired_at === null),
+    [quarantined],
+  );
 
   const techniques = useMemo(() => data?.techniques ?? [], [data?.techniques]);
   const tactics = useMemo(() => data?.tactics ?? [], [data?.tactics]);
@@ -481,6 +550,7 @@ export function MitreCoverage() {
 
   return (
     <div className="flex flex-col h-full min-h-0 -m-3">
+      <DroppedMappingsBanner mappings={droppedMappings} />
       <SummaryStrip
         pct={pct}
         covered={covered}

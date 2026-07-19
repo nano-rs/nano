@@ -116,23 +116,11 @@ pub async fn create_log_source(
 ) -> Result<Json<LogSource>, ApiError> {
     ensure_permission(&auth, LOG_SOURCES_CREATE)?;
 
-    // Tier enforcement: check data source limit
-    let tier_settings = nanosiem_core::TierSettings::new(state.pool.clone());
-    let tier_limits = tier_settings.get_tier_limits().await?;
-    if tier_limits.is_enforced() {
-        let source_count = state
-            .log_source_service
-            .list(None)
-            .await
-            .map(|s| s.len() as u32)
-            .unwrap_or(0);
-        nanosiem_core::check_limit(
-            "data sources",
-            source_count,
-            tier_limits.max_data_sources,
-            tier_limits.tier,
-            "Upgrade to Starter for unlimited data sources.",
-        )?;
+    // Tier enforcement: drafts are exempt (NAN-1920). A feed consumes a
+    // data-source slot only once it's a real, non-draft source, so creating a
+    // draft never trips the cap; the draft→active transition (deploy) re-checks.
+    if request.lifecycle_status.as_deref() != Some("draft") {
+        enforce_data_source_limit(&state).await?;
     }
 
     // Validate timezone
@@ -167,6 +155,34 @@ pub async fn create_log_source(
     );
 
     Ok(Json(log_source))
+}
+
+/// Enforce the data-source tier cap, counting only real (non-draft) sources.
+/// Drafts are exempt (NAN-1920): a feed consumes a slot only once it's active,
+/// so this is called at create (for non-draft creates) and at the draft→active
+/// deploy transition. Mirrors the "data sources" limit semantics used elsewhere.
+async fn enforce_data_source_limit(state: &AppState) -> Result<(), ApiError> {
+    let tier_settings = nanosiem_core::TierSettings::new(state.pool.clone());
+    let tier_limits = tier_settings.get_tier_limits().await?;
+    if tier_limits.is_enforced() {
+        // Fail closed: propagate a DB error (like get_tier_limits above) rather
+        // than counting 0 and silently letting a create/deploy past the cap.
+        let source_count = state
+            .log_source_service
+            .list(None)
+            .await?
+            .iter()
+            .filter(|ls| ls.lifecycle_status != "draft")
+            .count() as u32;
+        nanosiem_core::check_limit(
+            "data sources",
+            source_count,
+            tier_limits.max_data_sources,
+            tier_limits.tier,
+            "Upgrade to Starter for unlimited data sources.",
+        )?;
+    }
+    Ok(())
 }
 
 /// Update a log source
@@ -359,6 +375,15 @@ pub async fn deploy_log_source(
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<DeploymentResult>, ApiError> {
     ensure_permission(&auth, LOG_SOURCES_DEPLOY)?;
+
+    // Tier enforcement at the draft→active transition (NAN-1920): a draft is
+    // exempt from the data-source cap, so activating one via deploy is the point
+    // it starts consuming a slot. Enforce here so feeds can't be staged past the
+    // limit as drafts and then deployed. Non-draft sources were already counted
+    // at create, so re-deploying an active source skips the check.
+    if state.log_source_service.get(*id).await?.lifecycle_status == "draft" {
+        enforce_data_source_limit(&state).await?;
+    }
 
     let result = state.log_source_service.deploy(*id).await?;
 

@@ -54,6 +54,11 @@ pub(crate) fn row_to_log_source(row: &sqlx::postgres::PgRow) -> LogSource {
         deployed: row.get("deployed"),
         deployed_at: row.get("deployed_at"),
         enabled: row.get("enabled"),
+        // NAN-1920: try_get so read paths whose SELECT omits the column (or
+        // tenants pre-migration 258) default to "active" rather than panicking.
+        lifecycle_status: row
+            .try_get("lifecycle_status")
+            .unwrap_or_else(|_| "active".to_string()),
         stale_alert_enabled: row.get("stale_alert_enabled"),
         stale_threshold_minutes: row.get("stale_threshold_minutes"),
         sampling_ratio: row.try_get("sampling_ratio").unwrap_or(None),

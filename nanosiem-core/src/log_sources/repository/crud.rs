@@ -21,6 +21,7 @@ impl LogSourceRepository {
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values,
                 validated, validation_error, deployed, deployed_at, enabled,
+                lifecycle_status,
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
                 extension_vrl, extension_enabled,
@@ -108,6 +109,7 @@ impl LogSourceRepository {
                 ls.parser_vrl, ls.output_fields, ls.category, ls.vendor, ls.product, ls.icon, ls.color,
                 ls.match_field, ls.match_pattern, ls.match_values,
                 ls.validated, ls.validation_error, ls.deployed, ls.deployed_at, ls.enabled,
+                ls.lifecycle_status,
                 ls.stale_alert_enabled, ls.stale_threshold_minutes,
                 ls.sampling_ratio, ls.sampling_exclude_condition,
                 ls.extension_vrl, ls.extension_enabled,
@@ -136,6 +138,7 @@ impl LogSourceRepository {
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values,
                 validated, validation_error, deployed, deployed_at, enabled,
+                lifecycle_status,
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
                 extension_vrl, extension_enabled,
@@ -164,6 +167,7 @@ impl LogSourceRepository {
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values,
                 validated, validation_error, deployed, deployed_at, enabled,
+                lifecycle_status,
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
                 extension_vrl, extension_enabled,
@@ -193,6 +197,7 @@ impl LogSourceRepository {
                 ls.parser_vrl, ls.output_fields, ls.category, ls.vendor, ls.product, ls.icon, ls.color,
                 ls.match_field, ls.match_pattern, ls.match_values,
                 ls.validated, ls.validation_error, ls.deployed, ls.deployed_at, ls.enabled,
+                ls.lifecycle_status,
                 ls.stale_alert_enabled, ls.stale_threshold_minutes,
                 ls.sampling_ratio, ls.sampling_exclude_condition,
                 ls.extension_vrl, ls.extension_enabled,
@@ -224,6 +229,7 @@ impl LogSourceRepository {
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values,
                 validated, validation_error, deployed, deployed_at, enabled,
+                lifecycle_status,
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
                 extension_vrl, extension_enabled,
@@ -260,13 +266,16 @@ impl LogSourceRepository {
             INSERT INTO log_sources (
                 name, description, namespace, timezone, source_type, source_config, credential_id,
                 parser_vrl, output_fields, category, vendor, product, icon, color,
-                match_field, match_pattern, match_values, dispatch_source_config_id
+                match_field, match_pattern, match_values, dispatch_source_config_id,
+                lifecycle_status
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+                COALESCE($19, 'active'))
             RETURNING id, name, description, namespace, timezone, source_type, source_config, credential_id,
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values,
                 validated, validation_error, deployed, deployed_at, enabled,
+                lifecycle_status,
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
                 extension_vrl, extension_enabled,
@@ -294,6 +303,8 @@ impl LogSourceRepository {
         .bind(&new.match_pattern)
         .bind(&new.match_values)
         .bind(&new.dispatch_source_config_id)
+        // NAN-1920: None → COALESCE defaults to 'active' in the VALUES clause.
+        .bind(&new.lifecycle_status)
         .fetch_one(&self.pool)
         .await?;
 
@@ -377,11 +388,16 @@ impl LogSourceRepository {
                 -- parser's mapping VRL (enrichment parsers carry normalize_vrl,
                 -- not parser_vrl).
                 normalize_vrl = COALESCE($28, normalize_vrl)
+                -- NAN-1920: lifecycle_status is deliberately NOT set here — it is
+                -- server-controlled (create + deploy path only), never via this
+                -- generic update, so a client can't pre-flip a draft to bypass
+                -- the tier cap.
             WHERE id = $1
             RETURNING id, name, description, namespace, timezone, source_type, source_config, credential_id,
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values,
                 validated, validation_error, deployed, deployed_at, enabled,
+                lifecycle_status,
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
                 extension_vrl, extension_enabled,

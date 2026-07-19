@@ -252,6 +252,17 @@ export function AddFeed() {
   // ------------ Step 3 state ------------
   const [acceptWarnings, setAcceptWarnings] = useState(false);
   const [draftId, setDraftId] = useState<string | null>(null);
+  // NAN-1920: guards the debounced auto-persist effect against firing two
+  // overlapping CREATE calls before `draftId` state settles (create is async).
+  const autoPersistInFlight = useRef(false);
+  // NAN-1920: `draftId` state lags a create by a render; these refs give the
+  // handlers a synchronous view so an explicit Save/Deploy that lands mid
+  // auto-persist reuses the same row instead of racing a second create.
+  const draftIdRef = useRef<string | null>(null);
+  const autoPersistPromiseRef = useRef<Promise<void> | null>(null);
+  // NAN-1920: the pending (not-yet-fired) debounce timer. Held in a ref so an
+  // explicit Save/Deploy can cancel it before it races a second create.
+  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [savingDraft, setSavingDraft] = useState(false);
   const [deploying, setDeploying] = useState(false);
   // For new-feed creation, "reachability" really means "is the transport
@@ -677,6 +688,27 @@ export function AddFeed() {
     };
   }, [activeStep, sourceConfigId, feedId]);
 
+  // NAN-1920: await any in-flight auto-persist create and return the resulting
+  // draft id (synchronously via ref). Callers use this to reuse the auto-saved
+  // row instead of issuing a second, duplicate `createLogSource`.
+  const settleAutoPersist = useCallback(async (): Promise<string | null> => {
+    // Cancel a pending (not-yet-fired) debounce timer first — otherwise it could
+    // fire a SECOND createLogSource after this explicit Save/Deploy already
+    // created the row.
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+      debounceTimerRef.current = null;
+    }
+    if (autoPersistPromiseRef.current) {
+      try {
+        await autoPersistPromiseRef.current;
+      } catch {
+        /* auto-persist handles its own errors; fall through to the ref value */
+      }
+    }
+    return draftIdRef.current;
+  }, []);
+
   // ------------ Save draft ------------
   const handleSaveDraft = useCallback(async () => {
     if (!feedId || !name) {
@@ -689,6 +721,8 @@ export function AddFeed() {
     }
     setSavingDraft(true);
     try {
+      // NAN-1920: reuse the auto-persisted row if a create is in flight/done.
+      const existingId = await settleAutoPersist();
       const payload = {
         name,
         description: description || undefined,
@@ -706,10 +740,15 @@ export function AddFeed() {
         product: product || undefined,
         match_values: [feedId],
       };
-      if (draftId) {
-        await api.updateLogSource(draftId, payload);
+      if (existingId) {
+        // NAN-1920: lifecycle_status is server-controlled — an update never
+        // touches it, so an existing draft stays a draft here.
+        await api.updateLogSource(existingId, payload);
       } else {
-        const created = await api.createLogSource(payload);
+        // Fresh row from an explicit "Save draft" is created in the draft
+        // lifecycle; the server flips it to 'active' only on deploy.
+        const created = await api.createLogSource({ ...payload, lifecycle_status: 'draft' as const });
+        draftIdRef.current = created.id;
         setDraftId(created.id);
       }
       toast({ title: 'Draft saved', description: `Feed "${name}" saved as draft.` });
@@ -722,7 +761,82 @@ export function AddFeed() {
     } finally {
       setSavingDraft(false);
     }
-  }, [category, description, draftId, feedId, name, namespaceFull, product, sourceConfigId, timezone, toast, vendor, vrl]);
+  }, [category, description, feedId, name, namespaceFull, product, settleAutoPersist, sourceConfigId, timezone, toast, vendor, vrl]);
+
+  // ------------ Auto-persist draft (NAN-1920) ------------
+  // Persist the in-progress feed as a `lifecycle_status='draft'` log source as
+  // soon as Step 1 is minimally valid (feedId + display name). This is the core
+  // of NAN-1920: navigating away no longer silently loses the feed — it lands
+  // in Log Sources as a resumable Draft. We only CREATE here (guarded by
+  // `!draftId`); later field edits are flushed by explicit Save draft / Deploy,
+  // which keeps this unobtrusive (no continuous PUT-on-keystroke churn).
+  const autoPersistDraft = useCallback(async () => {
+    if (draftId || draftIdRef.current || autoPersistInFlight.current) return;
+    if (!feedId || !name) return;
+    autoPersistInFlight.current = true;
+    try {
+      const created = await api.createLogSource({
+        name,
+        description: description || undefined,
+        namespace: namespaceFull,
+        timezone,
+        source_type: 'routed',
+        source_config: {},
+        dispatch_source_config_id: sourceConfigId || undefined,
+        parser_vrl: vrl,
+        category: category || undefined,
+        vendor: vendor || undefined,
+        product: product || undefined,
+        match_values: [feedId],
+        lifecycle_status: 'draft' as const,
+      });
+      draftIdRef.current = created.id;
+      setDraftId(created.id);
+    } catch {
+      // Best-effort: no toast storm while the user is still typing. The explicit
+      // "Save draft" button surfaces errors (e.g. a duplicate feed name).
+    } finally {
+      autoPersistInFlight.current = false;
+    }
+  }, [category, description, draftId, feedId, name, namespaceFull, product, sourceConfigId, timezone, vendor, vrl]);
+
+  // Debounced trigger: create the draft ~1.2s after the user pauses once Step 1
+  // is valid, rather than on every keystroke. Re-arms while `!draftId`; once the
+  // draft exists this becomes inert.
+  useEffect(() => {
+    if (draftId || !feedId || !name) return;
+    // Store the timer in a ref so settleAutoPersist can cancel a still-pending
+    // debounce before it races a second create.
+    debounceTimerRef.current = setTimeout(() => {
+      debounceTimerRef.current = null;
+      // Capture the in-flight promise so an explicit Save/Deploy can await it
+      // (via settleAutoPersist) and reuse the row instead of racing a create.
+      autoPersistPromiseRef.current = autoPersistDraft();
+    }, 1200);
+    return () => {
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+        debounceTimerRef.current = null;
+      }
+    };
+  }, [feedId, name, draftId, autoPersistDraft]);
+
+  // ------------ Navigation guard (NAN-1920) ------------
+  // Browser close / refresh guard, mirroring the RuleEditor/Dashboard pattern
+  // (the app uses BrowserRouter, so React Router's `useBlocker` isn't available).
+  // Only meaningful BEFORE the first auto-save — once `draftId` is set the feed
+  // is safely persisted as a Draft, so we don't nag on the way out.
+  useEffect(() => {
+    const hasUnsavedWork =
+      !draftId && (Boolean(feedId) || Boolean(name) || Boolean(vrl.trim()) || Boolean(sampleText.trim()));
+    const handler = (e: BeforeUnloadEvent) => {
+      if (!hasUnsavedWork) return;
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [draftId, feedId, name, vrl, sampleText]);
 
   // ------------ Deploy ------------
   const handleDeploy = useCallback(async () => {
@@ -770,13 +884,22 @@ export function AddFeed() {
         vendor: vendor || undefined,
         product: product || undefined,
         match_values: [feedId],
+        // NAN-1920: lifecycle_status is server-controlled and intentionally
+        // omitted here. The api.deployLogSource call below flips draft → active
+        // server-side (which enforces the tier cap at that transition); a fresh
+        // create in the else-branch defaults to 'active' server-side.
       };
-      let createdId = draftId;
-      if (draftId) {
-        await api.updateLogSource(draftId, payload);
+      // NAN-1920: reuse the auto-persisted row if a create is in flight/done,
+      // so deploying mid auto-persist doesn't race a duplicate create.
+      const existingId = await settleAutoPersist();
+      let createdId = existingId;
+      if (existingId) {
+        await api.updateLogSource(existingId, payload);
       } else {
         const created = await api.createLogSource(payload);
         createdId = created.id;
+        draftIdRef.current = created.id;
+        setDraftId(created.id);
       }
 
       // 3. Auto-deploy both layers. The new design's "Deploy feed" CTA
@@ -822,7 +945,7 @@ export function AddFeed() {
     } finally {
       setDeploying(false);
     }
-  }, [canDeploy, category, description, draftId, feedId, name, namespaceFull, navigate, product, sourceConfigId, timezone, toast, vendor, vrl]);
+  }, [canDeploy, category, description, feedId, name, namespaceFull, navigate, product, settleAutoPersist, sourceConfigId, timezone, toast, vendor, vrl]);
 
   // ------------ Render ------------
   return (

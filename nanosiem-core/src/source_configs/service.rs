@@ -14,8 +14,8 @@ use super::creds_backend::{CredsBackend, CredsBackendError};
 use super::repository::{RouteClaim, SourceConfigRepository, SourceConfigRepositoryError};
 use super::types::{
     DeploymentResult, ListParams, NewRoutingRule, NewSourceConfiguration, RoutingRule,
-    SourceConfigDeployment, SourceConfiguration, SourceConfigurationWithRules, UpdateRoutingRule,
-    UpdateSourceConfiguration,
+    SourceConfigDeployment, SourceConfigType, SourceConfiguration, SourceConfigurationWithRules,
+    UpdateRoutingRule, UpdateSourceConfiguration,
 };
 use crate::log_telemetry::repository::is_safe_source_type;
 use crate::parsers::{
@@ -218,6 +218,10 @@ impl SourceConfigService {
         // unescaped interpolation.
         Self::validate_connection_config(&request.config_type, &request.connection_config)?;
 
+        // NAN-1919: a caller-supplied default_source_type is interpolated into
+        // the generated routing VRL — validate it before persistence.
+        Self::validate_default_source_type(request.default_source_type.as_deref())?;
+
         // NAN-883: single-instance drivers (currently `splunk_hec`) share an
         // OOTB Vector listener; a second config would emit a colliding
         // routing transform. Reject the duplicate with a Conflict (409).
@@ -308,6 +312,10 @@ impl SourceConfigService {
             };
             Self::validate_connection_config(&effective_type, conn)?;
         }
+
+        // NAN-1919: a patched default_source_type is interpolated into the
+        // generated routing VRL — validate it before persistence.
+        Self::validate_default_source_type(request.default_source_type.as_deref())?;
 
         // Validate credential exists if specified
         if let Some(cred_id) = request.credential_id {
@@ -750,6 +758,37 @@ impl SourceConfigService {
     /// Default-typed rules don't carry an interpolated value into VRL
     /// strings (the default branch only emits `target_source_type`), so
     /// the regex check is conditional on `match_type == "regex"`.
+    /// NAN-1919: validate a `default_source_type` scalar before it is
+    /// persisted. It is interpolated into the generated routing transform's VRL
+    /// string literal (`.source_type = "<value>"`) for unmatched pull-source
+    /// events, so it must satisfy the same allow-list as `target_source_type`.
+    /// `is_safe_source_type` restricts to `[A-Za-z0-9_-]`, which also rejects
+    /// the passthrough sentinel `${source_type}` (its `$`/`{`/`}` are outside
+    /// the allow-list) — that literal would otherwise collide with the
+    /// generator's system-level passthrough branch and silently suppress both
+    /// the default AND the "unknown" deploy warning — and any control char that
+    /// could break the generated VRL. `None` / whitespace-only is allowed
+    /// (falls back to "unknown" as before); validation runs on the trimmed
+    /// value to mirror what the generator emits.
+    fn validate_default_source_type(
+        value: Option<&str>,
+    ) -> Result<(), SourceConfigServiceError> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        if !is_safe_source_type(trimmed) {
+            return Err(SourceConfigServiceError::InvalidConfig(format!(
+                "default_source_type {trimmed:?} contains characters \
+                 outside [A-Za-z0-9_-] or is empty"
+            )));
+        }
+        Ok(())
+    }
+
     fn validate_routing_rule_values(
         match_type: &str,
         match_value: Option<&str>,
@@ -996,6 +1035,37 @@ impl SourceConfigService {
             .any(|r| r.match_type != "default")
     }
 
+    /// NAN-1919: whether a pull-transport config's generated routing transform
+    /// would fall back to `.source_type = "unknown"` for unmatched events.
+    /// Mirrors the fallback selection in `generate_routing_transform`: it emits
+    /// "unknown" only when there is no `default` rule, no source_type-coalesced
+    /// rule, AND no non-empty `default_source_type` on the config. Used by
+    /// `deploy` to surface a non-blocking warning.
+    ///
+    /// Invariant: the caller MUST exclude system-level sources (http / vector /
+    /// splunk_hec / otlp). Those route through the system-intermediary path,
+    /// which passes `.source_type` through unchanged and never emits "unknown";
+    /// this helper ignores `system_level` and would return a wrong answer for
+    /// them. `deploy` satisfies this by early-returning on the system path
+    /// before reaching the warning.
+    fn pull_routing_emits_unknown(config: &SourceConfigurationWithRules) -> bool {
+        let has_default = config
+            .routing_rules
+            .iter()
+            .any(|r| r.match_type == "default");
+        let has_coalesced = config
+            .routing_rules
+            .iter()
+            .any(|r| r.match_field == "source_type" && r.match_type != "default");
+        let has_config_default = config
+            .config
+            .default_source_type
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        !has_default && !has_coalesced && !has_config_default
+    }
+
     /// Deploy a source configuration to Vector
     pub async fn deploy(&self, id: Uuid) -> Result<DeploymentResult, SourceConfigServiceError> {
         let config_with_rules = self.repository.get_with_rules(id).await?;
@@ -1155,11 +1225,36 @@ impl SourceConfigService {
             config_file.display()
         );
 
+        // NAN-1919: non-blocking guardrail. When a pull-transport config has no
+        // routing rule and no seeded default_source_type, its generated routing
+        // transform stamps unmatched events with `.source_type = "unknown"`.
+        // Surface a warning (log + appended to the result message) but never
+        // fail the deploy — the config is still valid and running.
+        let is_pull = SourceConfigType::from_str(&config.config_type)
+            .map(|t| t.is_pull_source())
+            .unwrap_or(false);
+        let mut message = format!("Deployed '{}' successfully", config.name);
+        if is_pull && Self::pull_routing_emits_unknown(&config_with_rules) {
+            let warning = format!(
+                "Warning: pull source '{}' has no routing rule or default source type — \
+                 unmatched events will be stamped source_type=\"unknown\". Add a routing rule \
+                 (or onboard a feed) to set a real default.",
+                config.name
+            );
+            tracing::warn!(
+                config = %config.name,
+                config_type = %config.config_type,
+                "deploy will emit source_type=\"unknown\" for unmatched events"
+            );
+            message.push_str(" — ");
+            message.push_str(&warning);
+        }
+
         Ok(DeploymentResult {
             success: true,
             source_configuration_id: id,
             action: "deploy".to_string(),
-            message: format!("Deployed '{}' successfully", config.name),
+            message,
             deployment_id: Some(deployment.id),
         })
     }
@@ -1945,10 +2040,21 @@ impl SourceConfigService {
             let coalesced_rule = rules
                 .iter()
                 .find(|r| r.match_field == "source_type" && r.match_type != "default");
+            // NAN-1919: when no default/coalesced rule exists, fall back to the
+            // config's seeded `default_source_type` (from the onboarded feed's
+            // name) BEFORE "unknown", so unmatched pull-source events land under
+            // a real source type instead of the catch-all.
+            let config_default = config
+                .config
+                .default_source_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
             Self::vrl_escape(
                 default_rule
                     .or(coalesced_rule)
                     .map(|r| r.target_source_type.as_str())
+                    .or(config_default)
                     .unwrap_or("unknown"),
             )
         };

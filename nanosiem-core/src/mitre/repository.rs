@@ -6,13 +6,15 @@ use crate::log_telemetry::repository::is_safe_source_type;
 use crate::mitre::data_sources;
 use crate::mitre::types::{
     CoverageLevel, CoverageSummary, CoverageUnit, CoveringRule, DataSource, DataSourceReadiness,
-    MitreCoverageResponse, MitreSyncMetadata, MitreSyncState, MitreTactic, MitreTechnique,
-    TacticCoverage, TechniqueCoverage, TelemetryReadinessSnapshot,
+    MitreCoverageResponse, MitreQuarantinedMapping, MitreReconcileOutcome, MitreSyncMetadata,
+    MitreSyncState, MitreTactic, MitreTechnique, MitreTechniqueAlias, TacticCoverage,
+    TechniqueCoverage, TelemetryReadinessSnapshot,
 };
 use crate::rule_repository::extract_source_types;
 use sqlx::pool::PoolConnection;
 use sqlx::{Connection, PgConnection, PgPool, Postgres};
 use std::collections::{HashMap, HashSet};
+use uuid::Uuid;
 
 /// Repository for MITRE ATT&CK data
 pub struct MitreRepository {
@@ -40,6 +42,22 @@ impl MitreRepository {
         Ok(acquired.then_some(connection))
     }
 
+    /// Is the stored catalog already the pinned release, in full?
+    ///
+    /// "In full" includes the alias map (NAN-1923). The alias write, the mapping
+    /// repair and the non-destructive reconcile all hang off `replace_catalog_on`,
+    /// which `run_locked` skips entirely when this returns true — and every
+    /// tenant whose mappings a renumbering destroyed is, by definition, already
+    /// on the release that destroyed them. Without the `alias_count` comparison
+    /// the repair could not reach them until the next ATT&CK release moved the
+    /// pin.
+    ///
+    /// Comparing the recorded count rather than testing the table for rows keeps
+    /// this self-limiting: a release that legitimately ships zero revoked-by
+    /// edges records 0 and matches 0, where an EXISTS test would re-fetch the
+    /// bundle on every scheduler tick forever. A NULL `alias_count` (a sync
+    /// predating NAN-1918) never equals a count, so it buys exactly one
+    /// catch-up sync.
     pub(crate) async fn catalog_is_current_on(
         connection: &mut PgConnection,
         release_version: &str,
@@ -57,6 +75,9 @@ impl MitreRepository {
                   AND state.tactic_count = (SELECT COUNT(*)::integer FROM mitre_tactics)
                   AND state.technique_count = (
                       SELECT COUNT(*)::integer FROM mitre_techniques WHERE deprecated = FALSE
+                  )
+                  AND state.alias_count = (
+                      SELECT COUNT(*)::integer FROM mitre_technique_aliases
                   )
             )
             "#,
@@ -155,16 +176,20 @@ impl MitreRepository {
     /// the commit (NAN-1766 / D3). This closes the crash window where a node
     /// dying between the catalog commit and a separate reconcile pass would
     /// leave `mitre_sync_state = 'succeeded'` while now-invalid rule mappings
-    /// stayed live until the next pin bump. Returns the number of rule mappings
-    /// quarantined by that reconcile.
+    /// stayed live until the next pin bump.
+    ///
+    /// NAN-1918: `aliases` (harvested from the bundle's `revoked-by` edges) is
+    /// written before reconcile so renumbered techniques are migrated forward
+    /// rather than deleted. Returns what that pass did to existing mappings.
     pub(crate) async fn replace_catalog_on(
         connection: &mut PgConnection,
         tactics: &[MitreTactic],
         techniques: &[MitreTechnique],
+        aliases: &[MitreTechniqueAlias],
         release_version: &str,
         source_url: &str,
         source_sha256: &str,
-    ) -> Result<u64, sqlx::Error> {
+    ) -> Result<MitreReconcileOutcome, sqlx::Error> {
         let mut tx = connection.begin().await?;
 
         for tactic in tactics {
@@ -190,6 +215,11 @@ impl MitreRepository {
         }
 
         // Parents are sorted before sub-techniques by the parser.
+        //
+        // `deprecated` is written as a literal FALSE rather than bound from the
+        // struct, and reset to FALSE on conflict: every technique in this
+        // snapshot is current by construction (NAN-1921), and a row previously
+        // flagged deprecated that reappears in a later release is current again.
         for technique in techniques {
             sqlx::query(
                 r#"
@@ -261,18 +291,51 @@ impl MitreRepository {
         .execute(&mut *tx)
         .await?;
 
+        // NAN-1918: the alias map has to land before reconcile/repair run, since
+        // both resolve renumbered IDs through it. Replace wholesale — the pinned
+        // bundle is the sole authority, so a stale edge must not survive a
+        // release that dropped it.
+        sqlx::query("DELETE FROM mitre_technique_aliases")
+            .execute(&mut *tx)
+            .await?;
+        for alias in aliases {
+            sqlx::query(
+                r#"
+                INSERT INTO mitre_technique_aliases (old_id, new_id, updated_at)
+                VALUES ($1, $2, NOW())
+                ON CONFLICT (old_id) DO UPDATE SET
+                    new_id = EXCLUDED.new_id,
+                    updated_at = NOW()
+                "#,
+            )
+            .bind(&alias.old_id)
+            .bind(&alias.new_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Restore mappings a pre-alias sync destroyed, before reconcile runs —
+        // otherwise reconcile would see the empty arrays it left behind and
+        // treat the rule as intentionally unmapped. No-op once drained.
+        let repaired =
+            sqlx::query_scalar::<_, i64>("SELECT public.repair_quarantined_mitre_mappings()")
+                .fetch_one(&mut *tx)
+                .await?;
+
         // Reconcile existing detection-rule mappings against the freshly written
-        // (but not yet committed) catalog and quarantine any that are no longer
-        // canonical. Running it here — same transaction, before the `succeeded`
-        // flip below — guarantees the state record and the reconcile land (or
-        // roll back) atomically (NAN-1766 / D3). The catalog tables above are
-        // fully populated within this transaction, so the function's own
-        // empty-catalog guard never short-circuits here.
-        let quarantined = sqlx::query_scalar::<_, i64>(
-            "SELECT public.reconcile_detection_rule_mitre_mappings()",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
+        // (but not yet committed) catalog: migrate what the alias map can carry
+        // forward, quarantine only the rest. Running it here — same transaction,
+        // before the `succeeded` flip below — guarantees the state record and the
+        // reconcile land (or roll back) atomically (NAN-1766 / D3). The catalog
+        // tables above are fully populated within this transaction, so the
+        // function's own empty-catalog guard never short-circuits here.
+        let (remapped, quarantined, quarantined_rule_ids) =
+            sqlx::query_as::<_, (i64, i64, Vec<Uuid>)>(
+                "SELECT remapped, quarantined, quarantined_rule_ids \
+                 FROM public.reconcile_detection_rule_mitre_mappings()",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
 
         sqlx::query(
             r#"
@@ -283,6 +346,7 @@ impl MitreRepository {
                 source_sha256 = $3,
                 tactic_count = $4,
                 technique_count = $5,
+                alias_count = $6,
                 last_completed_at = NOW(),
                 last_success_at = NOW(),
                 last_error = NULL,
@@ -297,11 +361,50 @@ impl MitreRepository {
         .bind(source_sha256)
         .bind(tactics.len() as i32)
         .bind(techniques.len() as i32)
+        .bind(aliases.len() as i32)
         .execute(&mut *tx)
         .await?;
 
         tx.commit().await?;
-        Ok(u64::try_from(quarantined).unwrap_or(0))
+        Ok(MitreReconcileOutcome {
+            remapped: u64::try_from(remapped).unwrap_or(0),
+            repaired: u64::try_from(repaired).unwrap_or(0),
+            quarantined: u64::try_from(quarantined).unwrap_or(0),
+            quarantined_rule_ids,
+        })
+    }
+
+    /// Quarantined mappings for the operator-facing surface, newest first.
+    /// `include_repaired = false` shows only mappings still missing.
+    pub async fn list_quarantined_mappings(
+        &self,
+        include_repaired: bool,
+        limit: i64,
+    ) -> Result<Vec<MitreQuarantinedMapping>, sqlx::Error> {
+        sqlx::query_as::<_, MitreQuarantinedMapping>(
+            r#"
+            SELECT
+                quarantine.id,
+                quarantine.rule_id,
+                rule.name AS rule_name,
+                quarantine.original_tactics,
+                quarantine.original_techniques,
+                quarantine.reason,
+                quarantine.quarantined_at,
+                quarantine.repaired_at,
+                quarantine.repaired_tactics,
+                quarantine.repaired_techniques
+            FROM detection_rule_mitre_mapping_quarantine AS quarantine
+            LEFT JOIN detection_rules AS rule ON rule.id = quarantine.rule_id
+            WHERE $1 OR quarantine.repaired_at IS NULL
+            ORDER BY quarantine.quarantined_at DESC, quarantine.id DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(include_repaired)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
     }
 
     /// Get all tactics
@@ -811,6 +914,32 @@ mod sync_integration_tests {
             .unwrap()
             .expect("first sync owns the lock");
 
+        // NAN-1921. The isolated schema below protects the catalog tables, but
+        // it cannot protect `detection_rules`: `replace_catalog_on` invokes
+        // `public.reconcile_detection_rule_mitre_mappings()` and
+        // `public.repair_quarantined_mitre_mappings()`, which are schema-
+        // qualified by design — making them search-path-relative to suit a test
+        // would hand a caller with a hostile search_path control over which
+        // tables they mutate. So they reach `public.detection_rules` whatever
+        // this test's search_path says, and `replace_catalog_on` commits.
+        //
+        // On a fresh CI database that is harmless: no rules, so both functions
+        // are no-ops. On a developer database it is not — this test was observed
+        // rewriting three real rules' ATT&CK mappings during NAN-1918, and a
+        // mapping the alias map cannot resolve would have been blanked outright.
+        // Refuse rather than mutate.
+        let existing_rules: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM public.detection_rules")
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap_or(0);
+        assert_eq!(
+            existing_rules, 0,
+            "refusing to run: this test commits reconcile/repair against \
+             public.detection_rules, which holds {existing_rules} rule(s) here. \
+             Point DATABASE_URL at a scratch database."
+        );
+
         // The catalog replacement intentionally deletes objects absent from a
         // snapshot. Run that destructive proof in an isolated schema so an
         // ignored test can never replace a developer's real MITRE catalog.
@@ -833,6 +962,29 @@ mod sync_integration_tests {
                 .await
                 .unwrap();
         }
+        // NAN-1918. Migration 257 is not replayed wholesale here: it is written
+        // against `public` (it alters the quarantine table and defines functions
+        // that read `public.detection_rules`), so running it inside the isolated
+        // schema would either fail or reach back into real data. The catalog
+        // snapshot writes this table unqualified, like the tables above, so only
+        // its DDL is needed — kept in sync with 257 by hand.
+        // NAN-1923 adds mitre_sync_state.alias_count; migration 260 is scoped to
+        // `public` like 257, so mirror just the column here.
+        sqlx::raw_sql("ALTER TABLE mitre_sync_state ADD COLUMN IF NOT EXISTS alias_count INTEGER")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE mitre_technique_aliases (
+                 old_id VARCHAR(20) PRIMARY KEY,
+                 new_id VARCHAR(20) NOT NULL,
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 CONSTRAINT mitre_technique_aliases_not_self CHECK (old_id <> new_id)
+             )",
+        )
+        .execute(&mut *connection)
+        .await
+        .unwrap();
 
         assert!(repository
             .try_acquire_sync_connection(TEST_LOCK)
@@ -857,6 +1009,7 @@ mod sync_integration_tests {
             &mut connection,
             &initial_tactics,
             &initial_techniques,
+            &[],
             "test-v1",
             "https://example.invalid/v1.json",
             &"a".repeat(64),
@@ -872,6 +1025,7 @@ mod sync_integration_tests {
             &mut connection,
             &invalid_tactics,
             &initial_techniques,
+            &[],
             "test-invalid",
             "https://example.invalid/invalid.json",
             &"b".repeat(64),
@@ -904,6 +1058,7 @@ mod sync_integration_tests {
             &mut connection,
             &upgraded_tactics,
             &upgraded_techniques,
+            &[],
             "test-v2",
             "https://example.invalid/v2.json",
             &"c".repeat(64),
@@ -939,6 +1094,59 @@ mod sync_integration_tests {
                 Some(1),
                 Some(1)
             )
+        );
+
+        // NAN-1923. `run_locked` skips replace_catalog_on entirely when the
+        // catalog reports current, and replace_catalog_on is what writes the
+        // alias map and runs the mapping repair. A tenant already on the pinned
+        // release therefore never backfilled either — which is precisely the
+        // population a renumbering damages. Currency must account for the alias
+        // map, and must settle afterwards rather than re-fetching forever.
+        let sha = "c".repeat(64);
+        assert!(
+            MitreRepository::catalog_is_current_on(&mut connection, "test-v2", &sha)
+                .await
+                .unwrap(),
+            "a snapshot whose alias count matches what was recorded is current"
+        );
+
+        sqlx::query("UPDATE mitre_sync_state SET alias_count = NULL WHERE singleton = TRUE")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        assert!(
+            !MitreRepository::catalog_is_current_on(&mut connection, "test-v2", &sha)
+                .await
+                .unwrap(),
+            "a sync predating the alias map (NULL count) owes one catch-up sync"
+        );
+
+        sqlx::query(
+            "INSERT INTO mitre_technique_aliases (old_id, new_id) VALUES ('T9002', 'T9001')",
+        )
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE mitre_sync_state SET alias_count = 0 WHERE singleton = TRUE")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        assert!(
+            !MitreRepository::catalog_is_current_on(&mut connection, "test-v2", &sha)
+                .await
+                .unwrap(),
+            "a recorded count that disagrees with the table is not current"
+        );
+
+        sqlx::query("DELETE FROM mitre_technique_aliases")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        assert!(
+            MitreRepository::catalog_is_current_on(&mut connection, "test-v2", &sha)
+                .await
+                .unwrap(),
+            "a release with genuinely zero aliases must settle at 0, not re-fetch forever"
         );
 
         sqlx::query("SELECT pg_advisory_unlock($1)")

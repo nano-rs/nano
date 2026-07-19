@@ -58,8 +58,8 @@ import type { LogSource } from '@/lib/api';
 import { logSourceTransportLabel } from '@/lib/log-source-transports';
 import { cn } from '@/lib/utils';
 
-type DerivedStatus = 'deployed' | 'ready' | 'paused';
-type FilterId = 'all' | 'deployed' | 'ready' | 'warn';
+type DerivedStatus = 'deployed' | 'ready' | 'paused' | 'draft';
+type FilterId = 'all' | 'deployed' | 'ready' | 'warn' | 'draft';
 
 const CHART_PALETTE = [
   'oklch(72% 0.15 200)', // cyan
@@ -74,6 +74,9 @@ const CHART_PALETTE = [
 ];
 
 function deriveStatus(ls: LogSource): DerivedStatus {
+  // NAN-1920: a wizard draft (never deployed, still being built) is the most
+  // fundamental state — it takes precedence over enabled/deployed derivation.
+  if (ls.lifecycle_status === 'draft') return 'draft';
   if (!ls.enabled) return 'paused';
   if (ls.deployed) return 'deployed';
   return 'ready';
@@ -151,13 +154,15 @@ export function LogSources() {
     let deployed = 0;
     let ready = 0;
     let warn = 0;
+    let draft = 0;
     for (const ls of sources) {
       const status = deriveStatus(ls);
       if (status === 'deployed') deployed += 1;
       else if (status === 'ready') ready += 1;
+      else if (status === 'draft') draft += 1;
       if (derivePendingDeploy(ls)) warn += 1;
     }
-    return { total: sources.length, deployed, ready, warn };
+    return { total: sources.length, deployed, ready, warn, draft };
   }, [sources]);
 
   const filtered = useMemo(() => {
@@ -166,6 +171,7 @@ export function LogSources() {
       const status = deriveStatus(ls);
       if (filter === 'deployed' && status !== 'deployed') return false;
       if (filter === 'ready' && status !== 'ready') return false;
+      if (filter === 'draft' && status !== 'draft') return false;
       if (filter === 'warn' && !derivePendingDeploy(ls)) return false;
       if (!q) return true;
       const hay = [ls.name, ls.description, ls.vendor, ls.product, ls.source_type, ls.namespace]
@@ -499,7 +505,7 @@ function Toolbar({
   onQueryChange: (v: string) => void;
   filter: FilterId;
   onFilterChange: (id: FilterId) => void;
-  stats: { total: number; deployed: number; ready: number; warn: number };
+  stats: { total: number; deployed: number; ready: number; warn: number; draft: number };
   onRefresh: () => void;
   canCreate: boolean;
   onNew: () => void;
@@ -508,6 +514,7 @@ function Toolbar({
     { id: 'all', label: 'All', count: stats.total },
     { id: 'deployed', label: 'Deployed', count: stats.deployed },
     { id: 'ready', label: 'Ready', count: stats.ready },
+    { id: 'draft', label: 'Draft', count: stats.draft },
     { id: 'warn', label: 'Pending deploy', count: stats.warn },
   ];
   return (
@@ -1037,6 +1044,19 @@ function StatusBadge({
   validated: boolean;
   validationError?: string;
 }) {
+  // NAN-1920: a wizard draft (onboarded, not yet deployed) is its own first-
+  // class state and wins over every other badge — a draft is typically also
+  // unvalidated, but we surface the more meaningful "in progress" signal.
+  if (status === 'draft') {
+    return (
+      <span className="inline-flex items-center gap-1.5 h-[22px] px-2 rounded-[4px] bg-foreground/[0.04] text-foreground/70 text-[10.5px] font-medium border border-dashed border-border">
+        <Pencil className="w-3 h-3" />
+        Draft
+      </span>
+    );
+  }
+  // Non-draft feed whose VRL hasn't passed validation. Relabeled from "Draft"
+  // (NAN-1920) so it no longer collides with the lifecycle Draft badge above.
   if (!validated) {
     return (
       <Tooltip>
@@ -1047,7 +1067,7 @@ function StatusBadge({
             className="inline-flex items-center gap-1.5 h-[22px] px-2 rounded-[4px] bg-amber-500/15 text-amber-500 text-[10.5px] font-medium"
           >
             <AlertTriangle className="w-3 h-3" />
-            Draft
+            Unvalidated
           </button>
         </TooltipTrigger>
         {validationError && (

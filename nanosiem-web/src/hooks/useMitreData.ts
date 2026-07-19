@@ -148,3 +148,50 @@ export function useMitreCoverage(filters: CoverageFilters) {
     error: errorMessage(query.error),
   };
 }
+
+/**
+ * A rule mapping a catalog sync could not resolve (NAN-1918). `repaired_at`
+ * is set once a later sync managed to migrate it onto the current catalog.
+ */
+export interface MitreQuarantinedMapping {
+  id: number;
+  rule_id: string;
+  rule_name: string | null;
+  original_tactics: string[];
+  original_techniques: string[];
+  reason: string;
+  quarantined_at: string;
+  repaired_at: string | null;
+  repaired_tactics: string[] | null;
+  repaired_techniques: string[] | null;
+}
+
+interface MitreQuarantineResponse {
+  mappings: MitreQuarantinedMapping[];
+  unrepaired_count: number;
+}
+
+/**
+ * Rules whose ATT&CK mapping a catalog sync dropped.
+ *
+ * Coverage is computed from live mappings, so a rule that lost its mapping
+ * silently stops counting — and the percentage goes *up*. Surfacing this
+ * alongside the coverage figure is the point.
+ */
+export function useMitreQuarantine() {
+  const { user, isAuthenticated, isLoading: authLoading } = useAuth();
+  const authScope = mitreAuthScope(user?.id, getAccessToken());
+  const query = useQuery({
+    queryKey: mitreQueryKeys.quarantine(authScope),
+    queryFn: ({ signal }) =>
+      fetchJson<MitreQuarantineResponse>('/api/mitre/quarantine', { signal }),
+    enabled: isAuthenticated && !authLoading,
+  });
+
+  return {
+    mappings: query.data?.mappings ?? [],
+    unrepairedCount: query.data?.unrepaired_count ?? 0,
+    loading: authLoading || (isAuthenticated && query.isPending),
+    error: errorMessage(query.error),
+  };
+}
