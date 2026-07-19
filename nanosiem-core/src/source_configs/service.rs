@@ -1211,10 +1211,34 @@ impl SourceConfigService {
         // Reap stored credentials for source types that materialize them (so
         // renamed/deleted configs don't accumulate orphans on disk or in the
         // Secret). Idempotent in both backends.
-        if config.config_type == "gcp_pubsub" {
-            let safe_name = Self::safe_name(&config.name);
-            let key = format!("gcp_{}.creds", safe_name);
-            self.creds_backend().await?.remove_creds(&key).await?;
+        //
+        // NAN-1915: the reap key MUST match what `deploy` wrote. `deploy` keys
+        // credential files by config UUID (`creds_filename_stem`, NAN-952 — so
+        // `Prod-Kafka` and `prod kafka` can't collide), but this used to remove
+        // a `safe_name`-keyed filename that never existed post-NAN-952. The
+        // idempotent `remove_creds` then no-op'd and left the real UUID-keyed
+        // key material (GCP private key / Kafka CA) orphaned forever (delete()
+        // calls undeploy(), so the UUID is gone once the row is deleted). Kafka
+        // CA certs also had no reap branch at all. The `publications/<gen>/`
+        // snapshot copies self-heal via the generation materialize/prune once
+        // `sources/` is clean.
+        // Resolve the backend only for types that materialize a credential file,
+        // so a creds-less undeploy (aws_s3, system types) keeps its exact prior
+        // behavior and never depends on backend detection.
+        match config.config_type.as_str() {
+            "gcp_pubsub" => {
+                self.creds_backend()
+                    .await?
+                    .remove_creds(&Self::gcp_creds_key(&config.id))
+                    .await?;
+            }
+            "kafka" => {
+                self.creds_backend()
+                    .await?
+                    .remove_creds(&Self::kafka_ca_key(&config.id))
+                    .await?;
+            }
+            _ => {}
         }
 
         // Mark as undeployed BEFORE updating router, so the router query excludes this config
@@ -1424,13 +1448,6 @@ impl SourceConfigService {
             None
         };
 
-        // NAN-952: credential filenames are keyed by source-config UUID,
-        // not safe_name(config.name). safe_name lowercases + replaces
-        // non-alphanumerics with `_`, so e.g. "Prod-Kafka" and "prod kafka"
-        // both produced `prod_kafka` — second deploy clobbered the first
-        // tenant's CA. UUID is unique by construction.
-        let creds_filename_stem = Self::creds_filename_stem(&config.config.id);
-
         // For GCP Pub/Sub, dispatch credential storage to the active backend.
         // K8s mode PATCHes the `vector-source-credentials` Secret (mounted at
         // /etc/vector/source-creds/); Docker mode writes flat under sources/
@@ -1440,7 +1457,7 @@ impl SourceConfigService {
             if let Some(ref c) = creds {
                 if let Some(creds_json) = c["credentials_json"].as_str() {
                     if !creds_json.is_empty() {
-                        let key = format!("gcp_{}.creds", creds_filename_stem);
+                        let key = Self::gcp_creds_key(&config.config.id);
                         let backend = self.creds_backend().await?;
                         Some(backend.write_creds(&key, creds_json.as_bytes()).await?)
                     } else {
@@ -1464,7 +1481,7 @@ impl SourceConfigService {
             if let Some(ref c) = creds {
                 if let Some(ca_cert) = c["tls_ca_cert"].as_str() {
                     if !ca_cert.is_empty() {
-                        let key = format!("kafka_{}.ca.pem", creds_filename_stem);
+                        let key = Self::kafka_ca_key(&config.config.id);
                         let backend = self.creds_backend().await?;
                         Some(backend.write_creds(&key, ca_cert.as_bytes()).await?)
                     } else {
@@ -2402,6 +2419,22 @@ impl SourceConfigService {
         // every target (Docker bind-mount, K8s ConfigMap-as-files,
         // K8s Secret-as-files). No further sanitization needed.
         config_id.to_string()
+    }
+
+    /// `CredsBackend` key for a `gcp_pubsub` source config's service-account
+    /// JSON. NAN-1915: `deploy` (write) and `undeploy` (remove) MUST derive the
+    /// key from this single helper — they used to inline two `format!`s that
+    /// drifted (deploy keyed by UUID per NAN-952, undeploy still keyed by
+    /// `safe_name`), so the removal silently no-op'd and orphaned the key
+    /// material forever.
+    fn gcp_creds_key(config_id: &Uuid) -> String {
+        format!("gcp_{}.creds", Self::creds_filename_stem(config_id))
+    }
+
+    /// `CredsBackend` key for a `kafka` source config's TLS CA cert. Same
+    /// deploy/undeploy key-parity contract as [`Self::gcp_creds_key`] (NAN-1915).
+    fn kafka_ca_key(config_id: &Uuid) -> String {
+        format!("kafka_{}.ca.pem", Self::creds_filename_stem(config_id))
     }
 
     /// Convert name to safe identifier

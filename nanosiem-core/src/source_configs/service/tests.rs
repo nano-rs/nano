@@ -728,6 +728,80 @@
     }
 
     // ------------------------------------------------------------------
+    // NAN-1915: deploy/undeploy credential-key parity
+    // ------------------------------------------------------------------
+
+    /// `deploy` writes a source config's credential file keyed by config UUID
+    /// (`gcp_creds_key`) and `undeploy` must remove it with the SAME key. They
+    /// previously inlined divergent keys — deploy by UUID (NAN-952), undeploy by
+    /// `safe_name` — so the idempotent `remove_creds` no-op'd and orphaned the
+    /// GCP service-account key material forever. This drives the shared helper
+    /// through a disk backend and asserts the write→remove round-trip reaps the
+    /// file, and that a `safe_name`-based key (the old bug) would NOT.
+    #[tokio::test]
+    async fn undeploy_reaps_uuid_keyed_gcp_credential_deploy_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = CredsBackend::Disk {
+            config_dir: tmp.path().to_path_buf(),
+            runtime_path: "/etc/vector/sources".into(),
+        };
+        let id = Uuid::new_v4();
+
+        // Deploy: write the SA JSON under the UUID-derived key.
+        let deploy_key = SourceConfigService::gcp_creds_key(&id);
+        assert_eq!(deploy_key, format!("gcp_{id}.creds"), "key must be UUID-based");
+        backend
+            .write_creds(&deploy_key, b"{\"type\":\"service_account\"}")
+            .await
+            .unwrap();
+        let on_disk = tmp.path().join(format!("sources/configs__gcp_{id}.creds"));
+        assert!(on_disk.exists(), "deploy must materialize the creds file");
+
+        // Old bug: a safe_name-based key never matches the UUID file → no reap.
+        let buggy_key = format!("gcp_{}.creds", SourceConfigService::safe_name("Prod GCP Source"));
+        assert_ne!(deploy_key, buggy_key);
+        backend.remove_creds(&buggy_key).await.unwrap();
+        assert!(
+            on_disk.exists(),
+            "safe_name-keyed remove (pre-NAN-1915 bug) must NOT reap the UUID file"
+        );
+
+        // Fixed undeploy: same helper as deploy → reaps the file.
+        backend
+            .remove_creds(&SourceConfigService::gcp_creds_key(&id))
+            .await
+            .unwrap();
+        assert!(!on_disk.exists(), "undeploy must reap the deploy-written creds file");
+    }
+
+    /// Kafka CA certs are keyed + reaped the same way — and had no undeploy reap
+    /// branch at all before NAN-1915.
+    #[tokio::test]
+    async fn undeploy_reaps_uuid_keyed_kafka_ca_cert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = CredsBackend::Disk {
+            config_dir: tmp.path().to_path_buf(),
+            runtime_path: "/etc/vector/sources".into(),
+        };
+        let id = Uuid::new_v4();
+
+        let key = SourceConfigService::kafka_ca_key(&id);
+        assert_eq!(key, format!("kafka_{id}.ca.pem"), "key must be UUID-based");
+        backend
+            .write_creds(&key, b"-----BEGIN CERTIFICATE-----")
+            .await
+            .unwrap();
+        let on_disk = tmp.path().join(format!("sources/configs__kafka_{id}.ca.pem"));
+        assert!(on_disk.exists());
+
+        backend
+            .remove_creds(&SourceConfigService::kafka_ca_key(&id))
+            .await
+            .unwrap();
+        assert!(!on_disk.exists(), "undeploy must reap the kafka CA file");
+    }
+
+    // ------------------------------------------------------------------
     // NAN-884 K-6: per-config routing transform must stamp
     // `.metadata.forwarded_via` for pull sources so downstream rows can
     // be filtered by ingestion path (NAN-201 covered HTTP / HEC / vector
