@@ -309,8 +309,16 @@ if [[ -d "$NANO_INSTALL_DIR/.git" ]]; then
     else
         log "Updating existing checkout at $NANO_INSTALL_DIR"
         git -C "$NANO_INSTALL_DIR" fetch --depth 1 origin "$NANO_BRANCH"
-        git -C "$NANO_INSTALL_DIR" merge --ff-only "origin/$NANO_BRANCH" \
-            || warn "Fast-forward merge failed (diverged history?). Keeping current checkout."
+        # The nano-rs/nano mirror is force-regenerated on every sync, so its
+        # history diverges from any prior checkout and can never fast-forward.
+        # Hard-reset to the fetched remote HEAD instead. Safe: the clean-tree
+        # check above already skips this branch (preserving edits) when there
+        # are local changes, so this only resets an unmodified checkout — the
+        # authoritative state is always the mirror. (NAN-1929: an ff-only merge
+        # left a stale images.lock and then failed digest verification against
+        # the freshly-pulled :latest images.)
+        git -C "$NANO_INSTALL_DIR" reset --hard FETCH_HEAD \
+            || fail "Could not update $NANO_INSTALL_DIR to the latest release. Remove it and re-run to reclone."
     fi
 elif [[ -e "$NANO_INSTALL_DIR" ]]; then
     fail "$NANO_INSTALL_DIR exists but is not a git checkout. Move/remove it or set NANO_INSTALL_DIR to a different path."
