@@ -289,7 +289,10 @@ function PermissionRoute({
 function NotFoundPage() {
   const location = useLocation();
   return (
-    <div className="flex flex-col items-center justify-center h-full text-center px-8 select-none">
+    // NAN-1934: stable hook for the E2E 404 crawler. The SPA returns HTTP 200
+    // for dead routes (React decides 404 client-side), so tests/e2e/crawl-404.mjs
+    // keys off this marker rather than brittle copy or HTTP status.
+    <div data-testid="not-found-404" className="flex flex-col items-center justify-center h-full text-center px-8 select-none">
       <div className="relative mb-8">
         <span className="text-[10rem] font-black leading-none tracking-tighter bg-gradient-to-b from-muted-foreground/40 to-muted-foreground/10 bg-clip-text text-transparent">
           404

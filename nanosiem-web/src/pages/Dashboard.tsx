@@ -649,7 +649,7 @@ function FleetColumn() {
   return (
     <div className="flex flex-col gap-4">
       <div>
-        <SectionHead eyebrow="Fleet — last 24h" count={changes.length} action="activity log" href="/audit" />
+        <SectionHead eyebrow="Fleet — last 24h" count={changes.length} action="activity log" href="/settings/audit" />
         {changes.length === 0 ? (
           <div className="text-[11.5px] text-muted-foreground/70 px-1">No fleet activity in the last 24h.</div>
         ) : (
@@ -754,7 +754,7 @@ function ActivityFeed() {
 
   return (
     <div>
-      <SectionHead eyebrow="Team activity" action="full audit log" href="/audit" />
+      <SectionHead eyebrow="Team activity" action="full audit log" href="/settings/audit" />
       {rows.length === 0 ? (
         <div className="text-[11.5px] text-muted-foreground/70 px-1">No recent activity.</div>
       ) : (

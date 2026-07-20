@@ -230,7 +230,13 @@ impl HealthScheduler {
                 "{}. Threshold: {} minutes",
                 staleness_detail, status.stale_threshold_minutes
             )),
-            link: Some(format!("/log-sources/{}", status.feed_id)),
+            // NAN-1933: target the real /ingestion/log-sources/<typeid> route.
+            // feed_id is log_sources.id (a Uuid); encode it as the `lsrc` typeid
+            // the route resolves — Display would emit a raw UUID that 404s.
+            link: Some(format!(
+                "/ingestion/log-sources/{}",
+                crate::typeid::encode(crate::typeid::log_source::PREFIX, &status.feed_id)
+            )),
             metadata: serde_json::json!({
                 "feed_id": status.feed_id.to_string(),
                 "feed_name": status.feed_name,
@@ -285,3 +291,7 @@ impl HealthScheduler {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "scheduler_tests.rs"]
+mod tests;

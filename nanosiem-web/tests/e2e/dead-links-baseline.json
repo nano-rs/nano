@@ -1,0 +1,4 @@
+{
+  "_comment": "Known dead internal links (target matches no App.tsx route). Fix the link and delete the entry; new entries require review. Regenerate with --update-baseline.",
+  "baseline": []
+}

@@ -158,7 +158,18 @@ export function ParserRepoPreview({
 
       {/* Content */}
       <div className="flex-1 min-h-0 overflow-auto border-t border-border">
-        {tab === 'overview' && <OverviewPane parser={parser} onViewDiff={onViewDiff} />}
+        {tab === 'overview' && (
+          <OverviewPane
+            parser={parser}
+            onViewDiff={onViewDiff}
+            importable={!isImported && !isDeleted}
+            selectedConfigId={selectedConfigId}
+            onChangeConfigId={onChangeConfigId}
+            sourceTypeInput={sourceTypeInput}
+            onChangeSourceType={onChangeSourceType}
+            configs={configs}
+          />
+        )}
         {tab === 'vrl' && <VrlPane parser={parser} />}
         {tab === 'schema' && <SchemaPane parser={parser} />}
         {tab === 'import' && (
@@ -168,11 +179,6 @@ export function ParserRepoPreview({
             previewLoading={previewLoading}
             importMode={importMode}
             onChangeImportMode={onChangeImportMode}
-            selectedConfigId={selectedConfigId}
-            onChangeConfigId={onChangeConfigId}
-            sourceTypeInput={sourceTypeInput}
-            onChangeSourceType={onChangeSourceType}
-            configs={configs}
           />
         )}
       </div>
@@ -312,15 +318,32 @@ function ModeBtn({
 function OverviewPane({
   parser,
   onViewDiff,
+  importable,
+  selectedConfigId,
+  onChangeConfigId,
+  sourceTypeInput,
+  onChangeSourceType,
+  configs,
 }: {
   parser: RepoParserView;
   onViewDiff: (logSourceId: string) => void;
+  importable: boolean;
+  selectedConfigId: string | null;
+  onChangeConfigId: (id: string | null) => void;
+  sourceTypeInput: string;
+  onChangeSourceType: (s: string) => void;
+  configs: SourceConfiguration[];
 }) {
   const linkedId = parser.raw.linked_log_source_id ?? null;
   // NAN-1149: enrichment parsers don't describe a log source_type/transport;
   // they route a per-source mapping into a target table. Surface that pair
   // instead of the log-routing fields.
   const isEnrichment = parser.raw.kind === 'enrichment';
+  // NAN-1932: the source_type + dispatch controls used to live only in the
+  // Import tab, which users didn't discover. Surface them here on the default
+  // landing tab whenever the parser is actually importable (not already
+  // imported/deleted) and not an enrichment parser (no log routing to pick).
+  const showRouting = importable && !isEnrichment;
   return (
     <div className="p-4 space-y-4">
       <div>
@@ -331,6 +354,24 @@ function OverviewPane({
           {parser.desc !== '—' ? parser.desc : 'No description provided.'}
         </div>
       </div>
+
+      {/* Routing — source_type + dispatch config, the two fields users most
+          often adjust before importing. Grouped in a card so they read as the
+          actionable settings on this tab. */}
+      {showRouting && (
+        <div className="rounded-md border border-border bg-card p-3 space-y-4">
+          <SourceTypeField
+            sourceTypeInput={sourceTypeInput}
+            onChangeSourceType={onChangeSourceType}
+          />
+          <DispatchFromField
+            parser={parser}
+            configs={configs}
+            selectedConfigId={selectedConfigId}
+            onChangeConfigId={onChangeConfigId}
+          />
+        </div>
+      )}
 
       <div className="grid grid-cols-2 gap-3">
         {isEnrichment ? (
@@ -350,10 +391,14 @@ function OverviewPane({
           </>
         ) : (
           <>
-            <Meta
-              k="Source type"
-              v={<span className="font-mono">{parser.sourceType}</span>}
-            />
+            {/* When the editable Source type field is shown above, don't repeat
+                it read-only here. */}
+            {!showRouting && (
+              <Meta
+                k="Source type"
+                v={<span className="font-mono">{parser.sourceType}</span>}
+              />
+            )}
             <Meta
               k="Transport"
               v={parser.transport ? <TransportChip t={parser.transport} /> : <span>—</span>}
@@ -463,6 +508,120 @@ function Meta({ k, v }: { k: string; v: React.ReactNode }) {
     <div className="min-w-0">
       <div className="text-[9.5px] uppercase tracking-wider text-muted-foreground mb-0.5">{k}</div>
       <div className="text-[11.5px] text-foreground">{v}</div>
+    </div>
+  );
+}
+
+// ==================================================================
+// Routing controls — the source_type name and the "Dispatch from"
+// config picker. Shared by the Overview tab (importable parsers land
+// here) so users don't have to hunt for them. NAN-1932.
+// ==================================================================
+
+function SourceTypeField({
+  sourceTypeInput,
+  onChangeSourceType,
+}: {
+  sourceTypeInput: string;
+  onChangeSourceType: (s: string) => void;
+}) {
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1.5">
+        Source type
+      </div>
+      <input
+        type="text"
+        value={sourceTypeInput}
+        onChange={(e) => onChangeSourceType(e.target.value)}
+        placeholder="e.g., apache"
+        className="w-full h-[30px] px-2.5 rounded-md border border-border bg-card text-[12px] font-mono focus:outline-none focus:border-primary"
+      />
+      <div className="text-[10.5px] text-muted-foreground mt-1 leading-relaxed">
+        {sourceTypeInput ? (
+          <>
+            Routes by <code className="text-foreground">source_type = &quot;{sourceTypeInput}&quot;</code>
+          </>
+        ) : (
+          'Identifies this log type so the dispatch config can route events into the parser.'
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DispatchFromField({
+  parser,
+  configs,
+  selectedConfigId,
+  onChangeConfigId,
+}: {
+  parser: RepoParserView;
+  configs: SourceConfiguration[];
+  selectedConfigId: string | null;
+  onChangeConfigId: (id: string | null) => void;
+}) {
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">
+        Dispatch from
+      </div>
+      <div className="text-[11px] text-muted-foreground mb-2 leading-relaxed">
+        The Source Config that will route events into this parser. Compatible configs are
+        highlighted based on the parser's transport.
+      </div>
+      {configs.length === 0 ? (
+        <div className="rounded-md border border-border bg-card px-3 py-2.5 text-[11px] text-muted-foreground leading-relaxed">
+          No deployed source configurations. Create or deploy one before importing — the parser
+          still imports as a draft, but no events will route into it until a config exists.
+        </div>
+      ) : (
+        <div className="space-y-1.5">
+          {configs.map((c) => {
+            const compat = isTransportCompat(parser.transport, c.config_type);
+            const active = selectedConfigId === c.id;
+            return (
+              <button
+                key={c.id}
+                type="button"
+                onClick={() => onChangeConfigId(c.id)}
+                className={cn(
+                  'w-full text-left rounded-md border px-3 py-2 flex items-center gap-2.5 transition',
+                  active
+                    ? 'border-primary/40 bg-primary/5'
+                    : 'border-border bg-card hover:border-border/80 hover:bg-muted/40',
+                )}
+              >
+                <span
+                  className={cn(
+                    'w-[10px] h-[10px] rounded-full border-2',
+                    active ? 'border-primary bg-primary' : 'border-muted-foreground/50 bg-transparent',
+                  )}
+                />
+                <div className="flex-1 min-w-0">
+                  <div className="text-[12px] font-medium text-foreground flex items-center gap-1.5">
+                    {c.name}
+                    {compat ? (
+                      <span className="text-[9px] font-mono uppercase tracking-wider text-success border border-success/30 bg-success/5 rounded px-1 py-px">
+                        compat
+                      </span>
+                    ) : (
+                      <span className="text-[9px] font-mono uppercase tracking-wider text-muted-foreground border border-border rounded px-1 py-px">
+                        {c.config_type}
+                      </span>
+                    )}
+                  </div>
+                  {c.description && (
+                    <div className="text-[10.5px] text-muted-foreground truncate">
+                      {c.description}
+                    </div>
+                  )}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -663,26 +822,18 @@ function ImportOptionsPane({
   previewLoading,
   importMode,
   onChangeImportMode,
-  selectedConfigId,
-  onChangeConfigId,
-  sourceTypeInput,
-  onChangeSourceType,
-  configs,
 }: {
   parser: RepoParserView;
   preview: ParserImportPreview | null;
   previewLoading: boolean;
   importMode: 'linked' | 'forked';
   onChangeImportMode: (m: 'linked' | 'forked') => void;
-  selectedConfigId: string | null;
-  onChangeConfigId: (id: string | null) => void;
-  sourceTypeInput: string;
-  onChangeSourceType: (s: string) => void;
-  configs: SourceConfiguration[];
 }) {
   // NAN-1149: enrichment imports have no source_type / dispatch-config routing
   // — the lane routes by enrich_source into target_table, both fixed by the
-  // parser definition. Hide the log-routing controls and show that mapping.
+  // parser definition. Show that mapping instead.
+  // NAN-1932: the source_type + dispatch-config controls moved to the Overview
+  // tab (they're the common case); this tab keeps the advanced import options.
   const isEnrichment = parser.raw.kind === 'enrichment';
   return (
     <div className="p-4 space-y-4">
@@ -738,96 +889,6 @@ function ImportOptionsPane({
             fixed by the parser definition — there is no source-type or dispatch config to pick.
           </div>
         </div>
-      )}
-
-      {/* Target config */}
-      {!isEnrichment && (
-      <>
-      <div>
-        <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">
-          Dispatch from
-        </div>
-        <div className="text-[11px] text-muted-foreground mb-2 leading-relaxed">
-          The Source Config that will route events into this parser. Compatible configs are
-          highlighted based on the parser's transport.
-        </div>
-        {configs.length === 0 ? (
-          <div className="rounded-md border border-border bg-card px-3 py-2.5 text-[11px] text-muted-foreground leading-relaxed">
-            No deployed source configurations. Create or deploy one before importing — the parser
-            still imports as a draft, but no events will route into it until a config exists.
-          </div>
-        ) : (
-          <div className="space-y-1.5">
-            {configs.map((c) => {
-              const compat = isTransportCompat(parser.transport, c.config_type);
-              const active = selectedConfigId === c.id;
-              return (
-                <button
-                  key={c.id}
-                  type="button"
-                  onClick={() => onChangeConfigId(c.id)}
-                  className={cn(
-                    'w-full text-left rounded-md border px-3 py-2 flex items-center gap-2.5 transition',
-                    active
-                      ? 'border-primary/40 bg-primary/5'
-                      : 'border-border bg-card hover:border-border/80 hover:bg-muted/40',
-                  )}
-                >
-                  <span
-                    className={cn(
-                      'w-[10px] h-[10px] rounded-full border-2',
-                      active ? 'border-primary bg-primary' : 'border-muted-foreground/50 bg-transparent',
-                    )}
-                  />
-                  <div className="flex-1 min-w-0">
-                    <div className="text-[12px] font-medium text-foreground flex items-center gap-1.5">
-                      {c.name}
-                      {compat ? (
-                        <span className="text-[9px] font-mono uppercase tracking-wider text-success border border-success/30 bg-success/5 rounded px-1 py-px">
-                          compat
-                        </span>
-                      ) : (
-                        <span className="text-[9px] font-mono uppercase tracking-wider text-muted-foreground border border-border rounded px-1 py-px">
-                          {c.config_type}
-                        </span>
-                      )}
-                    </div>
-                    {c.description && (
-                      <div className="text-[10.5px] text-muted-foreground truncate">
-                        {c.description}
-                      </div>
-                    )}
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        )}
-      </div>
-
-      {/* Source type — text field, drives the routing rule */}
-      <div>
-        <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1.5">
-          Source type
-        </div>
-        <input
-          type="text"
-          value={sourceTypeInput}
-          onChange={(e) => onChangeSourceType(e.target.value)}
-          placeholder="e.g., apache"
-          className="w-full h-[30px] px-2.5 rounded-md border border-border bg-card text-[12px] font-mono focus:outline-none focus:border-primary"
-        />
-        <div className="text-[10.5px] text-muted-foreground mt-1 leading-relaxed">
-          {sourceTypeInput ? (
-            <>
-              Routes by <code className="text-foreground">source_type = &quot;{sourceTypeInput}&quot;</code>
-            </>
-          ) : (
-            'Identifies this log type so the dispatch config can route events into the parser.'
-          )}
-        </div>
-      </div>
-      </>
       )}
 
       {/* Proposed metadata from preview */}

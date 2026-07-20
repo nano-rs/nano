@@ -59,7 +59,7 @@ impl NotificationService {
             proposal.confidence_score * 100.0,
             proposal.changes_summary.join(", ")
         );
-        let link = format!("/tuning/{}", proposal.id);
+        let link = format!("/rules/tuning/{}", proposal.id);
 
         self.send_to_admin_groups(
             NotificationType::TuningTriggered,
@@ -98,7 +98,7 @@ impl NotificationService {
                 "No"
             }
         );
-        let link = format!("/tuning/{}", proposal.id);
+        let link = format!("/rules/tuning/{}", proposal.id);
 
         self.send_to_admin_groups(
             NotificationType::ValidationComplete,
@@ -125,7 +125,7 @@ impl NotificationService {
             rule_name,
             deployment.staging_ends_at.format("%Y-%m-%d %H:%M UTC")
         );
-        let link = format!("/tuning/{}", deployment.proposal_id);
+        let link = format!("/rules/tuning/{}", deployment.proposal_id);
 
         self.send_to_admin_groups(
             NotificationType::StagingDeployed,
@@ -150,7 +150,7 @@ impl NotificationService {
             The new rule version is now active.",
             rule_name
         );
-        let link = format!("/tuning/{}", deployment.proposal_id);
+        let link = format!("/rules/tuning/{}", deployment.proposal_id);
 
         self.send_to_admin_groups(
             NotificationType::Promoted,
@@ -177,7 +177,7 @@ impl NotificationService {
             Auto-tuning will be disabled for this rule for 7 days.",
             rule_name, reason
         );
-        let link = format!("/tuning/{}", proposal_id);
+        let link = format!("/rules/tuning/{}", proposal_id);
 
         self.send_to_admin_groups(
             NotificationType::Reverted,

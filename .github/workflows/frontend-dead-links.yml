@@ -1,0 +1,44 @@
+name: frontend dead-links gate
+
+# NAN-1934 — static "no new dead internal links" gate. Catches the class of bug
+# that shipped NAN-1933: an in-app/notification link whose target matches no
+# React Router route, so it renders the 404 page. Pure text analysis — no stack,
+# no browser, no build, ~1s. The Puppeteer crawler (tests/e2e/crawl-404.mjs) is
+# the runtime complement and is NOT run here (it needs a live stack + auth).
+#
+# Fails only on links NOT already in tests/e2e/dead-links-baseline.json, so it's
+# a ratchet: existing known-dead links are grandfathered, new ones are blocked.
+
+on:
+  pull_request:
+    paths:
+      - "nanosiem-web/src/**"
+      - "nanosiem-web/tests/e2e/**"
+      - "nanosiem-core/src/**"
+      - "nanosiem-api/src/**"
+      - "nanosiem-enterprise/src/**"
+      - "nanosiem-search/src/**"
+      - ".github/workflows/frontend-dead-links.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: frontend-dead-links-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dead-links:
+    # Self-hosted only (repo rule — never ubuntu-latest). No Docker, no build:
+    # just Node reading source files.
+    runs-on: [self-hosted, X64]
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Check for new dead internal links
+        run: node nanosiem-web/tests/e2e/check-dead-links.mjs

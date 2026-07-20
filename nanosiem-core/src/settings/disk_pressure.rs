@@ -919,7 +919,7 @@ impl DiskPressureService {
                 notification_type: NotificationType::DiskPressureWarning,
                 title: title.clone(),
                 message: Some(message.clone()),
-                link: Some("/settings?page=retention".to_string()),
+                link: Some("/settings/storage".to_string()),
                 metadata: serde_json::json!({
                     "usage_fraction": usage,
                     "severity": severity,
@@ -960,7 +960,7 @@ impl DiskPressureService {
                     date,
                     DAILY_TABLES.len()
                 )),
-                link: Some("/settings?page=retention".to_string()),
+                link: Some("/settings/storage".to_string()),
                 metadata: serde_json::json!({
                     "partition_date": date,
                     "tables": DAILY_TABLES,
