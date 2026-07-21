@@ -57,6 +57,7 @@ use crate::handlers;
         (name = "source_scopes", description = "Per-source RBAC scope registry (restricted source_types) and group grants"),
         (name = "credentials", description = "Cloud credential management"),
         (name = "dashboards", description = "Dashboard CRUD, panel queries, import/export"),
+        (name = "artifacts", description = "Shared artifact-analysis store (specimen reports: verdict, deobfuscation, IOCs, MITRE)"),
         (name = "notebooks", description = "Investigation notebooks, entries, sharing, and tabs"),
         (name = "tuning", description = "Detection rule tuning (baselines, proposals, versions)"),
         (name = "melod", description = "meloD AI assistant (chat, parser, query, detection, dashboard generation)"),
@@ -148,6 +149,9 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
         handlers::source_scopes::SourceScopesApiDoc::openapi(),
         handlers::credentials::CredentialsApiDoc::openapi(),
         handlers::dashboards::DashboardsApiDoc::openapi(),
+        // Shared artifact-analysis store (NAN-1977) — core (open + enterprise);
+        // the desktop Artifacts pane must work against open tenants.
+        handlers::artifacts::ArtifactsApiDoc::openapi(),
         handlers::demo::DemoApiDoc::openapi(),
         handlers::tuning::TuningApiDoc::openapi(),
         handlers::settings::SettingsApiDoc::openapi(),
@@ -338,10 +342,16 @@ mod tests {
         // NAN-1805 made risk alerting a dataset=risk detection rule). The
         // enterprise floor nets 513 + 6 (NAN-1799) − 1 (NAN-1806) = 518; the
         // open edition never had the thresholds path.
+        // NAN-1977 added 2 shared path templates (artifact-analysis store):
+        // /api/artifacts (GET, POST) + /api/artifacts/{id} (GET, PUT, DELETE) —
+        // counted in both editions, so both floors bump by 2 (518→520, 408→410).
+        // NAN-1981 added 1 ENTERPRISE path: GET /api/risk/notable-count (count of
+        // entities at/above the risk-notable thresholds — the Home "matter"
+        // number). Enterprise floor 520 + 1 = 521; open edition has no risk page.
         #[cfg(feature = "enterprise")]
-        let min_paths = 518;
+        let min_paths = 521;
         #[cfg(not(feature = "enterprise"))]
-        let min_paths = 408;
+        let min_paths = 410;
 
         assert!(
             path_count >= min_paths,

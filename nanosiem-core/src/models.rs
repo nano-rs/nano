@@ -3,6 +3,7 @@
 //! Database models for NanoSIEM
 
 pub mod alert;
+pub mod artifact;
 pub mod case;
 pub mod dashboard;
 pub mod detection_rule;
@@ -16,6 +17,7 @@ pub mod saved_search;
 pub mod shared_search;
 
 pub use alert::{AcknowledgeAlert, Alert, AlertStatus, CloseAlert, Disposition, NewAlert};
+pub use artifact::{Artifact, ArtifactSummary, NewArtifact, UpdateArtifact};
 pub use case::{
     AddAlertToCase,
     AiRecommendation,

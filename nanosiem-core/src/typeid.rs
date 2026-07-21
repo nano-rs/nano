@@ -352,6 +352,7 @@ typeid_prefix!(signal, "signal");
 typeid_prefix!(incident, "inc");
 typeid_prefix!(source_config, "srcfg");
 typeid_prefix!(dashboard, "dash");
+typeid_prefix!(artifact, "artf");
 typeid_prefix!(upload, "upload");
 typeid_prefix!(queue, "queue");
 typeid_prefix!(queue_routing_rule, "qrr");

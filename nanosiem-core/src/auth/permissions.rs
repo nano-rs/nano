@@ -17,6 +17,12 @@ pub const DASHBOARDS_CREATE: &str = "dashboards:create";
 pub const DASHBOARDS_EDIT: &str = "dashboards:edit";
 pub const DASHBOARDS_DELETE: &str = "dashboards:delete";
 
+// Artifact permissions (NAN-1977) — shared artifact-analysis store
+pub const ARTIFACTS_VIEW: &str = "artifacts:view";
+pub const ARTIFACTS_CREATE: &str = "artifacts:create";
+pub const ARTIFACTS_EDIT: &str = "artifacts:edit";
+pub const ARTIFACTS_DELETE: &str = "artifacts:delete";
+
 // Notebook permissions
 pub const NOTEBOOKS_VIEW: &str = "notebooks:view";
 pub const NOTEBOOKS_CREATE: &str = "notebooks:create";
@@ -230,6 +236,11 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     DASHBOARDS_CREATE,
     DASHBOARDS_EDIT,
     DASHBOARDS_DELETE,
+    // Artifacts
+    ARTIFACTS_VIEW,
+    ARTIFACTS_CREATE,
+    ARTIFACTS_EDIT,
+    ARTIFACTS_DELETE,
     // Notebooks
     NOTEBOOKS_VIEW,
     NOTEBOOKS_AGENT_RECORD,
@@ -392,6 +403,11 @@ pub const DEMO_PERMISSIONS: &[&str] = &[
     DASHBOARDS_CREATE,
     DASHBOARDS_EDIT,
     DASHBOARDS_DELETE,
+    // Artifacts — full analyst workflow (drop, analyze, curate; scoped to session)
+    ARTIFACTS_VIEW,
+    ARTIFACTS_CREATE,
+    ARTIFACTS_EDIT,
+    ARTIFACTS_DELETE,
     // Notebooks — full CRUD (scoped to session)
     NOTEBOOKS_VIEW,
     NOTEBOOKS_CREATE,
@@ -461,6 +477,7 @@ pub const DEMO_PERMISSIONS: &[&str] = &[
 pub const CATEGORIES: &[&str] = &[
     "search",
     "dashboards",
+    "artifacts",
     "notebooks",
     "detections",
     "alerts",

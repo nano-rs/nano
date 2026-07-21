@@ -40,6 +40,7 @@ pub mod credentials;
 // resolve.
 #[cfg(feature = "enterprise")]
 pub use nanosiem_enterprise::handlers::custom_enrichment;
+pub mod artifacts;
 pub mod dashboards;
 pub mod demo;
 pub mod detection_code_targets;

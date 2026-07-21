@@ -3,6 +3,7 @@
 //! Database repository implementations
 
 pub mod alerts;
+pub mod artifacts;
 // Cases & incidents are an enterprise feature (NAN-744): the API routes that
 // expose them live in nanosiem-enterprise, no open-core code calls these repos,
 // and the `ai_*` columns they SELECT only exist in the enterprise migration
@@ -29,6 +30,7 @@ pub mod shared_searches;
 pub mod source_scope;
 
 pub use alerts::{compute_event_hash, AlertInsert, AlertRepository, AlertRepositoryError};
+pub use artifacts::{ArtifactRepository, ArtifactRepositoryError};
 #[cfg(feature = "enterprise")]
 pub use cases::{CaseRepository, CaseRepositoryError, CaseWorkflowRepository};
 pub use dashboards::{DashboardRepository, DashboardRepositoryError};

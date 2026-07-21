@@ -116,6 +116,8 @@ pub enum AuditSource {
     /// Per-source RBAC scope events (restrict/un-restrict a source_type,
     /// grant/revoke a group's visibility of it) — NAN-1799.
     SourceScope,
+    /// Artifact-analysis store events (create, update, delete) — NAN-1977.
+    Artifact,
 }
 
 impl std::fmt::Display for AuditSource {
@@ -157,6 +159,7 @@ impl std::fmt::Display for AuditSource {
             Self::Audit => write!(f, "audit"),
             Self::Report => write!(f, "report"),
             Self::SourceScope => write!(f, "source_scope"),
+            Self::Artifact => write!(f, "artifact"),
         }
     }
 }

@@ -309,6 +309,17 @@ pub const REPORT_DELETED: &str = "report_deleted";
 pub const REPORT_RUN_TRIGGERED: &str = "report_run_triggered";
 
 // =============================================================================
+// Artifact Store Actions (NAN-1977)
+// =============================================================================
+
+/// Artifact was added to the shared analysis store
+pub const ARTIFACT_CREATED: &str = "artifact_created";
+/// Artifact was updated (analysis write-back)
+pub const ARTIFACT_UPDATED: &str = "artifact_updated";
+/// Artifact was removed from the store
+pub const ARTIFACT_DELETED: &str = "artifact_deleted";
+
+// =============================================================================
 // Log Source Actions
 // =============================================================================
 

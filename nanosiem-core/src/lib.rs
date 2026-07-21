@@ -177,9 +177,9 @@ pub use auth::{
 pub use entity_extraction::{EntityExtractor, ExtractedEntity};
 pub use crypto::{CryptoError, EncryptedData, EncryptionService};
 pub use db::{
-    DashboardRepository, DashboardRepositoryError, Database, DatabaseConfig, DualPool,
-    DualPoolConfig, DualPoolError, HealthStatus, NotebookRepository, NotebookRepositoryError,
-    TableNames,
+    ArtifactRepository, ArtifactRepositoryError, DashboardRepository, DashboardRepositoryError,
+    Database, DatabaseConfig, DualPool, DualPoolConfig, DualPoolError, HealthStatus,
+    NotebookRepository, NotebookRepositoryError, TableNames,
 };
 // Cases & incidents repositories are enterprise-only (NAN-1298). Re-exported at
 // the crate root only when the `enterprise` feature is on; gated out of the open

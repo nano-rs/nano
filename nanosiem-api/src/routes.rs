@@ -17,6 +17,12 @@ use tower_http::set_header::SetResponseHeaderLayer;
 /// Maximum upload file size: 100MB + overhead for multipart encoding
 const MAX_UPLOAD_SIZE: usize = 105 * 1024 * 1024;
 
+/// Body limit for the artifact-analysis store (NAN-1977). Sized above the
+/// handler's per-field caps (specimen `original`/`deobfuscated` at 4 MiB each +
+/// the structured JSON fields) so the handler's clean 400 — not axum's 2 MiB
+/// default 413 — is the authoritative rejection for oversized specimens.
+const ARTIFACT_BODY_LIMIT: usize = 12 * 1024 * 1024;
+
 /// Max size for an air-gap import bundle. The IPinfo-Lite enrichment payload is
 /// ~400MB uncompressed; the compressed `.tar.gz` is buffered before the
 /// streaming verify/parse, so the cap must comfortably exceed the 105MB upload
@@ -140,6 +146,24 @@ pub fn create_router(state: AppState) -> Router {
             (*rate_limit_state).clone(),
             upload_rate_limit_middleware,
         ));
+
+    // Artifact-analysis store (NAN-1977) — shared, RBAC-scoped. Its own sub-router
+    // so create/update carry a body limit above the specimen caps (see
+    // ARTIFACT_BODY_LIMIT) rather than inheriting axum's 2 MiB default; GET/DELETE
+    // ride along harmlessly. Auth is applied as an outer layer after the merge.
+    let artifact_routes = Router::new()
+        .route("/api/artifacts", get(handlers::artifacts::list_artifacts))
+        .route("/api/artifacts", post(handlers::artifacts::create_artifact))
+        .route("/api/artifacts/{id}", get(handlers::artifacts::get_artifact))
+        .route(
+            "/api/artifacts/{id}",
+            put(handlers::artifacts::update_artifact),
+        )
+        .route(
+            "/api/artifacts/{id}",
+            delete(handlers::artifacts::delete_artifact),
+        )
+        .layer(DefaultBodyLimit::max(ARTIFACT_BODY_LIMIT));
 
     // Air-gapped bundle import routes (NAN-1201) — enterprise only. These accept
     // large signed `.tar.gz` bundles (the IPinfo enrichment payload dwarfs the
@@ -1770,6 +1794,10 @@ pub fn create_router(state: AppState) -> Router {
                 "/api/risk/time-windowed",
                 get(handlers::risk::get_time_windowed_risk_scores::<AppState>),
             )
+            .route(
+                "/api/risk/notable-count",
+                get(handlers::risk::get_notable_count::<AppState>),
+            )
             // NAN-1806: /api/risk/thresholds retired with the notable scheduler
             // (NAN-1805) — risk alerting is a `dataset=risk` detection rule.
             .route(
@@ -2216,6 +2244,8 @@ pub fn create_router(state: AppState) -> Router {
         )
         // Upload endpoints (rate-limited to prevent DoS)
         .merge(upload_routes)
+        // Artifact-analysis store (NAN-1977) — body-limited sub-router
+        .merge(artifact_routes)
         // NAN-474: rate-limited dry-resolve sub-router
         .merge(dry_resolve_routes)
         // NAN-939: rate-limited Kafka broker-probe sub-router
