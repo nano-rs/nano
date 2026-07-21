@@ -1,0 +1,86 @@
+name: nano Desktop release
+
+# NAN-1937 — standalone build of the nano Desktop (Tauri) app for testers.
+# Deliberately SEPARATE from build-and-push.yml (the ~1h SIEM image pipeline):
+# this builds only the desktop app (frontend + one Rust binary) in minutes and
+# never touches Docker / images. Tauri can't cross-compile, so each installer is
+# built on its own native runner.
+#
+# Output: .dmg (macOS, Apple Silicon) + .msi/.exe (Windows x64) via tauri-action,
+# uploaded to a DRAFT GitHub Release. Unsigned for now — testers click through the
+# one-time OS warning (macOS: right-click > Open; Windows SmartScreen: More info >
+# Run anyway). Add code-signing secrets later to drop the warning.
+#
+# GitHub-hosted runners (macos-latest / windows-latest) are used on purpose: the
+# repo's self-hosted runners are Linux and can't produce mac/windows bundles.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write # create the draft release + upload installers
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest # Apple Silicon runner -> arm64 .dmg/.app
+            rust_target: aarch64-apple-darwin
+          - platform: windows-latest # -> .msi + .nsis (.exe)
+            rust_target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: nano-desktop/src-tauri
+
+      # The desktop reuses source from nanosiem-web/src. At vite RUNTIME those
+      # shared libs resolve to the desktop's own node_modules (vite.config
+      # aliases), but the `tsc --noEmit` typecheck resolves the shared files'
+      # imports (react, date-fns, @radix-ui/*) against nanosiem-web/node_modules —
+      # so its deps must be installed too. Deps only: no web build, no SIEM build.
+      - name: Install nanosiem-web deps (shared-module types)
+        run: npm ci
+        working-directory: nanosiem-web
+
+      - name: Install desktop frontend deps
+        run: npm ci
+        working-directory: nano-desktop
+
+      - name: Build + draft release (tauri-action)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: nano-desktop
+          tagName: nano-desktop-v__VERSION__-b${{ github.run_number }}
+          releaseName: nano Desktop v__VERSION__ (build ${{ github.run_number }})
+          releaseBody: |
+            Test build of the nano Desktop app (unsigned).
+            - macOS: right-click the app and choose Open, or run `xattr -dr com.apple.quarantine /Applications/nano.app`.
+            - Windows: on the SmartScreen prompt choose "More info" then "Run anyway".
+            The app connects to a nano backend — point it at your tenant URL on first launch.
+          releaseDraft: true
+          prerelease: true
+          includeUpdaterJson: false

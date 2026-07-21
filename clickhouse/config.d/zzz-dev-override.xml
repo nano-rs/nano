@@ -1,13 +1,23 @@
 <?xml version="1.0"?>
 <!--
-  Local Development Override
+  Self-hosted single-box (compose) defaults — NAN-1967.
 
-  Drastically reduces resource usage for laptop/dev environments.
-  Delete this file or exclude from volume mount for production deployments.
+  ClickHouse memory AUTO-SIZES to the container's memory limit
+  (deploy.resources.limits.memory) via max_server_memory_usage_to_ram_ratio
+  below, so raising that compose limit is the ONLY knob needed to give CH more
+  RAM — no config edit, and CH self-limits gracefully instead of being
+  OOM-killed by Docker. Correct for a 2 GB hobby box and a large box alike.
+
+  Cache sizes and background/ingest thread pools are kept modest so the smallest
+  boxes (2 GB) stay stable; larger boxes can raise them with a later-loading
+  config.d override (see the enterprise handoff's zzzz-nano-sizing.xml).
 -->
 <clickhouse>
-    <!-- Cap memory at 16GB (Docker VM has ~22GB; leaves room for PG/Vector/api/search) -->
-    <max_server_memory_usage>17179869184</max_server_memory_usage>
+    <!-- Auto-size to the container's memory limit (CH 26.x is cgroup-aware).
+         0 = no absolute cap; use the ratio of the detected limit. Was hardcoded
+         to 16 GiB, which mismatched the container cap and caused OOM-kills. -->
+    <max_server_memory_usage>0</max_server_memory_usage>
+    <max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio>
 
     <!-- Shrink caches from 28GB total to ~512MB total -->
     <mark_cache_size>134217728</mark_cache_size>                 <!-- 128MB (was 10GB) -->
