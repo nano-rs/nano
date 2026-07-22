@@ -298,6 +298,8 @@ impl AppState {
         DataAccessLayer::with_clickhouse_clustered(
             self.pool.clone(),
             self.dual_pool.clickhouse().clone(),
+            // NAN-2001: restricted identity for advanced-mode raw-SQL validation.
+            self.dual_pool.clickhouse_rawsql().clone(),
             self.dual_pool.table_names(),
             self.config.schema_profile(),
         )

@@ -99,6 +99,16 @@ services:
       # fall back to the app password so an upgrade never resolves from_env
       # to "" (an empty-password user).
       CLICKHOUSE_INGEST_PASSWORD: ${CLICKHOUSE_INGEST_PASSWORD:-${CLICKHOUSE_PASSWORD}}
+      # NAN-2001: read-only raw-SQL feature users, resolved by from_env in
+      # users.d/nanosiem-users.xml (`nanosiem_rawsql` / `nanosiem_rawsql_noaudit`).
+      # Same upgrade-safe fallback as INGEST above: a pre-NAN-2001 .env has no
+      # CLICKHOUSE_RAWSQL_PASSWORD, so fall back to the app password rather than
+      # resolving from_env to "" — DualPool is fail-closed, so an empty/mismatched
+      # rawsql password bricks api/search/jobs boot. The app services below use the
+      # IDENTICAL expression, so the CH user's from_env password and the app's
+      # connect password can never diverge.
+      CLICKHOUSE_RAWSQL_PASSWORD: ${CLICKHOUSE_RAWSQL_PASSWORD:-${CLICKHOUSE_PASSWORD}}
+      CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD: ${CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD:-${CLICKHOUSE_PASSWORD}}
     volumes:
       - nano-clickhouse-data:/var/lib/clickhouse
       - nano-clickhouse-logs:/var/log/clickhouse-server
@@ -263,6 +273,12 @@ services:
       CLICKHOUSE_CLUSTER: ""
       CLICKHOUSE_USER: nanosiem
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      # NAN-2001: read-only raw-SQL pool creds. DualPool::from_env reads these two
+      # passwords (usernames default to nanosiem_rawsql / nanosiem_rawsql_noaudit).
+      # Identical upgrade-safe expression to the clickhouse service feed, so the CH
+      # user password and this connect password never diverge.
+      CLICKHOUSE_RAWSQL_PASSWORD: ${CLICKHOUSE_RAWSQL_PASSWORD:-${CLICKHOUSE_PASSWORD}}
+      CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD: ${CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD:-${CLICKHOUSE_PASSWORD}}
       CLICKHOUSE_ADMIN_USER: nanosiem_admin
       CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD}
       CLICKHOUSE_SELF_USER: nanosiem
@@ -343,6 +359,12 @@ services:
       CLICKHOUSE_CLUSTER: ""
       CLICKHOUSE_USER: nanosiem
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      # NAN-2001: read-only raw-SQL pool creds. DualPool::from_env reads these two
+      # passwords (usernames default to nanosiem_rawsql / nanosiem_rawsql_noaudit).
+      # Identical upgrade-safe expression to the clickhouse service feed, so the CH
+      # user password and this connect password never diverge.
+      CLICKHOUSE_RAWSQL_PASSWORD: ${CLICKHOUSE_RAWSQL_PASSWORD:-${CLICKHOUSE_PASSWORD}}
+      CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD: ${CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD:-${CLICKHOUSE_PASSWORD}}
       CLICKHOUSE_ADMIN_USER: nanosiem_admin
       CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD}
       CLICKHOUSE_SELF_USER: nanosiem
@@ -414,6 +436,12 @@ services:
       CLICKHOUSE_CLUSTER: ""
       CLICKHOUSE_USER: nanosiem
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      # NAN-2001: read-only raw-SQL pool creds. DualPool::from_env reads these two
+      # passwords (usernames default to nanosiem_rawsql / nanosiem_rawsql_noaudit).
+      # Identical upgrade-safe expression to the clickhouse service feed, so the CH
+      # user password and this connect password never diverge.
+      CLICKHOUSE_RAWSQL_PASSWORD: ${CLICKHOUSE_RAWSQL_PASSWORD:-${CLICKHOUSE_PASSWORD}}
+      CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD: ${CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD:-${CLICKHOUSE_PASSWORD}}
       SEARCH_PORT: "3002"
       JWT_SECRET: ${JWT_SECRET}
       NANOSIEM_ENCRYPTION_KEY: ${NANOSIEM_ENCRYPTION_KEY}

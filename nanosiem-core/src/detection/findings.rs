@@ -176,13 +176,34 @@ impl FindingEvent {
     /// normalized values. Events without a `source_type` string contribute
     /// nothing; an all-empty result means "origin unknown" and the write-side
     /// policy treats that conservatively (see `FindingLogger::origin_restricted`).
+    ///
+    /// NAN-2001: aggregate rules (stats/timechart/top/rare) collapse the raw
+    /// stream, so their result rows carry NO per-event `source_type` — origin
+    /// would come out empty and the audit sentinel in `origin_restricted` would
+    /// never see the audit actor that leaked in via `risk_entity`. The detection
+    /// engine stamps such rows with the window's distinct source types under
+    /// `_nano_source_types` (the same array that fills `alerts.source_types`,
+    /// via `annotate_source_types_for_scoping`); harvest it here so aggregate
+    /// audit findings become KNOWN-origin and are redacted precisely (no
+    /// over-redaction of non-audit aggregate findings). Mirrors
+    /// `db::repository::alerts::distinct_source_types`.
     fn origin_source_types_from(events: &[serde_json::Value]) -> Vec<String> {
         let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut insert_normalized = |raw: &str| {
+            let normalized = raw.trim().to_lowercase();
+            if !normalized.is_empty() {
+                set.insert(normalized);
+            }
+        };
         for event in events {
             if let Some(st) = event.get("source_type").and_then(|v| v.as_str()) {
-                let normalized = st.trim().to_lowercase();
-                if !normalized.is_empty() {
-                    set.insert(normalized);
+                insert_normalized(st);
+            }
+            if let Some(arr) = event.get("_nano_source_types").and_then(|v| v.as_array()) {
+                for v in arr {
+                    if let Some(st) = v.as_str() {
+                        insert_normalized(st);
+                    }
                 }
             }
         }
@@ -474,19 +495,59 @@ impl FindingLogger {
         }
     }
 
-    /// NAN-1800: should this finding's matched-event evidence be redacted?
+    /// `source_type` origins ALWAYS treated as restricted for finding redaction
+    /// (NAN-2001), independent of the PG `restricted_source_types` registry.
     ///
+    /// Audit content re-enters `logs`/`ocsf_logs` as `source_type='findings'`
+    /// rows that embed the matched audit event (`message`, `risk_entity`,
+    /// `matched_events_sample`, `risk_factors`). The raw-SQL noaudit row policy
+    /// (`lower(source_type)!='audit'`) hides rows literally stamped
+    /// `source_type='audit'` but NOT this re-injected finding content, and
+    /// app-layer field redaction does not protect a raw-SQL read (it reads the
+    /// raw stored bytes). Redacting audit-origin evidence at WRITE time is the
+    /// storage-layer guarantee that DOES protect a raw-SQL read. Hard-wired as a
+    /// sentinel (never seeded through the registry, so it cannot be un-seeded)
+    /// so audit findings redact on every deployment, including those that never
+    /// configured per-source scoping. Detection is unaffected — this is strictly
+    /// post-match (audit rules still fire).
+    const ALWAYS_RESTRICTED_ORIGINS: &'static [&'static str] = &["audit"];
+
+    /// True if any origin `source_type` is an always-restricted sentinel
+    /// ([`ALWAYS_RESTRICTED_ORIGINS`] — currently `'audit'`). Pure so the
+    /// sentinel classification is unit-testable without a database. Inputs are
+    /// normalized (trim + lowercase) defensively; `origin_source_types_from`
+    /// already normalizes, but a directly-constructed `FindingEvent` may not.
+    fn is_always_restricted_origin(origin_source_types: &[String]) -> bool {
+        origin_source_types.iter().any(|st| {
+            let normalized = st.trim().to_lowercase();
+            Self::ALWAYS_RESTRICTED_ORIGINS.contains(&normalized.as_str())
+        })
+    }
+
+    /// NAN-1800 / NAN-2001: should this finding's matched-event evidence be
+    /// redacted?
+    ///
+    /// - Always-restricted sentinel origin (`'audit'`, NAN-2001): redact,
+    ///   checked FIRST and WITHOUT any PostgreSQL access, so audit findings
+    ///   redact even when the registry is empty or PG is unreachable. Aggregate
+    ///   audit rules reach this branch because `origin_source_types_from`
+    ///   harvests the engine's `_nano_source_types` stamp (NAN-2001 Change 2).
     /// - Known origin (`origin_source_types` non-empty): delegate to
     ///   `SourceScopeResolver::any_restricted` — THE home of the fail-closed
     ///   policy (restricted match ⇒ true; registry unavailable ⇒ true).
-    /// - Unknown origin (empty — aggregate rules whose result rows drop
-    ///   `source_type`): `any_restricted(&[])` would return false, which is
-    ///   fail-OPEN for evidence we cannot attribute. Be conservative instead:
-    ///   redact whenever ANY restriction exists at all, and redact when the
-    ///   registry is unavailable. An empty registry (no restrictions
-    ///   configured — the pre-feature default) stays visible, so deployments
-    ///   without source scoping are byte-identical to before.
+    /// - Unknown origin (empty — a finding with no attributable source, e.g. a
+    ///   retro-hunt indicator summary): `any_restricted(&[])` would return
+    ///   false, which is fail-OPEN for evidence we cannot attribute. Be
+    ///   conservative instead: redact whenever ANY restriction exists at all,
+    ///   and redact when the registry is unavailable. An empty registry (no
+    ///   restrictions configured — the pre-feature default) stays visible, so
+    ///   deployments without source scoping are byte-identical to before.
     async fn origin_restricted(&self, finding: &FindingEvent) -> bool {
+        // NAN-2001: audit origin is ALWAYS restricted — short-circuit before any
+        // PG access so this holds on every deployment and during a PG outage.
+        if Self::is_always_restricted_origin(&finding.origin_source_types) {
+            return true;
+        }
         if finding.origin_source_types.is_empty() {
             match self.source_scopes.restricted_snapshot().await {
                 Ok(restricted) => !restricted.is_empty(),
@@ -1140,6 +1201,128 @@ mod redaction_tests {
         let event: FindingEvent = serde_json::from_value(legacy).expect("legacy deserializes");
         assert!(event.origin_source_types.is_empty());
         assert!(!event.matched_events_redacted);
+    }
+
+    /// NAN-2001 Change 2: aggregate rules drop per-event `source_type`; the
+    /// engine stamps the window's distinct sources under `_nano_source_types`.
+    /// The finding must harvest that stamp so aggregate audit findings become
+    /// KNOWN-origin (the audit sentinel then redacts them). Mirrors
+    /// `db::repository::alerts::distinct_source_types`.
+    #[test]
+    fn origin_source_types_harvests_nano_annotation_for_aggregate_rows() {
+        // Pure aggregate row: no `source_type`, only the engine annotation.
+        let rows = vec![json!({ "count": 42, "_nano_source_types": ["Audit"] })];
+        assert_eq!(
+            FindingEvent::origin_source_types_from(&rows),
+            vec!["audit".to_string()],
+            "aggregate audit rows must resolve to audit origin via _nano_source_types"
+        );
+
+        // Mixed batch: per-event `source_type` AND the annotation, deduped +
+        // normalized (trim + lowercase).
+        let rows = vec![
+            json!({ "source_type": "syslog", "user": "a" }),
+            json!({ "count": 5, "_nano_source_types": ["audit", " Windows Event Log "] }),
+        ];
+        assert_eq!(
+            FindingEvent::origin_source_types_from(&rows),
+            vec![
+                "audit".to_string(),
+                "syslog".to_string(),
+                "windows event log".to_string(),
+            ],
+        );
+    }
+
+    /// NAN-2001 Change 1: 'audit' is an ALWAYS-restricted origin sentinel,
+    /// independent of the PG registry. Pure classification — no database.
+    #[test]
+    fn audit_origin_is_always_restricted_sentinel() {
+        let audit = |v: &[&str]| {
+            FindingLogger::is_always_restricted_origin(
+                &v.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        // Audit origin (and case/whitespace variants) is always restricted.
+        assert!(audit(&["audit"]));
+        assert!(audit(&["Audit"]));
+        assert!(audit(&["  AUDIT "]));
+        // Any audit member in a mixed origin flags the whole finding.
+        assert!(audit(&["syslog", "audit"]));
+        // Non-audit origins are NOT force-restricted — they defer to the
+        // registry, so deployments without audit rules stay byte-identical.
+        assert!(!audit(&["syslog"]));
+        assert!(!audit(&["windows event log"]));
+        assert!(!audit(&["auditbeat"])); // substring, not the token — not audit
+        assert!(!audit(&[]));
+    }
+
+    /// NAN-2001: an audit-origin finding redacts the actor (message collapses to
+    /// the count-only form, `risk_entity` / sample / factors cleared) while a
+    /// non-audit finding built identically is byte-identical (no regression).
+    #[test]
+    fn audit_origin_finding_redacts_actor_while_nonaudit_untouched() {
+        // Distinctive audit actor (matches the live-repro IP from the design).
+        let actor = "10.98.1.1";
+        let make = |origin: &str| FindingEvent {
+            finding_type: FindingType::Alert,
+            rule_id: Uuid::now_v7(),
+            rule_name: "Audit Actor Rule".to_string(),
+            rule_query: "source_type=audit | stats count by src_ip".to_string(),
+            severity: Severity::High,
+            rule_mode: crate::models::RuleMode::Alerting,
+            mitre_tactics: vec![],
+            mitre_techniques: vec![],
+            alert_id: Some(Uuid::now_v7()),
+            matched_event_count: 3,
+            matched_events_sample: vec![json!({ "src_ip": actor })],
+            realtime: false,
+            detected_at: Utc::now(),
+            raw_risk_score: 50,
+            risk_score: 75,
+            risk_entity: actor.to_string(),
+            risk_entity_field: Some("src_ip".to_string()),
+            risk_entity_type: "ip".to_string(),
+            risk_factors: vec![format!("factor:src_ip={actor}")],
+            origin_source_types: vec![origin.to_string()],
+            matched_events_redacted: false,
+        };
+
+        // Sentinel decision is pure (no PG): audit yes, syslog no.
+        let mut audit = make("audit");
+        let nonaudit = make("syslog");
+        // Snapshot the non-audit finding's serialization up front; the audit
+        // path must not touch it, so it stays byte-identical.
+        let nonaudit_before = nonaudit.to_log_json();
+        assert!(FindingLogger::is_always_restricted_origin(&audit.origin_source_types));
+        assert!(!FindingLogger::is_always_restricted_origin(&nonaudit.origin_source_types));
+
+        // Apply exactly what `log_finding` applies when the origin is restricted.
+        audit.redact_matched_events();
+        assert_eq!(
+            audit.message(),
+            "Audit Actor Rule - 3 event(s)",
+            "message must collapse to the count-only form"
+        );
+        assert_eq!(audit.risk_entity, "", "risk_entity must be emptied");
+        assert_eq!(audit.risk_entity_field, None);
+        assert!(audit.matched_events_sample.is_empty());
+        assert!(audit.matched_events_redacted);
+        assert_eq!(audit.matched_event_count, 3, "count is preserved");
+        assert_eq!(audit.risk_score, 75, "score is preserved");
+        // The audit actor must NOT survive into EITHER physical write branch.
+        let audit_md = audit.to_log_json();
+        assert!(!audit_md.to_string().contains(actor), "actor leaked into UDM metadata");
+        let ocsf = FindingLogger::build_ocsf_finding_event(&audit_md, &audit.message(), audit.detected_at);
+        assert!(!ocsf.to_string().contains(actor), "actor leaked into OCSF event");
+
+        // The non-audit finding is left fully intact — byte-identical to its
+        // pre-snapshot, and the actor is still present (redaction did not
+        // over-reach onto a non-audit origin).
+        assert_eq!(nonaudit.to_log_json(), nonaudit_before);
+        assert!(nonaudit.to_log_json().to_string().contains(actor));
+        assert!(nonaudit.message().contains(actor));
+        assert!(!nonaudit.matched_events_redacted);
     }
 }
 

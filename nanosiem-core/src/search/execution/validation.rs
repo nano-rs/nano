@@ -1,112 +1,57 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! SQL query validation utilities
+//! SQL validation for the raw-SQL surface (`POST /api/search/sql`, dashboards SQL
+//! panels, reports, meloD advanced mode).
 //!
-//! SECURITY: This module uses an ALLOWLIST approach for table access control.
-//! Only explicitly listed tables can be queried. Everything else is rejected
-//! by default. This is secure-by-default — new tables are blocked until
-//! explicitly added to the allowlist.
+//! **NAN-2001: this is no longer the security boundary.** The table ALLOWLIST,
+//! table-function denial (`url()/s3()/remote()/…` = SSRF), `system.*` denial,
+//! writes, and audit-row hiding are all enforced by ClickHouse via two dedicated
+//! read-only feature identities — `nanosiem_rawsql` / `nanosiem_rawsql_noaudit`
+//! (SELECT-only grants = the allowlist, plus a RESTRICTIVE `source_type!='audit'`
+//! row policy on the noaudit identity). The app selects the identity by the
+//! caller's `audit:view`; ClickHouse enforces the rest against its own semantics.
 //!
-//! This is Layer 2 (application-level) of a two-layer defense:
-//! - Layer 1: ClickHouse user-level grants (DB rejects unauthorized access)
-//! - Layer 2: This validator (UX + defense in depth)
+//! The old approach hand-walked the sqlparser AST (`validate_sql_query` +
+//! `inject_audit_filter`). It was **fail-open** (`match { known…; _ => {} }`) and
+//! validated against sqlparser's grammar (which diverges from ClickHouse's); an
+//! adversarial review bypassed it in **6 consecutive rounds**. That walk and the
+//! audit-filter injection are **deleted**.
+//!
+//! What remains is intentionally small:
+//!   1. a friendly single-SELECT parse check (UX; ClickHouse `readonly` grants
+//!      deny DML/DDL regardless), and
+//!   2. a MANDATORY reject of `system` / `information_schema` / `pg_catalog`
+//!      references and a small set of info-disclosure / sleep FUNCTIONS —
+//!      ClickHouse grants do NOT close these (some `system` metadata tables, e.g.
+//!      `system.settings`, and functions like `currentDatabase()`/`hostName()`
+//!      stay readable to a grant-only readonly user; verified live on CH 26.4).
+//!
+//! Both mandatory scans run on a **string-literal-stripped** copy of the SQL, so
+//! they match SQL *syntax*, never log *content* (`WHERE message LIKE '%system%'`
+//! and `'%delete%'` hunts are allowed again — the old substring scan blocked them).
 
 use crate::search::SearchError;
-use sqlparser::ast::{Expr, GroupByExpr, Query, SelectItem, SetExpr, TableFactor, TableWithJoins};
 
-/// Tables that search queries are allowed to reference.
-/// SECURITY: This is an allowlist — any table NOT in this list is rejected.
-/// When adding new ClickHouse tables, add them here to make them queryable.
+/// Info-disclosure / sleep FUNCTIONS that ClickHouse does not deny for a
+/// grant-only readonly user (they are not gated by grants nor by
+/// `allow_introspection_functions`). Matched only in FUNCTION-CALL form
+/// (`NAME(`) on string-literal-stripped SQL, so identifiers/log content such as
+/// `message ILIKE '%hostname%'` are NOT rejected.
 ///
-/// Naming convention in clustered deployments (see `deploy/scripts/init-clickhouse-cluster.sh`):
-/// - Bare name (e.g. `logs`) is the Distributed wrapper that fans out across shards.
-/// - `*_local` is the per-replica ReplicatedMergeTree that Vector writes to.
-/// - `*_distributed` is the legacy name still emitted by the nPL generator; allow it so
-///   user-submitted SQL can reference the same tables the nPL path generates.
-const ALLOWED_TABLES: &[&str] = &[
-    // Core event tables
-    "logs",
-    "logs_distributed",
-    // OCSF profile ingested-events table (NAN-1241) — raw-SQL search/dashboard
-    // panels reference it directly under NANO_SCHEMA_PROFILE=ocsf.
-    "ocsf_logs",
-    "ocsf_logs_distributed",
-    // OTLP spans dataset (NAN-1555) — `/search?dataset=spans` runs nPL over this
-    // native-storage table (migration 138). `_local`/`_distributed` follow the
-    // clustered-deployment naming convention so user-submitted SQL can reference
-    // the same tables the nPL generator targets.
-    "otel_spans",
-    "otel_spans_local",
-    "otel_spans_distributed",
-    // OTLP metrics dataset (NAN-1555 Phase 2) — raw data points (migration 140)
-    // plus the generic multi-resolution rollups (migration 144) that resolution
-    // routing reads for wide windows.
-    "otel_metrics",
-    "otel_metrics_local",
-    "otel_metrics_distributed",
-    "otel_metrics_1m",
-    "otel_metrics_1m_local",
-    "otel_metrics_1m_distributed",
-    "otel_metrics_1h",
-    "otel_metrics_1h_local",
-    "otel_metrics_1h_distributed",
-    "signals",
-    "signals_distributed",
-    "ingestion_errors",
-    "ingestion_errors_distributed",
-    // Prevalence aggregation
-    "domain_prevalence_agg",
-    "domain_prevalence_agg_distributed",
-    "hash_prevalence_agg",
-    "hash_prevalence_agg_distributed",
-    "ip_prevalence_agg",
-    "ip_prevalence_agg_distributed",
-    // Identity & enrichment
-    "identity_observations",
-    "identity_observations_distributed",
-    "entity_time_range_agg",
-    "entity_time_range_agg_distributed",
-    "custom_enrichment_results",
-    "custom_enrichment_results_distributed",
-    // Cloud analytics
-    "cloud_user_activity_agg",
-    "cloud_user_activity_agg_distributed",
-    // Internal metadata
-    "_migrations",
-    "nat_candidates",
-    // Audit filter wrapper alias (generated by search handler)
-    "_filtered",
-];
-
-/// Dangerous keywords that are never allowed in raw SQL, even in comments.
-/// Defense-in-depth: catches attempts that might slip past AST validation.
-const DANGEROUS_KEYWORDS: &[&str] = &[
-    "INSERT",
-    "UPDATE",
-    "DELETE",
-    "DROP",
-    "CREATE",
-    "ALTER",
-    "TRUNCATE",
-    "GRANT",
-    "REVOKE",
-    "PG_SLEEP",
-    "PG_TERMINATE_BACKEND",
-    "PG_CANCEL_BACKEND",
-    "COPY",
-    "EXECUTE",
-    "PREPARE",
-    // ClickHouse sleep functions
+/// DML/DDL keywords are deliberately NOT here: a real DML/DDL *statement* is
+/// already rejected by the single-SELECT parse below, and ClickHouse `readonly`
+/// + SELECT-only grants deny them at execution — listing them only caused
+/// false-positives on log content (`message LIKE '%delete%'`).
+const DISALLOWED_FUNCTIONS: &[&str] = &[
+    // Sleep / DoS
     "SLEEP",
     "SLEEPEACHROW",
-    // Information disclosure functions
+    "PG_SLEEP",
+    // Info disclosure (server / session / filesystem)
     "CURRENTDATABASE",
     "HOSTNAME",
     "CURRENTUSER",
     "GETSETTING",
-    "PG_READ_FILE",
-    "PG_READ_BINARY_FILE",
-    // Additional ClickHouse introspection functions (NAN-170 findings)
     "FQDN",
     "DISPLAYNAME",
     "SERVERUUID",
@@ -119,43 +64,50 @@ const DANGEROUS_KEYWORDS: &[&str] = &[
     "FILESYSTEMAVAILABLE",
     "GETOSKERNELVERSION",
     "GETMACRO",
+    // Postgres-oriented file / process functions (harmless on CH, kept for parity)
+    "PG_READ_FILE",
+    "PG_READ_BINARY_FILE",
+    "PG_TERMINATE_BACKEND",
+    "PG_CANCEL_BACKEND",
 ];
 
-/// Validate that SQL is a safe, single SELECT statement referencing only allowed tables.
+/// Validate that raw SQL is a single SELECT and does not reference forbidden
+/// schemas or call info-disclosure functions. See the module docs — this is
+/// defense-in-depth + UX, NOT the security boundary (ClickHouse is).
 pub fn validate_sql_query(sql: &str) -> Result<(), SearchError> {
     use sqlparser::dialect::ClickHouseDialect;
     use sqlparser::parser::Parser;
 
+    // Rejecting comments keeps the literal-stripping scans below sound (a comment
+    // can't hide a `system.*` reference from them). Also a cheap friendly check.
     reject_sql_comments(sql)?;
 
-    let dialect = ClickHouseDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
+    // Friendly UX: parse as exactly one SELECT. NOT the security boundary —
+    // ClickHouse readonly + SELECT-only grants deny DML/DDL regardless.
+    let statements = Parser::parse_sql(&ClickHouseDialect {}, sql)
         .map_err(|e| SearchError::SqlValidationError(format!("SQL parse error: {}", e)))?;
-
     if statements.len() != 1 {
         return Err(SearchError::SqlValidationError(
-            "Only single SELECT statements are allowed".to_string(),
+            "Only a single SELECT statement is allowed".to_string(),
+        ));
+    }
+    if !matches!(statements[0], sqlparser::ast::Statement::Query(_)) {
+        return Err(SearchError::SqlValidationError(
+            "Only SELECT statements are allowed".to_string(),
         ));
     }
 
-    match &statements[0] {
-        sqlparser::ast::Statement::Query(query) => {
-            validate_query(query)?;
-        }
-        _ => {
-            return Err(SearchError::SqlValidationError(
-                "Only SELECT statements are allowed".to_string(),
-            ));
-        }
-    }
-
-    // Defense-in-depth: keyword scan catches anything the AST walk might miss
-    check_dangerous_keywords(sql)?;
+    // A copy with single-quoted string literals removed, so the mandatory scans
+    // match SQL SYNTAX, never log CONTENT.
+    let code = strip_string_literals(sql);
+    reject_system_schema(&code)?;
+    reject_disallowed_functions(&code)?;
 
     Ok(())
 }
 
-/// Reject SQL comments to prevent comment-based LIMIT/OFFSET bypass tricks.
+/// Reject SQL comments to keep the literal-stripping scans sound (a `--`/`/* */`
+/// comment could otherwise hide a `system.*` reference from them).
 fn reject_sql_comments(sql: &str) -> Result<(), SearchError> {
     let mut in_single_quote = false;
     let chars: Vec<char> = sql.chars().collect();
@@ -188,408 +140,84 @@ fn reject_sql_comments(sql: &str) -> Result<(), SearchError> {
     Ok(())
 }
 
-/// Check for dangerous keywords using word-boundary regex matching.
-fn check_dangerous_keywords(sql: &str) -> Result<(), SearchError> {
-    let sql_upper = sql.to_uppercase();
-    for keyword in DANGEROUS_KEYWORDS {
-        if sql_upper.contains(keyword) {
-            let pattern = format!(r"\b{}\b", keyword);
-            if regex::Regex::new(&pattern)
-                .map(|re| re.is_match(&sql_upper))
-                .unwrap_or(false)
-            {
-                return Err(SearchError::SqlValidationError(format!(
-                    "Disallowed keyword: {}",
-                    keyword
-                )));
+/// Remove single-quoted string literals (handling doubled-quote `''` escapes) so
+/// downstream scans match SQL syntax rather than string content.
+fn strip_string_literals(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let chars: Vec<char> = sql.chars().collect();
+    let mut i = 0usize;
+    let mut in_str = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' {
+            if in_str && i + 1 < chars.len() && chars[i + 1] == '\'' {
+                // Escaped '' inside a string — skip both, stay in the string.
+                i += 2;
+                continue;
             }
+            in_str = !in_str;
+            i += 1;
+            continue;
         }
+        if !in_str {
+            out.push(c);
+        }
+        i += 1;
     }
-    Ok(())
+    out
 }
 
-/// Inject an audit source_type filter into a validated SQL query.
-///
-/// Parses the SQL, adds `AND lower(source_type) != 'audit'` to the WHERE clause
-/// (or creates a WHERE clause if none exists), and serializes back to SQL string.
-///
-/// This approach injects the filter directly into the query's WHERE clause rather
-/// than wrapping in a subquery, which would fail for aggregation queries where
-/// `source_type` is not in the output columns.
-pub fn inject_audit_filter(sql: &str) -> Result<String, SearchError> {
-    use sqlparser::dialect::ClickHouseDialect;
-    use sqlparser::parser::Parser;
+/// MANDATORY (NAN-2001): reject references to `system` / `information_schema` /
+/// `pg_catalog`. ClickHouse grants do NOT fully close these — some
+/// metadata/constant tables (`system.settings`, `system.tables`, `system.one`)
+/// stay readable to a grant-only readonly user (verified live), so this reject is
+/// load-bearing, not optional UX. `code` has string literals removed; here we
+/// also drop identifier quotes/backticks and collapse whitespace around dots so
+/// `"system"."tables"` and `system . tables` are caught.
+fn reject_system_schema(code: &str) -> Result<(), SearchError> {
+    let normalized: String = code
+        .chars()
+        .filter(|c| *c != '"' && *c != '`')
+        .collect::<String>()
+        .to_lowercase();
+    // Collapse any whitespace around dots: `system . tables` -> `system.tables`.
+    let normalized = regex::Regex::new(r"\s*\.\s*")
+        .unwrap()
+        .replace_all(&normalized, ".")
+        .into_owned();
 
-    let mut stmts = Parser::parse_sql(&ClickHouseDialect {}, sql)
-        .map_err(|e| SearchError::SqlValidationError(format!("SQL parse error: {}", e)))?;
-
-    if let Some(sqlparser::ast::Statement::Query(ref mut query)) = stmts.first_mut() {
-        inject_audit_filter_into_set_expr(&mut query.body)?;
-    }
-
-    Ok(stmts
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>()
-        .join("; "))
-}
-
-/// Recursively inject audit filter into the appropriate SetExpr.
-/// For UNION/INTERSECT/EXCEPT, inject into both sides.
-fn inject_audit_filter_into_set_expr(set_expr: &mut SetExpr) -> Result<(), SearchError> {
-    match set_expr {
-        SetExpr::Select(ref mut select) => {
-            let audit_filter = build_audit_filter_expr();
-            select.selection = Some(match select.selection.take() {
-                Some(existing) => Expr::BinaryOp {
-                    left: Box::new(existing),
-                    op: sqlparser::ast::BinaryOperator::And,
-                    right: Box::new(audit_filter),
-                },
-                None => audit_filter,
-            });
-            Ok(())
-        }
-        SetExpr::SetOperation {
-            ref mut left,
-            ref mut right,
-            ..
-        } => {
-            inject_audit_filter_into_set_expr(left)?;
-            inject_audit_filter_into_set_expr(right)?;
-            Ok(())
-        }
-        SetExpr::Query(ref mut q) => inject_audit_filter_into_set_expr(&mut q.body),
-        _ => Ok(()),
-    }
-}
-
-/// Build the expression: lower(source_type) != 'audit'
-fn build_audit_filter_expr() -> Expr {
-    use sqlparser::ast::*;
-
-    Expr::BinaryOp {
-        left: Box::new(Expr::Function(Function {
-            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("lower"))]),
-            args: FunctionArguments::List(FunctionArgumentList {
-                args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(
-                    Expr::Identifier(Ident::new("source_type")),
-                ))],
-                duplicate_treatment: None,
-                clauses: vec![],
-            }),
-            filter: None,
-            over: None,
-            null_treatment: None,
-            within_group: vec![],
-            parameters: FunctionArguments::None,
-            uses_odbc_syntax: false,
-        })),
-        op: BinaryOperator::NotEq,
-        right: Box::new(Expr::Value(
-            Value::SingleQuotedString("audit".to_string()).into(),
-        )),
-    }
-}
-
-// =============================================================================
-// AST Validation — Recursive walk of ALL nodes
-// =============================================================================
-
-/// Validate a full query (CTEs + body + ORDER BY + LIMIT)
-fn validate_query(query: &Query) -> Result<(), SearchError> {
-    // Check CTEs
-    if let Some(with) = &query.with {
-        for cte in &with.cte_tables {
-            validate_query(&cte.query)?;
-        }
-    }
-
-    // Check query body
-    validate_set_expr(&query.body)?;
-
-    // Check ORDER BY for subqueries
-    if let Some(ref order_by) = query.order_by {
-        if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind {
-            for item in exprs {
-                validate_expr(&item.expr)?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Validate a set expression (SELECT, UNION, etc.)
-fn validate_set_expr(set_expr: &SetExpr) -> Result<(), SearchError> {
-    match set_expr {
-        SetExpr::Select(select) => {
-            // FROM clause
-            for table_with_joins in &select.from {
-                validate_table_with_joins(table_with_joins)?;
-            }
-            // SELECT projections (scalar subqueries, expressions)
-            for item in &select.projection {
-                match item {
-                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                        validate_expr(expr)?;
-                    }
-                    SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(..) => {}
-                }
-            }
-            // WHERE clause
-            if let Some(selection) = &select.selection {
-                validate_expr(selection)?;
-            }
-            // HAVING clause
-            if let Some(having) = &select.having {
-                validate_expr(having)?;
-            }
-            // GROUP BY (can contain expressions)
-            match &select.group_by {
-                GroupByExpr::Expressions(exprs, _) => {
-                    for expr in exprs {
-                        validate_expr(expr)?;
-                    }
-                }
-                GroupByExpr::All(_) => {}
-            }
-            // Named window clauses — skipped for now as the named_window API
-            // varies across sqlparser versions. The key security boundary is
-            // the table allowlist, which catches any subquery regardless of position.
-        }
-        SetExpr::Query(query) => {
-            validate_query(query)?;
-        }
-        SetExpr::SetOperation { left, right, .. } => {
-            validate_set_expr(left)?;
-            validate_set_expr(right)?;
-        }
-        SetExpr::Values(_) => {}
-        SetExpr::Insert(_) => {
-            return Err(SearchError::SqlValidationError(
-                "INSERT not allowed".to_string(),
-            ));
-        }
-        SetExpr::Update(_) => {
-            return Err(SearchError::SqlValidationError(
-                "UPDATE not allowed".to_string(),
-            ));
-        }
-        SetExpr::Delete(_) => {
-            return Err(SearchError::SqlValidationError(
-                "DELETE not allowed".to_string(),
-            ));
-        }
-        SetExpr::Merge(_) => {
-            return Err(SearchError::SqlValidationError(
-                "MERGE not allowed".to_string(),
-            ));
-        }
-        SetExpr::Table(table) => {
-            let table_name = table
-                .table_name
-                .as_ref()
-                .map(|n| n.to_lowercase().replace('"', ""))
-                .unwrap_or_default();
-            check_table_allowed(&table_name)?;
-        }
-    }
-    Ok(())
-}
-
-/// Recursively validate all expressions for subqueries and blocked content.
-fn validate_expr(expr: &Expr) -> Result<(), SearchError> {
-    match expr {
-        Expr::Subquery(query) => validate_query(query)?,
-        Expr::InSubquery { subquery, expr, .. } => {
-            validate_query(subquery)?;
-            validate_expr(expr)?;
-        }
-        Expr::Exists { subquery, .. } => validate_query(subquery)?,
-        Expr::BinaryOp { left, right, .. } => {
-            validate_expr(left)?;
-            validate_expr(right)?;
-        }
-        Expr::UnaryOp { expr, .. } => validate_expr(expr)?,
-        Expr::Nested(e) => validate_expr(e)?,
-        Expr::InList { expr, list, .. } => {
-            validate_expr(expr)?;
-            for item in list {
-                validate_expr(item)?;
-            }
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            validate_expr(expr)?;
-            validate_expr(low)?;
-            validate_expr(high)?;
-        }
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            if let Some(op) = operand {
-                validate_expr(op)?;
-            }
-            for cond in conditions {
-                validate_expr(&cond.condition)?;
-                validate_expr(&cond.result)?;
-            }
-            if let Some(else_r) = else_result {
-                validate_expr(else_r)?;
-            }
-        }
-        Expr::Cast { expr, .. } => {
-            validate_expr(expr)?;
-        }
-        Expr::Function(func) => {
-            match &func.args {
-                sqlparser::ast::FunctionArguments::List(arg_list) => {
-                    for arg in &arg_list.args {
-                        match arg {
-                            sqlparser::ast::FunctionArg::Unnamed(
-                                sqlparser::ast::FunctionArgExpr::Expr(e),
-                            ) => validate_expr(e)?,
-                            sqlparser::ast::FunctionArg::Named {
-                                arg: sqlparser::ast::FunctionArgExpr::Expr(e),
-                                ..
-                            } => validate_expr(e)?,
-                            _ => {}
-                        }
-                    }
-                }
-                sqlparser::ast::FunctionArguments::Subquery(q) => {
-                    validate_query(q)?;
-                }
-                _ => {}
-            }
-            // Check FILTER clause
-            if let Some(filter) = &func.filter {
-                validate_expr(filter)?;
-            }
-            // Check window spec for subqueries
-            if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &func.over {
-                for expr in &spec.partition_by {
-                    validate_expr(expr)?;
-                }
-                for item in &spec.order_by {
-                    validate_expr(&item.expr)?;
-                }
-            }
-        }
-        Expr::IsNull(e) | Expr::IsNotNull(e) => validate_expr(e)?,
-        Expr::IsFalse(e) | Expr::IsTrue(e) | Expr::IsNotFalse(e) | Expr::IsNotTrue(e) => {
-            validate_expr(e)?;
-        }
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            validate_expr(expr)?;
-            validate_expr(pattern)?;
-        }
-        Expr::SimilarTo { expr, pattern, .. } => {
-            validate_expr(expr)?;
-            validate_expr(pattern)?;
-        }
-        Expr::Tuple(exprs) => {
-            for e in exprs {
-                validate_expr(e)?;
-            }
-        }
-        // All other expression types (literals, identifiers, wildcards, etc.) are safe
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Validate table references in joins.
-fn validate_table_with_joins(table_with_joins: &TableWithJoins) -> Result<(), SearchError> {
-    validate_table_factor(&table_with_joins.relation)?;
-    for join in &table_with_joins.joins {
-        validate_table_factor(&join.relation)?;
-        // Check JOIN conditions for subqueries
-        match &join.join_operator {
-            sqlparser::ast::JoinOperator::Inner(c)
-            | sqlparser::ast::JoinOperator::LeftOuter(c)
-            | sqlparser::ast::JoinOperator::RightOuter(c)
-            | sqlparser::ast::JoinOperator::FullOuter(c) => match c {
-                sqlparser::ast::JoinConstraint::On(expr) => validate_expr(expr)?,
-                _ => {}
-            },
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-/// Validate a table factor — this is where the allowlist is enforced.
-fn validate_table_factor(table_factor: &TableFactor) -> Result<(), SearchError> {
-    match table_factor {
-        TableFactor::Table { name, args, .. } => {
-            let full_name = name
-                .0
-                .iter()
-                .filter_map(|part| part.as_ident())
-                .map(|ident| ident.value.to_lowercase())
-                .collect::<Vec<_>>()
-                .join(".");
-            check_table_allowed(&full_name)?;
-
-            // Block ALL table functions (allowlist approach: if it has args, it's a function call)
-            if args.is_some() {
-                return Err(SearchError::SqlValidationError(format!(
-                    "Table function '{}' is not allowed",
-                    full_name
-                )));
-            }
-        }
-        TableFactor::Derived { subquery, .. } => {
-            validate_query(subquery)?;
-        }
-        TableFactor::TableFunction { expr, .. } => {
-            // Block all table functions unconditionally
+    for (needle, label) in [
+        ("system.", "system"),
+        ("information_schema", "information_schema"),
+        ("pg_catalog", "pg_catalog"),
+    ] {
+        if normalized.contains(needle) {
             return Err(SearchError::SqlValidationError(format!(
-                "Table function '{}' is not allowed",
-                expr
-            )));
-        }
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => {
-            validate_table_with_joins(table_with_joins)?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Check if a table name is in the allowlist.
-/// SECURITY: This is the core access control check. Only tables in ALLOWED_TABLES
-/// are permitted. Schema-qualified names (e.g., "nanosiem.logs") extract the table
-/// part and check against the allowlist.
-fn check_table_allowed(table_name: &str) -> Result<(), SearchError> {
-    // Extract the table name (last component if schema-qualified)
-    let name = table_name.split('.').last().unwrap_or(table_name);
-
-    // Check if schema prefix is our own database (nanosiem.logs → logs)
-    if table_name.contains('.') {
-        let schema = table_name.split('.').next().unwrap_or("");
-        // Only allow our own database schema prefix
-        if schema != "nanosiem" {
-            return Err(SearchError::SqlValidationError(format!(
-                "Access to schema '{}' is not allowed",
-                schema
+                "Access to '{}' schema objects is not allowed",
+                label
             )));
         }
     }
+    Ok(())
+}
 
-    if !ALLOWED_TABLES.contains(&name) {
-        return Err(SearchError::SqlValidationError(format!(
-            "Access to table '{}' is not allowed. Only search data tables are queryable.",
-            name
-        )));
+/// MANDATORY (NAN-2001): reject info-disclosure / sleep function CALLS. Matched
+/// as `NAME(` on the (literal-stripped) SQL so log content and identifiers that
+/// merely contain a function name are not rejected.
+fn reject_disallowed_functions(code: &str) -> Result<(), SearchError> {
+    let upper = code.to_uppercase();
+    for f in DISALLOWED_FUNCTIONS {
+        // Function-call form: word-boundary NAME, optional whitespace, then `(`.
+        let pattern = format!(r"\b{}\s*\(", f);
+        if regex::Regex::new(&pattern)
+            .map(|re| re.is_match(&upper))
+            .unwrap_or(false)
+        {
+            return Err(SearchError::SqlValidationError(format!(
+                "Disallowed function: {}()",
+                f
+            )));
+        }
     }
     Ok(())
 }
@@ -599,299 +227,133 @@ mod tests {
     use super::*;
 
     // =========================================================================
-    // Allowlist: permitted tables
+    // Allowed: any single SELECT that doesn't touch a forbidden schema/function.
+    // NAN-2001: the table allowlist is enforced by ClickHouse grants now, so the
+    // validator no longer rejects non-allowlisted table names.
     // =========================================================================
 
     #[test]
-    fn test_allow_core_tables() {
+    fn allows_plain_selects_including_previously_unknown_tables() {
         assert!(validate_sql_query("SELECT * FROM logs").is_ok());
         assert!(validate_sql_query("SELECT * FROM signals").is_ok());
-        assert!(validate_sql_query("SELECT * FROM ingestion_errors").is_ok());
+        assert!(validate_sql_query("SELECT * FROM ocsf_logs").is_ok());
+        // Formerly rejected by the in-app allowlist; ClickHouse grants deny these.
+        assert!(validate_sql_query("SELECT * FROM some_random_table").is_ok());
+        assert!(validate_sql_query("SELECT * FROM users").is_ok());
     }
 
     #[test]
-    fn test_allow_prevalence_tables() {
-        assert!(validate_sql_query("SELECT * FROM domain_prevalence_agg").is_ok());
-        assert!(validate_sql_query("SELECT * FROM hash_prevalence_agg").is_ok());
-        assert!(validate_sql_query("SELECT * FROM ip_prevalence_agg").is_ok());
-    }
-
-    #[test]
-    fn test_allow_enrichment_tables() {
-        assert!(validate_sql_query("SELECT * FROM identity_observations").is_ok());
-        assert!(validate_sql_query("SELECT * FROM entity_time_range_agg").is_ok());
-        assert!(validate_sql_query("SELECT * FROM custom_enrichment_results").is_ok());
-        assert!(validate_sql_query("SELECT * FROM cloud_user_activity_agg").is_ok());
-    }
-
-    #[test]
-    fn test_allow_schema_qualified() {
-        assert!(validate_sql_query("SELECT * FROM nanosiem.logs").is_ok());
-        assert!(validate_sql_query("SELECT * FROM nanosiem.signals").is_ok());
-    }
-
-    #[test]
-    fn test_allow_joins_between_allowed_tables() {
-        assert!(
-            validate_sql_query("SELECT * FROM logs JOIN signals ON logs.id = signals.id").is_ok()
-        );
-    }
-
-    #[test]
-    fn test_allow_subquery_on_allowed_tables() {
+    fn allows_complex_shapes() {
+        assert!(validate_sql_query(
+            "SELECT src_ip, count() AS c FROM logs GROUP BY src_ip HAVING count() > 10 ORDER BY c DESC LIMIT 100"
+        )
+        .is_ok());
         assert!(validate_sql_query(
             "SELECT * FROM logs WHERE src_ip IN (SELECT src_ip FROM signals)"
         )
         .is_ok());
-    }
-
-    #[test]
-    fn test_allow_union_on_allowed_tables() {
         assert!(validate_sql_query(
             "SELECT message FROM logs UNION ALL SELECT message FROM signals"
+        )
+        .is_ok());
+        assert!(
+            validate_sql_query("WITH base AS (SELECT * FROM logs) SELECT * FROM base").is_ok()
+        );
+        assert!(validate_sql_query(
+            "SELECT * FROM logs PREWHERE timestamp > '2026-01-01' LIMIT 1"
         )
         .is_ok());
     }
 
     #[test]
-    #[ignore = "CTE validation behavior changed; update expectations before re-enabling"]
-    fn test_allow_cte_on_allowed_tables() {
-        assert!(validate_sql_query("WITH base AS (SELECT * FROM logs) SELECT * FROM base").is_ok());
+    fn allows_log_content_that_looks_like_keywords() {
+        // Regression guard: the old substring keyword scan false-rejected these.
+        // Analysts must be able to hunt for these words in message/command content.
+        assert!(validate_sql_query("SELECT * FROM logs WHERE message ILIKE '%delete%'").is_ok());
+        assert!(validate_sql_query("SELECT * FROM logs WHERE message ILIKE '%hostname%'").is_ok());
+        assert!(
+            validate_sql_query("SELECT * FROM logs WHERE lower(message) LIKE '%grant access%'")
+                .is_ok()
+        );
+        assert!(
+            validate_sql_query("SELECT * FROM logs WHERE command_line = 'sleep 5; drop table'")
+                .is_ok()
+        );
     }
 
     // =========================================================================
-    // Allowlist: blocked tables (anything not in the list)
+    // MANDATORY: system / information_schema / pg_catalog rejected EVERYWHERE.
+    // The literal-stripped text scan catches them regardless of AST position —
+    // exactly the fail-open weakness that sank the old walk.
     // =========================================================================
 
     #[test]
-    fn test_reject_unknown_tables() {
-        assert!(validate_sql_query("SELECT * FROM some_random_table").is_err());
-        assert!(validate_sql_query("SELECT * FROM users").is_err());
-        assert!(validate_sql_query("SELECT * FROM api_keys").is_err());
-        assert!(validate_sql_query("SELECT * FROM sessions").is_err());
-        assert!(validate_sql_query("SELECT * FROM roles").is_err());
-        assert!(validate_sql_query("SELECT * FROM permissions").is_err());
-    }
-
-    #[test]
-    fn test_reject_system_schema() {
+    fn rejects_system_schema_in_every_position() {
         assert!(validate_sql_query("SELECT * FROM system.tables").is_err());
         assert!(validate_sql_query("SELECT * FROM system.settings").is_err());
-        assert!(validate_sql_query("SELECT * FROM system.columns").is_err());
-        assert!(validate_sql_query("SELECT * FROM system.query_log").is_err());
-        assert!(validate_sql_query("SELECT * FROM system.processes").is_err());
-        assert!(validate_sql_query("SELECT * FROM system.users").is_err());
-    }
-
-    #[test]
-    fn test_reject_information_schema() {
-        assert!(validate_sql_query("SELECT * FROM information_schema.tables").is_err());
-        assert!(validate_sql_query("SELECT * FROM information_schema.columns").is_err());
-    }
-
-    #[test]
-    fn test_reject_pg_catalog() {
-        assert!(validate_sql_query("SELECT * FROM pg_catalog.pg_tables").is_err());
-    }
-
-    // =========================================================================
-    // Blocked tables in every AST position (the bypass vectors)
-    // =========================================================================
-
-    #[test]
-    fn test_reject_in_join() {
+        assert!(validate_sql_query("SELECT * FROM system.numbers LIMIT 1").is_err());
         assert!(validate_sql_query(
             "SELECT * FROM logs JOIN system.query_log ON logs.id = system.query_log.id"
         )
         .is_err());
-    }
-
-    #[test]
-    fn test_reject_in_where_subquery() {
         assert!(validate_sql_query(
             "SELECT * FROM logs WHERE id IN (SELECT query_id FROM system.processes)"
         )
         .is_err());
-    }
-
-    #[test]
-    fn test_reject_in_select_projection() {
-        assert!(
-            validate_sql_query("SELECT (SELECT count() FROM system.tables) AS x FROM logs")
-                .is_err()
-        );
         assert!(validate_sql_query(
-            "SELECT id, (SELECT count(*) FROM system.processes) AS cnt FROM logs"
+            "SELECT (SELECT count() FROM system.tables) AS x FROM logs"
         )
         .is_err());
-    }
-
-    #[test]
-    fn test_reject_in_union() {
         assert!(
             validate_sql_query("SELECT id FROM logs UNION SELECT id FROM system.tables").is_err()
         );
-    }
-
-    #[test]
-    fn test_reject_in_cte() {
         assert!(validate_sql_query(
             "WITH evil AS (SELECT * FROM system.settings) SELECT * FROM evil"
         )
         .is_err());
-    }
-
-    #[test]
-    fn test_reject_quoted_identifiers() {
         assert!(validate_sql_query(r#"SELECT name FROM "system"."tables""#).is_err());
-        assert!(validate_sql_query(r#"SELECT * FROM "users""#).is_err());
-    }
-
-    // =========================================================================
-    // Table functions — all blocked
-    // =========================================================================
-
-    #[test]
-    fn test_reject_all_table_functions() {
-        assert!(validate_sql_query("SELECT * FROM numbers(100)").is_err());
-        assert!(validate_sql_query("SELECT * FROM file('test.csv')").is_err());
-        assert!(validate_sql_query("SELECT * FROM url('http://evil.com')").is_err());
-        assert!(validate_sql_query("SELECT * FROM remote('host', 'db', 'table')").is_err());
-    }
-
-    // =========================================================================
-    // Dangerous keywords / functions
-    // =========================================================================
-
-    #[test]
-    fn test_reject_dml() {
-        assert!(validate_sql_query("INSERT INTO logs VALUES (1)").is_err());
-        assert!(validate_sql_query("UPDATE logs SET status = 1").is_err());
-        assert!(validate_sql_query("DELETE FROM logs").is_err());
-        assert!(validate_sql_query("DROP TABLE logs").is_err());
+        assert!(validate_sql_query("SELECT * FROM information_schema.tables").is_err());
+        assert!(validate_sql_query("SELECT * FROM pg_catalog.pg_tables").is_err());
     }
 
     #[test]
-    fn test_reject_sleep_functions() {
-        assert!(validate_sql_query("SELECT sleep(2)").is_err());
-        assert!(validate_sql_query("SELECT sleepEachRow(1)").is_err());
+    fn does_not_flag_system_in_string_literal_or_identifier_substring() {
+        // 'system.tables' inside a string literal is content, not a schema ref.
+        assert!(validate_sql_query("SELECT * FROM logs WHERE message = 'system.tables'").is_ok());
+        // An identifier that merely contains 'system' (no `.`) is fine.
+        assert!(validate_sql_query("SELECT systemd_unit FROM logs").is_ok());
     }
 
+    // =========================================================================
+    // MANDATORY: info-disclosure / sleep functions rejected (CH doesn't gate them).
+    // =========================================================================
+
     #[test]
-    fn test_reject_info_disclosure_functions() {
+    fn rejects_info_disclosure_and_sleep_functions() {
         assert!(validate_sql_query("SELECT currentDatabase()").is_err());
         assert!(validate_sql_query("SELECT hostName()").is_err());
         assert!(validate_sql_query("SELECT currentUser()").is_err());
         assert!(validate_sql_query("SELECT getSetting('max_threads')").is_err());
         assert!(validate_sql_query("SELECT FQDN()").is_err());
         assert!(validate_sql_query("SELECT serverUUID()").is_err());
-        assert!(validate_sql_query("SELECT buildId()").is_err());
-        assert!(validate_sql_query("SELECT tcpPort()").is_err());
-        assert!(validate_sql_query("SELECT getOSKernelVersion()").is_err());
+        assert!(validate_sql_query("SELECT sleep(2)").is_err());
+        assert!(validate_sql_query("SELECT sleepEachRow(1)").is_err());
+        // whitespace before the paren is still a call
+        assert!(validate_sql_query("SELECT hostName ()").is_err());
     }
 
+    // =========================================================================
+    // Friendly UX + soundness: non-SELECT / multi-statement / comments.
+    // =========================================================================
+
     #[test]
-    fn test_reject_multiple_statements() {
+    fn rejects_non_select_multi_statement_and_comments() {
+        assert!(validate_sql_query("INSERT INTO logs VALUES (1)").is_err());
+        assert!(validate_sql_query("UPDATE logs SET status = 1").is_err());
+        assert!(validate_sql_query("DELETE FROM logs").is_err());
+        assert!(validate_sql_query("DROP TABLE logs").is_err());
         assert!(validate_sql_query("SELECT * FROM logs; DROP TABLE logs").is_err());
-    }
-
-    #[test]
-    fn test_reject_sql_comments() {
         assert!(validate_sql_query("SELECT * FROM logs -- bypass").is_err());
         assert!(validate_sql_query("SELECT * FROM logs /* bypass */").is_err());
-    }
-
-    // =========================================================================
-    // Valid complex queries (should pass)
-    // =========================================================================
-
-    #[test]
-    #[ignore = "CTE validation behavior changed; update expectations before re-enabling"]
-    fn test_allow_complex_valid_queries() {
-        assert!(validate_sql_query(
-            "SELECT src_ip, COUNT(*) as cnt FROM logs WHERE message LIKE '%error%' GROUP BY src_ip HAVING COUNT(*) > 10 ORDER BY cnt DESC LIMIT 100"
-        ).is_ok());
-
-        assert!(validate_sql_query(
-            "SELECT * FROM logs WHERE src_ip IN (SELECT src_ip FROM signals WHERE rule_name = 'test')"
-        ).is_ok());
-
-        assert!(validate_sql_query(
-            "WITH base AS (SELECT src_ip, count() AS cnt FROM logs GROUP BY src_ip) SELECT * FROM base WHERE cnt > 5"
-        ).is_ok());
-    }
-
-    // =========================================================================
-    // ClickHouse dialect features (NAN-1086)
-    // =========================================================================
-
-    #[test]
-    fn test_allow_prewhere() {
-        // PREWHERE is ClickHouse-specific and was rejected by PostgreSqlDialect.
-        assert!(validate_sql_query(
-            "SELECT count() AS c FROM logs PREWHERE timestamp >= '2026-01-01 00:00:00' AND timestamp <= '2026-01-02 00:00:00'"
-        ).is_ok());
-    }
-
-    #[test]
-    fn test_allow_prewhere_with_where() {
-        assert!(validate_sql_query(
-            "SELECT timestamp, src_ip FROM logs PREWHERE timestamp BETWEEN '2026-01-01 00:00:00' AND '2026-01-02 00:00:00' AND lower(source_type) = lower('windows') WHERE lower(message) ILIKE '%logon failure%' ORDER BY timestamp DESC LIMIT 100"
-        ).is_ok());
-    }
-
-    #[test]
-    fn test_allow_logs_distributed() {
-        // nPL generator emits logs_distributed; user-submitted SQL must be able to query it too.
-        assert!(validate_sql_query(
-            "SELECT count() AS c FROM logs_distributed WHERE timestamp >= '2026-01-01 00:00:00'"
-        ).is_ok());
-    }
-
-    #[test]
-    fn test_allow_other_distributed_tables() {
-        assert!(validate_sql_query("SELECT * FROM signals_distributed LIMIT 10").is_ok());
-        assert!(validate_sql_query("SELECT * FROM hash_prevalence_agg_distributed LIMIT 10").is_ok());
-        assert!(validate_sql_query("SELECT * FROM identity_observations_distributed LIMIT 10").is_ok());
-    }
-
-    #[test]
-    fn test_reject_unknown_distributed_table() {
-        // Allowlist still applies — random *_distributed names are blocked.
-        assert!(validate_sql_query(
-            "SELECT * FROM secrets_distributed LIMIT 1"
-        ).is_err());
-    }
-
-    #[test]
-    fn test_probe_clickhouse_features() {
-        // Probes for which ClickHouse-specific syntax the current sqlparser version actually
-        // parses. Documents the known feature surface; tighten as sqlparser gains support.
-        for (label, sql, expect_ok) in &[
-            ("PREWHERE", "SELECT * FROM logs PREWHERE timestamp > '2026-01-01' LIMIT 1", true),
-            ("ext.field dot", "SELECT ext.event_id FROM logs WHERE ext.event_id = 4624", true),
-            ("ext['k'] bracket", "SELECT ext['event_id'] FROM logs WHERE ext['event_id'] = 4624", true),
-            ("hasToken()", "SELECT * FROM logs WHERE hasToken(lower(message), 'error') LIMIT 1", true),
-            ("toStartOfHour", "SELECT toStartOfHour(timestamp) AS h, count() FROM logs GROUP BY h LIMIT 1", true),
-        ] {
-            let result = validate_sql_query(sql);
-            if *expect_ok {
-                assert!(result.is_ok(), "expected OK for {}: got {:?}", label, result.err());
-            } else {
-                assert!(result.is_err(), "expected ERR for {}: got OK", label);
-            }
-        }
-    }
-
-    #[test]
-    fn test_asof_join_known_unsupported() {
-        // ASOF JOIN is a ClickHouse-specific feature that sqlparser 0.61's ClickHouseDialect
-        // does NOT yet parse. Documenting the limitation here so the sql-guide MCP resource
-        // can be kept in sync. Remove this test (and add a positive one) once upstream support
-        // lands.
-        let result = validate_sql_query(
-            "SELECT m.timestamp FROM logs AS m ASOF LEFT JOIN identity_observations AS i ON m.src_ip = i.ip AND m.timestamp >= i.observed_at"
-        );
-        assert!(result.is_err(), "ASOF JOIN unexpectedly parsed — update sql-guide if so");
     }
 }

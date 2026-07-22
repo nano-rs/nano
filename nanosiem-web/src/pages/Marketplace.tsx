@@ -40,7 +40,7 @@ import { MarketplaceDrawer } from '@/components/marketplace/MarketplaceDrawer';
 import { InstallDialog } from '@/components/marketplace/InstallDialog';
 import { CoverageHero } from '@/components/marketplace/CoverageHero';
 
-type CategoryFilter = 'all' | 'data' | 'agent' | 'identity' | 'security';
+type CategoryFilter = 'all' | 'data' | 'agent' | 'identity';
 
 interface CategoryChip {
   id: CategoryFilter;
@@ -53,7 +53,6 @@ const CATEGORY_CHIPS: CategoryChip[] = [
   { id: 'data',     label: 'Data',     icon: Database },
   { id: 'agent',    label: 'Agent',    icon: Bot },
   { id: 'identity', label: 'Identity', icon: Users },
-  { id: 'security', label: 'Security', icon: Shield },
 ];
 
 interface SectionDef {
@@ -589,7 +588,6 @@ function countForCategory(cat: CategoryFilter, stats: CatalogStats | null): numb
   if (cat === 'data') return stats.data_count;
   if (cat === 'agent') return stats.agent_count;
   if (cat === 'identity') return stats.identity_count;
-  if (cat === 'security') return stats.security_count ?? 0;
   return 0;
 }
 

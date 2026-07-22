@@ -240,15 +240,14 @@ impl MarketplaceRepository {
     /// Get catalog stats
     #[instrument(skip(self))]
     pub async fn get_catalog_stats(&self) -> Result<CatalogStats, MarketplaceError> {
-        let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64)>(
+        let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
             r#"
             SELECT
                 COUNT(*) as total_entries,
                 COUNT(*) FILTER (WHERE installed = true) as installed_count,
                 COUNT(*) FILTER (WHERE category = 'data') as data_count,
                 COUNT(*) FILTER (WHERE category = 'agent') as agent_count,
-                COUNT(*) FILTER (WHERE category = 'identity') as identity_count,
-                COUNT(*) FILTER (WHERE category = 'security') as security_count
+                COUNT(*) FILTER (WHERE category = 'identity') as identity_count
             FROM marketplace_catalog
             "#,
         )
@@ -261,7 +260,6 @@ impl MarketplaceRepository {
             data_count: row.2,
             agent_count: row.3,
             identity_count: row.4,
-            security_count: row.5,
         })
     }
 

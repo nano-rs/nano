@@ -159,5 +159,146 @@
         <query>GRANT SELECT ON nanosiem.domain_prevalence_agg</query>
       </grants>
     </nanosiem_ingest>
+
+    <!--
+      NAN-2001: two dedicated READ-ONLY identities for the raw-SQL surface
+      (POST /api/search/sql, dashboards SQL panels, reports, meloD advanced mode).
+      The GRANT SELECT list IS the raw-SQL table allowlist — ClickHouse natively
+      denies table functions (url/s3/remote/file/…), system.*, other DBs, and
+      writes. This retires the fail-open sqlparser AST walk (validate_sql_query /
+      inject_audit_filter) that an adversarial review bypassed in 6 rounds.
+
+      Two identities, not one + SET ROLE (a missed role reset = silent audit
+      bypass):
+        * nanosiem_rawsql         — audit-capable (caller HAS audit:view). No row
+                                     policy; sees everything it is granted.
+        * nanosiem_rawsql_noaudit — caller LACKS audit:view (fail-closed default).
+                                     NARROWER grant set (audit-derived aggregates
+                                     whose source column is dropped at
+                                     materialization — *_prevalence_agg,
+                                     entity_time_range_agg, cloud_user_activity_agg,
+                                     nat_candidates — are NOT granted here; a row
+                                     policy cannot retroactively clean them) PLUS a
+                                     RESTRICTIVE row policy lower(source_type)!='audit'
+                                     (lower(source)!='audit' on identity_observations)
+                                     created by the migrator's ensure_rawsql_row_policies()
+                                     step (topology-aware: _local + ON CLUSTER on
+                                     clusters).
+
+      The app builds both clients in DualPool from CLICKHOUSE_RAWSQL_PASSWORD /
+      CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD and FAILS BOOT if either is missing (no
+      fallback to the broad nanosiem client) and if either user's granted table set
+      does not match the expected allowlist (drift guard). Grants list bare +
+      _local + _distributed twins uniformly: harmless unused grants on single-node
+      (the twins do not exist), and required on clusters (the Distributed engine
+      re-checks the SAME user's SELECT on *_local on each remote shard under the
+      cluster <secret>). Profile `rawsql` (query_limits.xml) is readonly with the
+      security-relevant settings constrained. Grants MUST stay declarative here —
+      users defined in users.xml cannot receive a SQL GRANT (495
+      ACCESS_STORAGE_READONLY); only the row policies are created via SQL.
+    -->
+    <nanosiem_rawsql>
+      <profile>rawsql</profile>
+      <networks>
+        <ip>::/0</ip>
+      </networks>
+      <password from_env="CLICKHOUSE_RAWSQL_PASSWORD"/>
+      <quota>default</quota>
+      <access_management>0</access_management>
+      <allow_ddl>0</allow_ddl>
+      <grants>
+        <query>GRANT SELECT ON nanosiem.logs</query>
+        <query>GRANT SELECT ON nanosiem.logs_local</query>
+        <query>GRANT SELECT ON nanosiem.logs_distributed</query>
+        <query>GRANT SELECT ON nanosiem.ocsf_logs</query>
+        <query>GRANT SELECT ON nanosiem.ocsf_logs_local</query>
+        <query>GRANT SELECT ON nanosiem.ocsf_logs_distributed</query>
+        <query>GRANT SELECT ON nanosiem.signals</query>
+        <query>GRANT SELECT ON nanosiem.signals_local</query>
+        <query>GRANT SELECT ON nanosiem.signals_distributed</query>
+        <query>GRANT SELECT ON nanosiem.domain_prevalence_agg</query>
+        <query>GRANT SELECT ON nanosiem.domain_prevalence_agg_local</query>
+        <query>GRANT SELECT ON nanosiem.domain_prevalence_agg_distributed</query>
+        <query>GRANT SELECT ON nanosiem.hash_prevalence_agg</query>
+        <query>GRANT SELECT ON nanosiem.hash_prevalence_agg_local</query>
+        <query>GRANT SELECT ON nanosiem.hash_prevalence_agg_distributed</query>
+        <query>GRANT SELECT ON nanosiem.ip_prevalence_agg</query>
+        <query>GRANT SELECT ON nanosiem.ip_prevalence_agg_local</query>
+        <query>GRANT SELECT ON nanosiem.ip_prevalence_agg_distributed</query>
+        <query>GRANT SELECT ON nanosiem.identity_observations</query>
+        <query>GRANT SELECT ON nanosiem.identity_observations_local</query>
+        <query>GRANT SELECT ON nanosiem.identity_observations_distributed</query>
+        <query>GRANT SELECT ON nanosiem.nat_candidates</query>
+        <query>GRANT SELECT ON nanosiem.nat_candidates_local</query>
+        <query>GRANT SELECT ON nanosiem.nat_candidates_distributed</query>
+        <query>GRANT SELECT ON nanosiem.entity_time_range_agg</query>
+        <query>GRANT SELECT ON nanosiem.entity_time_range_agg_local</query>
+        <query>GRANT SELECT ON nanosiem.entity_time_range_agg_distributed</query>
+        <query>GRANT SELECT ON nanosiem.cloud_user_activity_agg</query>
+        <query>GRANT SELECT ON nanosiem.cloud_user_activity_agg_local</query>
+        <query>GRANT SELECT ON nanosiem.cloud_user_activity_agg_distributed</query>
+        <query>GRANT SELECT ON nanosiem.custom_enrichment_results</query>
+        <query>GRANT SELECT ON nanosiem.custom_enrichment_results_local</query>
+        <query>GRANT SELECT ON nanosiem.custom_enrichment_results_distributed</query>
+        <query>GRANT SELECT ON nanosiem.ingestion_errors</query>
+        <query>GRANT SELECT ON nanosiem.ingestion_errors_local</query>
+        <query>GRANT SELECT ON nanosiem.ingestion_errors_distributed</query>
+        <query>GRANT SELECT ON nanosiem.otel_spans</query>
+        <query>GRANT SELECT ON nanosiem.otel_spans_local</query>
+        <query>GRANT SELECT ON nanosiem.otel_spans_distributed</query>
+        <query>GRANT SELECT ON nanosiem.otel_metrics</query>
+        <query>GRANT SELECT ON nanosiem.otel_metrics_local</query>
+        <query>GRANT SELECT ON nanosiem.otel_metrics_distributed</query>
+        <query>GRANT SELECT ON nanosiem.otel_metrics_1m</query>
+        <query>GRANT SELECT ON nanosiem.otel_metrics_1m_local</query>
+        <query>GRANT SELECT ON nanosiem.otel_metrics_1m_distributed</query>
+        <query>GRANT SELECT ON nanosiem.otel_metrics_1h</query>
+        <query>GRANT SELECT ON nanosiem.otel_metrics_1h_local</query>
+        <query>GRANT SELECT ON nanosiem.otel_metrics_1h_distributed</query>
+      </grants>
+    </nanosiem_rawsql>
+
+    <nanosiem_rawsql_noaudit>
+      <profile>rawsql</profile>
+      <networks>
+        <ip>::/0</ip>
+      </networks>
+      <password from_env="CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD"/>
+      <quota>default</quota>
+      <access_management>0</access_management>
+      <allow_ddl>0</allow_ddl>
+      <grants>
+        <query>GRANT SELECT ON nanosiem.logs</query>
+        <query>GRANT SELECT ON nanosiem.logs_local</query>
+        <query>GRANT SELECT ON nanosiem.logs_distributed</query>
+        <query>GRANT SELECT ON nanosiem.ocsf_logs</query>
+        <query>GRANT SELECT ON nanosiem.ocsf_logs_local</query>
+        <query>GRANT SELECT ON nanosiem.ocsf_logs_distributed</query>
+        <query>GRANT SELECT ON nanosiem.signals</query>
+        <query>GRANT SELECT ON nanosiem.signals_local</query>
+        <query>GRANT SELECT ON nanosiem.signals_distributed</query>
+        <query>GRANT SELECT ON nanosiem.identity_observations</query>
+        <query>GRANT SELECT ON nanosiem.identity_observations_local</query>
+        <query>GRANT SELECT ON nanosiem.identity_observations_distributed</query>
+        <query>GRANT SELECT ON nanosiem.custom_enrichment_results</query>
+        <query>GRANT SELECT ON nanosiem.custom_enrichment_results_local</query>
+        <query>GRANT SELECT ON nanosiem.custom_enrichment_results_distributed</query>
+        <query>GRANT SELECT ON nanosiem.ingestion_errors</query>
+        <query>GRANT SELECT ON nanosiem.ingestion_errors_local</query>
+        <query>GRANT SELECT ON nanosiem.ingestion_errors_distributed</query>
+        <query>GRANT SELECT ON nanosiem.otel_spans</query>
+        <query>GRANT SELECT ON nanosiem.otel_spans_local</query>
+        <query>GRANT SELECT ON nanosiem.otel_spans_distributed</query>
+        <query>GRANT SELECT ON nanosiem.otel_metrics</query>
+        <query>GRANT SELECT ON nanosiem.otel_metrics_local</query>
+        <query>GRANT SELECT ON nanosiem.otel_metrics_distributed</query>
+        <query>GRANT SELECT ON nanosiem.otel_metrics_1m</query>
+        <query>GRANT SELECT ON nanosiem.otel_metrics_1m_local</query>
+        <query>GRANT SELECT ON nanosiem.otel_metrics_1m_distributed</query>
+        <query>GRANT SELECT ON nanosiem.otel_metrics_1h</query>
+        <query>GRANT SELECT ON nanosiem.otel_metrics_1h_local</query>
+        <query>GRANT SELECT ON nanosiem.otel_metrics_1h_distributed</query>
+      </grants>
+    </nanosiem_rawsql_noaudit>
   </users>
 </clickhouse>

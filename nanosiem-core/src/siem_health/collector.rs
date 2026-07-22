@@ -935,15 +935,72 @@ async fn collect_enrichment_metrics(
     rollup
 }
 
-/// Collect installed marketplace/custom enrichment providers and their last
-/// run status. Gives the analyzer ground truth for whether a low coverage
-/// number is "not configured" (no provider) or "configured but failing"
-/// (provider enabled, last run errored). NAN-1178.
+/// Normalize a provider's raw `last_run_status` before it reaches the health
+/// analyzer.
 ///
-/// `custom_enrichments` is an enterprise-managed table; on deployments without
-/// it the query errors and we return an empty list (the analyzer then treats
-/// optional enrichments as simply not configured).
+/// `agent`-type providers are on-demand artifact lookups (VirusTotal,
+/// AbuseIPDB, GreyNoise) the triage agent calls per hash/IP/domain — they are
+/// **never scheduled** (`list_enabled_data_enrichments` only runs
+/// `enrichment_type = 'data'`, and manual "Sync now" rejects non-data), so
+/// their `last_run_status` is `NULL` by design. Surface that as an explicit
+/// `on_demand` marker instead of a raw null so the analyzer can't misread
+/// "never scheduled" as "a scheduled feed that never ran" and invent an outage
+/// (NAN-1994). Scheduled `data` feeds keep their real status untouched, so a
+/// genuine `failed` still surfaces.
+fn normalize_provider_run_status(
+    enrichment_type: &str,
+    last_run_status: Option<String>,
+) -> Option<String> {
+    match (enrichment_type, last_run_status) {
+        ("agent", None) => Some("on_demand".to_string()),
+        (_, status) => status,
+    }
+}
+
+/// Map a *native* (built-in) enrichment provider's sync state to a
+/// `last_run_status` string for the analyzer.
+///
+/// Native providers — chiefly IPinfo Lite (GeoIP/ASN) — have no
+/// `custom_enrichments` row; their state lives in `marketplace_catalog`
+/// (`last_sync_at`, `last_sync_status`, `record_count`). A provider that has
+/// **never synced**, or synced **zero records**, is *not yet active* — surface
+/// `never_synced` so the analyzer treats the capability as not-configured and
+/// stays silent, instead of flagging 0% coverage as an outage (NAN-2002). Only
+/// a provider that has actually loaded data reports its real sync status, so a
+/// genuine `failed` on a previously-working feed still surfaces.
+fn native_provider_run_status(
+    ever_synced: bool,
+    record_count: i64,
+    last_sync_status: Option<String>,
+) -> String {
+    if !ever_synced || record_count == 0 {
+        "never_synced".to_string()
+    } else {
+        last_sync_status.unwrap_or_else(|| "never_synced".to_string())
+    }
+}
+
+/// Collect installed enrichment providers and their last run status. Gives the
+/// analyzer ground truth for whether a low coverage number is "not configured"
+/// (no provider / never synced) or "configured but failing" (provider enabled,
+/// last run errored). NAN-1178.
+///
+/// Two sources are unioned:
+/// - `custom_enrichments` — installed Deno data/agent feeds. Enterprise-managed;
+///   absent on open-core builds (treated as "nothing configured"). `agent`-type
+///   on-demand lookups get their null status normalized to `on_demand` via
+///   [`normalize_provider_run_status`] so they aren't flagged as broken
+///   scheduled feeds (NAN-1994).
+/// - `marketplace_catalog` native providers — chiefly IPinfo Lite (GeoIP/ASN).
+///   These have no `custom_enrichments` row, so without this they were invisible
+///   to the analyzer and GeoIP 0% got flagged even when geo was never set up
+///   (NAN-2002). Their sync state maps through [`native_provider_run_status`],
+///   and IPinfo Lite is surfaced as `enrichment_type = "geo"` so the analyzer
+///   can tie it to the GeoIP/ASN fill numbers.
 async fn collect_enrichment_providers(pool: &PgPool) -> Vec<EnrichmentProviderStatus> {
+    let mut providers = Vec::new();
+
+    // Installed Deno data/agent enrichments.
     match sqlx::query_as::<_, (String, String, bool, Option<String>)>(
         "SELECT name, enrichment_type, enabled, last_run_status \
          FROM custom_enrichments \
@@ -952,23 +1009,61 @@ async fn collect_enrichment_providers(pool: &PgPool) -> Vec<EnrichmentProviderSt
     .fetch_all(pool)
     .await
     {
-        Ok(rows) => rows
-            .into_iter()
-            .map(
-                |(name, enrichment_type, enabled, last_run_status)| EnrichmentProviderStatus {
+        Ok(rows) => {
+            for (name, enrichment_type, enabled, last_run_status) in rows {
+                let last_run_status =
+                    normalize_provider_run_status(&enrichment_type, last_run_status);
+                providers.push(EnrichmentProviderStatus {
                     name,
                     enrichment_type,
                     enabled,
                     last_run_status,
-                },
-            )
-            .collect(),
+                });
+            }
+        }
         Err(e) => {
             // Not an error worth alarming on — absent table or open-core build.
-            tracing::debug!("No enrichment providers collected: {}", e);
-            vec![]
+            tracing::debug!("No custom enrichment providers collected: {}", e);
         }
     }
+
+    // Native (built-in) providers from the always-present marketplace_catalog.
+    match sqlx::query_as::<_, (String, String, bool, bool, Option<String>, i64)>(
+        "SELECT name, \
+                CASE WHEN slug ILIKE 'ipinfo%' THEN 'geo' ELSE category END AS enrichment_type, \
+                enabled, \
+                last_sync_at IS NOT NULL AS ever_synced, \
+                last_sync_status, \
+                COALESCE(record_count, 0)::bigint AS record_count \
+         FROM marketplace_catalog \
+         WHERE execution_backend = 'native' \
+         ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => {
+            for (name, enrichment_type, enabled, ever_synced, last_sync_status, record_count) in
+                rows
+            {
+                providers.push(EnrichmentProviderStatus {
+                    name,
+                    enrichment_type,
+                    enabled,
+                    last_run_status: Some(native_provider_run_status(
+                        ever_synced,
+                        record_count,
+                        last_sync_status,
+                    )),
+                });
+            }
+        }
+        Err(e) => {
+            tracing::debug!("No native enrichment providers collected: {}", e);
+        }
+    }
+
+    providers
 }
 
 /// Collect detection health metrics from PostgreSQL
@@ -1683,5 +1778,62 @@ mod tests {
         // recovered dict lands here on the next probe.
         assert!(!dict_is_unhealthy("LOADED", ""));
         assert!(!dict_is_unhealthy("NOT_LOADED", ""));
+    }
+
+    #[test]
+    fn agent_provider_null_status_normalized_to_on_demand() {
+        // NAN-1994: agent-type lookups (VirusTotal, AbuseIPDB, GreyNoise) are
+        // never scheduled, so a null last_run_status is expected. Surface it as
+        // `on_demand` so the health analyzer doesn't invent a "feed never ran"
+        // outage and tell the operator to check API keys / schedules.
+        assert_eq!(
+            normalize_provider_run_status("agent", None),
+            Some("on_demand".to_string())
+        );
+        // A real status on an agent provider (shouldn't occur, but be safe) is
+        // passed through untouched rather than masked.
+        assert_eq!(
+            normalize_provider_run_status("agent", Some("failed".to_string())),
+            Some("failed".to_string())
+        );
+        // Scheduled data feeds are untouched: a genuine null (never ran) stays
+        // null, and a real failure still surfaces so outages aren't hidden.
+        assert_eq!(normalize_provider_run_status("data", None), None);
+        assert_eq!(
+            normalize_provider_run_status("data", Some("failed".to_string())),
+            Some("failed".to_string())
+        );
+    }
+
+    #[test]
+    fn native_provider_never_synced_reports_never_synced() {
+        // NAN-2002: IPinfo Lite installed + enabled but never synced (or synced
+        // zero records) is not yet active — report `never_synced` so the
+        // analyzer stays silent about GeoIP 0% instead of flagging an outage.
+        assert_eq!(
+            native_provider_run_status(false, 0, None),
+            "never_synced"
+        );
+        // Synced timestamp present but still zero records = no usable data yet.
+        assert_eq!(
+            native_provider_run_status(true, 0, Some("success".to_string())),
+            "never_synced"
+        );
+        // Genuinely loaded data: report the real sync status so a later failure
+        // on a provider that HAS data still surfaces.
+        assert_eq!(
+            native_provider_run_status(true, 5000, Some("success".to_string())),
+            "success"
+        );
+        assert_eq!(
+            native_provider_run_status(true, 5000, Some("failed".to_string())),
+            "failed"
+        );
+        // Data present but null status: fall back to never_synced rather than
+        // inventing a success.
+        assert_eq!(
+            native_provider_run_status(true, 5000, None),
+            "never_synced"
+        );
     }
 }

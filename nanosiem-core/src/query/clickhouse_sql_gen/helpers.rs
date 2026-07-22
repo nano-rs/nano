@@ -1361,15 +1361,47 @@ pub(crate) fn sanitize_json_path(name: &str) -> String {
         .collect()
 }
 
-/// Escape an identifier (column/table name)
+/// Escape an identifier (column/table name) for ClickHouse.
+///
+/// A plain SQL bareword (`^[A-Za-z_][A-Za-z0-9_]*$`) that is not a reserved word
+/// is emitted verbatim — this keeps the generated SQL (and its golden tests)
+/// byte-identical for the overwhelming majority of column/alias names. EVERY
+/// other name — reserved words, dotted (`ext.foo`), spaced, or carrying any
+/// SQL-significant character (comma, parenthesis, quote, backslash) — is
+/// double-quoted with full escaping so it can never break out of the identifier
+/// position.
+///
+/// This is the shared sink for every generated alias and column reference.
+/// Hardened for NAN-1992: the previous "quote only when it has a dot, a space,
+/// or is reserved" check let a `rex` capture-group name like `a,version()`
+/// (comma/parens, `/**/` for whitespace, no dot) pass through RAW into
+/// `... AS <injection> FROM ...`, yielding SQL injection as the lowest-priv role.
+///
+/// Escaping order matters: backslashes are doubled BEFORE quotes. ClickHouse
+/// honours C-style backslash escapes inside double-quoted identifiers (verified
+/// against the server: `"a\", 2 AS b"` parses as a SINGLE identifier), so a
+/// trailing/embedded backslash would otherwise defeat plain quote-doubling. The
+/// generated SQL is validated with sqlparser's `ClickHouseDialect`, which accepts
+/// this quoting (the old code comment referencing PostgreSqlDialect was stale).
 pub(crate) fn escape_identifier(name: &str) -> String {
-    // Use double quotes for identifiers - valid in both ClickHouse and ANSI SQL
-    // (backticks work in ClickHouse but fail sqlparser's PostgreSqlDialect validator)
-    if name.contains('.') || is_reserved_word(name) || name.contains(' ') {
-        format!("\"{}\"", name.replace('"', "\"\""))
-    } else {
+    if is_bareword_identifier(name) && !is_reserved_word(name) {
         name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\"\""))
     }
+}
+
+/// True when `name` is a plain SQL bareword — a leading ASCII letter or
+/// underscore followed only by ASCII letters, digits, or underscores. Such a
+/// name needs no quoting and cannot carry a SQL breakout; anything else routes
+/// through the quoted+escaped branch of [`escape_identifier`].
+fn is_bareword_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Check if a word is a ClickHouse reserved word
@@ -1450,6 +1482,77 @@ mod inline_tests {
     fn test_escape_regex_pattern_backslash() {
         // Backslashes should be escaped
         assert_eq!(escape_regex_pattern(r"\d+"), r"\\d+");
+    }
+
+    #[test]
+    fn escape_identifier_leaves_plain_barewords_raw() {
+        // NAN-1992 no-churn invariant: any `^[A-Za-z_][A-Za-z0-9_]*$` name that
+        // is not reserved must be emitted VERBATIM — the generated SQL (and its
+        // hundreds of golden-string assertions) stays byte-identical.
+        for bareword in [
+            "event_type",
+            "total",
+            "src_ip",
+            "count",
+            "_agg_foo",
+            "COL1",
+            "rex_matches",
+        ] {
+            assert_eq!(
+                escape_identifier(bareword),
+                bareword,
+                "bareword `{bareword}` must stay raw"
+            );
+        }
+    }
+
+    #[test]
+    fn escape_identifier_quotes_reserved_dotted_and_spaced() {
+        // Unchanged from prior behavior — these already quoted before NAN-1992.
+        assert_eq!(escape_identifier("user"), "\"user\"");
+        assert_eq!(escape_identifier("order"), "\"order\"");
+        assert_eq!(escape_identifier("ext.foo"), "\"ext.foo\"");
+        // Legit quoted alias with a space (`eval "p95 latency" = …`) — the case
+        // NAN-1354 protects by owning output-name safety at this sink.
+        assert_eq!(escape_identifier("p95 latency"), "\"p95 latency\"");
+    }
+
+    #[test]
+    fn escape_identifier_neutralizes_rex_alias_injection() {
+        // NAN-1992: a `rex` capture-group name carrying a comma/paren (with `/**/`
+        // for whitespace so it dodged the old `contains(' ')` check) must be
+        // quoted into a single inert alias, never raw SQL.
+        assert_eq!(escape_identifier("a,version()"), "\"a,version()\"");
+        assert_eq!(
+            escape_identifier("a,version()/**/v,hostName()/**/h,currentUser()/**/u"),
+            "\"a,version()/**/v,hostName()/**/h,currentUser()/**/u\""
+        );
+        // A subquery breakout is likewise wrapped whole.
+        assert_eq!(
+            escape_identifier("a,(SELECT/**/count()/**/FROM/**/logs)/**/x"),
+            "\"a,(SELECT/**/count()/**/FROM/**/logs)/**/x\""
+        );
+    }
+
+    #[test]
+    fn escape_identifier_escapes_embedded_quote_and_backslash() {
+        // Embedded double-quote is doubled.
+        assert_eq!(escape_identifier("a\"b"), "\"a\"\"b\"");
+        // Backslash is doubled BEFORE the quote, because ClickHouse honors
+        // C-style `\"` escapes inside double-quoted identifiers (verified against
+        // the server) — otherwise a trailing/embedded backslash defeats the
+        // closing quote and breaks out. `bs` = one literal backslash.
+        let bs = "\\";
+        assert_eq!(
+            escape_identifier(&format!("foo{bs}")),
+            format!("\"foo{bs}{bs}\"")
+        );
+        // Combined backslash+quote breakout attempt (`foo\",x`) collapses to a
+        // single quoted identifier.
+        assert_eq!(
+            escape_identifier(&format!("foo{bs}\",x")),
+            format!("\"foo{bs}{bs}\"\",x\"")
+        );
     }
 
     #[test]

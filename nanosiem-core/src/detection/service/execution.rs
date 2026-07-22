@@ -197,7 +197,7 @@ impl DetectionService {
         // Restricted registry = the fail-closed authority. If nothing is
         // restricted, any/empty stamp is harmless (scoping is a no-op). Shares
         // the alert-write PG, so an error here would also fail the alert insert.
-        let restricted: std::collections::BTreeSet<String> = match sqlx::query_scalar::<_, String>(
+        let mut restricted: std::collections::BTreeSet<String> = match sqlx::query_scalar::<_, String>(
             "SELECT source_type FROM restricted_source_types",
         )
         .fetch_all(&self.pg_pool)
@@ -210,9 +210,20 @@ impl DetectionService {
                 return;
             }
         };
-        if restricted.is_empty() {
-            return;
-        }
+        // NAN-2001: 'audit' is an ALWAYS-restricted ORIGIN for finding redaction
+        // (hard-wired sentinel, see `FindingLogger::origin_restricted`), so the
+        // effective set is never empty. Seeding it here means the source_type
+        // companion runs for aggregate rules on EVERY deployment — including
+        // those with an empty per-source registry — so an aggregate AUDIT rule's
+        // rows get stamped `_nano_source_types` and its finding becomes
+        // known-origin (`origin_source_types_from` harvests the stamp). Without
+        // this, an audit aggregate rule on an unscoped deployment would leave the
+        // finding origin unknown and leak the audit actor via `risk_entity`.
+        // This only affects the STAMP the companion writes (the window's real
+        // matched source types); it does NOT enter any viewer's deny set — the
+        // read side reads the PG registry directly — so alert/detection_match
+        // visibility is unchanged (an empty registry denies nothing).
+        restricted.insert("audit".to_string());
         // Fail-CLOSED stamp: the full restricted set, so an unresolved-origin
         // aggregate alert overlaps ANY scoped viewer's deny set and defaults to
         // HIDDEN — used whenever the companion can't produce a trustworthy

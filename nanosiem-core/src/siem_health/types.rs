@@ -280,11 +280,14 @@ pub struct EnrichmentMetrics {
     pub identity_fill_prior_pct: f64,
     /// Per-source coverage (top sources by event volume).
     pub per_source_coverage: Vec<EnrichmentCoverageMetric>,
-    /// Installed marketplace/custom enrichment providers and their run status.
-    /// Lets the analyzer ground a low coverage number: a 0% IOC hit rate or 0%
-    /// identity fill means "no provider installed → expected" vs "provider
-    /// installed but failing → actionable", depending on this list. GeoIP/ASN
-    /// is native (IPinfo Lite) and does NOT appear here. NAN-1178.
+    /// Installed enrichment providers and their run status. Lets the analyzer
+    /// ground a low coverage number: a 0% IOC hit rate, 0% identity fill, or 0%
+    /// GeoIP means "no provider installed / never synced → expected" vs
+    /// "provider active but failing → actionable", depending on this list.
+    /// Includes both `custom_enrichments` feeds and native providers — the
+    /// GeoIP/ASN provider (IPinfo Lite) is surfaced here as `enrichment_type =
+    /// "geo"` with a `never_synced` status until it has loaded data
+    /// (NAN-1178, NAN-2002).
     #[serde(default)]
     pub providers: Vec<EnrichmentProviderStatus>,
 }
@@ -298,7 +301,11 @@ pub struct EnrichmentProviderStatus {
     pub enrichment_type: String,
     /// Whether the operator has this provider enabled.
     pub enabled: bool,
-    /// Last run outcome: "success", "failed", "running", or `None` if never run.
+    /// Last run outcome for scheduled `data` feeds: "success", "failed",
+    /// "running", or `None` if never run. `agent`-type on-demand lookups
+    /// (VirusTotal, AbuseIPDB, …) are never scheduled, so the collector
+    /// normalizes their null status to `"on_demand"` (NAN-1994) — a null here
+    /// therefore only ever means a scheduled feed that has not yet run.
     pub last_run_status: Option<String>,
 }
 

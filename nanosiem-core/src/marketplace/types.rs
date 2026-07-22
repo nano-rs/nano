@@ -23,8 +23,6 @@ pub enum MarketplaceCategory {
     Agent,
     /// Identity provider sync (Entra ID, Google Workspace, AD)
     Identity,
-    /// Threat-intel feeds (Tor Exit Nodes, MalwareBazaar, Shodan, URLhaus, ThreatFox)
-    Security,
 }
 
 impl std::fmt::Display for MarketplaceCategory {
@@ -33,7 +31,6 @@ impl std::fmt::Display for MarketplaceCategory {
             MarketplaceCategory::Data => write!(f, "data"),
             MarketplaceCategory::Agent => write!(f, "agent"),
             MarketplaceCategory::Identity => write!(f, "identity"),
-            MarketplaceCategory::Security => write!(f, "security"),
         }
     }
 }
@@ -46,7 +43,6 @@ impl std::str::FromStr for MarketplaceCategory {
             "data" => Ok(MarketplaceCategory::Data),
             "agent" => Ok(MarketplaceCategory::Agent),
             "identity" => Ok(MarketplaceCategory::Identity),
-            "security" => Ok(MarketplaceCategory::Security),
             _ => Err(format!("Invalid marketplace category: {}", s)),
         }
     }
@@ -394,7 +390,6 @@ pub struct CatalogStats {
     pub data_count: i64,
     pub agent_count: i64,
     pub identity_count: i64,
-    pub security_count: i64,
 }
 
 /// Status response for a single enrichment
@@ -501,12 +496,12 @@ pub struct RepoBrowseEntry {
 /// Determine the functional enrichment type (`"data"` vs `"agent"`) for a
 /// marketplace entry from its `category` and manifest `config`.
 ///
-/// `category` is a *UI grouping*, not a functional type: NAN-572 added a
-/// `"security"` category that spans BOTH bulk data feeds (ThreatFox, Tor exit
-/// nodes — `enrich(context)`) and on-demand agent lookups (urlhaus, shodan,
-/// malwarebazaar — `enrich(artifact, type, creds)`). Deriving the type from
-/// category alone mislabels the data feeds as `agent`, so they never get
-/// scheduled, hide their "Sync now" button, and crash preview (NAN-1585).
+/// `category` is a coarse *UI grouping*, not a functional type. The retired
+/// (NAN-1998) `"security"` category once spanned BOTH bulk data feeds (ThreatFox,
+/// Tor exit nodes — `enrich(context)`) and on-demand agent lookups (urlhaus,
+/// shodan, malwarebazaar — `enrich(artifact, type, creds)`). Deriving the type
+/// from category alone mislabeled the data feeds as `agent`, so they never got
+/// scheduled, hid their "Sync now" button, and crashed preview (NAN-1585).
 ///
 /// The manifest `config` carries the reliable signal:
 /// - on-demand AGENT lookups declare `artifact_types`
@@ -514,7 +509,8 @@ pub struct RepoBrowseEntry {
 ///
 /// Checked in that order so an entry declaring both is treated as an agent
 /// lookup. Falls back to `category` for legacy entries whose config carries
-/// neither marker.
+/// neither marker — and stays robust to any lingering/legacy category value
+/// (e.g. a pre-NAN-1998 `"security"` row) by resolving on the config markers.
 pub fn infer_enrichment_type(category: &str, config: &serde_json::Value) -> &'static str {
     if config.get("artifact_types").is_some() {
         "agent"
@@ -533,8 +529,10 @@ mod infer_type_tests {
     use serde_json::json;
 
     #[test]
-    fn data_feed_with_key_field_is_data_even_under_security_category() {
-        // ThreatFox / Tor: category 'security' (UI), but a bulk feed.
+    fn data_feed_with_key_field_is_data_even_under_legacy_security_category() {
+        // ThreatFox / Tor: a bulk feed. Config markers win even if a lingering
+        // pre-NAN-1998 'security' category value is passed (robustness during
+        // the retire-security migration window).
         assert_eq!(
             infer_enrichment_type("security", &json!({"key_field": "ioc", "key_type": "ip"})),
             "data"
@@ -542,8 +540,9 @@ mod infer_type_tests {
     }
 
     #[test]
-    fn agent_lookup_with_artifact_types_is_agent_even_under_security_category() {
-        // urlhaus / shodan / malwarebazaar: category 'security' (UI), on-demand lookup.
+    fn agent_lookup_with_artifact_types_is_agent_even_under_legacy_security_category() {
+        // urlhaus / shodan / malwarebazaar: on-demand lookup — resolves on the
+        // config marker regardless of a legacy 'security' category value.
         assert_eq!(
             infer_enrichment_type("security", &json!({"artifact_types": ["url"]})),
             "agent"
@@ -553,7 +552,7 @@ mod infer_type_tests {
     #[test]
     fn artifact_types_wins_when_both_markers_present() {
         assert_eq!(
-            infer_enrichment_type("security", &json!({"artifact_types": ["ip"], "key_field": "x"})),
+            infer_enrichment_type("legacy", &json!({"artifact_types": ["ip"], "key_field": "x"})),
             "agent"
         );
     }
@@ -562,6 +561,7 @@ mod infer_type_tests {
     fn falls_back_to_category_without_config_markers() {
         assert_eq!(infer_enrichment_type("data", &json!({})), "data");
         assert_eq!(infer_enrichment_type("agent", &json!({})), "agent");
+        // An unknown/legacy category with no config markers defaults to agent.
         assert_eq!(infer_enrichment_type("security", &json!({})), "agent");
     }
 }

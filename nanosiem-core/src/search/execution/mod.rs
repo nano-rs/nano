@@ -11,4 +11,4 @@ pub use clickhouse_executor::{
     escape_question_marks_in_strings, ClickHouseExecutor, ClickHouseLogReadRow,
 };
 pub use traits::SqlExecutor;
-pub use validation::{inject_audit_filter, validate_sql_query};
+pub use validation::validate_sql_query;

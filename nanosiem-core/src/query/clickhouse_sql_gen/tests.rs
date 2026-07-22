@@ -3910,3 +3910,89 @@
         assert_eq!(p.keyword_search_column(), "message");
         assert_eq!(p.keyword_search_columns(), vec!["message", "raw_data"]);
     }
+
+    /// NAN-1992: a `rex` capture-group name carrying comma/parens (with `/**/`
+    /// for whitespace, dodging the old space-check) must be emitted as a SINGLE
+    /// quoted, inert alias — never as raw SELECT expressions. This is the
+    /// reporter's exact PoC, asserted at the SQL-gen sink (independent of the
+    /// parse-time validation layer, so the sink is proven safe even if validation
+    /// is ever bypassed).
+    #[test]
+    fn rex_capture_name_injection_is_quoted_inert() {
+        let gen = ClickHouseSqlGenerator::new();
+
+        // Function-execution PoC.
+        let q = parse_query(
+            r#"* | stats count() as total | rex field=total "(?<a,version()/**/v,hostName()/**/h,currentUser()/**/u>\w+)""#,
+        )
+        .unwrap();
+        let sql = gen.generate(&q, &time_range()).unwrap();
+        // The whole malicious name is one double-quoted alias …
+        assert!(
+            sql.contains("AS \"a,version()/**/v,hostName()/**/h,currentUser()/**/u\""),
+            "capture name must be a single quoted alias, got:\n{sql}"
+        );
+        // … the alias is quoted from its very first character (no raw `AS a,`
+        // breakout), so the injected functions live only inside the quotes.
+        assert!(
+            sql.contains("[1] AS \"a,version()"),
+            "alias must be quoted from the start, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("AS a,version()"),
+            "raw comma-breakout alias must not appear, got:\n{sql}"
+        );
+
+        // Subquery-breakout PoC (direct log-store read past source scope).
+        let q2 = parse_query(
+            r#"* | stats count() as total | rex field=total "(?<a,(SELECT/**/count()/**/FROM/**/logs)/**/logrows>\w+)""#,
+        )
+        .unwrap();
+        let sql2 = gen.generate(&q2, &time_range()).unwrap();
+        assert!(
+            sql2.contains("AS \"a,(SELECT/**/count()/**/FROM/**/logs)/**/logrows\""),
+            "subquery breakout must be a single quoted alias, got:\n{sql2}"
+        );
+        assert!(
+            !sql2.contains("(SELECT/**/count()/**/FROM/**/logs)/**/logrows FROM"),
+            "injected subquery must not sit in raw SELECT position, got:\n{sql2}"
+        );
+
+        // A benign capture name is unchanged (no golden-SQL churn).
+        let q3 = parse_query(r#"error | rex "(?<foo>bar)""#).unwrap();
+        let sql3 = gen.generate(&q3, &time_range()).unwrap();
+        assert!(
+            sql3.contains("[1] AS foo FROM"),
+            "benign rex alias must stay a bareword, got:\n{sql3}"
+        );
+    }
+
+    /// NAN-1992: the `table <field> as "<alias>"` slot is the ONE other live
+    /// injection sink found during the audit — its alias parses via
+    /// `quoted_string` (to allow display aliases), so a comma-bearing alias
+    /// reached `escape_identifier` and broke out (`message AS a, src_ip` — two
+    /// columns). The same sink hardening quotes it into one inert column. Unlike
+    /// `rex`, table aliases are NOT parse-validated, because quoted display
+    /// aliases with spaces (`as "p95 latency"`) are intentionally supported
+    /// (NAN-1354) — the sink owns their safety.
+    #[test]
+    fn table_alias_injection_is_quoted_inert() {
+        let gen = ClickHouseSqlGenerator::new();
+        let q = parse_query(r#"* | table message as "a,src_ip""#).unwrap();
+        let sql = gen.generate(&q, &time_range()).unwrap();
+        assert!(
+            sql.contains("message AS \"a,src_ip\""),
+            "table alias must be a single quoted column, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("message AS a, src_ip") && !sql.contains("AS a,src_ip "),
+            "table alias must not break out into a second column, got:\n{sql}"
+        );
+        // A legit quoted display alias with a space still works (NAN-1354).
+        let q2 = parse_query(r#"* | table message as "p95 latency""#).unwrap();
+        let sql2 = gen.generate(&q2, &time_range()).unwrap();
+        assert!(
+            sql2.contains("message AS \"p95 latency\""),
+            "quoted display alias must survive, got:\n{sql2}"
+        );
+    }

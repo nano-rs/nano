@@ -54,14 +54,15 @@ pub async fn panel_query(
     // (the piped nPL arm and the SQL arm have different quoting/escaping rules).
     let query = substitute_variables(&request.query, &request.variables, is_sql);
 
-    // NAN-1799: compose the effective deny-set once and let the search service
-    // enforce it (per-source RBAC + the audit-log gate). The service injects the
-    // deny-set into the piped nPL query itself and fails raw SQL closed when the
-    // scope is restricted, so the handler no longer runs its own audit rewrite
-    // (`enforce_non_audit_query` / `inject_audit_filter`, NAN-704 — now superseded).
-    // Union the `audit` source into the caller's per-source deny set unless they
-    // hold `audit:view`; an unrestricted caller with `audit:view` yields a
-    // byte-identical query (empty deny set => unrestricted scope).
+    // NAN-1799: compose the effective deny-set once for the PIPED arm — the
+    // service injects it into the nPL query AST (per-source RBAC + the audit-log
+    // gate). Union the `audit` source into the caller's per-source deny set
+    // unless they hold `audit:view`; an unrestricted caller with `audit:view`
+    // yields a byte-identical query (empty deny set => unrestricted scope).
+    // NAN-2001: this audit-folded scope is the PIPED arm's audit mechanism ONLY.
+    // The raw-SQL arm must NOT use it (it would fail closed for every non-audit
+    // caller); the SQL arm builds a source-only scope + an explicit
+    // RawSqlAuditAccess below, and the ClickHouse row policy hides audit rows.
     let scope = {
         let mut deny = auth.denied_sources.deny_set().clone();
         if !auth.has_permission(permissions::AUDIT_VIEW) {
@@ -99,11 +100,21 @@ pub async fn panel_query(
 
         // Execute raw SQL query.
         //
-        // NAN-1799: the audit + per-source gate is enforced by the service, which
-        // fails raw SQL closed when `scope.is_restricted()` — i.e. the caller
-        // lacks `audit:view` or has any per-source deny — since raw SQL can't be
-        // safely scope-rewritten. The handler no longer pre-rewrites the SQL (the
-        // old `inject_audit_filter` path is gone); it just forwards `&scope`.
+        // NAN-2001: the SQL arm must NOT fold `audit` into the scope — the shared
+        // audit-folded `scope` above would trip search_sql's per-source
+        // fail-closed guard (`scope.is_restricted()`) and REFUSE every caller
+        // without `audit:view`, instead of hiding audit rows. So pass a
+        // SOURCE-ONLY scope (per-source denials still fail closed via NAN-1799)
+        // plus an explicit RawSqlAuditAccess: audit rows are hidden by the
+        // ClickHouse `nanosiem_rawsql_noaudit` identity's RESTRICTIVE row policy.
+        // The audit-folded `scope` remains the PIPED arm's mechanism (unchanged).
+        let sql_scope =
+            nanosiem_core::auth::ScopeSet::from_denied(auth.denied_sources.deny_set().clone());
+        let audit_access = if auth.has_permission(permissions::AUDIT_VIEW) {
+            nanosiem_core::search::RawSqlAuditAccess::Visible
+        } else {
+            nanosiem_core::search::RawSqlAuditAccess::Hidden
+        };
         let sql_request = nanosiem_core::RawSqlRequest {
             sql: query,
             time_range: request.time_range,
@@ -112,7 +123,10 @@ pub async fn panel_query(
         };
         // Raw SQL is neither cached nor routed through admission control here.
         (
-            state.search_service.search_sql(sql_request, &scope).await?,
+            state
+                .search_service
+                .search_sql(sql_request, &sql_scope, audit_access)
+                .await?,
             false,
             None,
         )

@@ -231,6 +231,20 @@ async fn run() -> Result<()> {
         );
     }
 
+    // NAN-2001: (re)create the raw-SQL audit row policies for
+    // `nanosiem_rawsql_noaudit` on the physical (`_local` on clusters) tables.
+    // Runs AFTER the distributed split + column reconcile so `_local` tables
+    // exist; the grants that form the allowlist are declarative in the user
+    // config, so only the policies are created here. Idempotent.
+    let policy_count = migrator
+        .ensure_rawsql_row_policies()
+        .await
+        .context("ensuring raw-SQL audit row policies (NAN-2001)")?;
+    tracing::info!(
+        "NAN-2001: ensured raw-SQL audit row policies on {} table(s)",
+        policy_count
+    );
+
     // NAN-1728 (C2/P0): now that the reference-table `_distributed` wrappers
     // exist, repoint the five dict-refresh MVs' FROM at them so each per-node
     // staging dict sees the COMPLETE cross-shard keyspace. This MUST run AFTER

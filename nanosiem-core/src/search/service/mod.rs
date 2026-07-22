@@ -90,6 +90,7 @@ mod prevalence_join;
 mod prevalence_processing;
 mod retro;
 mod sql_execution;
+pub use sql_execution::RawSqlAuditAccess;
 mod streaming;
 mod tree_view;
 
@@ -693,6 +694,14 @@ pub struct SearchService {
     backend: SearchBackend,
     /// ClickHouse executor (if configured)
     ch_executor: Option<ClickHouseExecutor>,
+    /// NAN-2001: raw-SQL executors backed by the two dedicated ClickHouse
+    /// feature identities. `search_sql` selects between them by the caller's
+    /// `RawSqlAuditAccess` so the table allowlist + audit-row hiding are enforced
+    /// by ClickHouse (grants + row policy), not by the retired AST walk. Kept
+    /// distinct from `ch_executor` (the broad `nanosiem` account) — raw SQL never
+    /// runs on the broad account.
+    ch_executor_rawsql: Option<ClickHouseExecutor>,
+    ch_executor_rawsql_noaudit: Option<ClickHouseExecutor>,
     /// Query tracker for cancellation support (local instance monitoring)
     query_tracker: super::query_tracking::QueryTracker,
     /// Job store for async search support (pluggable: in-memory or Redis)
@@ -923,6 +932,11 @@ impl SearchService {
         profile: std::sync::Arc<dyn crate::schema::SchemaProfile>,
     ) -> Self {
         let ch_executor = Some(ClickHouseExecutor::new(dual_pool.clickhouse().clone()));
+        // NAN-2001: raw-SQL executors on the two dedicated feature identities.
+        let ch_executor_rawsql =
+            Some(ClickHouseExecutor::new(dual_pool.clickhouse_rawsql().clone()));
+        let ch_executor_rawsql_noaudit =
+            Some(ClickHouseExecutor::new(dual_pool.clickhouse_rawsql_noaudit().clone()));
         Self {
             pg_pool: dual_pool.postgres().clone(),
             ch_client: Some(dual_pool.clickhouse().clone()),
@@ -933,6 +947,8 @@ impl SearchService {
             inputlookup_service: None,
             backend: SearchBackend::ClickHouse,
             ch_executor,
+            ch_executor_rawsql,
+            ch_executor_rawsql_noaudit,
             query_tracker: super::query_tracking::QueryTracker::new(),
             job_store: std::sync::Arc::new(super::jobs::InMemoryJobStore::new()),
             admission_controller: None,
@@ -983,6 +999,11 @@ impl SearchService {
         profile: std::sync::Arc<dyn crate::schema::SchemaProfile>,
     ) -> Self {
         let ch_executor = Some(ClickHouseExecutor::new(dual_pool.clickhouse().clone()));
+        // NAN-2001: raw-SQL executors on the two dedicated feature identities.
+        let ch_executor_rawsql =
+            Some(ClickHouseExecutor::new(dual_pool.clickhouse_rawsql().clone()));
+        let ch_executor_rawsql_noaudit =
+            Some(ClickHouseExecutor::new(dual_pool.clickhouse_rawsql_noaudit().clone()));
         Self {
             pg_pool: dual_pool.postgres().clone(),
             ch_client: Some(dual_pool.clickhouse().clone()),
@@ -993,6 +1014,8 @@ impl SearchService {
             inputlookup_service: None,
             backend: SearchBackend::ClickHouse,
             ch_executor,
+            ch_executor_rawsql,
+            ch_executor_rawsql_noaudit,
             query_tracker: super::query_tracking::QueryTracker::new(),
             job_store: std::sync::Arc::new(super::jobs::InMemoryJobStore::new()),
             admission_controller: None,

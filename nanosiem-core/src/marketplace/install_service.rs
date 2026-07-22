@@ -399,8 +399,10 @@ impl MarketplaceInstallService {
         let config = request.config.as_ref().unwrap_or(&entry.config.0);
 
         // Determine the functional enrichment type from category + config.
-        // `category` alone is unreliable: the 'security' UI grouping spans both
-        // bulk data feeds and on-demand agent lookups (NAN-1585).
+        // `category` alone is unreliable: the retired (NAN-1998) 'security' UI
+        // grouping spanned both bulk data feeds and on-demand agent lookups,
+        // which is what mislabeled the data feeds as agent (NAN-1585). Config
+        // markers are the source of truth.
         let enrichment_type = infer_enrichment_type(&entry.category, config);
 
         // Get default namespace

@@ -3,23 +3,62 @@
 use super::*;
 use crate::auth::ScopeSet;
 use crate::search::execution::clickhouse_executor::{
-    wrap_query_for_count, wrap_query_with_pagination, BoundedCountInput,
+    wrap_query_for_count, wrap_query_with_pagination, BoundedCountInput, ClickHouseExecutor,
 };
 use crate::search::query_processing::enforce_source_scope;
 
+/// NAN-2001: which raw-SQL ClickHouse identity a caller runs as. This is the ONE
+/// security decision the raw-SQL handler makes — everything else (table
+/// allowlist, table-function/`system.*` denial, audit-row hiding) is enforced by
+/// ClickHouse against its own semantics. Threaded EXPLICITLY from the caller's
+/// `audit:view` permission — never inferred from an empty `ScopeSet` (§3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RawSqlAuditAccess {
+    /// Fail-closed default: caller lacks `audit:view`. Runs as
+    /// `nanosiem_rawsql_noaudit`, whose RESTRICTIVE row policy hides
+    /// `source_type='audit'` rows.
+    #[default]
+    Hidden,
+    /// Caller HAS `audit:view`. Runs as the audit-capable `nanosiem_rawsql`.
+    Visible,
+}
+
 impl SearchService {
-    /// Execute a raw SQL query (SELECT only)
+    /// NAN-2001: select the raw-SQL executor for this caller's audit access. Raw
+    /// SQL always runs on a dedicated feature identity — a missing executor is a
+    /// hard error, never a fallback to the broad `nanosiem` account.
+    fn rawsql_executor(
+        &self,
+        audit: RawSqlAuditAccess,
+    ) -> Result<&ClickHouseExecutor, SearchError> {
+        let executor = match audit {
+            RawSqlAuditAccess::Visible => self.ch_executor_rawsql.as_ref(),
+            RawSqlAuditAccess::Hidden => self.ch_executor_rawsql_noaudit.as_ref(),
+        };
+        executor.ok_or_else(|| {
+            SearchError::DatabaseError(sqlx::Error::Configuration(
+                "raw-SQL ClickHouse feature identity not configured (NAN-2001)".into(),
+            ))
+        })
+    }
+
+    /// Execute a raw SQL query (SELECT only).
     ///
-    /// NAN-1799 FAIL-CLOSED: raw SQL cannot be AST-injected with a per-source
-    /// exclusion, so a caller with ANY restricted source is refused outright
-    /// (deny-when-scoped) — unscoped raw SQL over the logs table would leak
-    /// every denied source. Unrestricted callers behave exactly as before
-    /// (the handler-level `inject_audit_filter` still covers the audit gate).
+    /// NAN-2001: the table allowlist and the audit-view gate are enforced by
+    /// ClickHouse via `audit`-selected feature identities (grants + a RESTRICTIVE
+    /// row policy), NOT by the retired in-app AST walk. `validate_sql` is now only
+    /// a mandatory `system`/`information_schema` reject + friendly-error UX.
+    ///
+    /// NAN-1799 FAIL-CLOSED (unchanged): raw SQL cannot be AST-injected with a
+    /// per-source exclusion, so a caller with ANY restricted source is refused
+    /// outright (deny-when-scoped) — orthogonal to, and evaluated before, the
+    /// `RawSqlAuditAccess` routing.
     #[instrument(skip(self, scope))]
     pub async fn search_sql(
         &self,
         request: RawSqlRequest,
         scope: &ScopeSet,
+        audit: RawSqlAuditAccess,
     ) -> Result<SearchResponse, SearchError> {
         let start_time = Instant::now();
 
@@ -30,6 +69,11 @@ impl SearchService {
                     .to_string(),
             ));
         }
+
+        // NAN-2001: select the executor ONCE by audit access; the main query and
+        // the count companion both run on the chosen feature identity, so a
+        // noaudit caller can never read audit rows (nor their volume via count).
+        let executor = self.rawsql_executor(audit)?;
 
         // Validate time range
         request.time_range.validate()?;
@@ -45,8 +89,10 @@ impl SearchService {
         let offset = request.offset.unwrap_or(0);
         let sql = request.sql.trim().trim_end_matches(';');
 
-        // Execute the query
-        let (results, total_count) = self.execute_clickhouse_raw_sql(sql, limit, offset).await?;
+        // Execute the query on the selected raw-SQL identity.
+        let (results, total_count) = self
+            .execute_clickhouse_raw_sql(executor, sql, limit, offset)
+            .await?;
 
         // Calculate field statistics
         let mut stats = FieldStatistics::new();
@@ -55,19 +101,14 @@ impl SearchService {
         }
         let fields = stats.get_field_info(self.config.top_values_count);
 
-        // Generate histogram for raw SQL - use the full time range.
-        // NAN-1429: degrade to histogram:null on failure instead of failing
-        // the whole search (matches the piped-query path's behavior).
-        let histogram = match self
-            .generate_histogram_for_time_range(&request.time_range)
-            .await
-        {
-            Ok(h) => Some(h),
-            Err(e) => {
-                tracing::warn!("Raw SQL histogram query failed: {}", e);
-                None
-            }
-        };
+        // NAN-2001: the raw-SQL result histogram is deliberately omitted. It was a
+        // generic full-time-range logs timeline (not tied to the query) that ran
+        // on the broad `ch_client` — for a noaudit caller that would leak
+        // audit-event volume and bypass the feature identity. Routing it through
+        // the selected identity would ripple into the field-stats histogram
+        // helper; omitting is the low-risk, secure choice (the frontend already
+        // handles `histogram: null`, exactly as the piped path's error degrade).
+        let histogram = None;
 
         let execution_time_ms = start_time.elapsed().as_millis() as u64;
 
@@ -386,22 +427,19 @@ impl SearchService {
     /// must not rely on appending clauses directly to the user-provided SQL text.
     pub(crate) async fn execute_clickhouse_raw_sql(
         &self,
+        executor: &ClickHouseExecutor,
         sql: &str,
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
-        let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
-            SearchError::DatabaseError(sqlx::Error::Configuration(
-                "ClickHouse client not configured".into(),
-            ))
-        })?;
-
         let paginated_sql = wrap_query_with_pagination(sql, limit, offset);
         let count_sql = wrap_query_for_count(sql);
 
+        // NAN-2001: main query + count companion both run on the selected
+        // raw-SQL identity so neither the rows nor the total leak audit data.
         let (results, total_count) = tokio::join!(
-            ch_executor.execute_sql_to_json(&paginated_sql),
-            ch_executor.execute_count_query(&count_sql)
+            executor.execute_sql_to_json(&paginated_sql),
+            executor.execute_count_query(&count_sql)
         );
 
         Ok((results?, total_count?))

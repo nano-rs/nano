@@ -262,7 +262,7 @@ pub async fn cancel_search(
 pub async fn search_sql(
     State(state): State<SearchState>,
     axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
-    Json(mut request): Json<RawSqlRequest>,
+    Json(request): Json<RawSqlRequest>,
 ) -> Result<Json<SearchResponse>, SearchError> {
     // NAN-173: Gate raw SQL behind dedicated permission
     if !auth.claims.has_permission(permissions::SEARCH_SQL) {
@@ -271,35 +271,27 @@ pub async fn search_sql(
         ));
     }
 
-    // H1 fix: Users without audit:view permission cannot query audit source_type.
-    // Wrap the user's SQL in a subquery with a source_type filter so it cannot be bypassed.
-    if !auth.claims.has_permission(permissions::AUDIT_VIEW) {
-        // Validate the user's original SQL BEFORE wrapping to prevent UNION injection.
-        // An attacker could craft SQL with unbalanced parentheses (e.g. "SELECT * FROM logs) ...
-        // UNION ALL SELECT ...") that, when wrapped in SELECT * FROM (...), breaks out of
-        // the subquery and bypasses the audit filter. Validating the raw SQL first ensures
-        // it parses as a valid single SELECT, which cannot contain unbalanced parens.
-        nanosiem_core::search::validate_sql_query(request.sql.trim_end_matches(';'))
-            .map_err(|e| SearchError::QueryError(format!("SQL validation failed: {}", e)))?;
+    // NAN-2001: the audit-view gate now lives in ClickHouse. Derive the raw-SQL
+    // identity EXPLICITLY from audit:view (fail-closed default `Hidden` →
+    // `nanosiem_rawsql_noaudit` + its RESTRICTIVE `source_type!='audit'` row
+    // policy). The retired `inject_audit_filter` (and the pre-validation that
+    // only guarded it) are gone — no in-app SQL rewriting. Never infer audit
+    // visibility from scope (§3.3).
+    let audit_access = if auth.claims.has_permission(permissions::AUDIT_VIEW) {
+        nanosiem_core::search::RawSqlAuditAccess::Visible
+    } else {
+        nanosiem_core::search::RawSqlAuditAccess::Hidden
+    };
 
-        // Inject the audit filter using nanosiem_core's SQL manipulation utility.
-        // We use inject_where_clause which parses the SQL, adds the condition to
-        // the WHERE clause (or creates one), and serializes back. This avoids the
-        // subquery wrapper approach which fails when the inner query uses aggregation
-        // (e.g., SELECT count() — source_type not in output columns).
-        request.sql = nanosiem_core::search::inject_audit_filter(request.sql.trim_end_matches(';'))
-            .map_err(|e| {
-                SearchError::QueryError(format!("Audit filter injection failed: {}", e))
-            })?;
-    }
-
-    // NAN-1799 FAIL-CLOSED: raw SQL cannot be AST-injected with a per-source
-    // exclusion, so the service refuses outright (SqlValidationError) when the
-    // caller has ANY restricted source. We pass the SOURCE deny-set only —
-    // the audit gate stays handler-injected above so callers whose only
-    // restriction is the audit gate keep raw SQL working exactly as before.
+    // NAN-1799 FAIL-CLOSED (unchanged): raw SQL cannot be AST-injected with a
+    // per-source exclusion, so the service refuses outright (SqlValidationError)
+    // when the caller has ANY restricted source. Pass the SOURCE deny-set only —
+    // audit is handled by the RawSqlAuditAccess identity, NOT folded into scope.
     let start = Instant::now();
-    let result = state.search.search_sql(request, &auth.denied_sources).await;
+    let result = state
+        .search
+        .search_sql(request, &auth.denied_sources, audit_access)
+        .await;
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     record_search_query("sql", duration_ms, result.is_ok());

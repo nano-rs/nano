@@ -61,6 +61,17 @@ pub struct DualPoolConfig {
     pub clickhouse_admin_user: Option<String>,
     /// ClickHouse admin password (for migrations)
     pub clickhouse_admin_password: Option<String>,
+    /// NAN-2001: raw-SQL feature identity (audit-capable, read-only). Its GRANT
+    /// SELECT list IS the raw-SQL table allowlist. Username defaults to
+    /// `nanosiem_rawsql`; password is REQUIRED (boot fails if absent — no
+    /// fallback to the broad `nanosiem` client).
+    pub clickhouse_rawsql_user: String,
+    pub clickhouse_rawsql_password: Option<String>,
+    /// NAN-2001: raw-SQL feature identity for callers WITHOUT `audit:view`
+    /// (narrower grants + a RESTRICTIVE `source_type!='audit'` row policy).
+    /// Username defaults to `nanosiem_rawsql_noaudit`; password REQUIRED.
+    pub clickhouse_rawsql_noaudit_user: String,
+    pub clickhouse_rawsql_noaudit_password: Option<String>,
     /// Maximum PostgreSQL connections
     pub pg_max_connections: u32,
     /// Minimum PostgreSQL connections
@@ -97,6 +108,10 @@ impl Default for DualPoolConfig {
             clickhouse_password: String::new(),
             clickhouse_admin_user: None,
             clickhouse_admin_password: None,
+            clickhouse_rawsql_user: "nanosiem_rawsql".to_string(),
+            clickhouse_rawsql_password: None,
+            clickhouse_rawsql_noaudit_user: "nanosiem_rawsql_noaudit".to_string(),
+            clickhouse_rawsql_noaudit_password: None,
             pg_max_connections: 20, // Increased for tuning workload
             pg_min_connections: 2,  // Maintain ready connections
             ch_max_connections: 10,
@@ -147,6 +162,16 @@ impl DualPoolConfig {
         let clickhouse_admin_user = std::env::var("CLICKHOUSE_ADMIN_USER").ok();
         let clickhouse_admin_password = std::env::var("CLICKHOUSE_ADMIN_PASSWORD").ok();
 
+        // NAN-2001: raw-SQL feature identities. Username overridable; password
+        // REQUIRED (validated at DualPool::new — boot fails closed if absent).
+        let clickhouse_rawsql_user =
+            std::env::var("CLICKHOUSE_RAWSQL_USER").unwrap_or_else(|_| "nanosiem_rawsql".to_string());
+        let clickhouse_rawsql_password = std::env::var("CLICKHOUSE_RAWSQL_PASSWORD").ok();
+        let clickhouse_rawsql_noaudit_user = std::env::var("CLICKHOUSE_RAWSQL_NOAUDIT_USER")
+            .unwrap_or_else(|_| "nanosiem_rawsql_noaudit".to_string());
+        let clickhouse_rawsql_noaudit_password =
+            std::env::var("CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD").ok();
+
         let pg_max_connections = std::env::var("PG_MAX_CONNECTIONS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -195,6 +220,10 @@ impl DualPoolConfig {
             clickhouse_password,
             clickhouse_admin_user,
             clickhouse_admin_password,
+            clickhouse_rawsql_user,
+            clickhouse_rawsql_password,
+            clickhouse_rawsql_noaudit_user,
+            clickhouse_rawsql_noaudit_password,
             pg_max_connections,
             pg_min_connections,
             ch_max_connections,
@@ -487,6 +516,60 @@ impl TableNames {
     }
 }
 
+/// NAN-2001: expected SELECT allowlist (bare names) for the audit-capable
+/// `nanosiem_rawsql` identity. The boot-time grant assertion requires the
+/// granted set (normalized of `_local`/`_distributed` twins) to be a subset of
+/// this. Keep in sync with `clickhouse/users.d/nanosiem-users.xml` and the
+/// per-surface user configs.
+const RAWSQL_ALLOWED_TABLES: &[&str] = &[
+    "logs",
+    "ocsf_logs",
+    "signals",
+    "domain_prevalence_agg",
+    "hash_prevalence_agg",
+    "ip_prevalence_agg",
+    "identity_observations",
+    "nat_candidates",
+    "entity_time_range_agg",
+    "cloud_user_activity_agg",
+    "custom_enrichment_results",
+    "ingestion_errors",
+    "otel_spans",
+    "otel_metrics",
+    "otel_metrics_1m",
+    "otel_metrics_1h",
+];
+
+/// NAN-2001: expected SELECT allowlist for the audit-HIDDEN
+/// `nanosiem_rawsql_noaudit` identity. NARROWER than `RAWSQL_ALLOWED_TABLES` —
+/// the audit-baked aggregates (`*_prevalence_agg`, `entity_time_range_agg`,
+/// `cloud_user_activity_agg`, `nat_candidates`) are OMITTED because a row policy
+/// cannot retroactively strip audit contribution baked into their merge states.
+/// Granting any of those to this identity is a boot-failing security drift.
+const RAWSQL_NOAUDIT_ALLOWED_TABLES: &[&str] = &[
+    "logs",
+    "ocsf_logs",
+    "signals",
+    "identity_observations",
+    "custom_enrichment_results",
+    "ingestion_errors",
+    "otel_spans",
+    "otel_metrics",
+    "otel_metrics_1m",
+    "otel_metrics_1h",
+];
+
+/// NAN-2001: the RESTRICTIVE audit row-policy short-names created by the
+/// migrator's `ensure_rawsql_row_policies`. Boot verifies these exist (when an
+/// admin client is available) so a noaudit identity can never have grants but no
+/// audit-hiding policy. Keep in sync with the reconciler's `rawsql_hide_audit_*`.
+const RAWSQL_HIDE_POLICY_NAMES: &[&str] = &[
+    "rawsql_hide_audit_logs",
+    "rawsql_hide_audit_ocsf_logs",
+    "rawsql_hide_audit_signals",
+    "rawsql_hide_audit_identity_observations",
+];
+
 #[derive(Clone)]
 pub struct DualPool {
     postgres: PgPool,
@@ -494,6 +577,13 @@ pub struct DualPool {
     /// Admin client for DDL operations (CREATE/DROP views, etc.)
     /// Falls back to regular client if admin credentials not configured
     clickhouse_admin: ClickHouseClient,
+    /// NAN-2001: raw-SQL feature clients. `clickhouse_rawsql` is audit-capable;
+    /// `clickhouse_rawsql_noaudit` carries the RESTRICTIVE audit row policy. The
+    /// raw-SQL handler picks by the caller's `audit:view`. Both are REQUIRED —
+    /// boot fails (no fallback to `clickhouse`) if a credential is missing, and
+    /// their grant sets are asserted against the expected allowlist at boot.
+    clickhouse_rawsql: ClickHouseClient,
+    clickhouse_rawsql_noaudit: ClickHouseClient,
     /// Whether distributed tables exist (logs_distributed, etc.)
     /// Detected at init time by checking system.tables.
     is_clustered: bool,
@@ -619,6 +709,41 @@ impl DualPool {
             );
         }
 
+        // NAN-2001: build the two raw-SQL feature clients. FAIL BOOT if a
+        // credential is missing (never fall back to the broad `nanosiem` client)
+        // and if a client's granted table set drifts from the expected allowlist.
+        let clickhouse_rawsql = Self::build_rawsql_client(
+            config,
+            &config.clickhouse_rawsql_user,
+            &config.clickhouse_rawsql_password,
+            "CLICKHOUSE_RAWSQL_PASSWORD",
+            RAWSQL_ALLOWED_TABLES,
+        )
+        .await?;
+        let clickhouse_rawsql_noaudit = Self::build_rawsql_client(
+            config,
+            &config.clickhouse_rawsql_noaudit_user,
+            &config.clickhouse_rawsql_noaudit_password,
+            "CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD",
+            RAWSQL_NOAUDIT_ALLOWED_TABLES,
+        )
+        .await?;
+
+        // NAN-2001 defense-in-depth: the noaudit identity is granted SELECT
+        // declaratively, but audit-hiding depends on the RESTRICTIVE row policies
+        // created by the migrator's `ensure_rawsql_row_policies`. When we have an
+        // access-management admin client (api / jobs / migrator services — NOT the
+        // search service, which has no admin and skips this), verify those
+        // policies actually exist. This catches a version-skew deploy (a new app
+        // booting before the current migrator ran the reconciler): the noaudit
+        // user can't self-check them (`system.row_policies` needs a grant it lacks)
+        // and the search service has no admin, but api/jobs boot from the same
+        // DualPool and will fail the deploy visibly rather than silently leak audit.
+        if using_admin {
+            Self::assert_rawsql_row_policies_present(&clickhouse_admin, &config.clickhouse_database)
+                .await?;
+        }
+
         // Detect whether distributed tables exist (cluster mode)
         let is_clustered = clickhouse
             .query(&format!(
@@ -670,9 +795,176 @@ impl DualPool {
             postgres,
             clickhouse,
             clickhouse_admin,
+            clickhouse_rawsql,
+            clickhouse_rawsql_noaudit,
             is_clustered,
             logs_table,
         })
+    }
+
+    /// NAN-2001: build + verify a raw-SQL feature client, failing boot if the
+    /// credential is missing (no fallback to the broad account) or if its granted
+    /// table set has drifted from the expected allowlist.
+    async fn build_rawsql_client(
+        config: &DualPoolConfig,
+        user: &str,
+        password: &Option<String>,
+        env_var: &str,
+        allowed: &[&str],
+    ) -> Result<ClickHouseClient, DualPoolError> {
+        let password = password.as_ref().ok_or_else(|| {
+            DualPoolError::ConfigError(format!(
+                "{env_var} is required for the raw-SQL feature identity '{user}' (NAN-2001). \
+                 Boot fails closed rather than falling back to the broad ClickHouse account. \
+                 Set {env_var} to the password of the '{user}' ClickHouse user."
+            ))
+        })?;
+
+        let mut client = ClickHouseClient::default()
+            .with_url(&config.clickhouse_url)
+            .with_database(&config.clickhouse_database)
+            .with_user(user);
+        if !password.is_empty() {
+            client = client.with_password(password);
+        }
+
+        client
+            .query("SELECT 1")
+            .fetch_one::<u8>()
+            .await
+            .map_err(|e| {
+                DualPoolError::ClickHouseConnectionError(format!(
+                    "Failed to connect to ClickHouse as raw-SQL identity '{user}': {e}"
+                ))
+            })?;
+
+        Self::assert_rawsql_grants(&client, user, allowed).await?;
+        tracing::info!(
+            "ClickHouse raw-SQL identity '{}' connected and grant-verified ({} allowlisted tables)",
+            user,
+            allowed.len()
+        );
+        Ok(client)
+    }
+
+    /// NAN-2001 grant drift guard. Read the current user's own SELECT grants and
+    /// assert the normalized (`_local`/`_distributed`-stripped) `nanosiem.<table>`
+    /// set is a SUBSET of `allowed` (no over-grant) and includes `logs`. This is
+    /// the security property: the noaudit identity must never be granted the
+    /// audit-baked aggregates, and neither identity may hold a whole-DB grant.
+    async fn assert_rawsql_grants(
+        client: &ClickHouseClient,
+        user: &str,
+        allowed: &[&str],
+    ) -> Result<(), DualPoolError> {
+        // `SHOW GRANTS` is always readable for the current user (no privilege
+        // needed) — unlike `system.grants`, which a grant-only user cannot read.
+        let grant_rows: Vec<String> = client
+            .query("SHOW GRANTS")
+            .fetch_all::<String>()
+            .await
+            .map_err(|e| {
+                DualPoolError::ClickHouseConnectionError(format!(
+                    "Could not read grants for raw-SQL identity '{user}' to verify the allowlist \
+                     (NAN-2001): {e}"
+                ))
+            })?;
+
+        // Capture BOTH the database and table token from each
+        // `GRANT SELECT[(...)] ON <db>.<table>` line, so the guard rejects any
+        // grant outside the `nanosiem` database (not just `nanosiem.*`) and any
+        // whole-database grant — both are over-grants the allowlist must exclude.
+        let re =
+            regex::Regex::new(r"(?i)\bON\s+`?([A-Za-z0-9_*]+)`?\.`?([A-Za-z0-9_*]+)`?").unwrap();
+        let mut normalized: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for row in &grant_rows {
+            // Only SELECT grants define read access (skip dictGet / other privileges).
+            if !row.to_uppercase().contains("GRANT SELECT") {
+                continue;
+            }
+            let Some(caps) = re.captures(row) else {
+                continue;
+            };
+            let db = &caps[1];
+            let table = &caps[2];
+            // Cross-database SELECT grant (incl. `*.*`) → over-grant, fail closed.
+            if !db.eq_ignore_ascii_case("nanosiem") {
+                return Err(DualPoolError::ConfigError(format!(
+                    "raw-SQL identity '{user}' holds a SELECT grant outside the nanosiem database \
+                     ('{db}.{table}', NAN-2001) — it must be granted SELECT only on the explicit \
+                     nanosiem allowlist tables. Fix the grant declaration for this identity."
+                )));
+            }
+            // Whole-database grant (`nanosiem.*`) → over-grant, fail closed.
+            if table == "*" {
+                return Err(DualPoolError::ConfigError(format!(
+                    "raw-SQL identity '{user}' holds a whole-database SELECT grant on nanosiem.* \
+                     (NAN-2001) — it must be granted SELECT only on the explicit allowlist tables. \
+                     Fix the grant declaration for this identity."
+                )));
+            }
+            let norm = table
+                .trim_end_matches("_distributed")
+                .trim_end_matches("_local")
+                .to_string();
+            normalized.insert(norm);
+        }
+
+        for t in &normalized {
+            if !allowed.contains(&t.as_str()) {
+                return Err(DualPoolError::ConfigError(format!(
+                    "raw-SQL identity '{user}' is granted SELECT on 'nanosiem.{t}', which is NOT in \
+                     its expected raw-SQL allowlist (NAN-2001). This is a security drift — refusing \
+                     to boot. Reconcile the grant declaration (users.d XML / k8s tpl / nano-main)."
+                )));
+            }
+        }
+        if !normalized.contains("logs") {
+            return Err(DualPoolError::ConfigError(format!(
+                "raw-SQL identity '{user}' is not granted SELECT on nanosiem.logs (NAN-2001) — its \
+                 grants did not load. Check the user's <grants> in the ClickHouse user config."
+            )));
+        }
+        Ok(())
+    }
+
+    /// NAN-2001: verify (via an access-management admin client) that the
+    /// RESTRICTIVE audit row policies for `nanosiem_rawsql_noaudit` exist. The
+    /// short-names are created cluster-wide by the migrator's
+    /// `ensure_rawsql_row_policies`; policies created `ON CLUSTER` are present in
+    /// every node's access storage, so a single-node `system.row_policies` read is
+    /// authoritative. Fails boot if any is missing (audit-hiding would be broken).
+    async fn assert_rawsql_row_policies_present(
+        admin: &ClickHouseClient,
+        database: &str,
+    ) -> Result<(), DualPoolError> {
+        let names = RAWSQL_HIDE_POLICY_NAMES.join("', '");
+        let found: u64 = admin
+            .query(&format!(
+                "SELECT count(DISTINCT short_name) FROM system.row_policies \
+                 WHERE database = '{database}' AND short_name IN ('{names}')"
+            ))
+            .fetch_one()
+            .await
+            .map_err(|e| {
+                DualPoolError::ClickHouseConnectionError(format!(
+                    "Could not verify raw-SQL audit row policies via the admin client (NAN-2001): {e}"
+                ))
+            })?;
+
+        let expected = RAWSQL_HIDE_POLICY_NAMES.len() as u64;
+        if found < expected {
+            return Err(DualPoolError::ConfigError(format!(
+                "Only {found}/{expected} raw-SQL audit row policies exist in ClickHouse (NAN-2001). \
+                 `nanosiem_rawsql_noaudit` is granted SELECT but the RESTRICTIVE \
+                 `source_type != 'audit'` policies are missing — a noaudit raw-SQL caller could read \
+                 audit rows. This means the ClickHouse migrator's `ensure_rawsql_row_policies` step \
+                 has not run against this database (e.g. a version-skew deploy where the app started \
+                 before the current migrator). Run the current ClickHouse migrator, then restart. \
+                 Refusing to boot."
+            )));
+        }
+        Ok(())
     }
 
     /// NAN-1728 (P1): converge `CLICKHOUSE_CLUSTER` with the detected cluster.
@@ -739,6 +1031,22 @@ impl DualPool {
     /// Use this for materialized view creation, schema changes, etc.
     pub fn clickhouse_admin(&self) -> &ClickHouseClient {
         &self.clickhouse_admin
+    }
+
+    /// NAN-2001: audit-capable raw-SQL client (`nanosiem_rawsql`). Read-only,
+    /// SELECT only on the raw-SQL allowlist. Used for `POST /api/search/sql`
+    /// (and dashboards SQL / meloD advanced validation) when the caller HAS
+    /// `audit:view`.
+    pub fn clickhouse_rawsql(&self) -> &ClickHouseClient {
+        &self.clickhouse_rawsql
+    }
+
+    /// NAN-2001: audit-HIDDEN raw-SQL client (`nanosiem_rawsql_noaudit`). Carries
+    /// the RESTRICTIVE `source_type!='audit'` row policy and a narrower grant
+    /// set. Used (fail-closed default) when the caller LACKS `audit:view`, and
+    /// always for reports.
+    pub fn clickhouse_rawsql_noaudit(&self) -> &ClickHouseClient {
+        &self.clickhouse_rawsql_noaudit
     }
 
     /// Whether this ClickHouse deployment has distributed tables (cluster mode).

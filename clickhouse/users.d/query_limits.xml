@@ -296,6 +296,96 @@
             <query_profiler_real_time_period_ns>0</query_profiler_real_time_period_ns>
             <query_profiler_cpu_time_period_ns>0</query_profiler_cpu_time_period_ns>
         </admin>
+
+        <!-- =================================================================
+             RAWSQL PROFILE (NAN-2001)
+             The two raw-SQL feature identities (nanosiem_rawsql /
+             nanosiem_rawsql_noaudit). Read-only, hardened. The GRANT SELECT
+             list (nanosiem-users.xml) is the allowlist; this profile is
+             defense-in-depth against a settings-based bypass.
+
+             readonly=2 (not 1): blocks writes/DDL regardless of grants, yet
+             still lets the app apply its per-query settings via HTTP params
+             (max_execution_time / max_memory_usage / max_threads / priority /
+             queue_max_wait_ms / max_result_rows / max_result_bytes /
+             result_overflow_mode). readonly=1 would reject every one of those
+             unless individually whitelisted — fragile against a client upgrade.
+             The <constraints> below make readonly=2 and the security-relevant
+             settings CONST (a user can't lower readonly or flip a security
+             toggle for its session) and bound the resource maxima. Validated
+             live on CH 26.4.3.37.
+
+             NOTE: `select_from_system_db_requires_grant` is a SERVER-level
+             access_control_improvements setting (not per-profile), so system.*
+             metadata tables (e.g. system.settings) stay readable to a
+             grant-only user — that is why the app-side system/information_schema
+             reject in validate_sql_query is MANDATORY, not optional UX.
+             ================================================================= -->
+        <rawsql>
+            <!-- Security hardening -->
+            <readonly>2</readonly>
+            <allow_ddl>0</allow_ddl>
+            <allow_introspection_functions>0</allow_introspection_functions>
+            <!-- Fail-closed cross-shard: a missing policy/user on a shard must
+                 surface as an error, never a silent partial result (handoff §3.5). -->
+            <skip_unavailable_shards>0</skip_unavailable_shards>
+
+            <!-- Resource limits (defaults; app overrides within the MAX bounds below) -->
+            <max_memory_usage>20000000000</max_memory_usage>
+            <max_memory_usage_for_user>40000000000</max_memory_usage_for_user>
+            <max_execution_time>300</max_execution_time>
+            <max_rows_to_read>1000000000</max_rows_to_read>
+            <max_bytes_to_read>100000000000</max_bytes_to_read>
+            <max_result_rows>1000000</max_result_rows>
+            <max_result_bytes>1000000000</max_result_bytes>
+            <max_threads>16</max_threads>
+            <queue_max_wait_ms>60000</queue_max_wait_ms>
+            <result_overflow_mode>throw</result_overflow_mode>
+
+            <!-- SIEM query optimizations (parity with the default analyst profile
+                 so raw SQL is not slower) -->
+            <optimize_move_to_prewhere>1</optimize_move_to_prewhere>
+            <optimize_read_in_order>1</optimize_read_in_order>
+            <optimize_aggregation_in_order>1</optimize_aggregation_in_order>
+            <use_skip_indexes>1</use_skip_indexes>
+            <use_query_condition_cache>1</use_query_condition_cache>
+            <use_skip_indexes_for_top_k>1</use_skip_indexes_for_top_k>
+            <enable_full_text_index>1</enable_full_text_index>
+
+            <!-- Logging (audit which raw SQL ran) -->
+            <log_queries>1</log_queries>
+            <log_query_threads>0</log_query_threads>
+
+            <!-- Lock the security-relevant settings CONST and bound the resource
+                 maxima. `<readonly/>` inside a constraint means "const /
+                 unchangeable" (ClickHouse's confusingly-named XML form). -->
+            <constraints>
+                <readonly>
+                    <readonly/>
+                </readonly>
+                <allow_ddl>
+                    <readonly/>
+                </allow_ddl>
+                <allow_introspection_functions>
+                    <readonly/>
+                </allow_introspection_functions>
+                <skip_unavailable_shards>
+                    <readonly/>
+                </skip_unavailable_shards>
+                <max_execution_time>
+                    <max>600</max>
+                </max_execution_time>
+                <max_result_rows>
+                    <max>5000000</max>
+                </max_result_rows>
+                <max_threads>
+                    <max>32</max>
+                </max_threads>
+                <max_memory_usage>
+                    <max>40000000000</max>
+                </max_memory_usage>
+            </constraints>
+        </rawsql>
     </profiles>
 
     <!-- =======================================================================

@@ -29,7 +29,9 @@ pub use admission::{
     ClickHouseQuerySettings, QueryPriority,
 };
 pub use config::{SearchBackend, SearchConfig};
-pub use execution::{inject_audit_filter, validate_sql_query};
+// NAN-2001: `inject_audit_filter` retired — the audit gate is enforced by the
+// ClickHouse `nanosiem_rawsql_noaudit` row policy, not by AST rewriting.
+pub use execution::validate_sql_query;
 // NAN-1389: exposed for the lookup pre-check PG integration suite
 pub use processing::validate_lookup_tables;
 pub use jobs::{
@@ -58,7 +60,7 @@ pub use service::cloud_dossier::{
     CloudDossierTimeline, CloudDossierTimelineLane, CloudDossierTimelineMarker,
     CloudDossierUserAgent,
 };
-pub use service::SearchService;
+pub use service::{RawSqlAuditAccess, SearchService};
 pub use streaming::{is_query_streamable, SearchStreamEvent, StreamingChunk};
 pub use types::{
     parse_clickhouse_error, AssetEventFilters, AssetFacets, AssetPagination, CloudEventFilters,

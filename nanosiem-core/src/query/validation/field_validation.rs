@@ -5,7 +5,7 @@
 //! Validates field references in queries, suggests corrections for typos,
 //! and allows ext JSON fields that don't closely match UDM fields.
 
-use crate::query::ast::{Command, Query, RiskScoreExpr, SearchExpr};
+use crate::query::ast::{Command, Query, RexMode, RiskScoreExpr, SearchExpr};
 use crate::udm::fields::UdmField;
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -621,10 +621,36 @@ fn validate_command_fields(
                 }
             }
         }
-        Command::Rex { field, .. } => {
+        Command::Rex {
+            field,
+            pattern,
+            mode,
+        } => {
             if let Some(field_name) = field {
                 if let Err(err) = is_valid_field(field_name, derived, profile) {
                     errors.push(err);
+                }
+            }
+            // NAN-1992: a rex capture-group NAME becomes an output-column alias
+            // in generated SQL (`extractGroups(...)[i] AS <name>`). Regex group
+            // names are extracted as `[^>]+` — unconstrained — so `rex` was the
+            // ONE identifier slot that never reached this format check, letting a
+            // name like `a,version()` (with `/**/` for whitespace) thread through
+            // `escape_identifier` into raw SQL. Validate the names like every
+            // other alias; legitimate group names are always
+            // `[A-Za-z_][A-Za-z0-9_]*`, so this rejects only injection attempts.
+            // The sink itself (`escape_identifier`) is also hardened — this is the
+            // consistent parse-time layer, matching lookup/dedup/bin/etc.
+            if matches!(mode, RexMode::Extract) {
+                for cap in regex::Regex::new(r"\(\?(?:P?<([^>]+)>)")
+                    .unwrap()
+                    .captures_iter(pattern)
+                {
+                    if let Some(name) = cap.get(1) {
+                        if let Err(err) = validate_field_name_format(name.as_str()) {
+                            errors.push(err);
+                        }
+                    }
                 }
             }
         }
@@ -1503,6 +1529,32 @@ mod tests {
         assert!(
             !errors.is_empty(),
             "format-invalid lookup OUTPUT name must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_rex_capture_name_injection_rejected() {
+        // NAN-1992: a rex capture-group name that isn't a plain identifier
+        // (comma/parens — a SQL-injection attempt) is rejected at validation,
+        // aligning rex with every other identifier slot. `escape_identifier`
+        // also neutralizes it at the sink; this is the parse-time defense layer.
+        for q in [
+            r#"* | rex field=message "(?<a,version()/**/v>\w+)""#,
+            r#"* | rex field=message "(?P<a,(SELECT/**/1)/**/x>\w+)""#,
+        ] {
+            let query = parse_query(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+            assert!(
+                !validate_query_fields(&query).is_empty(),
+                "injection rex capture name must be rejected: {q}"
+            );
+        }
+        // Legit capture names (both PCRE forms) still validate cleanly.
+        let query =
+            parse_query(r#"* | rex field=message "(?<user>\w+)@(?P<domain>\w+\.\w+)""#).unwrap();
+        assert_eq!(
+            validate_query_fields(&query).len(),
+            0,
+            "legit rex capture names must not be rejected"
         );
     }
 

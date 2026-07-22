@@ -177,6 +177,7 @@ fn primary_expr(input: &str) -> ParseResult<'_, SearchExpr> {
         in_cidr_filter,
         in_subsearch_filter,
         in_list_filter,
+        regex_match_operator_filter,
         regex_filter,
         wildcard_keyword,
         function_word_comparator_filter,
@@ -343,6 +344,37 @@ fn grouped_expr(input: &str) -> ParseResult<'_, SearchExpr> {
         |e| SearchExpr::Group(Box::new(e)),
     )
     .parse(input)
+}
+
+/// Parse the `=~` / `!~` regex-match operators: `field =~ "pattern"` / `field !~ "pattern"`.
+///
+/// NAN-1993: these are aliases for the `field=/pattern/` regex-match filter — they build the
+/// SAME AST (`Comparator::Regex` / `NotRegex` + `Value::Regex`), so they reuse the identical,
+/// already-safely-escaped (`escape_regex_pattern`) SQL-gen path; no new injection surface. The
+/// RHS is a quoted string treated as an (unanchored) regex, matching `=/pattern/` semantics.
+/// Registered ahead of `regex_filter`/`field_filter`; it fails through cleanly for `=`, `!=`,
+/// and `=/…/` because those don't match the `=~` / `!~` tags.
+fn regex_match_operator_filter(input: &str) -> ParseResult<'_, SearchExpr> {
+    let (input, field) = field_name(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, negated) = alt((value(true, tag("!~")), value(false, tag("=~")))).parse(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, pattern) = quoted_string(input)?;
+
+    let op = if negated {
+        Comparator::NotRegex
+    } else {
+        Comparator::Regex
+    };
+
+    Ok((
+        input,
+        SearchExpr::FieldFilter {
+            field,
+            op,
+            value: Value::Regex(pattern),
+        },
+    ))
 }
 
 /// Parse regex filter: field=/pattern/ or field!=/pattern/

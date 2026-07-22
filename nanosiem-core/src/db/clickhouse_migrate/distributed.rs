@@ -31,6 +31,121 @@ impl ClickHouseMigrator {
         ("logs", "event_type", "LowCardinality(String) ALIAS action"),
     ];
 
+    /// NAN-2001: (re)create the RESTRICTIVE audit row policies for the
+    /// `nanosiem_rawsql_noaudit` identity — the raw-SQL audit boundary. For each
+    /// audit-bearing, policy-coverable table it attaches a PERMISSIVE `USING 1`
+    /// base policy plus a RESTRICTIVE `lower(<col>) != 'audit'` policy (ClickHouse
+    /// ANDs RESTRICTIVE with all access, so a future PERMISSIVE policy on the same
+    /// table can never widen it).
+    ///
+    /// The SELECT grants that form the allowlist live DECLARATIVELY in the user
+    /// config (users.d XML / operator extraUsersConfig / nano-main) — a user
+    /// defined in users.xml cannot receive a SQL `GRANT` (495
+    /// ACCESS_STORAGE_READONLY), but a SQL row policy CAN target it, so only the
+    /// policies are created here.
+    ///
+    /// Topology-aware + drift-proof: the policy attaches to the PHYSICAL,
+    /// data-holding table — `<table>_local` when a Distributed-wrapper split
+    /// exists (detected at runtime via `system.tables`, robust against wrapper-set
+    /// drift between this reconciler and `init-clickhouse-cluster.sh`), else the
+    /// bare name — and fans out `ON CLUSTER` on an operator-managed cluster.
+    /// Attaching to the physical `_local` (never the Distributed wrapper) is what
+    /// makes remote-shard reads honor the policy (handoff §3.5). Idempotent (`OR
+    /// REPLACE`); must run AFTER tables (+ any `_local` split) exist. Requires an
+    /// access-management client (the migrator's `nanosiem_admin`). Returns the
+    /// count of tables a policy pair was applied to.
+    ///
+    /// DEPLOY INVARIANT (security): the app grants `nanosiem_rawsql_noaudit`
+    /// SELECT via declarative config, but AUDIT-HIDING depends on THESE policies.
+    /// The app can't self-verify them at boot (the noaudit user can't read
+    /// `system.row_policies`, and the raw-SQL-serving search service has no
+    /// access-management client), so it trusts this step ran. The migrator is a
+    /// REQUIRED init step ordered before the app in every deploy (compose
+    /// `depends_on`, k8s migrate-job) and fails closed if a policy can't be
+    /// created — so a successful migrator run always leaves the policies in place
+    /// before the app serves raw SQL. On a version-skew upgrade, run the CURRENT
+    /// migrator (with this step) before the upgraded app, or a noaudit caller
+    /// would have grants but no policy → audit leak.
+    pub async fn ensure_rawsql_row_policies(&mut self) -> Result<usize, ClickHouseMigrateError> {
+        // (table, source-identity column). `identity_observations` retains
+        // `source` (renamed from `source_type` by its MV); everything else uses
+        // `source_type`. A copy-pasted column here is a SILENT audit leak, so it
+        // is picked per table, never templated.
+        const RAWSQL_AUDIT_POLICY_TABLES: &[(&str, &str)] = &[
+            ("logs", "source_type"),
+            ("ocsf_logs", "source_type"),
+            ("signals", "source_type"),
+            ("identity_observations", "source"),
+        ];
+
+        let cluster_name = self.detect_cluster().await?;
+        // ON CLUSTER only for an operator-managed explicit cluster. A Replicated
+        // database (cluster == db) auto-propagates access-entity DDL; single-node
+        // has no cluster. Mirrors `ensure_distributed_tables`.
+        let on_cluster = match &cluster_name {
+            Some(c) if c != &self.database => format!(" ON CLUSTER '{}'", c),
+            _ => String::new(),
+        };
+
+        let mut applied = 0usize;
+        for &(table, col) in RAWSQL_AUDIT_POLICY_TABLES {
+            // Resolve the physical table: prefer `<table>_local` when it exists
+            // (Distributed topology), else the bare name (single-node, or an
+            // unwrapped per-shard local table).
+            let local_name = format!("{}_local", table);
+            let local_exists: u64 = self
+                .client
+                .query(&format!(
+                    "SELECT count() FROM system.tables WHERE database = '{}' AND name = '{}'",
+                    self.database, local_name
+                ))
+                .fetch_one()
+                .await
+                .unwrap_or(0);
+            let physical = if local_exists > 0 { local_name.as_str() } else { table };
+
+            let baseline = format!(
+                "CREATE ROW POLICY OR REPLACE rawsql_baseline_{name} ON {db}.{tbl}{oc} \
+                 USING 1 AS PERMISSIVE TO nanosiem_rawsql_noaudit",
+                name = table,
+                db = self.database,
+                tbl = physical,
+                oc = on_cluster,
+            );
+            let hide_audit = format!(
+                "CREATE ROW POLICY OR REPLACE rawsql_hide_audit_{name} ON {db}.{tbl}{oc} \
+                 USING lower({col}) != 'audit' AS RESTRICTIVE TO nanosiem_rawsql_noaudit",
+                name = table,
+                db = self.database,
+                tbl = physical,
+                oc = on_cluster,
+                col = col,
+            );
+
+            for sql in [baseline, hide_audit] {
+                self.client.query(&sql).execute().await.map_err(|e| {
+                    ClickHouseMigrateError::ClickHouse(format!(
+                        "creating raw-SQL audit row policy on {}.{}: {}",
+                        self.database, physical, e
+                    ))
+                })?;
+            }
+            tracing::info!(
+                "NAN-2001: raw-SQL audit row policies ensured on {}.{} (source col '{}'){}",
+                self.database,
+                physical,
+                col,
+                if on_cluster.is_empty() {
+                    ""
+                } else {
+                    " ON CLUSTER"
+                }
+            );
+            applied += 1;
+        }
+        Ok(applied)
+    }
+
     /// Create Distributed table wrappers for cross-shard queries.
     ///
     /// For each data table, creates `{table}_distributed` using Distributed engine.

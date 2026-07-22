@@ -939,27 +939,27 @@ impl ReportService {
             .unwrap_or("piped");
 
         let result = if mode == "sql" {
-            // Bind SQL panels to the report window, then fail-closed strip audit.
+            // Bind SQL panels to the report window. NAN-2001: reports NEVER expose
+            // audit — the SQL arm ALWAYS runs as the audit-hidden identity
+            // (`RawSqlAuditAccess::Hidden`), independent of the owner's audit:view,
+            // so the ClickHouse `source_type!='audit'` row policy strips audit
+            // rows. The retired handler-side inject_audit_filter is gone.
             let expanded = crate::sql_hygiene::expand_sql_time_macros(&query, &start, &end);
-            match crate::search::inject_audit_filter(expanded.trim_end_matches(';')) {
-                Ok(sql) => {
-                    self.search_service
-                        .search_sql(
-                            RawSqlRequest {
-                                sql,
-                                time_range: TimeRangeInput::new(start, end),
-                                limit: Some(REPORT_PANEL_ROW_CAP),
-                                offset: None,
-                            },
-                            // OWNER-SCOPED (NAN-1809): a restricted owner trips
-                            // search_sql's fail-closed guard here, and the
-                            // refusal renders inline as this panel's error.
-                            scope,
-                        )
-                        .await
-                }
-                Err(e) => Err(e),
-            }
+            self.search_service
+                .search_sql(
+                    RawSqlRequest {
+                        sql: expanded.trim_end_matches(';').to_string(),
+                        time_range: TimeRangeInput::new(start, end),
+                        limit: Some(REPORT_PANEL_ROW_CAP),
+                        offset: None,
+                    },
+                    // OWNER-SCOPED (NAN-1809): a restricted owner trips
+                    // search_sql's fail-closed guard here, and the refusal
+                    // renders inline as this panel's error.
+                    scope,
+                    crate::search::RawSqlAuditAccess::Hidden,
+                )
+                .await
         } else {
             match enforce_non_audit_query(&query) {
                 Ok(safe) => {

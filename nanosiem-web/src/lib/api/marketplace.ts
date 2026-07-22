@@ -16,7 +16,7 @@ export interface MarketplaceCatalogEntry {
   slug: string;
   name: string;
   description?: string;
-  category: 'data' | 'agent' | 'identity' | 'security';
+  category: 'data' | 'agent' | 'identity';
   tags: string[];
   icon?: string;
   author?: string;
@@ -62,12 +62,13 @@ export interface MarketplaceCatalogEntry {
  * Whether an entry is a bulk *data* feed (scheduled sync into ClickHouse) vs an
  * on-demand *agent* lookup or identity provider.
  *
- * `category` is a UI grouping, not a functional type: the 'security' category
- * spans both bulk feeds (ThreatFox, Tor exit nodes) and on-demand lookups
- * (urlhaus, shodan, malwarebazaar). Gating sync UI on `category === 'data'`
- * therefore hid the "Sync now" button for the security-tab data feeds
- * (NAN-1585). Mirror the backend's `infer_enrichment_type`: prefer the config
- * markers (`artifact_types` ⇒ agent, `key_field` ⇒ data), fall back to category.
+ * `category` is a coarse UI grouping, not a functional type. Historically the
+ * (now-retired, NAN-1998) 'security' category spanned both bulk feeds (ThreatFox,
+ * Tor exit nodes) and on-demand lookups (urlhaus, shodan, malwarebazaar), so
+ * gating sync UI on `category === 'data'` hid the "Sync now" button for those
+ * data feeds (NAN-1585). Mirror the backend's `infer_enrichment_type`: prefer the
+ * config markers (`artifact_types` ⇒ agent, `key_field` ⇒ data), fall back to
+ * category.
  */
 export function isDataFeed(entry: MarketplaceCatalogEntry): boolean {
   const config = entry.config ?? {};
@@ -110,7 +111,6 @@ export interface CatalogStats {
   data_count: number;
   agent_count: number;
   identity_count: number;
-  security_count: number;
 }
 
 export interface CatalogListResponse {

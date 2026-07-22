@@ -6,7 +6,7 @@ mod syntax_fixes;
 
 use crate::query::{parse_query, Command, Query};
 // NAN-1580 retro-hunt parser tests use these AST types directly.
-use crate::query::{RetroAxis, SearchExpr, Value};
+use crate::query::{Comparator, RetroAxis, SearchExpr, Value};
 
 // === NAN-1580: `ioc` observable term + `retro` command parsing ===
 
@@ -547,4 +547,40 @@ fn test_top_rare_bounds_token_parses_and_defaults_false() {
         }
         other => panic!("Expected Top, got {other:?}"),
     }
+}
+
+// === NAN-1993: `=~` / `!~` regex-match operators (aliases for `=/pattern/`) ===
+
+#[test]
+fn test_parse_regex_match_operators() {
+    // `=~ "pat"` builds the IDENTICAL FieldFilter AST as `=/pat/`, so it reuses the
+    // same safely-escaped SQL-gen path (Comparator::Regex + Value::Regex).
+    match parse_query(r#"user =~ "admin""#).unwrap() {
+        Query::Search(SearchExpr::FieldFilter { field, op, value }) => {
+            assert_eq!(field, "user");
+            assert_eq!(op, Comparator::Regex);
+            assert_eq!(value, Value::Regex("admin".to_string()));
+        }
+        other => panic!("Expected regex FieldFilter, got {other:?}"),
+    }
+    match parse_query(r#"user !~ "admin""#).unwrap() {
+        Query::Search(SearchExpr::FieldFilter { op, .. }) => {
+            assert_eq!(op, Comparator::NotRegex);
+        }
+        other => panic!("Expected negated regex FieldFilter, got {other:?}"),
+    }
+    // Byte-identical AST to the `=/…/` forms — guarantees identical generated SQL.
+    assert_eq!(
+        parse_query(r#"user =~ "admin""#).unwrap(),
+        parse_query("user=/admin/").unwrap()
+    );
+    assert_eq!(
+        parse_query(r#"user !~ "admin""#).unwrap(),
+        parse_query("user!=/admin/").unwrap()
+    );
+    // No-space form and where-clause position both parse; `=` and `!=` still work.
+    assert!(parse_query(r#"user=~"admin""#).is_ok());
+    assert!(parse_query(r#"* | where user =~ "admin""#).is_ok());
+    assert!(parse_query(r#"user="admin""#).is_ok());
+    assert!(parse_query("user=/admin/").is_ok());
 }
