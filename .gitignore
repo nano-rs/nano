@@ -16,10 +16,13 @@ dist/
 *.swp
 *.swo
 .DS_Store
+# Editor local history / SQL-REPL history artifact
+.history
 
 # Claude Code session state
 .claude/worktrees/
 .claude/launch.json
+.claude/scheduled_tasks.lock
 
 # deepsec review tool workspace
 .deepsec/
