@@ -521,7 +521,9 @@ impl TableNames {
 /// granted set (normalized of `_local`/`_distributed` twins) to be a subset of
 /// this. Keep in sync with `clickhouse/users.d/nanosiem-users.xml` and the
 /// per-surface user configs.
-const RAWSQL_ALLOWED_TABLES: &[&str] = &[
+// pub(crate) so the migrator's `ensure_rawsql_users` (NAN-2003) grants the SAME
+// allowlist it would validate here — single source of truth for the two.
+pub(crate) const RAWSQL_ALLOWED_TABLES: &[&str] = &[
     "logs",
     "ocsf_logs",
     "signals",
@@ -546,7 +548,7 @@ const RAWSQL_ALLOWED_TABLES: &[&str] = &[
 /// `cloud_user_activity_agg`, `nat_candidates`) are OMITTED because a row policy
 /// cannot retroactively strip audit contribution baked into their merge states.
 /// Granting any of those to this identity is a boot-failing security drift.
-const RAWSQL_NOAUDIT_ALLOWED_TABLES: &[&str] = &[
+pub(crate) const RAWSQL_NOAUDIT_ALLOWED_TABLES: &[&str] = &[
     "logs",
     "ocsf_logs",
     "signals",

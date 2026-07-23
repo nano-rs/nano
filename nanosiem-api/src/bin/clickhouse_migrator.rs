@@ -231,11 +231,31 @@ async fn run() -> Result<()> {
         );
     }
 
+    // NAN-2003: bootstrap the raw-SQL feature users BEFORE the row policies that
+    // grant TO them. On an existing tenant they were never created (compose
+    // `clickhouse-init.sh` is fresh-only; the k8s bootstrap Job was racy), which
+    // left the policy step below dead on `UNKNOWN_ROLE` and the app fail-closed.
+    // Idempotent: a no-op wherever the users already exist (open-core users.xml,
+    // fresh managed). Runs on every migrate so it self-heals existing tenants.
+    let rawsql_users_created = migrator
+        .ensure_rawsql_users(
+            config.clickhouse_rawsql_password.as_deref(),
+            config.clickhouse_rawsql_noaudit_password.as_deref(),
+        )
+        .await
+        .context("ensuring raw-SQL feature users (NAN-2003)")?;
+    if rawsql_users_created > 0 {
+        tracing::info!(
+            "NAN-2003: bootstrapped {} raw-SQL feature user(s)",
+            rawsql_users_created
+        );
+    }
+
     // NAN-2001: (re)create the raw-SQL audit row policies for
     // `nanosiem_rawsql_noaudit` on the physical (`_local` on clusters) tables.
     // Runs AFTER the distributed split + column reconcile so `_local` tables
-    // exist; the grants that form the allowlist are declarative in the user
-    // config, so only the policies are created here. Idempotent.
+    // exist; the grants that form the allowlist come from users.xml or the
+    // bootstrap step above, so only the policies are created here. Idempotent.
     let policy_count = migrator
         .ensure_rawsql_row_policies()
         .await

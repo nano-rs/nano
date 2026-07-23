@@ -59,6 +59,9 @@ services:
       CLICKHOUSE_DATABASE: nanosiem
       CLICKHOUSE_USER: nanosiem
       CLICKHOUSE_PASSWORD: nanosiem
+      # NAN-2003: migrator bootstraps the raw-SQL feature users when missing.
+      CLICKHOUSE_RAWSQL_PASSWORD: ${CLICKHOUSE_RAWSQL_PASSWORD:-${CLICKHOUSE_PASSWORD:-nanosiem}}
+      CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD: ${CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD:-${CLICKHOUSE_PASSWORD:-nanosiem}}
       CLICKHOUSE_ADMIN_USER: nanosiem_admin
       CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD:-nanosiem_admin_secret}
       CLICKHOUSE_SELF_USER: nanosiem

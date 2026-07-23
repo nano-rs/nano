@@ -38,11 +38,10 @@ impl ClickHouseMigrator {
     /// ANDs RESTRICTIVE with all access, so a future PERMISSIVE policy on the same
     /// table can never widen it).
     ///
-    /// The SELECT grants that form the allowlist live DECLARATIVELY in the user
-    /// config (users.d XML / operator extraUsersConfig / nano-main) — a user
-    /// defined in users.xml cannot receive a SQL `GRANT` (495
-    /// ACCESS_STORAGE_READONLY), but a SQL row policy CAN target it, so only the
-    /// policies are created here.
+    /// The SELECT grants that form the allowlist come from users.d XML or
+    /// [`Self::ensure_rawsql_users`] — a user defined in users.xml cannot receive
+    /// a SQL `GRANT` (495 ACCESS_STORAGE_READONLY), but a SQL row policy CAN
+    /// target it, so only the policies are created here.
     ///
     /// Topology-aware + drift-proof: the policy attaches to the PHYSICAL,
     /// data-holding table — `<table>_local` when a Distributed-wrapper split
@@ -144,6 +143,210 @@ impl ClickHouseMigrator {
             applied += 1;
         }
         Ok(applied)
+    }
+
+    /// NAN-2003: bootstrap the two NAN-2001 raw-SQL feature users
+    /// (`nanosiem_rawsql` / `nanosiem_rawsql_noaudit`) when they don't already
+    /// exist. This is the guarantee that `ensure_rawsql_row_policies` (which
+    /// grants row policies TO `nanosiem_rawsql_noaudit`) and the app tier (which
+    /// authenticates as both) depend on — and it must run BEFORE the policy step.
+    ///
+    /// Why it exists: on an EXISTING tenant the users were never created. The
+    /// compose `clickhouse-init.sh` `CREATE USER`s them only on a *fresh* CH data
+    /// dir; the k8s bootstrap Job was fire-and-forget/non-fatal and raced the
+    /// migrate Job. Either way the migrator's policy step then died on
+    /// `UNKNOWN_ROLE` and the fail-closed app never started. The migrator runs on
+    /// every migrate (before the app in every deploy shape), has the admin
+    /// client, so it is the one place that can repair this uniformly.
+    ///
+    /// Safe across every deploy shape:
+    /// - A user is created + granted ONLY if absent from `system.users`. An
+    ///   already-present user is left completely untouched — open-core users live
+    ///   in `users.xml` storage where a SQL `GRANT` fails `495
+    ///   ACCESS_STORAGE_READONLY`, so their grants MUST stay declarative. We only
+    ///   ever create+grant the SQL-storage users we own.
+    /// - The `rawsql` settings profile is created only when we're about to create
+    ///   a user AND it's absent (so open-core, whose users already exist, never
+    ///   touches profile DDL — no risk of a spurious migrate failure there).
+    /// - Fail-closed: a missing user with no password errors rather than minting a
+    ///   blank-password identity. Compose passes the
+    ///   `${CLICKHOUSE_RAWSQL_PASSWORD:-${CLICKHOUSE_PASSWORD}}` fallback and k8s
+    ///   passes the secret, so a real password is essentially always present.
+    /// - Topology-aware `ON CLUSTER` (same gate as the sibling reconcilers).
+    ///
+    /// Grants mirror the DECLARATIVE allowlists in `dual_pool` (single source of
+    /// truth) so a users.xml user and a migrator-created user carry byte-identical
+    /// privileges. Returns the number of users this call actually created.
+    pub async fn ensure_rawsql_users(
+        &mut self,
+        rawsql_password: Option<&str>,
+        noaudit_password: Option<&str>,
+    ) -> Result<usize, ClickHouseMigrateError> {
+        let cluster_name = self.detect_cluster().await?;
+        // ON CLUSTER only for an operator-managed explicit cluster; a Replicated
+        // database auto-propagates access-entity DDL, single-node has no cluster.
+        let on_cluster = match &cluster_name {
+            Some(c) if c != &self.database => format!(" ON CLUSTER '{}'", c),
+            _ => String::new(),
+        };
+
+        // (user, password, SELECT allowlist) — the allowlists are the single
+        // canonical lists re-used from `dual_pool` so they can never drift.
+        let users: [(&str, Option<&str>, &[&str]); 2] = [
+            (
+                "nanosiem_rawsql",
+                rawsql_password,
+                crate::db::dual_pool::RAWSQL_ALLOWED_TABLES,
+            ),
+            (
+                "nanosiem_rawsql_noaudit",
+                noaudit_password,
+                crate::db::dual_pool::RAWSQL_NOAUDIT_ALLOWED_TABLES,
+            ),
+        ];
+
+        let mut profile_ensured = false;
+        let mut created = 0usize;
+        for (user, password, tables) in users {
+            let exists: u64 = self
+                .client
+                .query(&format!(
+                    "SELECT count() FROM system.users WHERE name = '{}'",
+                    user
+                ))
+                .fetch_one()
+                .await
+                .map_err(|e| {
+                    ClickHouseMigrateError::ClickHouse(format!(
+                        "checking whether raw-SQL user '{}' exists: {}",
+                        user, e
+                    ))
+                })?;
+            if exists > 0 {
+                tracing::info!(
+                    "NAN-2003: raw-SQL user '{}' already present — leaving its \
+                     declaratively-managed grants untouched",
+                    user
+                );
+                continue;
+            }
+
+            let password = password.filter(|p| !p.is_empty()).ok_or_else(|| {
+                ClickHouseMigrateError::ClickHouse(format!(
+                    "raw-SQL user '{}' is missing and no password is set — refusing to \
+                     create a blank-password identity. Set CLICKHOUSE_RAWSQL_PASSWORD / \
+                     CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD (they fall back to \
+                     CLICKHOUSE_PASSWORD in the shipped compose) so the migrator can \
+                     bootstrap it.",
+                    user
+                ))
+            })?;
+
+            // Lazily ensure the `rawsql` profile exists — only when we actually
+            // need to create a user, and only if absent (a check, not a
+            // permission-dependent IF NOT EXISTS), so the open-core path that
+            // skips user creation never runs profile DDL.
+            if !profile_ensured {
+                let profile_exists: u64 = self
+                    .client
+                    .query("SELECT count() FROM system.settings_profiles WHERE name = 'rawsql'")
+                    .fetch_one()
+                    .await
+                    .map_err(|e| {
+                        ClickHouseMigrateError::ClickHouse(format!(
+                            "checking whether raw-SQL settings profile exists: {}",
+                            e
+                        ))
+                    })?;
+                if profile_exists == 0 {
+                    // Byte-identical to the users.xml / clickhouse-init.sh profile:
+                    // readonly=2 lets the app set per-query settings; CONST locks the
+                    // security-relevant ones; MAX bounds cap the rest.
+                    let profile_sql = format!(
+                        "CREATE SETTINGS PROFILE IF NOT EXISTS rawsql{oc} SETTINGS \
+                         readonly = 2 CONST, allow_ddl = 0 CONST, \
+                         allow_introspection_functions = 0 CONST, \
+                         skip_unavailable_shards = 0 CONST, \
+                         max_execution_time = 300 MAX 600, \
+                         max_result_rows = 1000000 MAX 5000000, \
+                         max_threads = 16 MAX 32, \
+                         max_memory_usage = 20000000000 MAX 40000000000",
+                        oc = on_cluster,
+                    );
+                    self.client
+                        .query(&profile_sql)
+                        .execute()
+                        .await
+                        .map_err(|e| {
+                            ClickHouseMigrateError::ClickHouse(format!(
+                                "creating raw-SQL settings profile: {}",
+                                e
+                            ))
+                        })?;
+                }
+                profile_ensured = true;
+            }
+
+            let create_sql = format!(
+                "CREATE USER IF NOT EXISTS {user}{oc} IDENTIFIED BY ? \
+                 SETTINGS PROFILE 'rawsql'",
+                user = user,
+                oc = on_cluster,
+            );
+            self.client
+                .query(&create_sql)
+                .bind(password)
+                .execute()
+                .await
+                .map_err(|e| {
+                    ClickHouseMigrateError::ClickHouse(format!(
+                        "creating raw-SQL user '{}': {}",
+                        user, e
+                    ))
+                })?;
+
+            let grant_prefix = format!("GRANT{}", on_cluster);
+            let mut grant_count = 0usize;
+            for table in tables {
+                // Match the fresh-tenant init job: clustered deployments use
+                // bare Distributed wrappers plus `_local` physical tables and
+                // retain legacy `_distributed` aliases. ClickHouse stores a
+                // grant by object name even before that object exists, so these
+                // three grants are safe on single-node deployments too.
+                let local = format!("{}_local", table);
+                let distributed = format!("{}_distributed", table);
+                for object in [*table, local.as_str(), distributed.as_str()] {
+                    let grant_sql = format!(
+                        "{prefix} SELECT ON {db}.{tbl} TO {user}",
+                        prefix = grant_prefix,
+                        db = self.database,
+                        tbl = object,
+                        user = user,
+                    );
+                    self.client.query(&grant_sql).execute().await.map_err(|e| {
+                        ClickHouseMigrateError::ClickHouse(format!(
+                            "granting SELECT on {}.{} to raw-SQL user '{}': {}",
+                            self.database, object, user, e
+                        ))
+                    })?;
+                    grant_count += 1;
+                }
+            }
+
+            created += 1;
+            tracing::info!(
+                "NAN-2003: created raw-SQL user '{}' with {} SELECT grant(s){}",
+                user,
+                grant_count,
+                if on_cluster.is_empty() {
+                    ""
+                } else {
+                    " ON CLUSTER"
+                }
+            );
+        }
+
+        Ok(created)
     }
 
     /// Create Distributed table wrappers for cross-shard queries.
