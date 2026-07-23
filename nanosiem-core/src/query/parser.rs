@@ -50,6 +50,21 @@ const MAX_NESTING_DEPTH: usize = 50;
 /// via CTE explosion (each pipe generates a SQL CTE stage)
 const MAX_PIPE_COMMANDS: usize = 25;
 
+/// Maximum length of a single operator/term chain — AND/OR boolean chains and
+/// eval arithmetic/logical/comparison chains. Each term becomes one level of a
+/// LEFT-NESTED AST, and many recursive walks (in-memory eval/where evaluation,
+/// `PrettyPrint`, the audit source-scope gate, command extraction) descend that
+/// spine, so an unbounded chain stack-overflows the worker process — an
+/// uncatchable abort. The parser builds these via `many0(...).fold(...)`, which
+/// is iterative and therefore NOT bounded by `MAX_NESTING_DEPTH` (that guard
+/// only covers parenthesis/subsearch recursion). NAN-2010 (D: F13/F14/F30/F31).
+const MAX_CHAIN_LEN: usize = 1024;
+
+/// Absolute raw-query length cap (bytes), enforced before parsing as a cheap DoS
+/// backstop that bounds total work/AST size regardless of shape. Generous — far
+/// above any legitimate query (large IN/IOC lists included). NAN-2010.
+const MAX_QUERY_LEN: usize = 1_048_576;
+
 thread_local! {
     static NESTING_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -78,6 +93,20 @@ impl Drop for NestingGuard {
     fn drop(&mut self) {
         NESTING_DEPTH.with(|d| d.set(d.get() - 1));
     }
+}
+
+/// Reject an over-long operator/term chain (see [`MAX_CHAIN_LEN`]) at parse time,
+/// before the `many0(...).fold(...)` combinators build a deep left-nested AST
+/// that a later recursive walk would stack-overflow on. Returns a nom `Failure`
+/// (halts backtracking) so the query is rejected with a clean parse error.
+fn check_chain_len(input: &str, len: usize) -> Result<(), nom::Err<nom::error::Error<&str>>> {
+    if len > MAX_CHAIN_LEN {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        )));
+    }
+    Ok(())
 }
 
 /// Strip comments from query input
@@ -236,6 +265,26 @@ fn split_time_modifiers(input: &str) -> (String, Vec<String>) {
 pub fn parse_query(input: &str) -> Result<Query, ParseError> {
     // Reset nesting depth counter at the start of each parse
     NESTING_DEPTH.with(|d| d.set(0));
+
+    // NAN-2010: reject an absurdly long query before doing any work — a cheap
+    // DoS backstop that bounds total AST size regardless of shape.
+    if input.len() > MAX_QUERY_LEN {
+        return Err(ParseError {
+            message: format!(
+                "Query too long: {} bytes exceeds limit of {}",
+                input.len(),
+                MAX_QUERY_LEN
+            ),
+            position: 0,
+            line: 1,
+            column: 1,
+            token: None,
+            context_before: None,
+            expected: vec![],
+            suggestions: vec![],
+            full_query: None,
+        });
+    }
 
     // Strip comments before parsing
     // Handle // single-line comments and /* */ block comments

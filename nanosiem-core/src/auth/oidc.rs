@@ -230,7 +230,6 @@ pub struct OidcService {
     oidc_repo: OidcRepository,
     user_repo: UserRepository,
     group_repo: GroupRepository,
-    http_client: Client,
     /// Cache for discovery documents
     discovery_cache: std::sync::Arc<tokio::sync::RwLock<HashMap<String, OidcDiscovery>>>,
     /// Cache for JWKS
@@ -247,14 +246,9 @@ impl OidcService {
             oidc_repo,
             user_repo,
             group_repo,
-            // SSRF (NAN-1369): discovery/JWKS URLs are validated with
-            // validate_with_dns, but the fetch must not follow a 302 to a
-            // private/metadata IP. Use the shared restricted redirect policy
-            // (allows legitimate hostname redirects, blocks IP-literal/non-https).
-            http_client: Client::builder()
-                .redirect(crate::inputlookup::restricted_redirect_policy())
-                .build()
-                .unwrap_or_default(),
+            // SSRF (NAN-1369 / NAN-2018): discovery & JWKS fetches build a
+            // per-request client PINNED to the SSRF-validated IP (see
+            // fetch_discovery / fetch_jwks), so no shared http_client is kept.
             discovery_cache: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             jwks_cache: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }
@@ -270,22 +264,26 @@ impl OidcService {
             }
         }
 
-        // H4: Validate issuer URL against SSRF before fetching
-        let ssrf_validator = crate::inputlookup::SsrfValidator::default_secure();
-        ssrf_validator
-            .validate_with_dns(issuer)
-            .await
-            .map_err(|e| {
-                OidcError::DiscoveryError(format!("Issuer URL blocked by security policy: {}", e))
-            })?;
-
         // Fetch from well-known endpoint
         let discovery_url = format!(
             "{}/.well-known/openid-configuration",
             issuer.trim_end_matches('/')
         );
 
-        let response = self.http_client.get(&discovery_url).send().await?;
+        // H4 + NAN-2018: SSRF-validate AND pin — build a client that dials only
+        // the validated IP for this fetch, closing the DNS-rebinding TOCTOU.
+        // Redirects keep the restricted policy (blocks IP-literal / non-https).
+        let (client, _) = crate::inputlookup::SsrfValidator::default_secure()
+            .build_pinned_client(
+                &discovery_url,
+                Client::builder().redirect(crate::inputlookup::restricted_redirect_policy()),
+            )
+            .await
+            .map_err(|e| {
+                OidcError::DiscoveryError(format!("Issuer URL blocked by security policy: {}", e))
+            })?;
+
+        let response = client.get(&discovery_url).send().await?;
 
         if !response.status().is_success() {
             return Err(OidcError::DiscoveryError(format!(
@@ -317,16 +315,18 @@ impl OidcService {
             }
         }
 
-        // H4: Validate JWKS URI against SSRF
-        let ssrf_validator = crate::inputlookup::SsrfValidator::default_secure();
-        ssrf_validator
-            .validate_with_dns(jwks_uri)
+        // H4 + NAN-2018: SSRF-validate AND pin the JWKS fetch to the validated IP.
+        let (client, _) = crate::inputlookup::SsrfValidator::default_secure()
+            .build_pinned_client(
+                jwks_uri,
+                Client::builder().redirect(crate::inputlookup::restricted_redirect_policy()),
+            )
             .await
             .map_err(|e| {
                 OidcError::JwksError(format!("JWKS URL blocked by security policy: {}", e))
             })?;
 
-        let response = self.http_client.get(jwks_uri).send().await?;
+        let response = client.get(jwks_uri).send().await?;
 
         if !response.status().is_success() {
             return Err(OidcError::JwksError(format!(
@@ -546,8 +546,23 @@ impl OidcService {
             ("code_verifier", code_verifier),
         ];
 
-        let response = self
-            .http_client
+        // NAN-2018: validate AND pin the token endpoint (from the provider's
+        // discovery doc) before posting the code + client_secret, so a DNS rebind
+        // can't redirect the secret to an internal/metadata host.
+        let (client, _) = crate::inputlookup::SsrfValidator::default_secure()
+            .build_pinned_client(
+                token_endpoint,
+                Client::builder().redirect(crate::inputlookup::restricted_redirect_policy()),
+            )
+            .await
+            .map_err(|e| {
+                OidcError::TokenExchangeError(format!(
+                    "Token endpoint blocked by security policy: {}",
+                    e
+                ))
+            })?;
+
+        let response = client
             .post(token_endpoint)
             .form(&params)
             .send()

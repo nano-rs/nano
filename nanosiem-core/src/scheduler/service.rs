@@ -335,22 +335,21 @@ impl SchedulerService {
     ) -> Result<(usize, usize), SchedulerError> {
         info!(job_id = %job.id, url = %job.url, "Fetching data from URL");
 
-        // Validate URL against SSRF attacks (blocks private IPs, localhost, metadata endpoints).
-        // allow_http for internal/legacy feeds; private/metadata ranges stay blocked.
-        SsrfValidator::http_allowed_validator()
-            .validate_with_dns(&job.url)
+        // NAN-2018: SSRF-validate AND resolve, then PIN the client to the
+        // validated IP so a DNS rebind between check and connect can't reach an
+        // internal/metadata address. Redirects now use the shared restricted
+        // policy (previously the default policy blindly followed redirects,
+        // including to IP literals). allow_http for internal/legacy feeds;
+        // private/metadata ranges stay blocked.
+        let builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(SCHEDULER_FETCH_TIMEOUT_SECS))
+            .redirect(crate::inputlookup::restricted_redirect_policy());
+        let (client, url) = SsrfValidator::http_allowed_validator()
+            .build_pinned_client(&job.url, builder)
             .await
             .map_err(|e| SchedulerError::SsrfBlocked(e.to_string()))?;
 
-        // Build HTTP client with timeout
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(SCHEDULER_FETCH_TIMEOUT_SECS))
-            .build()
-            .map_err(|e| {
-                SchedulerError::FetchError(format!("Failed to create HTTP client: {}", e))
-            })?;
-
-        let mut request = client.get(&job.url);
+        let mut request = client.get(url);
 
         // Add authentication headers if provided
         if let Some(ref headers) = job.auth_headers {

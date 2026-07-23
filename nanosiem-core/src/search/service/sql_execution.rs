@@ -288,7 +288,7 @@ impl SearchService {
             ..Default::default()
         };
         let mut sql = self
-            .dataset_generator(dataset, query)
+            .dataset_generator(dataset, query, scope.deny_set())
             .await
             .generate_with_options(&query_for_sql, &tr, &options)
             .map_err(|e| SearchError::SqlGenError(e.to_string()))?;

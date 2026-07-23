@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 
 use super::*;
-use crate::query::parse_query;
+use crate::query::{parse_query, PrettyPrint};
 
 // ---------------------------------------------------------------------------
 // Scope-gate oracle (NAN-1794 audit gate, generalized for NAN-1799 deny sets)
@@ -598,6 +598,98 @@ fn test_scope_gate_multi_member_renders_sorted_not_in() {
         out.contains(r#"source_type NOT IN ("audit", "insider")"#),
         "multi-member gate must render sorted NOT IN: {out}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// NAN-2006: pretty_print -> re-parse round-trip authorization bypass
+// (Cluster A — F1, F2, F4, F5, F6, F7, F9)
+// ---------------------------------------------------------------------------
+
+/// For any attacker-crafted query the enforcement path has only two acceptable
+/// outcomes: the mandatory exclusion survives on EVERY scan, or the query is
+/// refused (fail-closed). It must NEVER return an `Ok` string that re-parses
+/// with a scan the exclusion no longer covers. Cross-checked with the
+/// independent `assert_scope_gate_on_every_scan` oracle (not the production
+/// verifier), so it genuinely validates the fix rather than restating it.
+fn assert_no_scope_leak(payload: &str, deny_set: &BTreeSet<String>) {
+    match enforce_source_scope(payload, deny_set) {
+        Ok(enforced) => {
+            let reparsed = parse_query(&enforced).unwrap_or_else(|e| {
+                panic!("enforced query claimed OK but does not re-parse: {enforced} -> {e:?}")
+            });
+            assert_scope_gate_on_every_scan(&reparsed, deny_set, payload);
+        }
+        // Fail-closed refusal is a safe outcome: no query runs, nothing leaks.
+        Err(_) => {}
+    }
+}
+
+/// Every F1–F9 breakout payload — a crafted keyword / quoted field name / rex
+/// pattern / where-clause that historically re-parsed `source_type=audit` (or an
+/// ungated `| append` subsearch) into a position the injected exclusion no
+/// longer covered — must be unable to read denied sources, under BOTH the audit
+/// deny set and multi-source RBAC deny sets.
+#[test]
+fn test_nan2006_breakout_payloads_cannot_leak_denied_sources() {
+    let payloads = [
+        // F1 / F7: single-quoted keyword, quote+paren breakout to a top-level OR arm.
+        r#"'x") OR source_type=audit OR ("y'"#,
+        // F2: keyword with zero-space `||` OR breakout.
+        r#"'x)||source_type=audit||(y'"#,
+        // F7: quoted keyword that re-tokenizes into `(*)||(*)`.
+        r#""*)||(*""#,
+        // F4: quoted-string field name carrying a full OR breakout.
+        r#"'src_ip=1) OR source_type=audit OR (user'=1"#,
+        // F5 / F9: rex pattern that closes its quote and injects an ungated append.
+        r#"error | rex field=message 'x" | append [ source_type="audit" ] | eval k="z'"#,
+        // F6: where-clause keyword injecting an ungated append.
+        r#"error | where 'x" | append [ source_type="audit" ] | eval k="z'"#,
+        // F9 variant: rex with a bracketed append subsearch.
+        r#"error | rex field=message '(?<x>.)" | append [search source_type="audit"] junk="'"#,
+    ];
+    for payload in payloads {
+        assert_no_scope_leak(payload, &deny(&["audit"]));
+        assert_no_scope_leak(payload, &deny(&["audit", "insider"]));
+        assert_no_scope_leak(payload, &deny(&["hr_edr", "windows_dns"]));
+    }
+}
+
+/// The serialization hardening must not over-reject: legitimate queries whose
+/// values / patterns contain characters that are INERT inside a double-quoted
+/// literal (`|`, `\`, `'`, parens) still run, gated, rather than being refused.
+#[test]
+fn test_nan2006_benign_special_chars_still_run_gated() {
+    let deny_set = deny(&["audit"]);
+    for npl in [
+        r#"command_line="a|b|c""#,
+        r#"file_path="C:\Windows\System32""#,
+        r#"user="O'Connor""#,
+        r#"error | rex field=message "(foo|bar)baz""#,
+        r#"error | eval msg="a|b" | stats count"#,
+    ] {
+        assert_npl_is_scope_gated(npl, &deny_set);
+    }
+}
+
+/// AC3 (NAN-2006): for adversarial inputs, the exact round-trip every handler
+/// performs — `parse(pretty_print(inject(parse(x))))` — still carries the
+/// top-level source_type guard on every scan.
+#[test]
+fn test_nan2006_round_trip_preserves_top_level_guard() {
+    let deny_set = deny(&["audit"]);
+    for payload in [
+        r#"'x") OR source_type=audit OR ("y'"#,
+        r#"error | rex field=message 'a" | append [ source_type="audit" ]'"#,
+    ] {
+        let parsed = match parse_query(payload) {
+            Ok(p) => p,
+            Err(_) => continue, // unparseable input is refused upstream
+        };
+        let printed = inject_source_type_exclusion_recursive(&parsed, &deny_set).pretty_print();
+        let reparsed = parse_query(&printed)
+            .unwrap_or_else(|e| panic!("pretty_print output must re-parse: {printed} -> {e:?}"));
+        assert_scope_gate_on_every_scan(&reparsed, &deny_set, payload);
+    }
 }
 
 /// `{"audit"}` exactly must be byte-identical to the legacy audit gate — every

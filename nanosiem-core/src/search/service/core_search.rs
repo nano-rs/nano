@@ -820,6 +820,38 @@ impl SearchService {
 
         let time_range = TimeRange::new(adjusted_time_range.start, adjusted_time_range.end);
 
+        // NAN-2022: asset/cloud/baseline cap their search window (heavy per-window
+        // aggregation). Rather than hard-reject an over-wide range with a 400 mid-hunt,
+        // clamp end-anchored to the cap (keep the most recent slice) and surface a
+        // warning naming the window actually analyzed. The clamped range flows into the
+        // initial fetch and the view builders below, so their internal caps never trip.
+        // The explain path is untouched (no execution guard there); non-capped queries
+        // fall through byte-identically.
+        let (time_range, window_clamp_warning) = if is_asset_query {
+            super::window_clamp::clamp_with_warning(
+                &time_range,
+                chrono::Duration::hours(Self::MAX_ASSET_VIEW_HOURS),
+                "asset",
+                &format!("{}h", Self::MAX_ASSET_VIEW_HOURS),
+            )
+        } else if is_cloud_query {
+            super::window_clamp::clamp_with_warning(
+                &time_range,
+                chrono::Duration::hours(Self::MAX_CLOUD_VIEW_HOURS),
+                "cloud",
+                &format!("{}h", Self::MAX_CLOUD_VIEW_HOURS),
+            )
+        } else if is_baseline_query {
+            super::window_clamp::clamp_with_warning(
+                &time_range,
+                chrono::Duration::days(super::baseline::MAX_BASELINE_CURRENT_DAYS),
+                "baseline",
+                &format!("{}d", super::baseline::MAX_BASELINE_CURRENT_DAYS),
+            )
+        } else {
+            (time_range, None)
+        };
+
         // Fast path: if this is an asset query and the identifier is directly in the search
         // expression (e.g. `src_host="workstation03" | asset`), skip the initial SQL query
         // entirely and call build_asset_view directly with the pre-extracted identifier.
@@ -848,7 +880,8 @@ impl SearchService {
                     fields: Vec::new(),
                     generated_sql: None,
                     histogram: None,
-                    warnings: None,
+                    // NAN-2022: surface the window-clamp warning on the asset fast path too.
+                    warnings: window_clamp_warning.map(|w| vec![w]),
                     cost_score: None,
                     display_type: Some(display_type),
                     column_order,
@@ -965,6 +998,12 @@ impl SearchService {
             let mut ch_gen = self
                 .ch_sql_generator
                 .clone()
+                // NAN-2009 (F20/F21): resolve_identity's ASOF join to
+                // identity_observations is a SEPARATE dataset the nPL-text gate
+                // (enforce_source_scope) does not cover. Carry the caller's
+                // source-scope deny-set so generate_resolve_identity_sql filters
+                // the join's build side. Empty deny-set = byte-identical SQL.
+                .with_source_scope_deny(scope.deny_set().clone())
                 .with_max_group_array_size(query_limits.max_group_array_size as usize)
                 .with_max_mvexpand_rows(query_limits.max_mvexpand_rows as usize);
             // NAN-1798 P2: attach the resolved risk config BEFORE any dataset
@@ -1649,11 +1688,18 @@ impl SearchService {
             }
         }
 
-        let (warnings, cost_score) = if all_warnings.is_empty() {
+        let (mut warnings, cost_score) = if all_warnings.is_empty() {
             (None, None)
         } else {
             (Some(all_warnings), Some(cost_analysis.estimated_cost))
         };
+
+        // NAN-2022: attach the window-clamp warning (if the range was clamped). Kept
+        // separate from the tuple above so it never spuriously sets `cost_score`, which
+        // reflects cost analysis only.
+        if let Some(w) = window_clamp_warning {
+            warnings.get_or_insert_with(Vec::new).push(w);
+        }
 
         let execution_time_ms = start_time.elapsed().as_millis() as u64;
 

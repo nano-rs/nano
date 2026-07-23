@@ -209,13 +209,22 @@ impl PrettyPrint for Command {
                 if let Some(f) = field {
                     result.push_str(&format!(" field={}", f));
                 }
-                result.push_str(&format!(" \"{}\"", pattern));
+                // NAN-2006 (F5/F9): the rex pattern is re-emitted inside `"…"`
+                // and re-parsed downstream. Strip the breakout `"`/newlines
+                // (keeping regex `|`/parens, which are inert inside the quotes)
+                // so a pattern like `x" | append [ source_type="audit" ]` cannot
+                // close the string and inject an ungated subsearch.
+                result.push_str(&format!(" \"{}\"", super::helpers::npl_quoted_body(pattern)));
                 if let RexMode::Sed {
                     pattern: sed_pat,
                     replacement,
                 } = mode
                 {
-                    result.push_str(&format!(" mode=sed \"s/{}/{}/\"", sed_pat, replacement));
+                    result.push_str(&format!(
+                        " mode=sed \"s/{}/{}/\"",
+                        super::helpers::npl_quoted_body(sed_pat),
+                        super::helpers::npl_quoted_body(replacement)
+                    ));
                 }
                 result
             }

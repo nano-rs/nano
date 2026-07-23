@@ -13,9 +13,7 @@ use crate::identity::types::{
     ConnectionTestResult, DeltaSyncResult, GoogleWorkspaceCredentials,
 };
 
-pub struct GoogleWorkspaceSync {
-    client: reqwest::Client,
-}
+pub struct GoogleWorkspaceSync;
 
 /// NAN-1196: percent-encode a credential-supplied value before interpolating it
 /// into a Google Directory API query string, so it cannot inject additional
@@ -26,13 +24,7 @@ fn enc(s: &str) -> String {
 
 impl GoogleWorkspaceSync {
     pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .redirect(super::restricted_redirect_policy())
-                .build()
-                .unwrap_or_default(),
-        }
+        Self
     }
 
     /// Obtain an access token using JWT service account authentication.
@@ -85,9 +77,10 @@ impl GoogleWorkspaceSync {
             .map_err(|e| SyncError::InvalidCredentials(format!("JWT signing failed: {}", e)))?;
 
         // Exchange JWT for access token
-        let resp = self
-            .client
-            .post(token_uri)
+        let (client, dial_url) =
+            super::guarded_client(token_uri, std::time::Duration::from_secs(30)).await?;
+        let resp = client
+            .post(dial_url)
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
                 ("assertion", &jwt),
@@ -130,9 +123,10 @@ impl GoogleWorkspaceSync {
             url.push_str(&format!("&pageToken={}", pt));
         }
 
-        let resp = self
-            .client
-            .get(&url)
+        let (client, url) =
+            super::guarded_client(&url, std::time::Duration::from_secs(30)).await?;
+        let resp = client
+            .get(url)
             .bearer_auth(token)
             .send()
             .await
@@ -284,9 +278,10 @@ impl SyncProvider for GoogleWorkspaceSync {
                 url.push_str(&format!("&pageToken={}", token));
             }
 
-            let resp = self
-                .client
-                .get(&url)
+            let (client, url) =
+                super::guarded_client(&url, std::time::Duration::from_secs(30)).await?;
+            let resp = client
+                .get(url)
                 .bearer_auth(&token)
                 .send()
                 .await
@@ -348,12 +343,16 @@ impl SyncProvider for GoogleWorkspaceSync {
         };
 
         // Try listing 1 user
-        let resp = self
-            .client
-            .get(format!(
+        let (client, url) = super::guarded_client(
+            &format!(
                 "https://admin.googleapis.com/admin/directory/v1/users?customer=my_customer&domain={}&maxResults=1",
                 enc(&creds.domain)
-            ))
+            ),
+            std::time::Duration::from_secs(30),
+        )
+        .await?;
+        let resp = client
+            .get(url)
             .bearer_auth(&token)
             .send()
             .await

@@ -415,6 +415,13 @@ impl ClickHouseSqlGenerator {
                                 // Hop window - overlapping windows that advance by a fixed interval
                                 // Each event belongs to multiple windows: span/advance windows
                                 let advance_seconds = advance.as_secs();
+                                // NAN-2010 (F22): a zero hop (`bin ... hop=0s`) would
+                                // divide-by-zero panic the codegen below. Reject cleanly.
+                                if advance_seconds == 0 {
+                                    return Err(SqlGenError::InvalidQuery(
+                                        "bin hop must be greater than 0".into(),
+                                    ));
+                                }
                                 let num_windows = (span_seconds / advance_seconds) as i64;
 
                                 // Generate array of window offsets: [0, -advance, -2*advance, ...]

@@ -264,7 +264,11 @@ impl ClickHouseExecutor {
         fields: &[String],
         row_cap: Option<usize>,
     ) -> String {
-        let base_upper = base_sql.to_uppercase();
+        // NAN-2010 (F26/F27): ASCII-fold (length-preserving) so byte offsets
+        // found here stay valid for slicing `base_sql`. `to_uppercase()` is NOT
+        // length-preserving (ligatures contract, ß expands), so a multibyte user
+        // value in the query shifted the offset off a char boundary and panicked.
+        let base_upper = base_sql.to_ascii_uppercase();
         let settings_pos = base_upper.find(" SETTINGS ").unwrap_or(base_sql.len());
 
         // Build SELECT with topK/uniq for each field (shared by both paths).
@@ -621,7 +625,11 @@ impl ClickHouseExecutor {
     /// `ext.trafficbytes_out` and `activity` to `ext.activity` (NAN-1241).
     pub fn build_field_values_sql(&self, base_sql: &str, field_expr: &str, limit: usize) -> String {
         // Strip trailing ORDER BY and SETTINGS from the base SQL
-        let base_upper = base_sql.to_uppercase();
+        // NAN-2010 (F26/F27): ASCII-fold (length-preserving) so byte offsets
+        // found here stay valid for slicing `base_sql`. `to_uppercase()` is NOT
+        // length-preserving (ligatures contract, ß expands), so a multibyte user
+        // value in the query shifted the offset off a char boundary and panicked.
+        let base_upper = base_sql.to_ascii_uppercase();
         let order_pos = base_upper.rfind(" ORDER BY ").unwrap_or(base_sql.len());
         let settings_pos = base_upper.rfind(" SETTINGS ").unwrap_or(base_sql.len());
         let end_pos = order_pos.min(settings_pos);
@@ -631,7 +639,7 @@ impl ClickHouseExecutor {
         // Replace the final top-level SELECT with our field-values aggregation.
         if base_no_order
             .trim_start()
-            .to_uppercase()
+            .to_ascii_uppercase()
             .starts_with("WITH ")
         {
             // Find the last SELECT at parenthesis depth 0
@@ -655,7 +663,7 @@ impl ClickHouseExecutor {
                 let cte_part = &base_no_order[..pos];
                 let final_select = &base_no_order[pos..];
                 // Extract the FROM source (stage name) from the final SELECT
-                if let Some(from_idx) = final_select.to_uppercase().find(" FROM ") {
+                if let Some(from_idx) = final_select.to_ascii_uppercase().find(" FROM ") {
                     let after_from = &final_select[from_idx + 6..];
                     let source = after_from.split_whitespace().next().unwrap_or("stage_0");
                     return format!(

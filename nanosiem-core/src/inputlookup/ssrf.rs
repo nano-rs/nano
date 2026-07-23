@@ -56,6 +56,9 @@ pub enum SsrfError {
 
     #[error("Redirect to blocked destination: {0}")]
     BlockedRedirect(String),
+
+    #[error("Failed to build outbound HTTP client: {0}")]
+    ClientBuildFailed(String),
 }
 
 /// An IPv4/IPv6 CIDR block used for the SSRF egress allowlist. Parsed from
@@ -273,6 +276,25 @@ impl SsrfValidator {
 
         // Step 4: hand back the parsed URL + validated, pinnable addresses.
         Ok((url, addrs))
+    }
+
+    /// One-call form of [`validate_and_resolve`](Self::validate_and_resolve) +
+    /// [`pin_resolved_addrs`]: SSRF-validate `url`, then build `builder` into a
+    /// client PINNED to the validated resolved addresses (NAN-2018), returning
+    /// the client and the parsed URL. The caller configures `builder`
+    /// (timeout / redirect policy / TLS) and sets any auth headers per-request.
+    /// Use this for per-request fetchers; long-lived clients over a stable host
+    /// can pin once at construction via `pin_resolved_addrs` directly.
+    pub async fn build_pinned_client(
+        &self,
+        url: &str,
+        builder: reqwest::ClientBuilder,
+    ) -> Result<(reqwest::Client, Url), SsrfError> {
+        let (validated, addrs) = self.validate_and_resolve(url).await?;
+        let client = pin_resolved_addrs(builder, &validated, &addrs)?
+            .build()
+            .map_err(|e| SsrfError::ClientBuildFailed(e.to_string()))?;
+        Ok((client, validated))
     }
 
     /// Validate a URL string before fetching
@@ -653,6 +675,32 @@ pub fn restricted_redirect_policy() -> reqwest::redirect::Policy {
         }
         attempt.follow()
     })
+}
+
+/// Pin an outbound `reqwest` client builder to the SSRF-validated `addrs` for
+/// `validated`'s host, closing the DNS-rebinding TOCTOU (NAN-2018): the built
+/// client dials ONLY these pre-validated addresses instead of re-resolving the
+/// hostname at connect time. The hostname is still used for TLS SNI and the
+/// `Host` header. An empty `addrs` — an IP-literal host, already validated — is
+/// a no-op: reqwest dials the literal directly with no rebinding window.
+///
+/// Pair with [`SsrfValidator::validate_and_resolve`] (or use the one-call
+/// [`SsrfValidator::build_pinned_client`]):
+/// ```ignore
+/// let (url, addrs) = validator.validate_and_resolve(raw).await?;
+/// let client = pin_resolved_addrs(reqwest::Client::builder().timeout(t), &url, &addrs)?
+///     .build()?;
+/// ```
+pub fn pin_resolved_addrs(
+    builder: reqwest::ClientBuilder,
+    validated: &Url,
+    addrs: &[SocketAddr],
+) -> Result<reqwest::ClientBuilder, SsrfError> {
+    if addrs.is_empty() {
+        return Ok(builder);
+    }
+    let host = validated.host_str().ok_or(SsrfError::MissingHostname)?;
+    Ok(builder.resolve_to_addrs(host, addrs))
 }
 
 #[cfg(test)]
@@ -1225,5 +1273,39 @@ mod tests {
         let v = SsrfValidator::http_allowed_validator();
         assert!(v.validate_ip_address(ip("10.1.2.3")).is_err());
         assert!(v.validate_ip_address(ip("192.168.1.1")).is_err());
+    }
+
+    // NAN-2018: shared IP-pinning helper.
+
+    #[test]
+    fn pin_resolved_addrs_empty_is_noop_and_builds() {
+        // IP-literal host path: no addrs to pin, builder must still build.
+        let url = Url::parse("https://93.184.216.34/").unwrap();
+        let builder = pin_resolved_addrs(reqwest::Client::builder(), &url, &[]).unwrap();
+        assert!(builder.build().is_ok());
+    }
+
+    #[test]
+    fn pin_resolved_addrs_with_addrs_builds_pinned_client() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let url = Url::parse("https://example.com/").unwrap();
+        let addrs = [SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443)];
+        let builder = pin_resolved_addrs(reqwest::Client::builder(), &url, &addrs).unwrap();
+        assert!(builder.build().is_ok());
+    }
+
+    #[tokio::test]
+    async fn build_pinned_client_rejects_blocked_ip_literal() {
+        // The validate step inside build_pinned_client must reject a blocked
+        // literal before any client is built (no DNS needed).
+        let v = validator();
+        assert!(v
+            .build_pinned_client("https://169.254.169.254/", reqwest::Client::builder())
+            .await
+            .is_err());
+        assert!(v
+            .build_pinned_client("https://127.0.0.1/", reqwest::Client::builder())
+            .await
+            .is_err());
     }
 }

@@ -21,6 +21,26 @@ use super::types::{SearchRequest, SearchResponse};
 /// Maximum number of concurrent jobs
 const MAX_JOBS: usize = 1000;
 
+/// Truncate a stored query for a job-list preview WITHOUT panicking on a
+/// non-char-boundary byte offset.
+///
+/// NAN-2010 (F12/F15/F16/F17/F25): the client query is stored verbatim (before
+/// any parse), and the previews sliced it with `&query[..97]` guarded only by a
+/// byte-length check. A multibyte UTF-8 character straddling byte 97 made the
+/// slice panic — and because `list_all` enumerates every user's jobs, an
+/// unprivileged user's crafted query persistently broke `/api/search/admin/jobs`
+/// for admins (cross-user DoS). Cut at the largest char boundary at or below 97.
+fn truncate_query_preview(query: &str) -> String {
+    if query.len() <= 100 {
+        return query.to_string();
+    }
+    let mut end = 97;
+    while end > 0 && !query.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &query[..end])
+}
+
 /// TTL for completed/failed jobs (5 minutes)
 const COMPLETED_JOB_TTL: Duration = Duration::from_secs(300);
 
@@ -499,11 +519,7 @@ impl SearchJobStore for InMemoryJobStore {
             .filter(|r| r.value().user_id == Some(user_id))
             .map(|r| {
                 let job = r.value();
-                let query = if job.request.query.len() > 100 {
-                    format!("{}...", &job.request.query[..97])
-                } else {
-                    job.request.query.clone()
-                };
+                let query = truncate_query_preview(&job.request.query);
                 SearchJobSummary {
                     job_id: job.id.clone(),
                     status: job.status.clone(),
@@ -522,11 +538,7 @@ impl SearchJobStore for InMemoryJobStore {
             .iter()
             .map(|r| {
                 let job = r.value();
-                let query = if job.request.query.len() > 100 {
-                    format!("{}...", &job.request.query[..97])
-                } else {
-                    job.request.query.clone()
-                };
+                let query = truncate_query_preview(&job.request.query);
                 AdminSearchJobSummary {
                     job_id: job.id.clone(),
                     status: job.status.clone(),
@@ -1085,11 +1097,7 @@ impl SearchJobStore for RedisJobStore {
         let mut summaries = Vec::new();
         for jid in job_ids {
             if let Some(job) = self.get(&jid).await {
-                let query = if job.request.query.len() > 100 {
-                    format!("{}...", &job.request.query[..97])
-                } else {
-                    job.request.query.clone()
-                };
+                let query = truncate_query_preview(&job.request.query);
                 let created_at_ms = job.created_at_ms();
                 let elapsed_ms = job.elapsed_ms();
                 summaries.push(SearchJobSummary {
@@ -1125,11 +1133,7 @@ impl SearchJobStore for RedisJobStore {
         let mut summaries = Vec::new();
         for jid in job_ids {
             if let Some(job) = self.get(&jid).await {
-                let query = if job.request.query.len() > 100 {
-                    format!("{}...", &job.request.query[..97])
-                } else {
-                    job.request.query.clone()
-                };
+                let query = truncate_query_preview(&job.request.query);
                 let created_at_ms = job.created_at_ms();
                 let elapsed_ms = job.elapsed_ms();
                 summaries.push(AdminSearchJobSummary {
@@ -1177,6 +1181,27 @@ impl SearchJobStore for RedisJobStore {
 mod tests {
     use super::*;
     use crate::search::types::TimeRangeInput;
+
+    /// NAN-2010 (F12/F15/F16/F17/F25): the job-list preview must not panic when
+    /// the stored query has a multibyte character straddling the truncation
+    /// offset. Before the fix `&query[..97]` panicked, breaking the admin
+    /// all-jobs endpoint for every admin (cross-user DoS).
+    #[test]
+    fn truncate_query_preview_never_panics_on_multibyte_boundary() {
+        // 95 ASCII + two 3-byte chars => byte 97 lands inside the first '€'.
+        let q = format!("{}€€", "a".repeat(95));
+        assert!(q.len() > 100 && !q.is_char_boundary(97));
+        let preview = truncate_query_preview(&q);
+        assert!(preview.ends_with("..."));
+        assert!(preview.len() <= 100 + 3);
+
+        // A 4-byte emoji straddling the offset must also be safe.
+        let q2 = format!("{}😀ok", "b".repeat(96));
+        let _ = truncate_query_preview(&q2); // must not panic
+
+        // Short queries are returned verbatim.
+        assert_eq!(truncate_query_preview("short"), "short");
+    }
 
     fn make_test_request() -> SearchRequest {
         SearchRequest {

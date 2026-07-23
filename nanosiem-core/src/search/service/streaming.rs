@@ -207,6 +207,7 @@ impl SearchService {
                 start_time,
                 display_type,
                 column_order,
+                scope,
             )
             .await;
         } else {
@@ -343,6 +344,7 @@ impl SearchService {
         start_time: Instant,
         display_type: DisplayType,
         column_order: Option<Vec<String>>,
+        scope: &ScopeSet,
     ) {
         use crate::query::QueryOptions;
         use crate::search::streaming::{compute_daily_chunks, SearchStreamEvent, StreamingChunk};
@@ -399,7 +401,14 @@ impl SearchService {
             // streamed logs query carrying a `[dataset=risk …]` bracket)
             // would silently compute default-config scores. Same cheap
             // textual pre-filter as core_search for the subsearch case.
-            let mut generator = self.ch_sql_generator.clone();
+            // NAN-2009 (F20/F21): carry the caller's source-scope deny-set so the
+            // resolve_identity ASOF join to identity_observations (a dataset the
+            // nPL-text gate does not cover) filters its build side. Empty
+            // deny-set = byte-identical SQL.
+            let mut generator = self
+                .ch_sql_generator
+                .clone()
+                .with_source_scope_deny(scope.deny_set().clone());
             if super::touches_risk_dataset(request.dataset.as_deref(), &request.query) {
                 generator = generator.with_risk_config(self.risk_query_config.resolve().await);
             }

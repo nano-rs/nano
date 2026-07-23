@@ -18,7 +18,7 @@ use crate::search::query_processing::BaselineCommandInfo;
 /// Current window (the analyst's search range) is capped so `<wide range> |
 /// baseline` can't become a full scan — baseline scans this window PLUS the
 /// lookback.
-const MAX_BASELINE_CURRENT_DAYS: i64 = 7;
+pub(crate) const MAX_BASELINE_CURRENT_DAYS: i64 = 7;
 
 /// Upper bound on the `window=` lookback. The new-to-entity check scans raw logs
 /// per dimension (~0.3–0.8 GiB/entity at 7d), so an unbounded window is a
@@ -65,7 +65,9 @@ impl SearchService {
             )));
         }
 
-        // Bound the scan.
+        // Bound the scan. Backstop only (NAN-2022): core_search clamps the current window
+        // end-anchored upstream before calling this, so a wide range never reaches here in
+        // practice. Kept as defense-in-depth for any future direct caller.
         if (time_range.end - time_range.start).num_days() > MAX_BASELINE_CURRENT_DAYS {
             return Err(SearchError::SqlValidationError(format!(
                 "| baseline current window is limited to {MAX_BASELINE_CURRENT_DAYS} days — narrow \

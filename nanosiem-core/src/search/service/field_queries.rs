@@ -131,7 +131,7 @@ impl SearchService {
         // generated against `logs` and the companion enumerated UDM columns,
         // producing ClickHouse 47 `Unknown expression identifier`. Logs unchanged.
         let base_sql = self
-            .dataset_generator(dataset, &query)
+            .dataset_generator(dataset, &query, scope.deny_set())
             .await
             .generate(&base_query, &tr)
             .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
@@ -286,7 +286,9 @@ impl SearchService {
         // against the dataset profile (e.g. spans `attributes['k']` MapKey), so a
         // sidebar field drill-in on a spans/metrics search reads the right table
         // and column. Logs unchanged.
-        let generator = self.dataset_generator(dataset, &query).await;
+        let generator = self
+            .dataset_generator(dataset, &query, scope.deny_set())
+            .await;
 
         // Generate base SQL for the query
         let base_sql = generator

@@ -387,6 +387,14 @@ pub fn apply_timechart_post_processing(
 ) -> Result<Vec<serde_json::Value>, SearchError> {
     use std::collections::HashMap;
 
+    // NAN-2010 (F28): a zero span (`timechart span=0s count`) would
+    // divide-by-zero panic `round_to_bucket` below. Reject before touching rows.
+    if span.as_secs() == 0 {
+        return Err(SearchError::ParseError(
+            "timechart span must be greater than 0".to_string(),
+        ));
+    }
+
     // Group results by time bucket (and optionally by split field)
     let mut groups: HashMap<(String, Option<String>), Vec<&serde_json::Value>> = HashMap::new();
 
@@ -520,10 +528,44 @@ fn round_to_bucket(dt: DateTime<Utc>, span: std::time::Duration) -> DateTime<Utc
             dt.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc()
         }
         _ => {
+            // NAN-2010 (F28): defensive — a zero/negative span must never
+            // divide-by-zero panic here. Callers reject span=0 (a stack overflow
+            // / abort is uncatchable), so this only guards a direct misuse.
+            if span_secs <= 0 {
+                return dt;
+            }
             // Generic bucketing for other intervals
             let timestamp = dt.timestamp();
             let bucket_timestamp = (timestamp / span_secs) * span_secs;
             DateTime::from_timestamp(bucket_timestamp, 0).unwrap_or(dt)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    /// NAN-2010 (F28): a zero timechart span must return a clean error, not a
+    /// divide-by-zero panic in `round_to_bucket`.
+    #[test]
+    fn timechart_span_zero_is_rejected() {
+        let rows = vec![serde_json::json!({ "timestamp": "2024-01-01T00:00:00Z" })];
+        let out = apply_timechart_post_processing(
+            &rows,
+            std::time::Duration::from_secs(0),
+            &[],
+            &[],
+        );
+        assert!(out.is_err(), "timechart span=0 must error, not panic");
+    }
+
+    /// Defensive: `round_to_bucket` must not divide-by-zero even if handed a
+    /// zero span directly.
+    #[test]
+    fn round_to_bucket_zero_span_returns_input() {
+        let dt = Utc.with_ymd_and_hms(2024, 1, 1, 12, 34, 56).unwrap();
+        assert_eq!(round_to_bucket(dt, std::time::Duration::from_secs(0)), dt);
     }
 }

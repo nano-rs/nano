@@ -43,6 +43,11 @@ fn logical_or_expr(input: &str) -> ParseResult<'_, EvalExpression> {
     ))
     .parse(input)?;
 
+    // NAN-2010 (D: F13/F31): bound the eval operator-chain length so a
+    // left-nested `BinaryOp` spine (e.g. `1+1+1+…`) can't stack-overflow the
+    // recursive evaluator.
+    super::check_chain_len(input, rest.len())?;
+
     let expr = rest
         .into_iter()
         .fold(first, |acc, (op, e)| EvalExpression::BinaryOp {
@@ -69,6 +74,11 @@ fn logical_and_expr(input: &str) -> ParseResult<'_, EvalExpression> {
         comparison_expr,
     ))
     .parse(input)?;
+
+    // NAN-2010 (D: F13/F31): bound the eval operator-chain length so a
+    // left-nested `BinaryOp` spine (e.g. `1+1+1+…`) can't stack-overflow the
+    // recursive evaluator.
+    super::check_chain_len(input, rest.len())?;
 
     let expr = rest
         .into_iter()
@@ -113,6 +123,11 @@ fn comparison_expr(input: &str) -> ParseResult<'_, EvalExpression> {
     ))
     .parse(input)?;
 
+    // NAN-2010 (D: F13/F31): bound the eval operator-chain length so a
+    // left-nested `BinaryOp` spine (e.g. `1+1+1+…`) can't stack-overflow the
+    // recursive evaluator.
+    super::check_chain_len(input, rest.len())?;
+
     let expr = rest
         .into_iter()
         .fold(first, |acc, (op, e)| EvalExpression::BinaryOp {
@@ -139,6 +154,11 @@ fn additive_expr(input: &str) -> ParseResult<'_, EvalExpression> {
         multiplicative_expr,
     ))
     .parse(input)?;
+
+    // NAN-2010 (D: F13/F31): bound the eval operator-chain length so a
+    // left-nested `BinaryOp` spine (e.g. `1+1+1+…`) can't stack-overflow the
+    // recursive evaluator.
+    super::check_chain_len(input, rest.len())?;
 
     let expr = rest
         .into_iter()
@@ -168,6 +188,11 @@ fn multiplicative_expr(input: &str) -> ParseResult<'_, EvalExpression> {
     ))
     .parse(input)?;
 
+    // NAN-2010 (D: F13/F31): bound the eval operator-chain length so a
+    // left-nested `BinaryOp` spine (e.g. `1+1+1+…`) can't stack-overflow the
+    // recursive evaluator.
+    super::check_chain_len(input, rest.len())?;
+
     let expr = rest
         .into_iter()
         .fold(first, |acc, (op, e)| EvalExpression::BinaryOp {
@@ -191,6 +216,11 @@ fn concat_expr(input: &str) -> ParseResult<'_, EvalExpression> {
         primary_eval_expr,
     ))
     .parse(input)?;
+
+    // NAN-2010 (D: F13/F31): bound the eval operator-chain length so a
+    // left-nested `BinaryOp` spine (e.g. `1+1+1+…`) can't stack-overflow the
+    // recursive evaluator.
+    super::check_chain_len(input, rest.len())?;
 
     let expr = rest
         .into_iter()

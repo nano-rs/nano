@@ -362,11 +362,24 @@ fn eval_function_to_sql(
             // 2-arg form: cidrmatch(cidr, ip) — legacy nPL convention
             // Multi-arg form: cidr_match(ip, cidr1, cidr2, ...) — alternate convention
             if arg_sqls.len() == 2 {
-                // Legacy: cidrmatch(cidr, ip) → isIPAddressInRange(ip, cidr)
-                // Guard against empty strings which crash isIPAddressInRange
+                // NAN-2020: accept BOTH cidr_match(ip, cidr) (modern order) and
+                // the legacy cidrmatch(cidr, ip). The CIDR is the argument that
+                // contains '/'; the other is the IP. The previous branch hardcoded
+                // the legacy (cidr, ip) order, so `cidr_match(src_ip, "10.0.0.0/8")`
+                // emitted isIPAddressInRange('10.0.0.0/8', src_ip) — ClickHouse
+                // then read the CIDR as the address (Code 60) and 500'd every
+                // `where cidr_match(...)` / `if(cidr_match(...))`.
+                let (ip, cidr) = if arg_sqls[0].contains('/') && !arg_sqls[1].contains('/') {
+                    (&arg_sqls[1], &arg_sqls[0]) // legacy cidrmatch(cidr, ip)
+                } else {
+                    // modern cidr_match(ip, cidr) — also the default when neither
+                    // or both args look like a CIDR (ip-first is the documented form)
+                    (&arg_sqls[0], &arg_sqls[1])
+                };
+                // Guard against empty strings which crash isIPAddressInRange.
                 Ok(format!(
                     "(length({}) > 0 AND isIPAddressInRange({}, {}))",
-                    arg_sqls[1], arg_sqls[1], arg_sqls[0]
+                    ip, ip, cidr
                 ))
             } else if arg_sqls.len() > 2 {
                 // Multi-CIDR: cidr_match(ip, cidr1, cidr2, ...) → OR chain
@@ -595,11 +608,17 @@ fn eval_function_to_sql(
                 "month" => Ok(format!("toStartOfMonth({})", ts)),
                 "quarter" => Ok(format!("toStartOfQuarter({})", ts)),
                 "year" => Ok(format!("toStartOfYear({})", ts)),
-                _ => Ok(format!(
-                    "toStartOfInterval({}, INTERVAL 1 {})",
-                    ts,
-                    unit.to_uppercase()
-                )),
+                // NAN-2008 (F8): reject any other unit instead of interpolating
+                // it. The old fallthrough emitted `INTERVAL 1 <unit>` with the
+                // user-controlled unit UNQUOTED — a direct SQL-injection point
+                // (e.g. `date_trunc("second) OR 1=1 -- ", ts)`). Every supported
+                // unit maps to a fixed `toStartOf*` token above; anything else is
+                // rejected, exactly like `date_part` below.
+                other => Err(SqlGenError::InvalidQuery(format!(
+                    "date_trunc() unsupported unit '{}' (supported: second, minute, \
+                     hour, day, week, month, quarter, year)",
+                    other
+                ))),
             }
         }
         "date_part" | "datepart" => {
@@ -1418,6 +1437,121 @@ fn eval_function_to_sql(
                 "Unknown eval function '{}'. Use a supported function.",
                 name
             )))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Generate SQL for `date_trunc(<unit>, timestamp)`.
+    fn date_trunc(unit: &str) -> Result<String, SqlGenError> {
+        let gen = ClickHouseSqlGenerator::new();
+        let expr = EvalExpression::FunctionCall {
+            name: "date_trunc".to_string(),
+            args: vec![
+                EvalExpression::Literal(Value::String(unit.to_string())),
+                EvalExpression::Field("timestamp".to_string()),
+            ],
+        };
+        eval_expression_to_sql(&gen, &expr)
+    }
+
+    fn cidr(name: &str, args: Vec<EvalExpression>) -> String {
+        let gen = ClickHouseSqlGenerator::new();
+        eval_expression_to_sql(
+            &gen,
+            &EvalExpression::FunctionCall {
+                name: name.to_string(),
+                args,
+            },
+        )
+        .expect("cidr codegen")
+    }
+
+    /// NAN-2020: the 2-arg cidr form must emit `isIPAddressInRange(<ip>, <cidr>)` —
+    /// the CIDR (the '/'-bearing arg) in the PREFIX position — for BOTH modern
+    /// `cidr_match(ip, cidr)` and legacy `cidrmatch(cidr, ip)`. The old code
+    /// hardcoded (cidr, ip) order and produced `isIPAddressInRange('10.0.0.0/8',
+    /// src_ip)`, which ClickHouse rejected (Code 60) → 500 on `where cidr_match`.
+    #[test]
+    fn cidr_match_2arg_puts_cidr_in_prefix_position() {
+        let ip = || EvalExpression::Field("src_ip".to_string());
+        let net = || EvalExpression::Literal(Value::String("10.0.0.0/8".to_string()));
+
+        let modern = cidr("cidr_match", vec![ip(), net()]); // cidr_match(ip, cidr)
+        assert!(
+            modern.contains("isIPAddressInRange(src_ip,"),
+            "ip must be the address arg: {modern}"
+        );
+        assert!(
+            !modern.contains("isIPAddressInRange('10.0.0.0/8'"),
+            "cidr must NOT be the address arg (swapped): {modern}"
+        );
+        assert!(
+            modern.contains("length(src_ip) > 0"),
+            "empty-string guard must be on the ip arg: {modern}"
+        );
+
+        let legacy = cidr("cidrmatch", vec![net(), ip()]); // cidrmatch(cidr, ip)
+        assert!(
+            legacy.contains("isIPAddressInRange(src_ip,"),
+            "legacy order must still resolve ip as address: {legacy}"
+        );
+    }
+
+    /// The multi-CIDR (3+ arg) form already treated arg0 as the IP — unchanged.
+    #[test]
+    fn cidr_match_multi_cidr_ip_first() {
+        let sql = cidr(
+            "cidr_match",
+            vec![
+                EvalExpression::Field("src_ip".to_string()),
+                EvalExpression::Literal(Value::String("10.0.0.0/8".to_string())),
+                EvalExpression::Literal(Value::String("192.168.0.0/16".to_string())),
+            ],
+        );
+        assert!(sql.contains("isIPAddressInRange(src_ip,"), "{sql}");
+        assert!(!sql.contains("isIPAddressInRange('10.0.0.0/8'"), "{sql}");
+    }
+
+    /// NAN-2008 (F8): a crafted unit must be REJECTED, never interpolated into
+    /// the generated SQL. The old fallthrough emitted `INTERVAL 1 <unit>` with
+    /// the unit unquoted, so a payload could break out of the function call.
+    #[test]
+    fn date_trunc_rejects_injection_unit() {
+        for unit in [
+            "second) OR 1=1 -- ",
+            "second), count() FROM system.tables -- ",
+            "day); DROP",
+            "SECOND UNION SELECT",
+            "microsecond", // previously interpolated via the fallthrough
+            "",
+        ] {
+            let out = date_trunc(unit);
+            assert!(out.is_err(), "unit {unit:?} must be rejected, got {out:?}");
+        }
+    }
+
+    /// The eight supported units keep their exact `toStartOf*` golden SQL — the
+    /// fix only removes the interpolating fallthrough, nothing else.
+    #[test]
+    fn date_trunc_legit_units_unchanged() {
+        let gen = ClickHouseSqlGenerator::new();
+        let ts = eval_expression_to_sql(&gen, &EvalExpression::Field("timestamp".to_string()))
+            .unwrap();
+        for (unit, func) in [
+            ("second", "toStartOfSecond"),
+            ("minute", "toStartOfMinute"),
+            ("hour", "toStartOfHour"),
+            ("day", "toStartOfDay"),
+            ("week", "toStartOfWeek"),
+            ("month", "toStartOfMonth"),
+            ("quarter", "toStartOfQuarter"),
+            ("year", "toStartOfYear"),
+        ] {
+            assert_eq!(date_trunc(unit).unwrap(), format!("{}({})", func, ts));
         }
     }
 }

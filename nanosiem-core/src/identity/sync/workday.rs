@@ -16,19 +16,11 @@ use tracing::{info, instrument};
 use super::{SyncError, SyncProvider};
 use crate::identity::types::{ConnectionTestResult, DeltaSyncResult, WorkdayCredentials};
 
-pub struct WorkdaySync {
-    client: reqwest::Client,
-}
+pub struct WorkdaySync;
 
 impl WorkdaySync {
     pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120)) // RaaS reports can be large
-                .redirect(super::restricted_redirect_policy())
-                .build()
-                .unwrap_or_default(),
-        }
+        Self
     }
 
     /// Extract the report entries array from the RaaS JSON response.
@@ -71,10 +63,10 @@ impl WorkdaySync {
 
         // NAN-1196: `report_url` is fully admin-controlled; validate the
         // destination before basic-auth credentials are sent to it.
-        super::guard_outbound_url(&url).await?;
-        let resp = self
-            .client
-            .get(&url)
+        let (client, url) =
+            super::guarded_client(&url, std::time::Duration::from_secs(120)).await?;
+        let resp = client
+            .get(url)
             .basic_auth(&creds.username, Some(&creds.password))
             .header("Accept", "application/json")
             .send()
@@ -182,17 +174,20 @@ impl SyncProvider for WorkdaySync {
 
         // NAN-1196: reject a hostile `report_url` (SSRF/credential exfil) before
         // sending basic-auth; surface it as a failed connection test.
-        if let Err(e) = super::guard_outbound_url(&url).await {
-            return Ok(ConnectionTestResult {
-                success: false,
-                response_time_ms: Some(start.elapsed().as_millis() as u64),
-                error: Some(e.to_string()),
-                user_count_sample: None,
-            });
-        }
-        let resp = self
-            .client
-            .get(&url)
+        let (client, url) =
+            match super::guarded_client(&url, std::time::Duration::from_secs(120)).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    return Ok(ConnectionTestResult {
+                        success: false,
+                        response_time_ms: Some(start.elapsed().as_millis() as u64),
+                        error: Some(e.to_string()),
+                        user_count_sample: None,
+                    });
+                }
+            };
+        let resp = client
+            .get(url)
             .basic_auth(&creds.username, Some(&creds.password))
             .header("Accept", "application/json")
             .send()

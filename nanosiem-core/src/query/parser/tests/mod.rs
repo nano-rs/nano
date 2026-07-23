@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+mod dos_limits;
 mod error_messages;
 mod leading_command;
 mod syntax_fixes;

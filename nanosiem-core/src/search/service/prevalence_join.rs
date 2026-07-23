@@ -93,7 +93,7 @@ impl SearchService {
             sql.len()
         );
         // Log whether a WHERE clause was generated (detail at debug level)
-        if let Some(where_pos) = sql.to_uppercase().rfind("\nWHERE ") {
+        if let Some(where_pos) = sql.to_ascii_uppercase().rfind("\nWHERE ") {
             let where_clause = &sql[where_pos..sql.len().min(where_pos + 500)];
             tracing::debug!("Generated SQL WHERE clause: {}", where_clause);
         } else {
@@ -643,7 +643,7 @@ impl SearchService {
         };
         let base_sql_clean = base_sql.trim().trim_end_matches(';');
         let base_no_order =
-            if let Some(order_pos) = base_sql_clean.to_lowercase().rfind(" order by ") {
+            if let Some(order_pos) = base_sql_clean.to_ascii_lowercase().rfind(" order by ") {
                 &base_sql_clean[..order_pos]
             } else {
                 base_sql_clean
@@ -1009,7 +1009,7 @@ impl SearchService {
 
         // Remove ORDER BY clause if present (case insensitive)
         let base_sql_no_order =
-            if let Some(order_pos) = base_sql_clean.to_lowercase().rfind(" order by ") {
+            if let Some(order_pos) = base_sql_clean.to_ascii_lowercase().rfind(" order by ") {
                 &base_sql_clean[..order_pos]
             } else {
                 base_sql_clean

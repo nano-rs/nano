@@ -103,6 +103,10 @@ fn or_expr(input: &str) -> ParseResult<'_, SearchExpr> {
     ))
     .parse(input)?;
 
+    // NAN-2010 (D): bound the OR-chain length so the left-nested `Or(Or(...))`
+    // AST can't stack-overflow a recursive walk.
+    super::check_chain_len(input, rest.len())?;
+
     let expr = rest
         .into_iter()
         .fold(first, |acc, e| SearchExpr::Or(Box::new(acc), Box::new(e)));
@@ -125,6 +129,10 @@ fn and_expr(input: &str) -> ParseResult<'_, SearchExpr> {
         not_expr,
     ))
     .parse(input)?;
+
+    // NAN-2010 (D): bound the AND-chain length (implicit-AND `a a a …` included)
+    // so the left-nested `And(And(...))` AST can't stack-overflow a recursive walk.
+    super::check_chain_len(input, rest.len())?;
 
     let expr = rest
         .into_iter()
@@ -1107,6 +1115,11 @@ fn function_word_comparator_filter(input: &str) -> ParseResult<'_, SearchExpr> {
 
 /// Parse IN [search ...] subsearch filter: field IN [search ...] or field NOT IN [search ...]
 fn in_subsearch_filter(input: &str) -> ParseResult<'_, SearchExpr> {
+    // NAN-2010 (F10): a nested `field IN [ field IN [ … ] ]` chain recurses
+    // through `query` once per bracket. Count it toward MAX_NESTING_DEPTH — the
+    // guard otherwise only wraps parenthesized groups, so bracket nesting drove
+    // unbounded recursive-descent stack depth (uncatchable overflow).
+    let _guard = super::enter_nesting(input)?;
     let (input, field) = field_name(input)?;
     let (input, _) = multispace1(input)?;
 

@@ -583,4 +583,39 @@ mod source_scope_tests {
             "missing fallback gate:\n{sql}"
         );
     }
+
+    /// NAN-2009 (F20/F21): end-to-end through the full `generate()` pipeline
+    /// (not just the codegen helper). A `| resolve_identity` query built with a
+    /// non-empty deny set — the state the search paths now attach via
+    /// `with_source_scope_deny(scope.deny_set())` — gates the
+    /// identity_observations build side; the same query with no deny set stays
+    /// byte-identical (no gate). This is the property that was silently broken:
+    /// the mechanism existed but no caller ever populated the deny set.
+    #[test]
+    fn full_generate_gates_resolve_identity_for_scoped_caller() {
+        use crate::query::parse_query;
+        let tr = TimeRange {
+            start: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap(),
+        };
+        let query = parse_query("src_ip=10.0.0.5 | resolve_identity field=src_ip")
+            .expect("query parses");
+
+        let scoped_sql = ClickHouseSqlGenerator::new()
+            .with_source_scope_deny(deny(&["insider"]))
+            .generate(&query, &tr)
+            .expect("scoped codegen");
+        assert!(
+            scoped_sql.contains("lower(source) != 'insider'"),
+            "scoped resolve_identity must gate identity_observations:\n{scoped_sql}"
+        );
+
+        let unscoped_sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &tr)
+            .expect("unscoped codegen");
+        assert!(
+            !unscoped_sql.contains("lower(source)"),
+            "unrestricted caller must stay byte-identical (no gate):\n{unscoped_sql}"
+        );
+    }
 }

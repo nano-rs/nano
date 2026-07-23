@@ -21,9 +21,9 @@ use crate::extensions::{AiClient, CloudRiskProvider, NoopAiClient, NoopCloudRisk
 use crate::lookup::LookupService;
 use crate::prevalence::{PrevalenceData, PrevalenceService, TimeWindow as PrevalenceTimeWindow};
 use crate::query::{
-    analyze_query_cost, parse_query, AggFunc, ClickHouseSqlGenerator, Command, ParseError, PrevalenceField,
-    PrevalenceOperator, PrevalenceThreshold, PrevalenceTimeWindow as AstTimeWindow, Query,
-    TimeRange, WarningSeverity,
+    analyze_query_cost, parse_query, AggFunc, BinSpan, ClickHouseSqlGenerator, Command, ParseError,
+    PrevalenceField, PrevalenceOperator, PrevalenceThreshold,
+    PrevalenceTimeWindow as AstTimeWindow, Query, TimeRange, WarningSeverity, WindowType,
 };
 use crate::udm::UdmField;
 
@@ -93,6 +93,7 @@ mod sql_execution;
 pub use sql_execution::RawSqlAuditAccess;
 mod streaming;
 mod tree_view;
+mod window_clamp;
 
 /// Crate-public re-export of the ONE source-scope SQL predicate builder
 /// (NAN-1801, P3). The hand-built "side-door" SQL paths in other crates
@@ -241,6 +242,14 @@ pub(crate) fn validate_query_field_names(
     query: &Query,
     profile: &dyn crate::schema::SchemaProfile,
 ) -> Result<(), SearchError> {
+    // NAN-2019: reject a zero timechart span / bin span / bin hop here — this runs
+    // on every search path (core_search / streaming / explain), so all paths get a
+    // clean 400 instead of the SQL-pushdown path emitting `INTERVAL 0` and coming
+    // back as a ClickHouse 500. The bin-hop codegen guard (NAN-2010/F22) and the
+    // timechart in-memory guard (F28) stay as defense-in-depth for non-search
+    // codegen paths (saved rules, dashboards).
+    validate_time_spans(query)?;
+
     if let Some(err) =
         crate::query::validation::validate_query_fields_with_profile(query, Some(profile))
             .into_iter()
@@ -251,6 +260,41 @@ pub(crate) fn validate_query_field_names(
             suggestions: err.suggestions,
             message: err.message,
         });
+    }
+    Ok(())
+}
+
+/// Reject non-positive `timechart` / `bin` spans and `bin` hop advances before
+/// they reach SQL generation or ClickHouse (NAN-2019). A zero span becomes
+/// `INTERVAL 0` / a divide-by-zero — a clean validation error is far better than
+/// a ClickHouse 500 or a panic. Walks the piped command chain.
+fn validate_time_spans(query: &Query) -> Result<(), SearchError> {
+    let err = |m: &str| Err(SearchError::SqlValidationError(m.to_string()));
+    let mut node = query;
+    while let Query::Piped { source, command } = node {
+        match command {
+            Command::Timechart { span, .. } if span.is_zero() => {
+                return err("timechart span must be greater than 0");
+            }
+            Command::Bin {
+                span, window_type, ..
+            } => {
+                match span {
+                    BinSpan::Time(d) if d.is_zero() => return err("bin span must be greater than 0"),
+                    BinSpan::Numeric(n) if *n <= 0.0 => {
+                        return err("bin span must be greater than 0")
+                    }
+                    _ => {}
+                }
+                if let WindowType::Hop { advance } = window_type {
+                    if advance.is_zero() {
+                        return err("bin hop must be greater than 0");
+                    }
+                }
+            }
+            _ => {}
+        }
+        node = source;
     }
     Ok(())
 }
@@ -840,9 +884,17 @@ impl SearchService {
         &self,
         dataset: Option<&str>,
         raw_query: &str,
+        deny_set: &std::collections::BTreeSet<String>,
     ) -> ClickHouseSqlGenerator {
         let ds = crate::query::Dataset::from_selector(dataset.unwrap_or("logs"));
-        let mut generator = self.ch_sql_generator.clone();
+        // NAN-2009 (F20/F21): carry the caller's source-scope deny-set so the
+        // resolve_identity ASOF join to identity_observations (reached via the
+        // explain and field-values paths, which build their generator here)
+        // filters its build side. Empty deny-set = byte-identical SQL.
+        let mut generator = self
+            .ch_sql_generator
+            .clone()
+            .with_source_scope_deny(deny_set.clone());
         if touches_risk_dataset(dataset, raw_query) {
             generator = generator.with_risk_config(self.risk_query_config.resolve().await);
         }
@@ -1134,6 +1186,33 @@ impl SearchService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NAN-2019: a zero timechart span / bin span / bin hop must be rejected at
+    /// validation (a clean 400) rather than reaching ClickHouse as `INTERVAL 0`
+    /// (a 500) or a divide-by-zero. Legit spans/hops still validate.
+    #[test]
+    fn validate_time_spans_rejects_zero_span_and_hop() {
+        for q in [
+            "* | timechart span=0s count",
+            "error | bin span=0s",
+            "error | bin span=1h hop=0s",
+            "* | bin bytes_out span=0",
+            "* | prevalence src_ip | timechart span=0s count",
+        ] {
+            let parsed = parse_query(q).unwrap_or_else(|e| panic!("{q} should parse: {e:?}"));
+            assert!(validate_time_spans(&parsed).is_err(), "{q} must be rejected");
+        }
+        for q in [
+            "* | timechart span=1h count",
+            "error | bin span=10m",
+            "error | bin span=1h hop=5m",
+            "* | bin bytes_out span=5000",
+            "* | stats count by src_ip",
+        ] {
+            let parsed = parse_query(q).unwrap_or_else(|e| panic!("{q} should parse: {e:?}"));
+            assert!(validate_time_spans(&parsed).is_ok(), "{q} must be allowed");
+        }
+    }
 
     /// NAN-1428: the companion id scheme is fixed — cancel derives these
     /// exact ids; changing the suffixes breaks kill coverage for in-flight

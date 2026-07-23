@@ -313,7 +313,7 @@ impl SearchService {
 
         // Step 3.5: Identity resolution — resolve dest_ip → dest_host (and src_ip → src_host)
         // for edges missing hostname information
-        self.resolve_lateral_hostnames(clickhouse, &mut deduped_edges)
+        self.resolve_lateral_hostnames(clickhouse, &mut deduped_edges, scope)
             .await;
 
         // Step 4: Build output
@@ -535,6 +535,7 @@ impl SearchService {
         &self,
         clickhouse: &clickhouse::Client,
         edges: &mut [LateralEdge],
+        scope: &ScopeSet,
     ) {
         // Collect all IPs that need resolution (where hostname is empty)
         let mut ips_to_resolve: HashSet<String> = HashSet::new();
@@ -556,16 +557,9 @@ impl SearchService {
         let placeholders = vec!["?"; ip_vec.len()].join(",");
 
         let identity_table = self.table_names.read("identity_observations");
-        let sql = format!(
-            r#"SELECT ip, hostname
-            FROM (
-                SELECT ip, hostname,
-                    ROW_NUMBER() OVER (PARTITION BY ip ORDER BY source_priority DESC, observed_at DESC) AS rn
-                FROM {identity_table}
-                WHERE ip IN ({placeholders}) AND hostname != ''
-            )
-            WHERE rn = 1"#
-        );
+        // NAN-2009 (F24): gate the identity_observations read by the caller's
+        // source-scope deny-set (see `lateral_hostname_resolution_sql`).
+        let sql = lateral_hostname_resolution_sql(&identity_table, &placeholders, scope.deny_set());
 
         let mut ip_to_hostname: HashMap<String, String> = HashMap::new();
         // Hostname resolution is best-effort enrichment — degrade gracefully
@@ -1046,6 +1040,35 @@ fn build_hop_sql(
     )
 }
 
+/// Build the lateral-view IP→hostname resolution SQL over `identity_observations`,
+/// gated by the caller's source-scope deny-set.
+///
+/// NAN-2009 (F24): the lateral hostname enrichment reads a SEPARATE dataset the
+/// hop queries' `source_type` gate does not cover — `identity_observations`,
+/// whose source_type column is named `source` (NAN-1797). Without this gate a
+/// scoped caller re-surfaces IP→hostname mappings observed only by a denied
+/// source, exactly as `resolve_asset_identities` (asset.rs) already guards. An
+/// empty deny-set renders no predicate → byte-identical SQL.
+fn lateral_hostname_resolution_sql(
+    identity_table: &str,
+    placeholders: &str,
+    deny_set: &BTreeSet<String>,
+) -> String {
+    let scope_and = source_scope_sql_predicate("source", deny_set)
+        .map(|pred| format!(" AND {pred}"))
+        .unwrap_or_default();
+    format!(
+        r#"SELECT ip, hostname
+            FROM (
+                SELECT ip, hostname,
+                    ROW_NUMBER() OVER (PARTITION BY ip ORDER BY source_priority DESC, observed_at DESC) AS rn
+                FROM {identity_table}
+                WHERE ip IN ({placeholders}) AND hostname != ''{scope_and}
+            )
+            WHERE rn = 1"#
+    )
+}
+
 /// Render a caller's source-scope deny-set as a ClickHouse WHERE predicate over
 /// `column_expr` (NAN-1797/NAN-1799).
 ///
@@ -1250,6 +1273,33 @@ mod source_scope_tests {
             source_scope_sql_predicate("source_type", &deny(&["Weird'Name", "OTEL_TRACES"]))
                 .as_deref(),
             Some("lower(source_type) NOT IN ('otel_traces', 'weird''name')")
+        );
+    }
+
+    /// NAN-2009 (F24): the lateral IP→hostname enrichment reads
+    /// `identity_observations` (source_type column = `source`). A scoped caller
+    /// must gate it; an unrestricted caller must stay byte-identical.
+    #[test]
+    fn lateral_hostname_resolution_gates_identity_observations() {
+        let scoped = lateral_hostname_resolution_sql(
+            "identity_observations",
+            "?,?",
+            &deny(&["windows_dns"]),
+        );
+        assert!(
+            scoped.contains("AND hostname != '' AND lower(source) != 'windows_dns'"),
+            "scoped hostname resolution must gate on the source column:\n{scoped}"
+        );
+
+        let unscoped =
+            lateral_hostname_resolution_sql("identity_observations", "?,?", &BTreeSet::new());
+        assert!(
+            !unscoped.contains("lower(source)"),
+            "unrestricted caller must emit no gate:\n{unscoped}"
+        );
+        assert!(
+            unscoped.contains("WHERE ip IN (?,?) AND hostname != ''"),
+            "unrestricted SQL must be byte-identical to the pre-fix form:\n{unscoped}"
         );
     }
 

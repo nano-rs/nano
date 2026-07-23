@@ -107,13 +107,23 @@ pub enum SyncError {
 // connect-time IP re-check via a custom connector would. The accompanying
 // `restricted_redirect_policy` blocks the common redirect-to-IP-literal bypass.
 
-/// Validate an outbound provider URL before sending credentials to it.
+/// Validate an outbound provider URL AND build a `reqwest` client PINNED to the
+/// validated IP before we deliver credentials to it.
+///
 /// Requires `https`, rejects the non-public TLDs provider sync never targets
 /// (`.localhost` / `.local` / `.internal`), and rejects any host (literal or
-/// resolved) that lands in a blocked range — all via the shared DNS-aware
-/// `SsrfValidator` (NAN-1369), so identity sync uses exactly the same SSRF
-/// rules as every other outbound path.
-pub(crate) async fn guard_outbound_url(raw_url: &str) -> Result<(), SyncError> {
+/// resolved) in a blocked range — all via the shared DNS-aware `SsrfValidator`
+/// (NAN-1369), so identity sync uses exactly the same SSRF rules as every other
+/// outbound path. NAN-2018: it then PINS the client to the exact validated
+/// addresses via `resolve_to_addrs`, closing the DNS-rebinding TOCTOU the old
+/// validate-then-connect flow left open — a rebind can no longer redirect the
+/// bound secret (SSWS token / basic auth / signed JWT) to an internal target.
+/// Redirects use the shared restricted policy. Returns the pinned client and the
+/// parsed URL to dial. `timeout` is per-provider (Workday RaaS needs a long one).
+pub(crate) async fn guarded_client(
+    raw_url: &str,
+    timeout: std::time::Duration,
+) -> Result<(reqwest::Client, url::Url), SyncError> {
     let validator = SsrfValidator::new(SsrfConfig {
         allow_http: false, // credential delivery is https-only
         blocked_domains: vec![
@@ -125,9 +135,13 @@ pub(crate) async fn guard_outbound_url(raw_url: &str) -> Result<(), SyncError> {
     });
 
     validator
-        .validate_with_dns(raw_url)
+        .build_pinned_client(
+            raw_url,
+            reqwest::Client::builder()
+                .timeout(timeout)
+                .redirect(restricted_redirect_policy()),
+        )
         .await
-        .map(|_| ())
         .map_err(|e| match e {
             SsrfError::DnsResolutionFailed(host, msg) => {
                 SyncError::NetworkError(format!("DNS resolution failed for {host:?}: {msg}"))
@@ -184,13 +198,14 @@ mod ssrf_tests {
 
     #[tokio::test]
     async fn guard_rejects_scheme_and_literal_metadata() {
-        assert!(guard_outbound_url("http://example.com/").await.is_err());
-        assert!(guard_outbound_url("https://169.254.169.254/latest/meta-data/")
+        let t = std::time::Duration::from_secs(30);
+        assert!(guarded_client("http://example.com/", t).await.is_err());
+        assert!(guarded_client("https://169.254.169.254/latest/meta-data/", t)
             .await
             .is_err());
-        assert!(guard_outbound_url("https://10.0.0.5/api/v1/users")
+        assert!(guarded_client("https://10.0.0.5/api/v1/users", t)
             .await
             .is_err());
-        assert!(guard_outbound_url("https://localhost/x").await.is_err());
+        assert!(guarded_client("https://localhost/x", t).await.is_err());
     }
 }

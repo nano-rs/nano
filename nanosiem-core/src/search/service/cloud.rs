@@ -370,7 +370,9 @@ impl SearchService {
     ) -> Result<Vec<serde_json::Value>, SearchError> {
         use serde_json::json;
 
-        // Reject overly-wide ranges before doing any expensive work.
+        // Backstop only (NAN-2022): the `/api/search` path clamps the window end-anchored
+        // upstream (core_search) before calling this, so a wide range never reaches here in
+        // practice. Kept as defense-in-depth for any future direct caller.
         let max_secs = Self::MAX_CLOUD_VIEW_HOURS * 3600;
         if (time_range.end - time_range.start).num_seconds() > max_secs {
             return Err(SearchError::SqlValidationError(format!(
@@ -868,15 +870,14 @@ impl SearchService {
         ),
         SearchError,
     > {
-        // Same cap as build_cloud_view — prevents bypassing the limit via the
-        // pagination endpoint with offset 0.
-        let max_secs = Self::MAX_CLOUD_VIEW_HOURS * 3600;
-        if (time_range.end - time_range.start).num_seconds() > max_secs {
-            return Err(SearchError::SqlValidationError(format!(
-                "Cloud view queries are limited to {}h.",
-                Self::MAX_CLOUD_VIEW_HOURS
-            )));
-        }
+        // NAN-2022: match build_cloud_view — clamp an over-wide window end-anchored to
+        // the cap instead of rejecting, so the timeline "load more" stays consistent
+        // with the (already clamped) primary cloud view rather than 400-ing on offset 0.
+        let clamped_range = super::window_clamp::end_anchored_clamp(
+            time_range,
+            chrono::Duration::hours(Self::MAX_CLOUD_VIEW_HOURS),
+        );
+        let time_range = &clamped_range;
 
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,

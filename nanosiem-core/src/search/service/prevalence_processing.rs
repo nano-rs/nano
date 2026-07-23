@@ -937,10 +937,14 @@ impl SearchService {
             .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
 
         // Extract the WHERE clause from the base SQL
-        let where_clause = if let Some(where_pos) = base_sql.to_lowercase().find(" where ") {
+        // NAN-2010 (F26/F27): ASCII-fold (length-preserving) so these offsets
+        // stay valid for slicing the original strings; `to_lowercase()` is not
+        // length-preserving and a multibyte user value could shift the offset
+        // off a char boundary and panic.
+        let where_clause = if let Some(where_pos) = base_sql.to_ascii_lowercase().find(" where ") {
             let after_where = &base_sql[where_pos + 7..];
             // Find end of WHERE (before ORDER BY or end of string)
-            if let Some(order_pos) = after_where.to_lowercase().find(" order by") {
+            if let Some(order_pos) = after_where.to_ascii_lowercase().find(" order by") {
                 after_where[..order_pos].to_string()
             } else {
                 after_where.trim_end_matches(';').to_string()

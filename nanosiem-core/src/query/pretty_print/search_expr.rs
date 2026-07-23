@@ -9,11 +9,18 @@ impl PrettyPrint for SearchExpr {
     fn pretty_print(&self) -> String {
         match self {
             SearchExpr::Keyword(kw) => {
-                // Quote keywords with spaces
-                if kw.contains(' ') {
-                    format!("\"{}\"", kw)
-                } else {
+                // NAN-2006: emit a keyword bare ONLY when it re-parses verbatim
+                // as an `unquoted_keyword`. Anything else (space, quote, paren,
+                // pipe, `=`, a reserved AND/OR/NOT, …) MUST be a double-quoted
+                // string with breakout chars stripped, so the source-scope
+                // gate's pretty_print -> re-parse round-trip cannot be broken
+                // out of. The old code only quoted on a space, leaving e.g.
+                // `x") OR source_type=audit OR ("y` to re-tokenize into an
+                // ungated top-level OR arm (F1/F2/F6/F7).
+                if is_bare_keyword(kw) {
                     kw.clone()
+                } else {
+                    format!("\"{}\"", super::helpers::npl_quoted_body(kw))
                 }
             }
             SearchExpr::FieldFilter { field, op, value } => {
@@ -30,11 +37,12 @@ impl PrettyPrint for SearchExpr {
                         | Comparator::EndsWith
                         | Comparator::NotEndsWith
                 );
+                let field_str = emit_field(field);
                 let value_str = format_value_for_filter(value);
                 if needs_spaces {
-                    format!("{} {} {}", field, op_str, value_str)
+                    format!("{} {} {}", field_str, op_str, value_str)
                 } else {
-                    format!("{}{}{}", field, op_str, value_str)
+                    format!("{}{}{}", field_str, op_str, value_str)
                 }
             }
             SearchExpr::FunctionFilter {
@@ -133,10 +141,57 @@ impl PrettyPrint for SearchExpr {
 pub(super) fn format_value_for_filter(value: &Value) -> String {
     match value {
         Value::String(s) => {
-            // Always quote strings in field filters to ensure correct parsing
-            format!("\"{}\"", s.replace('"', "\\\""))
+            // Always quote strings in field filters. NAN-2006: the parser has no
+            // working backslash escape (NAN-1157), so the old `s.replace('"',
+            // "\\\"")` was a no-op that let a `"`-bearing value break out of the
+            // source-scope gate (F1/F4). Strip the breakout `"`/newlines instead.
+            format!("\"{}\"", super::helpers::npl_quoted_body(s))
         }
         // For other value types, use their Display impl
         _ => value.to_string(),
     }
+}
+
+/// Emit a field-filter LHS. A field that re-parses verbatim via `field_name`
+/// is emitted bare; anything else came from a quoted-string field (the parser
+/// accepts `alt((quoted_string, field_name))` for the LHS — NAN-2006/F4, e.g.
+/// `'src_ip=1) OR source_type=audit OR (user'=1`) and is emitted as a
+/// double-quoted string with breakout chars stripped so it cannot re-tokenize
+/// into query structure.
+fn emit_field(field: &str) -> String {
+    if is_bare_field(field) {
+        field.to_string()
+    } else {
+        format!("\"{}\"", super::helpers::npl_quoted_body(field))
+    }
+}
+
+/// True when `kw` re-parses verbatim as an `unquoted_keyword`
+/// (`query::parser::search_expr::unquoted_keyword`): non-empty, every char in
+/// `[alnum _ - . * ?]`, and NOT a reserved word (`AND`/`OR`/`NOT`, which would
+/// re-tokenize as a boolean operator). Anything else must be quoted.
+fn is_bare_keyword(kw: &str) -> bool {
+    !kw.is_empty()
+        && kw
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '*' | '?'))
+        && !matches!(kw.to_ascii_uppercase().as_str(), "AND" | "OR" | "NOT")
+}
+
+/// True when `field` re-parses verbatim as a `field_name`
+/// (`query::parser::values::field_name`): dot-separated segments where the
+/// first segment starts with a letter or `_` and every char is alphanumeric or
+/// `_`. Anything else (came from a quoted-string field) must be quoted.
+fn is_bare_field(field: &str) -> bool {
+    let mut segments = field.split('.');
+    let first_ok = match segments.next() {
+        Some(seg) => {
+            let mut chars = seg.chars();
+            matches!(chars.next(), Some(c) if c.is_alphabetic() || c == '_')
+                && chars.all(|c| c.is_alphanumeric() || c == '_')
+        }
+        None => false,
+    };
+    first_ok
+        && segments.all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_alphanumeric() || c == '_'))
 }

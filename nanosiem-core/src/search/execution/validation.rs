@@ -31,6 +31,7 @@
 //! and `'%delete%'` hunts are allowed again — the old substring scan blocked them).
 
 use crate::search::SearchError;
+use sqlparser::tokenizer::{Token, Whitespace};
 
 /// Info-disclosure / sleep FUNCTIONS that ClickHouse does not deny for a
 /// grant-only readonly user (they are not gated by grants nor by
@@ -77,14 +78,34 @@ const DISALLOWED_FUNCTIONS: &[&str] = &[
 pub fn validate_sql_query(sql: &str) -> Result<(), SearchError> {
     use sqlparser::dialect::ClickHouseDialect;
     use sqlparser::parser::Parser;
+    use sqlparser::tokenizer::Tokenizer;
 
-    // Rejecting comments keeps the literal-stripping scans below sound (a comment
-    // can't hide a `system.*` reference from them). Also a cheap friendly check.
-    reject_sql_comments(sql)?;
+    let dialect = ClickHouseDialect {};
+
+    // NAN-2007 (F3,F11,F18,F19,F23): tokenize with the SAME lexer the parser (and
+    // ClickHouse) uses, so the MANDATORY scans below cannot desync from what
+    // actually executes. The previous hand-rolled `strip_string_literals` /
+    // `reject_sql_comments` modeled only `''` doubling and were blind to
+    // ClickHouse backslash escapes (`\'`) and backtick / double-quote quoted
+    // identifiers — a `'\''` or a `'` inside `` `ident` `` flipped their quote
+    // state and hid a `system.*` reference or an info-disclosure function call
+    // from the scans while sqlparser/ClickHouse ran it as code.
+    let tokens = Tokenizer::new(&dialect, sql)
+        .tokenize()
+        .map_err(|e| SearchError::SqlValidationError(format!("SQL parse error: {}", e)))?;
+
+    // Reject comments — a `--` / `/* */` can split or hide a `system.*` reference
+    // from the reconstructed-text scans. Detected from TOKENS, so a `--` inside a
+    // string literal or a quoted identifier is not misread as a comment.
+    if tokens.iter().any(is_comment_token) {
+        return Err(SearchError::SqlValidationError(
+            "SQL comments are not allowed".to_string(),
+        ));
+    }
 
     // Friendly UX: parse as exactly one SELECT. NOT the security boundary —
     // ClickHouse readonly + SELECT-only grants deny DML/DDL regardless.
-    let statements = Parser::parse_sql(&ClickHouseDialect {}, sql)
+    let statements = Parser::parse_sql(&dialect, sql)
         .map_err(|e| SearchError::SqlValidationError(format!("SQL parse error: {}", e)))?;
     if statements.len() != 1 {
         return Err(SearchError::SqlValidationError(
@@ -97,72 +118,59 @@ pub fn validate_sql_query(sql: &str) -> Result<(), SearchError> {
         ));
     }
 
-    // A copy with single-quoted string literals removed, so the mandatory scans
-    // match SQL SYNTAX, never log CONTENT.
-    let code = strip_string_literals(sql);
+    // Reconstruct the SQL from tokens with string LITERALS dropped and quoted
+    // identifiers reduced to their bare value, so the mandatory scans match SQL
+    // SYNTAX (schema/function references), never log CONTENT.
+    let code = strip_string_literals(&tokens);
     reject_system_schema(&code)?;
     reject_disallowed_functions(&code)?;
 
     Ok(())
 }
 
-/// Reject SQL comments to keep the literal-stripping scans sound (a `--`/`/* */`
-/// comment could otherwise hide a `system.*` reference from them).
-fn reject_sql_comments(sql: &str) -> Result<(), SearchError> {
-    let mut in_single_quote = false;
-    let chars: Vec<char> = sql.chars().collect();
-    let mut i = 0usize;
-
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '\'' {
-            if in_single_quote && i + 1 < chars.len() && chars[i + 1] == '\'' {
-                i += 2;
-                continue;
-            }
-            in_single_quote = !in_single_quote;
-            i += 1;
-            continue;
-        }
-
-        if !in_single_quote && i + 1 < chars.len() {
-            let n = chars[i + 1];
-            if (c == '-' && n == '-') || (c == '/' && n == '*') {
-                return Err(SearchError::SqlValidationError(
-                    "SQL comments are not allowed".to_string(),
-                ));
-            }
-        }
-
-        i += 1;
-    }
-
-    Ok(())
+/// True for the tokenizer's comment whitespace kinds (`--` line, `/* */` block).
+fn is_comment_token(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Whitespace(
+            Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_)
+        )
+    )
 }
 
-/// Remove single-quoted string literals (handling doubled-quote `''` escapes) so
-/// downstream scans match SQL syntax rather than string content.
-fn strip_string_literals(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let chars: Vec<char> = sql.chars().collect();
-    let mut i = 0usize;
-    let mut in_str = false;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '\'' {
-            if in_str && i + 1 < chars.len() && chars[i + 1] == '\'' {
-                // Escaped '' inside a string — skip both, stay in the string.
-                i += 2;
-                continue;
-            }
-            in_str = !in_str;
-            i += 1;
-            continue;
+/// Reconstruct scannable SQL text from `tokens`, dropping string-literal CONTENT
+/// (so `WHERE message LIKE '%system%'` / `'%delete%'` hunts are not flagged) but
+/// KEEPING identifiers — including backtick / double-quote quoted ones, which the
+/// tokenizer surfaces as [`Token::Word`] with the quotes already stripped, so
+/// `` `system` `` and `"hostName"` are still caught. Using the tokenizer's own
+/// output means the scanned text can never desync from what the parser sees.
+///
+/// Tokens are space-separated so word boundaries survive for the regex scans
+/// (`hostName (`, `system . tables`). Comments are rejected upstream, so their
+/// content never reaches here.
+fn strip_string_literals(tokens: &[Token]) -> String {
+    let mut out = String::new();
+    for token in tokens {
+        out.push(' ');
+        match token {
+            // Quoted identifiers surface as Word with the enclosing quotes
+            // removed — emit the bare value.
+            Token::Word(w) => out.push_str(&w.value),
+            // Single-quote-family VALUE literals: never a schema/function
+            // reference in ClickHouse. Drop the content entirely.
+            Token::SingleQuotedString(_)
+            | Token::TripleSingleQuotedString(_)
+            | Token::DollarQuotedString(_)
+            | Token::SingleQuotedByteStringLiteral(_)
+            | Token::NationalStringLiteral(_)
+            | Token::EscapedStringLiteral(_)
+            | Token::UnicodeStringLiteral(_)
+            | Token::HexStringLiteral(_) => {}
+            // Everything else (punctuation, numbers, operators, non-comment
+            // whitespace, and — fail-safe — any future token kind) keeps its
+            // textual form, so an identifier can never be silently dropped.
+            other => out.push_str(&other.to_string()),
         }
-        if !in_str {
-            out.push(c);
-        }
-        i += 1;
     }
     out
 }
@@ -355,5 +363,58 @@ mod tests {
         assert!(validate_sql_query("SELECT * FROM logs; DROP TABLE logs").is_err());
         assert!(validate_sql_query("SELECT * FROM logs -- bypass").is_err());
         assert!(validate_sql_query("SELECT * FROM logs /* bypass */").is_err());
+    }
+
+    // =========================================================================
+    // NAN-2007: parser-differential bypasses of the mandatory scans.
+    // The old hand-rolled literal stripper desynced from ClickHouse/sqlparser on
+    // backslash escapes (`\'`) and backtick/double-quote identifiers, hiding a
+    // `system.*` reference or a disallowed function from the scans.
+    // =========================================================================
+
+    #[test]
+    fn rejects_backslash_escape_desync_hiding_system_schema() {
+        // F3/F19: a `\'` closes the string for ClickHouse/sqlparser but the old
+        // stripper stayed "in string" and swallowed `... FROM system.tables`.
+        assert!(validate_sql_query(
+            r#"SELECT message FROM logs WHERE message='\'' UNION ALL SELECT name FROM system.tables"#
+        )
+        .is_err());
+        assert!(
+            validate_sql_query(r#"SELECT '\'' AS x, name, engine FROM system.tables"#).is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_backslash_escape_desync_hiding_disallowed_function() {
+        // F18: same desync used to hide an info-disclosure function call.
+        assert!(validate_sql_query(r#"SELECT 'a\'', hostName() FROM logs"#).is_err());
+        assert!(validate_sql_query(r#"SELECT 'x\'' AS a, sleep(3) FROM logs"#).is_err());
+    }
+
+    #[test]
+    fn rejects_backtick_identifier_desync() {
+        // F11: a `'` inside a backtick identifier used to flip the stripper into
+        // "in string" and swallow the trailing `hostName()` / `system.*` ref.
+        assert!(validate_sql_query("SELECT 1 AS `a'`, hostName() FROM logs").is_err());
+        assert!(validate_sql_query("SELECT * FROM `system`.`tables`").is_err());
+        assert!(validate_sql_query(
+            r#"SELECT "col'x", getSetting('max_threads') FROM logs"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn allows_benign_backslash_and_backtick_content() {
+        // No over-rejection: escaped backslashes in string content, a schema name
+        // that only appears inside a string literal, and legit backtick idents.
+        assert!(validate_sql_query(r#"SELECT * FROM logs WHERE message = 'a\\b'"#).is_ok());
+        assert!(
+            validate_sql_query(r#"SELECT * FROM logs WHERE message ILIKE '%system.tables%'"#)
+                .is_ok()
+        );
+        assert!(
+            validate_sql_query("SELECT `src_ip`, count() AS c FROM logs GROUP BY `src_ip`").is_ok()
+        );
     }
 }

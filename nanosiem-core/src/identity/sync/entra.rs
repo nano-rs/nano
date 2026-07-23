@@ -11,9 +11,7 @@ use tracing::{info, instrument, warn};
 use super::{SyncError, SyncProvider};
 use crate::identity::types::{ConnectionTestResult, DeltaSyncResult, EntraIdCredentials};
 
-pub struct EntraIdSync {
-    client: reqwest::Client,
-}
+pub struct EntraIdSync;
 
 /// NAN-1196: an Entra `tenant_id` is a GUID or a verified domain. Restrict it to
 /// that charset (alphanumerics, dot, hyphen) so it can never introduce a slash,
@@ -28,13 +26,7 @@ fn is_valid_entra_tenant_id(tenant_id: &str) -> bool {
 
 impl EntraIdSync {
     pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .redirect(super::restricted_redirect_policy())
-                .build()
-                .unwrap_or_default(),
-        }
+        Self
     }
 
     /// Obtain an OAuth2 access token using client credentials grant
@@ -53,9 +45,10 @@ impl EntraIdSync {
             creds.tenant_id
         );
 
-        let resp = self
-            .client
-            .post(&url)
+        let (client, url) =
+            super::guarded_client(&url, std::time::Duration::from_secs(30)).await?;
+        let resp = client
+            .post(url)
             .form(&[
                 ("grant_type", "client_credentials"),
                 ("client_id", &creds.client_id),
@@ -98,8 +91,9 @@ impl EntraIdSync {
         token: &str,
         url: &str,
     ) -> Result<(Vec<serde_json::Value>, Option<String>), SyncError> {
-        let resp = self
-            .client
+        let (client, url) =
+            super::guarded_client(url, std::time::Duration::from_secs(30)).await?;
+        let resp = client
             .get(url)
             .bearer_auth(token)
             .header("ConsistencyLevel", "eventual")
@@ -243,9 +237,10 @@ impl SyncProvider for EntraIdSync {
         let mut new_delta_link = None;
 
         loop {
-            let resp = self
-                .client
-                .get(&url)
+            let (client, dial_url) =
+                super::guarded_client(&url, std::time::Duration::from_secs(30)).await?;
+            let resp = client
+                .get(dial_url)
                 .bearer_auth(&token)
                 .header("ConsistencyLevel", "eventual")
                 .send()
@@ -324,9 +319,13 @@ impl SyncProvider for EntraIdSync {
         };
 
         // Try fetching a small number of users to verify permissions
-        let resp = self
-            .client
-            .get("https://graph.microsoft.com/v1.0/users?$top=1&$select=id")
+        let (client, url) = super::guarded_client(
+            "https://graph.microsoft.com/v1.0/users?$top=1&$select=id",
+            std::time::Duration::from_secs(30),
+        )
+        .await?;
+        let resp = client
+            .get(url)
             .bearer_auth(&token)
             .send()
             .await
@@ -335,9 +334,9 @@ impl SyncProvider for EntraIdSync {
         let elapsed = start.elapsed().as_millis() as u64;
 
         if resp.status().is_success() {
-            // Get approximate user count
-            let count_resp = self
-                .client
+            // Get approximate user count (reuse the client already pinned to
+            // graph.microsoft.com; same host).
+            let count_resp = client
                 .get("https://graph.microsoft.com/v1.0/users/$count")
                 .bearer_auth(&token)
                 .header("ConsistencyLevel", "eventual")

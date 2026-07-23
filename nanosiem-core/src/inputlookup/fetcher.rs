@@ -8,10 +8,12 @@
 //! - Applies rate limiting per user
 //! - Follows redirects safely
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use url::Url;
 use governor::{
     clock::DefaultClock,
     state::{InMemoryState, NotKeyed},
@@ -81,14 +83,20 @@ pub struct UrlFetcher {
 
 impl UrlFetcher {
     /// Create a new URL fetcher with the given configuration
-    pub fn new(config: InputLookupConfig) -> Self {
-        // Build HTTP client with custom redirect policy
-        let client = Client::builder()
+    /// Base reqwest client config shared by the default client and the
+    /// per-request IP-pinned clients (NAN-2011), so the two can never drift.
+    fn base_client_builder(config: &InputLookupConfig) -> reqwest::ClientBuilder {
+        Client::builder()
             .user_agent(&config.user_agent)
-            // We handle redirects manually to validate each redirect target
+            // We handle redirects manually to validate each redirect target.
             .redirect(Policy::none())
             .timeout(Duration::from_secs(config.default_timeout_secs as u64))
             .connect_timeout(Duration::from_secs(10))
+    }
+
+    pub fn new(config: InputLookupConfig) -> Self {
+        // Build HTTP client with custom redirect policy
+        let client = Self::base_client_builder(&config)
             .build()
             .expect("Failed to build HTTP client");
 
@@ -151,17 +159,13 @@ impl UrlFetcher {
             return Err(FetchError::RateLimitExceeded);
         }
 
-        // Validate URL with DNS resolution
-        let validated_url = self.validator.validate_with_dns(url).await?;
-
-        // Perform the fetch
+        // Perform the fetch. `fetch_with_redirects` SSRF-validates AND IP-pins
+        // every hop (NAN-2011), so no separate pre-validation is needed here.
         let start = Instant::now();
         let timeout =
             Duration::from_secs(timeout_secs.unwrap_or(self.config.default_timeout_secs) as u64);
 
-        let response = self
-            .fetch_with_redirects(validated_url.as_str(), timeout, 0)
-            .await?;
+        let response = self.fetch_with_redirects(url, timeout, 0).await?;
         let status = response.status();
 
         // Check status code
@@ -206,9 +210,18 @@ impl UrlFetcher {
                 });
             }
 
-            let response = self.client.get(url).timeout(timeout).send().await?;
+            // NAN-2011 (F29): SSRF-validate AND resolve the host, then PIN the
+            // validated addresses into the client so the connection dials exactly
+            // what was checked — closing the DNS-rebinding TOCTOU window between
+            // the SSRF check and the connect. `self.client` re-resolved DNS at
+            // connect time, so a rebind between validate and dial reached
+            // internal addresses. Every redirect hop re-validates and re-pins
+            // (this fn recurses per hop).
+            let (validated, addrs) = self.validator.validate_and_resolve(url).await?;
+            let client = self.pinned_client(&validated, &addrs)?;
+            let response = client.get(validated.clone()).timeout(timeout).send().await?;
 
-            // Handle redirects
+            // Handle redirects (Policy::none, so 3xx surfaces here).
             if response.status().is_redirection() {
                 if let Some(location) = response.headers().get("location") {
                     let redirect_url = location.to_str().map_err(|_| FetchError::HttpStatus {
@@ -216,29 +229,47 @@ impl UrlFetcher {
                         message: "Invalid redirect location header".to_string(),
                     })?;
 
-                    // Resolve relative URLs
-                    let base =
-                        url::Url::parse(url).map_err(|e| SsrfError::InvalidUrl(e.to_string()))?;
-                    let redirect_url = base
+                    // Resolve relative URLs against the validated base.
+                    let redirect_url = validated
                         .join(redirect_url)
                         .map_err(|e| SsrfError::InvalidUrl(e.to_string()))?;
 
-                    // Validate redirect target — resolves DNS and rejects redirects whose
-                    // hostname resolves to a private/link-local/metadata IP.
-                    let validated = self
+                    // Stricter redirect policy (blocks IP-literal / non-https
+                    // redirects); the recursion below re-validates and re-pins.
+                    let validated_redirect = self
                         .validator
                         .validate_redirect(redirect_url.as_str())
                         .await?;
 
-                    debug!("Following redirect to: {}", validated);
+                    debug!("Following redirect to: {}", validated_redirect);
                     return self
-                        .fetch_with_redirects(validated.as_str(), timeout, redirect_count + 1)
+                        .fetch_with_redirects(
+                            validated_redirect.as_str(),
+                            timeout,
+                            redirect_count + 1,
+                        )
                         .await;
                 }
             }
 
             Ok(response)
         })
+    }
+
+    /// Build a reqwest client that dials ONLY the SSRF-validated `addrs` for
+    /// `validated`'s host (NAN-2011), so a DNS rebind after validation cannot
+    /// redirect the connection to an internal address. For an IP-literal host
+    /// `addrs` is empty (it was validated directly) and the shared client is
+    /// reused — reqwest dials the literal with no rebinding window.
+    fn pinned_client(&self, validated: &Url, addrs: &[SocketAddr]) -> Result<Client, FetchError> {
+        if addrs.is_empty() {
+            return Ok(self.client.clone());
+        }
+        let host = validated.host_str().ok_or(SsrfError::MissingHostname)?;
+        Self::base_client_builder(&self.config)
+            .resolve_to_addrs(host, addrs)
+            .build()
+            .map_err(FetchError::HttpError)
     }
 
     /// Read response body with size limit
@@ -382,5 +413,48 @@ mod tests {
 
         let result = fetcher.fetch("http://127.0.0.1/", None, 0).await;
         assert!(matches!(result, Err(FetchError::SsrfValidation(_))));
+    }
+
+    /// NAN-2011 (F29): the fetch path now validates AND resolves through
+    /// `validate_and_resolve`, so the cloud-metadata endpoint is rejected by
+    /// both its IP literal and its hostname before any connect.
+    #[tokio::test]
+    async fn test_fetcher_rejects_cloud_metadata_ip() {
+        let config = InputLookupConfig {
+            allow_http: true,
+            ..Default::default()
+        };
+        let fetcher = UrlFetcher::new(config);
+
+        let result = fetcher
+            .fetch("http://169.254.169.254/latest/meta-data/", None, 0)
+            .await;
+        assert!(matches!(result, Err(FetchError::SsrfValidation(_))));
+    }
+
+    #[tokio::test]
+    async fn test_fetcher_rejects_cloud_metadata_hostname() {
+        let config = InputLookupConfig {
+            allow_http: true,
+            ..Default::default()
+        };
+        let fetcher = UrlFetcher::new(config);
+
+        // Blocked by hostname (no DNS needed) — a rebind can't even begin.
+        let result = fetcher
+            .fetch("http://metadata.google.internal/", None, 0)
+            .await;
+        assert!(matches!(result, Err(FetchError::SsrfValidation(_))));
+    }
+
+    /// The IP-literal branch of `pinned_client` reuses the shared client (empty
+    /// addrs = nothing to override); a hostname with pinned addrs builds a
+    /// dedicated client. Exercises the branch without a live connection.
+    #[test]
+    fn pinned_client_reuses_shared_client_for_ip_literal() {
+        let fetcher = UrlFetcher::new(InputLookupConfig::default());
+        let url = Url::parse("https://93.184.216.34/").unwrap();
+        // Empty addrs (IP literal) => must not fail building a client.
+        assert!(fetcher.pinned_client(&url, &[]).is_ok());
     }
 }

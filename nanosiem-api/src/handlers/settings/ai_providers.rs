@@ -814,8 +814,14 @@ async fn test_provider_connection(
         // targets before any outbound request. On-prem / air-gapped operators
         // opt private endpoints back in via NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS;
         // metadata endpoints stay blocked regardless.
-        ai_base_url_validator()
-            .validate_with_dns(&base_url)
+        // NAN-2018: validate AND pin the client to the validated IP so a DNS
+        // rebind between the check and the connect can't reach loopback /
+        // private / metadata after the check passed.
+        let (pinned_client, _base) = ai_base_url_validator()
+            .build_pinned_client(
+                &base_url,
+                reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
+            )
             .await
             .map_err(|e| format!("base_url rejected: {}", e))?;
 
@@ -824,7 +830,7 @@ async fn test_provider_connection(
             .filter(|s| !s.is_empty())
             .map(str::to_string);
 
-        let mut req = client
+        let mut req = pinned_client
             .post(format!("{}/chat/completions", base_url))
             .header("content-type", "application/json");
         if !api_key.is_empty() {

@@ -458,6 +458,9 @@ fn ssrf_error_to_api(err: SsrfError) -> ApiError {
         SsrfError::BlockedRedirect(msg) => {
             ApiError::ValidationError(format!("Ingestion URL redirect is not allowed: {}", msg))
         }
+        SsrfError::ClientBuildFailed(msg) => {
+            ApiError::ValidationError(format!("Ingestion URL client error: {}", msg))
+        }
     }
 }
 

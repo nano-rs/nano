@@ -318,7 +318,37 @@ pub fn enforce_source_scope(
             e
         ))
     })?;
-    let mut enforced = inject_source_type_exclusion_recursive(&parsed, deny_set).pretty_print();
+    let injected = inject_source_type_exclusion_recursive(&parsed, deny_set);
+    let mut enforced = injected.pretty_print();
+
+    // NAN-2006 (F1,F2,F4,F5,F6,F7,F9) — FAIL-CLOSED round-trip verification.
+    //
+    // The security guarantee is that EVERY scan in the query is ANDed at its
+    // top level with the mandatory source-type exclusion. Every caller re-parses
+    // this serialized string (core_search.rs:481, sql_execution.rs:162,
+    // streaming.rs, field_queries.rs, prevalence, cloud, reports), and the nPL
+    // grammar has NO working escape for `"` (NAN-1157) — so historically a
+    // crafted keyword / rex pattern / filter value / quoted field name could
+    // break out of the injected `Group(...)`, re-balance the parens, and
+    // re-parse `source_type=<denied>` as an ungated top-level OR arm (or inject
+    // an ungated `| append [...]` subsearch). The pretty-printer now strips the
+    // breakout `"`, but we do NOT let serialization fidelity be the only thing
+    // standing between an authenticated user and audit / denied-source rows:
+    // re-parse our own output exactly as the callers will, and PROVE the gate
+    // survived on every scan. If it did not, refuse to run the query.
+    let reparsed = parse_query(&enforced).map_err(|e| {
+        crate::SearchError::SqlValidationError(format!(
+            "source-scope enforcement produced an unparseable query: {}",
+            e
+        ))
+    })?;
+    if !all_scans_gated(&reparsed, deny_set) {
+        return Err(crate::SearchError::SqlValidationError(
+            "source-scope enforcement could not be verified for this query; \
+             refusing to run it (NAN-2006)"
+                .to_string(),
+        ));
+    }
 
     // NAN-1453: `parse_query` strips `earliest=`/`latest=` (they are TimeRange
     // controls, not AST nodes), so the pretty-printed rewrite above drops them.
@@ -500,6 +530,171 @@ fn gate_command(command: &Command, deny_set: &BTreeSet<String>) -> Command {
         | Command::Baseline { .. } => {}
     }
     gated
+}
+
+/// FAIL-CLOSED verification (NAN-2006): true iff EVERY base-table scan in
+/// `query` — the top-level `Search` leaf AND the `Search` leaf of every
+/// subsearch at any depth (join / append / IN-subsearch, including those nested
+/// inside where / transaction / sequence / funnel conditions) — is ANDed at its
+/// TOP LEVEL with the exact [`mandatory_exclusion`] conjunct for `deny_set`.
+///
+/// This is the structural inverse of the postcondition of
+/// [`inject_source_type_exclusion_recursive`] ("every scan is
+/// `And(Group(<gated user expr>), <mandatory exclusion>)`"), and the production
+/// twin of the `assert_scope_gate_on_every_scan` test oracle.
+/// [`enforce_source_scope`] runs it on the RE-PARSED pretty-printed output, so
+/// if a crafted token broke out of a `Group` and dislodged the exclusion from
+/// its ANDed position (or injected an ungated subsearch), this returns `false`
+/// and the query is refused rather than run ungated.
+///
+/// It is a *proof*, not a heuristic: `X AND source_type NOT IN (D)` cannot match
+/// a row of any source in `D` for ANY user expr `X`. A gate merely *mentioned*
+/// inside `X` (under a `Not`, in an `Or` arm) does NOT satisfy it — exactly the
+/// NAN-1794 bypass class.
+fn all_scans_gated(query: &Query, deny_set: &BTreeSet<String>) -> bool {
+    match query {
+        Query::Search(expr) => match expr {
+            SearchExpr::And(left, right) if is_mandatory_exclusion(right, deny_set) => {
+                expr_subsearches_gated(left, deny_set)
+            }
+            _ => false,
+        },
+        Query::Piped { source, command } => {
+            all_scans_gated(source, deny_set) && command_subsearches_gated(command, deny_set)
+        }
+    }
+}
+
+/// True iff `expr` is exactly the conjunct [`mandatory_exclusion`] emits for
+/// `deny_set`: the legacy `source_type != "audit"` FieldFilter when the deny set
+/// is exactly `{"audit"}`, else a negated `source_type NOT IN (…)` whose string
+/// value set equals `deny_set` (a superset/subset is NOT the gate).
+fn is_mandatory_exclusion(expr: &SearchExpr, deny_set: &BTreeSet<String>) -> bool {
+    if deny_set.len() == 1 && deny_set.contains("audit") {
+        return matches!(
+            expr,
+            SearchExpr::FieldFilter {
+                field,
+                op: Comparator::Ne,
+                value: Value::String(s),
+            } if field.eq_ignore_ascii_case("source_type") && s.eq_ignore_ascii_case("audit")
+        );
+    }
+    match expr {
+        SearchExpr::InList {
+            field,
+            values,
+            negated: true,
+        } if field.eq_ignore_ascii_case("source_type") => {
+            let got: BTreeSet<String> = values
+                .iter()
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            got.len() == values.len() && &got == deny_set
+        }
+        _ => false,
+    }
+}
+
+/// Require every `InSubsearch` reachable in `expr` to be fully gated. Mirrors
+/// the subsearch-reaching walk in [`gate_search_expr`]; exhaustive (no `_` arm)
+/// so a new `Query`-carrying `SearchExpr` variant is a compile error here rather
+/// than a silent gap in the fail-closed verification.
+fn expr_subsearches_gated(expr: &SearchExpr, deny_set: &BTreeSet<String>) -> bool {
+    match expr {
+        SearchExpr::InSubsearch { subsearch, .. } => all_scans_gated(subsearch, deny_set),
+        SearchExpr::And(l, r) | SearchExpr::Or(l, r) => {
+            expr_subsearches_gated(l, deny_set) && expr_subsearches_gated(r, deny_set)
+        }
+        SearchExpr::Not(inner) | SearchExpr::Group(inner) => {
+            expr_subsearches_gated(inner, deny_set)
+        }
+        SearchExpr::Keyword(_)
+        | SearchExpr::FieldFilter { .. }
+        | SearchExpr::FunctionFilter { .. }
+        | SearchExpr::FieldFunctionFilter { .. }
+        | SearchExpr::InList { .. }
+        | SearchExpr::BooleanFunction(_)
+        | SearchExpr::LiteralComparison { .. }
+        | SearchExpr::IocMatch { .. } => true,
+    }
+}
+
+/// Require every subsearch reachable in `command` to be fully gated. Mirrors
+/// [`gate_command`]; exhaustive (no `_` arm) so a new subsearch-bearing
+/// `Command` variant is a compile error here rather than a silent gap.
+fn command_subsearches_gated(command: &Command, deny_set: &BTreeSet<String>) -> bool {
+    match command {
+        Command::Join { subsearch, .. } | Command::Append { subsearch, .. } => {
+            all_scans_gated(subsearch, deny_set)
+        }
+        Command::Where { condition } => expr_subsearches_gated(condition, deny_set),
+        Command::Transaction {
+            startswith,
+            endswith,
+            ..
+        } => {
+            startswith
+                .as_ref()
+                .map_or(true, |e| expr_subsearches_gated(e, deny_set))
+                && endswith
+                    .as_ref()
+                    .map_or(true, |e| expr_subsearches_gated(e, deny_set))
+        }
+        Command::Sequence { conditions, .. } => conditions
+            .iter()
+            .all(|c| expr_subsearches_gated(c, deny_set)),
+        Command::Funnel { steps, .. } => steps
+            .iter()
+            .all(|(_, c)| expr_subsearches_gated(c, deny_set)),
+        // Commands carrying no nested `Query`/`SearchExpr` — nothing to verify.
+        // Enumerated (no `_` arm) to keep the fail-closed property above.
+        Command::Stats { .. }
+        | Command::Chart { .. }
+        | Command::StreamStats { .. }
+        | Command::Sort { .. }
+        | Command::Head { .. }
+        | Command::Tail { .. }
+        | Command::Timechart { .. }
+        | Command::Table { .. }
+        | Command::Rename { .. }
+        | Command::Lookup { .. }
+        | Command::Eval { .. }
+        | Command::Dedup { .. }
+        | Command::Bin { .. }
+        | Command::Rex { .. }
+        | Command::Fields { .. }
+        | Command::Top { .. }
+        | Command::Rare { .. }
+        | Command::Fillnull { .. }
+        | Command::Mvexpand { .. }
+        | Command::Spath { .. }
+        | Command::Format { .. }
+        | Command::Return { .. }
+        | Command::Risk { .. }
+        | Command::Prevalence { .. }
+        | Command::Sample { .. }
+        | Command::Reverse
+        | Command::EventStats { .. }
+        | Command::Anomaly { .. }
+        | Command::InputLookup { .. }
+        | Command::Tree { .. }
+        | Command::ResolveIdentity { .. }
+        | Command::Asset { .. }
+        | Command::Cloud { .. }
+        | Command::Lateral { .. }
+        | Command::Ai { .. }
+        | Command::Output { .. }
+        | Command::Services
+        | Command::Service { .. }
+        | Command::Trace { .. }
+        | Command::Metric { .. }
+        | Command::Retro { .. }
+        | Command::Baseline { .. } => true,
+    }
 }
 
 /// Recursively strip lateral and all commands after it
