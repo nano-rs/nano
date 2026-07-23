@@ -41,7 +41,22 @@ async fn cluster_all_shard_ch_probe(
         .fetch_one::<u64>()
         .await
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .or_else(|e| {
+            // NAN-2025: the runtime `nanosiem` CH user intentionally lacks the
+            // REMOTE grant (`clusterAllReplicas`/`remote` are denied per the
+            // NAN-2001 SSRF posture), and on a single-shard cluster this all-shard
+            // probe has no diagnostic value anyway (the LB `SELECT 1` already
+            // proved the sole shard reachable). Treat a privilege denial as a skip
+            // rather than flipping the whole health check to a false CH-down
+            // verdict and flooding WARN on every /health call.
+            let msg = e.to_string();
+            if msg.contains("ACCESS_DENIED") || msg.contains("Code: 497") {
+                tracing::debug!("all-shard health probe skipped (probe not permitted): {msg}");
+                Ok(())
+            } else {
+                Err(msg)
+            }
+        })
 }
 
 /// Minimal public health check response (prevents information disclosure)

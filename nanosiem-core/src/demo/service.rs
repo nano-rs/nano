@@ -456,40 +456,76 @@ impl DemoService {
 
     /// Clean up all expired demo sessions and their resources.
     pub async fn cleanup_expired_sessions(&self) -> Result<u64, DemoError> {
-        // Use a transaction to hold FOR UPDATE SKIP LOCKED rows
-        let mut tx = self.pool.begin().await?;
-
+        // Snapshot the candidate sessions WITHOUT holding a batch-wide lock. Each
+        // session is then cleaned in its OWN transaction (NAN-2026). Previously the
+        // whole batch shared one transaction, so a single failing session (e.g. a
+        // FK violation deleting its user) aborted the transaction and every
+        // subsequent statement failed with "current transaction is aborted"; the
+        // final commit rolled everything back, so NO session was ever marked
+        // cleaned_up — the same sessions re-failed every run and demo data
+        // accumulated. Per-session transactions contain a failure to just that
+        // session and let the healthy ones commit.
         let expired_sessions: Vec<DemoSession> = sqlx::query_as(
-            r#"
-            SELECT * FROM demo.sessions
-            WHERE expires_at < NOW() AND cleaned_up = FALSE
-            FOR UPDATE SKIP LOCKED
-            "#,
+            "SELECT * FROM demo.sessions WHERE expires_at < NOW() AND cleaned_up = FALSE",
         )
-        .fetch_all(&mut *tx)
+        .fetch_all(&self.pool)
         .await?;
 
-        let count = expired_sessions.len() as u64;
-        if count == 0 {
-            tx.commit().await?;
+        if expired_sessions.is_empty() {
             return Ok(0);
         }
 
-        info!(count = count, "Cleaning up expired demo sessions");
+        info!(
+            count = expired_sessions.len(),
+            "Cleaning up expired demo sessions"
+        );
 
+        let mut cleaned = 0u64;
         for session in &expired_sessions {
-            if let Err(e) = self.cleanup_session_in_tx(session, &mut tx).await {
-                error!(
-                    session_id = %session.id,
-                    user_id = %session.user_id,
-                    error = %e,
-                    "Failed to clean up demo session"
-                );
+            let mut tx = match self.pool.begin().await {
+                Ok(tx) => tx,
+                Err(e) => {
+                    error!(session_id = %session.id, error = %e,
+                        "Failed to begin demo session cleanup transaction");
+                    continue;
+                }
+            };
+
+            // Re-lock the row under this transaction so a concurrent cleanup run
+            // (multi-replica / leader failover) can't double-process it. SKIP
+            // LOCKED yields it to whoever already holds it; the cleaned_up filter
+            // skips one that was finished between the snapshot and now.
+            let claimed: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM demo.sessions WHERE id = $1 AND cleaned_up = FALSE FOR UPDATE SKIP LOCKED",
+            )
+            .bind(session.id)
+            .fetch_optional(&mut *tx)
+            .await
+            .unwrap_or(None);
+            if claimed.is_none() {
+                let _ = tx.rollback().await;
+                continue;
+            }
+
+            match self.cleanup_session_in_tx(session, &mut tx).await {
+                Ok(()) => match tx.commit().await {
+                    Ok(()) => cleaned += 1,
+                    Err(e) => error!(
+                        session_id = %session.id, user_id = %session.user_id, error = %e,
+                        "Failed to commit demo session cleanup"
+                    ),
+                },
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    error!(
+                        session_id = %session.id, user_id = %session.user_id, error = %e,
+                        "Failed to clean up demo session"
+                    );
+                }
             }
         }
 
-        tx.commit().await?;
-        Ok(count)
+        Ok(cleaned)
     }
 
     /// Clean up a single demo session within an existing transaction.

@@ -38,6 +38,15 @@
              the dict LIFETIME. *.* is the only scope CH accepts for this grant;
              it adds no read/write/DDL capability beyond the grants above. -->
         <query>GRANT SYSTEM RELOAD DICTIONARY ON *.*</query>
+        <!-- NAN-2027: distribute runtime DDL the user is already granted per-table
+             ON CLUSTER across every shard/replica — the IPinfo generation purge
+             (ALTER … DELETE ON CLUSTER), retention TTL, storage tiering, GDPR
+             erasure, and lookup-table writes. Without it those ON CLUSTER
+             statements fail Code 497 (grant CLUSTER ON *.*) on a clustered
+             deployment. CLUSTER only accepts *.* scope and adds no read/write
+             capability beyond the per-table grants above — only their cluster
+             fan-out. Empty/no-op on single-node (on_cluster_clause() is empty). -->
+        <query>GRANT CLUSTER ON *.*</query>
         <query>GRANT SELECT(bytes_on_disk, rows, data_uncompressed_bytes, partition, database, table, active) ON system.parts</query>
         <query>GRANT SELECT(total_space, free_space, type) ON system.disks</query>
         <!-- NAN-1405: siem-health insert-integrity probes — detect the

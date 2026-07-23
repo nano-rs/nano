@@ -16,6 +16,17 @@ use crate::search::{SearchExecutionLimits, SearchRequest, TimeRangeInput};
 use super::DetectionError;
 use super::DetectionService;
 
+/// Only the `Logs` dataset carries a per-event `source_type` column. The derived
+/// risk/spans/metrics grains project aggregated columns whose outer scope has no
+/// `source_type`, so the logs-shaped source_type companion
+/// (`… | stats count by source_type`) resolves to UNKNOWN_IDENTIFIER (CH code 47)
+/// on those datasets every cycle (NAN-2024). Callers skip the companion for these
+/// and fail closed with the full restricted set — the same result the doomed
+/// query's error handler already produces.
+fn dataset_exposes_source_type(dataset: Option<&str>) -> bool {
+    crate::query::Dataset::from_selector(dataset.unwrap_or("logs")) == crate::query::Dataset::Logs
+}
+
 impl DetectionService {
     // ========================================================================
     // Rule Execution
@@ -246,6 +257,18 @@ impl DetectionService {
                 }
             }
         };
+
+        // NAN-2024: the companion is logs-shaped (`… | stats count by source_type`),
+        // but non-Logs datasets (risk/spans/metrics) are derived grains whose outer
+        // projection has no `source_type` column — the query is UNKNOWN_IDENTIFIER
+        // (CH code 47) on every cycle. Skip the doomed round-trip and fail closed
+        // with the full restricted set (the exact stamp the catch below produces).
+        if !dataset_exposes_source_type(rule.dataset.as_deref()) {
+            debug!(rule_id = %rule.id, dataset = ?rule.dataset,
+                "NAN-2024: non-logs dataset has no source_type grain; failing closed (companion skipped)");
+            apply(results, &restricted_stamp());
+            return;
+        }
 
         let Some(companion) = Self::source_type_companion_query(&rule.query) else {
             warn!(rule_id = %rule.id,
@@ -586,5 +609,23 @@ impl DetectionService {
                 Ok(None)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dataset_exposes_source_type;
+
+    /// NAN-2024: only the logs dataset carries a per-event `source_type`; the
+    /// derived risk/spans/metrics grains do not, so the source_type companion is
+    /// skipped (fail-closed) for them rather than run and error every cycle.
+    #[test]
+    fn only_logs_dataset_exposes_source_type() {
+        assert!(dataset_exposes_source_type(None)); // default selector => logs
+        assert!(dataset_exposes_source_type(Some("logs")));
+        assert!(dataset_exposes_source_type(Some(""))); // unknown/empty => logs
+        assert!(!dataset_exposes_source_type(Some("risk")));
+        assert!(!dataset_exposes_source_type(Some("spans")));
+        assert!(!dataset_exposes_source_type(Some("metrics")));
     }
 }

@@ -460,6 +460,28 @@ impl EnrichmentService {
                 continue;
             }
 
+            // NAN-2027: surface upstream rate-limiting distinctly (with any
+            // Retry-After) instead of a generic download failure, so a genuinely
+            // throttled feed reads as intentional backoff in the logs. The main
+            // 429 driver — a per-cycle re-download storm from the ON CLUSTER purge
+            // failing every run — is fixed by making that purge non-fatal above;
+            // this keeps a rate-limited upstream legible on the hourly retry.
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            {
+                let retry_after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|r| format!(" (Retry-After: {r})"))
+                    .unwrap_or_default();
+                return Err(EnrichmentError::DownloadError(format!(
+                    "HTTP {}: upstream throttled/unavailable{}",
+                    status.as_u16(),
+                    retry_after
+                )));
+            }
+
             if !status.is_success() {
                 return Err(EnrichmentError::DownloadError(format!(
                     "HTTP {}: {}",
@@ -655,12 +677,33 @@ impl EnrichmentService {
                  DELETE WHERE source_id = ? AND updated_at < fromUnixTimestamp64Milli(toInt64(?))",
                 on_cluster = on_cluster_clause()
             );
-            ch.query(&purge_sql)
+            // NAN-2027: the fresh generation is already inserted and the dict
+            // resolves the newest row via argMax(updated_at), so a failed
+            // stale-generation purge is a cosmetic bloat issue — NOT a reason to
+            // fail the whole sync. Propagating this error marked the source
+            // `failed` every cycle, which re-queued a full ~24 MB re-download
+            // (hourly + on every restart) and eventually earned an upstream 429.
+            // The `ON CLUSTER` mutation needs the CLUSTER grant on this user; where
+            // that grant is missing the sync now still succeeds with fresh data,
+            // and the next successful purge (once the grant lands) reclaims the
+            // accumulated generations.
+            match ch
+                .query(&purge_sql)
                 .bind(source_id)
                 .bind(run_ms)
                 .execute()
-                .await?;
-            info!(source_id, "Stale IP enrichment CIDRs removed (lightweight delete)");
+                .await
+            {
+                Ok(()) => {
+                    info!(source_id, "Stale IP enrichment CIDRs removed (lightweight delete)")
+                }
+                Err(e) => warn!(
+                    source_id,
+                    error = %e,
+                    "IP enrichment stale-generation purge failed; fresh data is live \
+                     (dict reads newest via argMax), leaving prior generations in place (non-fatal)"
+                ),
+            }
         } else {
             warn!(
                 source_id,
