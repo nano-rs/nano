@@ -103,6 +103,26 @@ impl SearchService {
             }
         };
 
+        // NAN-2004: run the SAME input-side field-name validation the batch path
+        // applies (core_search.rs, NAN-1354/NAN-1992) so a malformed /
+        // injection-shaped field or `rex` capture-group name (e.g. a comma/paren
+        // name using `/**/` for whitespace) is rejected HERE too, instead of
+        // compiling to a single garbage-named column. `escape_identifier` already
+        // neutralizes it in codegen (the payload collapses to one inert quoted
+        // alias — no sub-select/currentUser executes), but the streaming path was
+        // the one sink that skipped this pre-check; validating on BOTH paths keeps
+        // them from drifting if that escape ever regresses. Surfaced as an Error
+        // event, matching how this path already reports parse/OOM/time-range
+        // errors (the batch path returns an equivalent 400).
+        let query_profile = self.dataset_profile(request.dataset.as_deref());
+        if let Err(e) = validate_query_field_names(&query, query_profile.as_ref()) {
+            send_event!(SearchStreamEvent::Error {
+                code: "VALIDATION_ERROR".to_string(),
+                message: format!("{}", e),
+            });
+            return;
+        }
+
         // NAN-806: apply implicit sort after a trailing `stats`/`chart` with a
         // `by` clause so the outer LIMIT returns top-N groups instead of an
         // arbitrary hash-bucket slice. Streamable queries aren't aggregations,
@@ -858,5 +878,36 @@ mod tests {
         // Aggregation sets chunks_queried_all=true unconditionally
         // (see execute_streaming_path) so this branch is unreachable for it.
         assert!(!gate(true, u64::MAX, MAX));
+    }
+
+    #[test]
+    fn streaming_path_rejects_rex_capture_name_injection() {
+        // NAN-2004: `search_streaming` now runs the SAME field-name validation
+        // (`validate_query_field_names`) the batch path does, so an
+        // injection-shaped `rex` capture name — comma/paren using `/**/` for
+        // whitespace, which slips past the space check — is rejected on the
+        // streaming path instead of compiling to one inert garbage-named column.
+        // `escape_identifier` still neutralizes it in codegen; this guards the
+        // parse-time layer the streaming path was previously missing. The check is
+        // profile-independent (a comma/paren name is invalid under any schema), so
+        // the no-profile `validate_query_fields` is an exact proxy for the wrapper.
+        use crate::query::{parse_query, validation::validate_query_fields};
+        for q in [
+            r#"* | stats count() as total | rex field=total "(?<a,version()/**/v,hostName()/**/h,currentUser()/**/u>\w+)""#,
+            r#"* | stats count() as total | rex field=total "(?<a,(SELECT/**/count()/**/FROM/**/logs)/**/logrows,currentUser()/**/u>\w+)""#,
+        ] {
+            let query = parse_query(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+            assert!(
+                !validate_query_fields(&query).is_empty(),
+                "streaming path must reject injection-shaped rex capture name: {q}"
+            );
+        }
+        // A legit capture name still validates cleanly on the streaming path.
+        let ok = parse_query(r#"* | stats count() as total | rex field=total "(?<digits>\d+)""#)
+            .unwrap();
+        assert!(
+            validate_query_fields(&ok).is_empty(),
+            "legit rex capture name must not be rejected on the streaming path"
+        );
     }
 }
