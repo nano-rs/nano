@@ -191,6 +191,9 @@ impl SearchService {
             /* is_clickhouse = */ true,
             /* has_prevalence_svc = */ self.prevalence_service.is_some(),
         )
+            // Restricted execution cannot use source-less prevalence
+            // dictionaries; keep Inspect SQL on the same residual path.
+            && crate::auth::ArtifactScope::from_scope(scope).is_unrestricted()
             // NAN-1798 P2: mirror the execute path — risk-touching queries do
             // not take the prevalence pushdown (see core_search).
             && !super::touches_risk_dataset(dataset, query)

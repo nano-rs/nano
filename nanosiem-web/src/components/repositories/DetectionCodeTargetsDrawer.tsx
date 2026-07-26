@@ -171,6 +171,7 @@ export function DetectionCodeTargetsDrawer({ open, onClose, canManage }: Props) 
           can_read: false,
           can_write: false,
           default_branch: null,
+          error_code: 'request_failed',
           message: err.message,
         }),
       );

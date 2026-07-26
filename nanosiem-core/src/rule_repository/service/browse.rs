@@ -69,11 +69,17 @@ impl RuleRepositoryService {
             })
     }
 
-    /// Preview importing a rule
+    /// Preview importing a rule, scoped to the caller's visible sources.
+    ///
+    /// NAN-2081: the preview's `available_source_types` / coverage decision are
+    /// derived from live ClickHouse telemetry, so `access` must carry both the
+    /// caller's live-data capability and their effective per-source deny set.
+    /// [`LiveInventoryAccess::Denied`] returns the catalog half only.
     pub async fn preview_import(
         &self,
         repo_id: Uuid,
         path: &str,
+        access: &crate::rule_repository::LiveInventoryAccess<'_>,
     ) -> Result<ImportPreview, RuleRepositoryError> {
         let repo = self.get_repository(repo_id).await?;
         let repo_rule = self.get_rule(repo_id, path).await?;
@@ -108,10 +114,14 @@ impl RuleRepositoryService {
             .clone()
             .unwrap_or_else(|| "medium".to_string());
 
-        // Auto-refresh coverage data if empty (first use)
-        {
+        // Auto-refresh coverage data if empty (first use). Emptiness is judged
+        // on the RAW cache, not the caller's scoped view — otherwise a caller
+        // denied every cached source would re-scan ClickHouse every request.
+        // Skipped entirely for a caller with no live-data capability: they must
+        // not be able to trigger a tenant-wide telemetry scan either.
+        if access.permits_live_data() {
             let analyzer = self.coverage_analyzer.read().await;
-            if analyzer.get_available_source_types().is_empty() {
+            if analyzer.is_inventory_empty() {
                 drop(analyzer); // Release read lock before acquiring write lock
                 let mut analyzer = self.coverage_analyzer.write().await;
                 if let Err(e) = analyzer.refresh_available_fields().await {
@@ -122,7 +132,7 @@ impl RuleRepositoryService {
 
         let coverage = {
             let analyzer = self.coverage_analyzer.read().await;
-            analyzer.check_rule_coverage(&repo_rule)
+            analyzer.check_rule_coverage(&repo_rule, access)
         };
 
         // Validate source types

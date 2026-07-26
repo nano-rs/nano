@@ -10,8 +10,12 @@
 //! here. Keeping only the definition persisted means the number is always
 //! consistent with the spans and there is no recompute job.
 //!
-//! Read endpoints require `search:view` (the console is a search-adjacent
-//! surface); mutations require `settings:system` (SLOs are configuration).
+//! The list endpoint computes live attainment from `otel_spans`, so it requires
+//! `search:view` AND `search:execute` (NAN-2083): a view-only principal that is
+//! denied canonical search must not be able to run this span aggregate through
+//! the wrapper. Mutations require `settings:system` (SLOs are configuration)
+//! and return only the persisted definition, so they never execute a live
+//! search as a side effect (NAN-2139).
 
 use axum::{
     Extension, Json,
@@ -213,7 +217,11 @@ pub async fn list_slos(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<ListSlosResponse>, ApiError> {
+    // NAN-2083: `enrich` runs a live `otel_spans` aggregate per SLO. Gate on
+    // `search:execute` (not just the view capability) before any query, so a
+    // view-only principal cannot reach span data through this wrapper.
     ensure_permission(&auth, permissions::SEARCH_VIEW)?;
+    ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
 
     let repo = SloRepository::new(state.pool.clone());
     let defs = repo.list().await.map_err(map_repo_err)?;
@@ -233,7 +241,7 @@ pub async fn list_slos(
     tag = "observability",
     request_body = SloRequest,
     responses(
-        (status = 201, description = "SLO created (with live attainment)", body = Slo),
+        (status = 201, description = "SLO definition created", body = SloDefinition),
         (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
     ),
@@ -243,7 +251,7 @@ pub async fn create_slo(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Json(req): Json<SloRequest>,
-) -> Result<(StatusCode, Json<Slo>), ApiError> {
+) -> Result<(StatusCode, Json<SloDefinition>), ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let (name, service, threshold) = req.validate()?;
@@ -277,8 +285,7 @@ pub async fn create_slo(
         .await
         .map_err(map_repo_err)?;
 
-    let slo = enrich(&state, def).await?;
-    Ok((StatusCode::CREATED, Json(slo)))
+    Ok((StatusCode::CREATED, Json(def)))
 }
 
 /// Update an existing SLO.
@@ -289,7 +296,7 @@ pub async fn create_slo(
     params(("id" = String, Path, description = "SLO typeid (slo_<base32>) or bare UUID")),
     request_body = SloRequest,
     responses(
-        (status = 200, description = "SLO updated (with live attainment)", body = Slo),
+        (status = 200, description = "SLO definition updated", body = SloDefinition),
         (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "SLO not found", body = ErrorResponse),
@@ -301,7 +308,7 @@ pub async fn update_slo(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
     Json(req): Json<SloRequest>,
-) -> Result<Json<Slo>, ApiError> {
+) -> Result<Json<SloDefinition>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let (name, service, threshold) = req.validate()?;
@@ -320,8 +327,7 @@ pub async fn update_slo(
         .await
         .map_err(map_repo_err)?;
 
-    let slo = enrich(&state, def).await?;
-    Ok(Json(slo))
+    Ok(Json(def))
 }
 
 /// Delete an SLO.
@@ -358,3 +364,34 @@ pub async fn delete_slo(
     components(schemas(Slo, ListSlosResponse, SloRequest, SloDefinition, SloSliKind))
 )]
 pub struct ObservabilitySlosApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use utoipa::OpenApi;
+
+    #[test]
+    fn mutation_responses_are_definition_only() {
+        let spec = serde_json::to_value(ObservabilitySlosApiDoc::openapi())
+            .expect("OpenAPI document serializes");
+
+        for (path, method, status) in [
+            ("/api/observability/slos", "post", "201"),
+            ("/api/observability/slos/{id}", "put", "200"),
+        ] {
+            assert_eq!(
+                spec["paths"][path][method]["responses"][status]["content"]["application/json"]["schema"]
+                    ["$ref"],
+                "#/components/schemas/SloDefinition",
+                "{method} {path} must not promise live search-derived fields"
+            );
+        }
+
+        assert_eq!(
+            spec["paths"]["/api/observability/slos"]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/ListSlosResponse",
+            "the read endpoint remains the explicitly enriched surface"
+        );
+    }
+}

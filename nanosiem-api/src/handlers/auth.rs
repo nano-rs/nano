@@ -34,7 +34,7 @@ use nanosiem_core::auth::{
 };
 
 use crate::handlers::AuditExt;
-use crate::middleware::AuthContext;
+use crate::middleware::{require_session_auth, AuthContext};
 use crate::state::AppState;
 
 // The Set-Cookie helpers (`build_access_token_cookie`,
@@ -292,6 +292,7 @@ pub struct LogoutRequest {
     responses(
         (status = 204, description = "Logout successful"),
         (status = 401, description = "Invalid token", body = AuthApiError),
+        (status = 403, description = "Forbidden — interactive session required (API keys have no session)", body = AuthApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -302,6 +303,21 @@ pub async fn logout(
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<LogoutRequest>,
 ) -> Result<Response, (StatusCode, Json<AuthApiError>)> {
+    // NAN-2040: an API key has no interactive browser session to end. Its subject
+    // is its owner, so without this a (possibly zero-permission) key could
+    // force-revoke ALL of the owner's browser sessions via the bulk termination
+    // below (the alternate route past the session-handler guards). API keys are
+    // revoked by deleting the key, not by logout.
+    if auth.is_api_key {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(AuthApiError::new(
+                "interactive_session_required",
+                "Logout requires an interactive session; API keys have no session to end.",
+            )),
+        ));
+    }
+
     let ip_address = extract_client_ip(&headers, Some(&addr));
     let user_agent = extract_user_agent(&headers);
     let client_ctx = ClientContext::new(ip_address.clone(), user_agent.clone());
@@ -639,9 +655,10 @@ pub struct ChangePasswordResponse {
     responses(
         (status = 200, description = "Password changed successfully", body = ChangePasswordResponse),
         (status = 401, description = "Current password is incorrect", body = AuthApiError),
+        (status = 403, description = "Session-only endpoint — API keys are rejected", body = AuthApiError),
         (status = 400, description = "New password does not meet requirements", body = AuthApiError),
     ),
-    security(("bearer_auth" = []), ("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn change_password(
     State(state): State<AppState>,
@@ -650,6 +667,15 @@ pub async fn change_password(
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<ChangePasswordRequest>,
 ) -> Result<Response, (StatusCode, Json<AuthApiError>)> {
+    // NAN-2080: credential mutation is session-only. An owner-bound API key maps
+    // its `sub` to the owner user id, so without this gate a leaked automation
+    // key plus the owner's password could rotate the password / take over the
+    // account without an MFA-completed interactive session. Password confirmation
+    // is re-auth, not proof of a second factor. (Note: a password change does NOT
+    // revoke the owner's API keys — a long-lived key survives the rotation.)
+    require_session_auth(&auth)
+        .map_err(|(s, j)| (s, Json(AuthApiError::new(&j.error, &j.message))))?;
+
     let ip_address = extract_client_ip(&headers, Some(&addr));
     let user_agent = extract_user_agent(&headers);
     let client_ctx = ClientContext::new(ip_address.clone(), user_agent.clone());
@@ -857,3 +883,29 @@ pub async fn validate_token(
     ))
 )]
 pub struct AuthApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NAN-2080: `change_password` is session-only. An owner-bound API key (whose
+    /// `sub` maps to the owner) plus the owner's password must not be able to
+    /// rotate the password — `require_session_auth` rejects it with 403 before
+    /// any credential mutation.
+    #[test]
+    fn change_password_rejects_api_key_principals() {
+        use nanosiem_core::auth::ApiKeyInfo;
+
+        let api_key_ctx = AuthContext::from_api_key(&ApiKeyInfo {
+            id: Uuid::now_v7(),
+            name: "automation".to_string(),
+            permissions: vec![],
+            user_id: Some(Uuid::now_v7()),
+        });
+
+        let err = require_session_auth(&api_key_ctx)
+            .map_err(|(s, j)| (s, Json(AuthApiError::new(&j.error, &j.message))))
+            .expect_err("api-key principal must be rejected on change_password");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+}

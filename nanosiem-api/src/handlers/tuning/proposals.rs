@@ -18,6 +18,7 @@ use nanosiem_core::tuning::{
 use nanosiem_core::typeid::TypeIdParam;
 use uuid::Uuid;
 
+use super::effective_tuning_scope;
 use super::types::{
     ApprovalOutcome, ApprovalResponse, ApproveProposalRequest, ListProposalsQuery,
     RejectProposalRequest, RejectionResponse,
@@ -154,6 +155,10 @@ pub async fn list_proposals(
             query.proposal_type,
             query.limit,
             query.offset,
+            // NAN-2085 / NAN-2088: proposals derived from a source this reader
+            // is denied — and every proposal whose provenance is incomplete —
+            // are filtered out in SQL, not after the page is assembled.
+            &effective_tuning_scope(&auth),
         )
         .await
         .map_err(|e| ApiError::InternalError(format!("Failed to list proposals: {}", e)))?;
@@ -191,7 +196,7 @@ pub async fn get_proposal(
     // Get proposal by ID
     let proposal = state
         .tuning_repository
-        .get_proposal(*id)
+        .get_proposal(*id, &effective_tuning_scope(&auth))
         .await
         .map_err(|e| ApiError::InternalError(format!("Failed to get proposal: {}", e)))?
         .ok_or_else(|| ApiError::NotFound("Proposal not found".to_string()))?;
@@ -236,7 +241,7 @@ pub async fn approve_proposal(
     // 1. Retrieve proposal
     let proposal = state
         .tuning_repository
-        .get_proposal(*id)
+        .get_proposal(*id, &effective_tuning_scope(&auth))
         .await
         .map_err(|e| ApiError::InternalError(format!("Failed to get proposal: {}", e)))?
         .ok_or_else(|| ApiError::NotFound("Proposal not found".to_string()))?;
@@ -309,6 +314,10 @@ pub async fn approve_proposal(
                 mutation: ProposalRuleMutation::Pause,
                 reviewer_notes: request.comment.clone(),
                 log_trigger_reason: "Silent-rule pause manually approved".to_string(),
+                // NAN-2085 / NAN-2088: re-checked under the proposal row lock,
+                // so a concurrent re-stamp onto a denied source cannot be
+                // actioned on the strength of the earlier read.
+                scope: effective_tuning_scope(&auth),
             })
             .await
             .map_err(map_atomic_apply_error)?;
@@ -356,6 +365,10 @@ pub async fn approve_proposal(
                 mutation: ProposalRuleMutation::Acknowledge,
                 reviewer_notes: request.comment.clone(),
                 log_trigger_reason: "Silent-rule diagnostic manually acknowledged".to_string(),
+                // NAN-2085 / NAN-2088: re-checked under the proposal row lock,
+                // so a concurrent re-stamp onto a denied source cannot be
+                // actioned on the strength of the earlier read.
+                scope: effective_tuning_scope(&auth),
             })
             .await
             .map_err(map_atomic_apply_error)?;
@@ -410,6 +423,10 @@ pub async fn approve_proposal(
                 mutation: ProposalRuleMutation::Hints,
                 reviewer_notes: request.comment.clone(),
                 log_trigger_reason: "Triage-hint proposal manually approved".to_string(),
+                // NAN-2085 / NAN-2088: re-checked under the proposal row lock,
+                // so a concurrent re-stamp onto a denied source cannot be
+                // actioned on the strength of the earlier read.
+                scope: effective_tuning_scope(&auth),
             })
             .await
             .map_err(map_atomic_apply_error)?;
@@ -518,6 +535,9 @@ pub async fn approve_proposal(
                             validation_skipped: request.skip_validation,
                             reason: request.comment.clone(),
                         },
+                        // Re-checked under the proposal row lock that freezes
+                        // the claim, not trusted from the earlier read.
+                        &effective_tuning_scope(&auth),
                     )
                     .await
                     .map_err(map_pr_operation_error)?
@@ -716,6 +736,10 @@ pub async fn approve_proposal(
                     },
                     reviewer_notes: request.comment.clone(),
                     log_trigger_reason: "Query-tuning proposal manually approved".to_string(),
+                    // NAN-2085 / NAN-2088: re-checked under the proposal row
+                    // lock, so a concurrent re-stamp onto a denied source
+                    // cannot be actioned on the strength of the earlier read.
+                    scope: effective_tuning_scope(&auth),
                 },
                 state.materialized_view_generator.as_ref(),
                 Some(&runtime_sync_owner),
@@ -944,7 +968,7 @@ pub async fn reject_proposal(
     // 1. Retrieve proposal
     let proposal = state
         .tuning_repository
-        .get_proposal(*id)
+        .get_proposal(*id, &effective_tuning_scope(&auth))
         .await
         .map_err(|e| ApiError::InternalError(format!("Failed to get proposal: {}", e)))?
         .ok_or_else(|| ApiError::NotFound("Proposal not found".to_string()))?;
@@ -962,7 +986,11 @@ pub async fn reject_proposal(
     let transitioned = if proposal.status == TuningStatus::PrPending {
         state
             .tuning_repository
-            .cancel_expired_pr_operation(proposal.id, &request.reason)
+            .cancel_expired_pr_operation(
+                proposal.id,
+                &request.reason,
+                &effective_tuning_scope(&auth),
+            )
             .await
             .map_err(map_pr_operation_error)?
     } else {
@@ -979,6 +1007,10 @@ pub async fn reject_proposal(
                 ],
                 TuningStatus::Rejected,
                 Some(&request.reason),
+                // NAN-2085 / NAN-2088: the deny scope rides inside the
+                // compare-and-set, so a proposal re-stamped onto a denied
+                // source after step 1 cannot be rejected on the old read.
+                &effective_tuning_scope(&auth),
             )
             .await
             .map_err(|e| {

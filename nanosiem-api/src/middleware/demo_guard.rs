@@ -61,7 +61,7 @@ const ALLOWED_SELF_PATHS: &[&str] = &[
 /// Demo users have `settings:ai` so the search UI can detect whether meloD is
 /// configured and enable natural-language query building. Keep this list tight:
 /// read-only probes only, not general settings access.
-const ALLOWED_SAFE_PATHS: &[&str] = &["/api/settings/ai-providers"];
+const ALLOWED_SAFE_PATHS: &[&str] = &["/api/settings/ai-availability"];
 
 /// Middleware that blocks admin endpoints for demo users.
 ///
@@ -174,14 +174,17 @@ mod tests {
 
     fn app() -> Router {
         Router::new()
-            .route("/api/settings/ai-providers", get(|| async { "ok" }))
+            .route("/api/settings/ai-availability", get(|| async { "ok" }))
             .route("/api/settings/search", get(|| async { "ok" }))
             .layer(from_fn_with_state(DeploymentMode::Demo, demo_guard))
     }
 
     #[test]
-    fn allows_demo_read_for_ai_provider_status_probe() {
-        assert!(is_allowed_safe_path("/api/settings/ai-providers", &Method::GET));
+    fn allows_demo_read_for_ai_availability_probe() {
+        assert!(is_allowed_safe_path(
+            "/api/settings/ai-availability",
+            &Method::GET
+        ));
     }
 
     #[test]
@@ -189,6 +192,10 @@ mod tests {
         assert!(!is_allowed_safe_path(
             "/api/settings/ai-providers",
             &Method::POST
+        ));
+        assert!(!is_allowed_safe_path(
+            "/api/settings/ai-providers",
+            &Method::GET
         ));
         assert!(!is_allowed_safe_path("/api/settings/ai-providers/openai", &Method::GET));
     }
@@ -203,11 +210,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn demo_user_can_read_ai_provider_status_probe() {
+    async fn demo_user_can_read_ai_availability_probe() {
         let response = app()
             .oneshot(
                 Request::builder()
-                    .uri("/api/settings/ai-providers")
+                    .uri("/api/settings/ai-availability")
                     .method(Method::GET)
                     .extension(demo_auth_context())
                     .body(Body::empty())

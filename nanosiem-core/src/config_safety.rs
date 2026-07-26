@@ -11,9 +11,8 @@
 //! generator still uses string interpolation rather than structured TOML
 //! serialization.
 //!
-//! Both `SourceConfigService` (connection_config) and `LogSourceService`
-//! (parser-owned source_config) validate through here so the two paths can't
-//! drift (NAN-689 / NAN-1371).
+//! `SourceConfigService` validates connection configuration through this
+//! shared implementation (NAN-689 / NAN-1371).
 
 /// Maximum nesting depth walked before refusing to validate — bounds stack use
 /// on a malicious deeply-nested payload (NAN-946).
@@ -120,7 +119,10 @@ mod tests {
 
     #[test]
     fn rejects_control_chars_in_arrays_and_keys() {
-        assert!(validate_safe_config_strings(&json!({ "topics": ["ok", "ev\nil"] }), "cfg", &[]).is_err());
+        assert!(
+            validate_safe_config_strings(&json!({ "topics": ["ok", "ev\nil"] }), "cfg", &[])
+                .is_err()
+        );
         let mut map = serde_json::Map::new();
         map.insert("bad\nkey".to_string(), json!("v"));
         assert!(validate_safe_config_strings(&serde_json::Value::Object(map), "cfg", &[]).is_err());
@@ -128,7 +130,8 @@ mod tests {
 
     #[test]
     fn allows_clean_config_and_tab() {
-        let v = json!({ "bootstrap_servers": "a:9092,b:9092", "group_id": "g\t1", "topics": ["x"] });
+        let v =
+            json!({ "bootstrap_servers": "a:9092,b:9092", "group_id": "g\t1", "topics": ["x"] });
         assert!(validate_safe_config_strings(&v, "cfg", &[]).is_ok());
     }
 
@@ -149,7 +152,8 @@ mod tests {
         // …but a non-exempt sibling with a newline is still rejected.
         let bad = json!({ "_credentials": { "sasl_password": "p\nass" } });
         assert!(
-            validate_safe_config_strings(&bad, "cfg", &["tls_ca_cert", "credentials_json"]).is_err()
+            validate_safe_config_strings(&bad, "cfg", &["tls_ca_cert", "credentials_json"])
+                .is_err()
         );
     }
 

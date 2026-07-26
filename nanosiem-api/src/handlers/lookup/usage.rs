@@ -56,7 +56,14 @@ pub async fn get_lookup_table_usage(
     Extension(auth): Extension<AuthContext>,
     Path(name): Path<String>,
 ) -> Result<Json<Vec<LookupUsage>>, ApiError> {
+    // Composite operation: the response domain is lookup management, but the
+    // handler reads protected detection content (rule IDs, names, tactics, and
+    // up to 200 chars of the rule's nPL query via `sample_join`). Require
+    // `detections:view` in addition to `lookup:view` so a lookup-only caller
+    // that GET /api/rules/{id} correctly denies cannot recover the same detection
+    // metadata here (NAN-2105 / CWE-862).
     ensure_permission(&auth, permissions::LOOKUP_VIEW)?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     let lookup_service = state.lookup_service.clone();
 

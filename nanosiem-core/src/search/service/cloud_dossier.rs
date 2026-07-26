@@ -1379,7 +1379,7 @@ impl SearchService {
         };
         let risk_summary = self
             .cloud_risk
-            .risk_for_entities(&[principal.to_string()])
+            .risk_for_entities(&[principal.to_string()], scope)
             .await
             .ok()
             .flatten();

@@ -10,17 +10,24 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 
 use super::types::*;
+use crate::auth::ScopeSet;
 use crate::db::TableNames;
+use crate::search::service::source_scope_sql_predicate;
 
-/// Collect all health metrics from ClickHouse and PostgreSQL
+/// Collect all health metrics from ClickHouse and PostgreSQL.
+///
+/// `scope` applies to every logs-table scan. Scheduled/SYSTEM callers pass
+/// [`ScopeSet::unrestricted`]; viewer-triggered checks pass the caller's
+/// canonical effective scope so denied source rows never reach either analyzer.
 pub async fn collect_metrics(
     pool: &PgPool,
     ch_client: &ClickHouseClient,
     is_clustered: bool,
+    scope: &ScopeSet,
 ) -> CollectedMetrics {
-    let ingestion = collect_ingestion_metrics(ch_client, is_clustered).await;
-    let parsing = collect_parsing_metrics(ch_client, is_clustered).await;
-    let enrichment = collect_enrichment_metrics(pool, ch_client, is_clustered).await;
+    let ingestion = collect_ingestion_metrics(ch_client, is_clustered, scope).await;
+    let parsing = collect_parsing_metrics(ch_client, is_clustered, scope).await;
+    let enrichment = collect_enrichment_metrics(pool, ch_client, is_clustered, scope).await;
     let detection = collect_detection_metrics(pool).await;
     let alerting = collect_alerting_metrics(pool).await;
 
@@ -34,15 +41,25 @@ pub async fn collect_metrics(
     }
 }
 
-/// Collect ingestion health metrics from ClickHouse
-async fn collect_ingestion_metrics(
-    ch: &ClickHouseClient,
-    is_clustered: bool,
-) -> IngestionMetrics {
-    // Get per-source-type volumes for last 24h and prior 24h
-    let logs_table =
-        TableNames::new(is_clustered).read(crate::schema::active_logs_table());
-    let sql = format!(
+/// Canonical logs-row predicate shared by every source-derived health scan.
+///
+/// Empty source identities are never useful health partitions. The viewer deny
+/// set is rendered by the same builder used by interactive search and every
+/// other hand-built ClickHouse side door. An unrestricted scope adds no
+/// source-scope predicate at all; in particular, the scheduled SYSTEM path is
+/// not silently downgraded to the historical hard-coded `audit` exclusion.
+fn source_rows_predicate(scope: &ScopeSet) -> String {
+    let mut predicate = "source_type != ''".to_string();
+    if let Some(scope_predicate) = source_scope_sql_predicate("source_type", scope.deny_set()) {
+        predicate.push_str("\n          AND ");
+        predicate.push_str(&scope_predicate);
+    }
+    predicate
+}
+
+fn build_ingestion_sql(logs_table: &str, scope: &ScopeSet) -> String {
+    let source_rows = source_rows_predicate(scope);
+    format!(
         r#"
         SELECT
             source_type,
@@ -50,12 +67,22 @@ async fn collect_ingestion_metrics(
             countIf(timestamp >= now() - INTERVAL 48 HOUR AND timestamp < now() - INTERVAL 24 HOUR) AS count_prior_24h
         FROM {logs_table}
         WHERE timestamp >= now() - INTERVAL 48 HOUR
-          AND source_type != 'audit'
-          AND source_type != ''
+          AND {source_rows}
         GROUP BY source_type
         ORDER BY count_24h DESC
     "#
-    );
+    )
+}
+
+/// Collect ingestion health metrics from ClickHouse
+async fn collect_ingestion_metrics(
+    ch: &ClickHouseClient,
+    is_clustered: bool,
+    scope: &ScopeSet,
+) -> IngestionMetrics {
+    // Get per-source-type volumes for last 24h and prior 24h
+    let logs_table = TableNames::new(is_clustered).read(crate::schema::active_logs_table());
+    let sql = build_ingestion_sql(&logs_table, scope);
 
     let mut source_volumes: Vec<SourceVolumeMetric> = Vec::new();
     let mut total_24h: u64 = 0;
@@ -579,6 +606,7 @@ fn dict_is_unhealthy(status: &str, last_exception: &str) -> bool {
 async fn collect_parsing_metrics(
     ch: &ClickHouseClient,
     is_clustered: bool,
+    scope: &ScopeSet,
 ) -> ParsingMetrics {
     // Field coverage: percentage of events where key fields are populated.
     // Resolve the active profile once so the table name AND the column set used
@@ -587,9 +615,8 @@ async fn collect_parsing_metrics(
     let ocsf = crate::schema::active_profile_from_env()
         .map(|p| p.id() == crate::schema::SchemaId::Ocsf)
         .unwrap_or(false);
-    let logs_table =
-        TableNames::new(is_clustered).read(crate::schema::active_logs_table());
-    let coverage_sql = build_field_coverage_sql(&logs_table, ocsf);
+    let logs_table = TableNames::new(is_clustered).read(crate::schema::active_logs_table());
+    let coverage_sql = build_field_coverage_sql(&logs_table, ocsf, scope);
 
     let mut field_coverage: Vec<FieldCoverageMetric> = Vec::new();
     match ch
@@ -616,7 +643,7 @@ async fn collect_parsing_metrics(
         }
     }
 
-    let ext_sql = build_ext_usage_sql(&logs_table, ocsf);
+    let ext_sql = build_ext_usage_sql(&logs_table, ocsf, scope);
 
     let mut high_ext_sources: Vec<ExtUsageMetric> = Vec::new();
     match ch.query(&ext_sql).fetch_all::<(String, u64, f64)>().await {
@@ -642,7 +669,7 @@ async fn collect_parsing_metrics(
     let lowercase_invariant_violations = if ocsf {
         vec![]
     } else {
-        collect_lowercase_invariant_violations(ch, &logs_table).await
+        collect_lowercase_invariant_violations(ch, &logs_table, scope).await
     };
 
     info!(
@@ -672,8 +699,9 @@ async fn collect_parsing_metrics(
 async fn collect_lowercase_invariant_violations(
     ch: &ClickHouseClient,
     logs_table: &str,
+    scope: &ScopeSet,
 ) -> Vec<LowercaseInvariantViolation> {
-    let sql = build_lowercase_invariant_sql(logs_table);
+    let sql = build_lowercase_invariant_sql(logs_table, scope);
     match ch.query(&sql).fetch_all::<(String, u64)>().await {
         Ok(rows) => rows
             .into_iter()
@@ -718,12 +746,13 @@ fn lowercase_invariant_columns() -> Vec<&'static str> {
 /// ingested before the Vector downcase lanes) must not flag forever — the
 /// tripwire is for ACTIVE drift. Validated on local CH (26.4): zero rows on
 /// invariant-clean data, and the legs count real mixed-case when present.
-fn build_lowercase_invariant_sql(logs_table: &str) -> String {
+fn build_lowercase_invariant_sql(logs_table: &str, scope: &ScopeSet) -> String {
     let legs = lowercase_invariant_columns()
         .iter()
         .map(|c| format!("('{c}', countIf({c} != lower({c})))"))
         .collect::<Vec<_>>()
         .join(",\n                ");
+    let source_rows = source_rows_predicate(scope);
     format!(
         r#"
         SELECT t.1 AS column, t.2 AS violations
@@ -733,6 +762,7 @@ fn build_lowercase_invariant_sql(logs_table: &str) -> String {
             ] AS pairs
             FROM {logs_table}
             WHERE timestamp > now() - INTERVAL 1 HOUR
+              AND {source_rows}
         )
         ARRAY JOIN pairs AS t
         WHERE t.2 > 0
@@ -749,6 +779,7 @@ async fn collect_enrichment_metrics(
     pool: &PgPool,
     ch: &ClickHouseClient,
     is_clustered: bool,
+    scope: &ScopeSet,
 ) -> EnrichmentMetrics {
     // Installed marketplace/custom enrichment providers. Built into `empty`
     // (cloned into the live rollup below) so the list is attached on every
@@ -764,8 +795,8 @@ async fn collect_enrichment_metrics(
         providers: collect_enrichment_providers(pool).await,
     };
 
-    let logs_table =
-        TableNames::new(is_clustered).read(crate::schema::active_logs_table());
+    let logs_table = TableNames::new(is_clustered).read(crate::schema::active_logs_table());
+    let source_rows = source_rows_predicate(scope);
 
     // Geo/ASN fill is meaningful only over *geo-eligible* rows — those with a
     // public, locatable IP on either end. The previous metric counted
@@ -823,8 +854,7 @@ async fn collect_enrichment_metrics(
             {identity_pct_expr} AS identity_pct
         FROM {logs_table}
         WHERE timestamp >= now() - INTERVAL 24 HOUR
-          AND source_type != 'audit'
-          AND source_type != ''
+          AND {source_rows}
         "#
     );
 
@@ -868,8 +898,7 @@ async fn collect_enrichment_metrics(
             {identity_pct_expr} AS identity_pct
         FROM {logs_table}
         WHERE timestamp >= now() - INTERVAL 24 HOUR
-          AND source_type != 'audit'
-          AND source_type != ''
+          AND {source_rows}
         GROUP BY source_type
         HAVING total_events >= 100
         ORDER BY total_events DESC
@@ -914,8 +943,7 @@ async fn collect_enrichment_metrics(
         FROM {logs_table}
         WHERE timestamp >= now() - INTERVAL 48 HOUR
           AND timestamp < now() - INTERVAL 24 HOUR
-          AND source_type != 'audit'
-          AND source_type != ''
+          AND {source_rows}
         "#
         );
         match ch.query(&identity_prior_sql).fetch_one::<f64>().await {
@@ -1329,7 +1357,7 @@ async fn collect_alerting_metrics(pool: &PgPool) -> AlertingMetrics {
 /// Build the per-source field-coverage SQL. Extracted as a pure function so
 /// regression tests can pin its shape — the inline version previously had a
 /// JSON-vs-String comparison bug (NAN-614) that is hard to catch by reading.
-fn build_field_coverage_sql(logs_table: &str, ocsf: bool) -> String {
+fn build_field_coverage_sql(logs_table: &str, ocsf: bool, scope: &ScopeSet) -> String {
     // The result tuple `(source_type, total_events, src_ip_pct, user_pct,
     // event_type_pct, message_pct)` is fixed by `FieldCoverageMetric`, so under
     // OCSF we map the four semantic coverage slots onto the canonical OCSF
@@ -1339,6 +1367,7 @@ fn build_field_coverage_sql(logs_table: &str, ocsf: bool) -> String {
     // message → `message`. Dotted OCSF identifiers are double-quoted so
     // ClickHouse reads them as a single column, not a nested-tuple access.
     // UDM path is byte-identical. NAN-1259.
+    let source_rows = source_rows_predicate(scope);
     if ocsf {
         format!(
             r#"
@@ -1351,8 +1380,7 @@ fn build_field_coverage_sql(logs_table: &str, ocsf: bool) -> String {
             countIf(message != '') * 100.0 / count() AS message_pct
         FROM {logs_table}
         WHERE timestamp >= now() - INTERVAL 24 HOUR
-          AND source_type != 'audit'
-          AND source_type != ''
+          AND {source_rows}
         GROUP BY source_type
         HAVING total_events >= 100
         ORDER BY total_events DESC
@@ -1370,8 +1398,7 @@ fn build_field_coverage_sql(logs_table: &str, ocsf: bool) -> String {
             countIf(message != '') * 100.0 / count() AS message_pct
         FROM {logs_table}
         WHERE timestamp >= now() - INTERVAL 24 HOUR
-          AND source_type != 'audit'
-          AND source_type != ''
+          AND {source_rows}
         GROUP BY source_type
         HAVING total_events >= 100
         ORDER BY total_events DESC
@@ -1396,20 +1423,20 @@ fn build_field_coverage_sql(logs_table: &str, ocsf: bool) -> String {
 /// — current SIEM traffic is overwhelmingly v4 and `isIPv4String` gates it out.
 fn public_ipv4_expr(col: &str) -> String {
     let non_global = [
-        "0.0.0.0/8",        // "this network"
-        "10.0.0.0/8",       // RFC1918
-        "100.64.0.0/10",    // CGN / shared address space
-        "127.0.0.0/8",      // loopback
-        "169.254.0.0/16",   // link-local
-        "172.16.0.0/12",    // RFC1918
-        "192.0.0.0/24",     // IETF protocol assignments
-        "192.0.2.0/24",     // TEST-NET-1 (RFC5737 documentation)
-        "192.168.0.0/16",   // RFC1918
-        "198.18.0.0/15",    // benchmarking (RFC2544)
-        "198.51.100.0/24",  // TEST-NET-2 (RFC5737 documentation)
-        "203.0.113.0/24",   // TEST-NET-3 (RFC5737 documentation)
-        "224.0.0.0/4",      // multicast
-        "240.0.0.0/4",      // reserved + broadcast
+        "0.0.0.0/8",       // "this network"
+        "10.0.0.0/8",      // RFC1918
+        "100.64.0.0/10",   // CGN / shared address space
+        "127.0.0.0/8",     // loopback
+        "169.254.0.0/16",  // link-local
+        "172.16.0.0/12",   // RFC1918
+        "192.0.0.0/24",    // IETF protocol assignments
+        "192.0.2.0/24",    // TEST-NET-1 (RFC5737 documentation)
+        "192.168.0.0/16",  // RFC1918
+        "198.18.0.0/15",   // benchmarking (RFC2544)
+        "198.51.100.0/24", // TEST-NET-2 (RFC5737 documentation)
+        "203.0.113.0/24",  // TEST-NET-3 (RFC5737 documentation)
+        "224.0.0.0/4",     // multicast
+        "240.0.0.0/4",     // reserved + broadcast
     ];
     let mut expr = format!("(isIPv4String({col})");
     for range in non_global {
@@ -1446,12 +1473,13 @@ fn public_ipv4_expr(col: &str) -> String {
 /// paths (incl. nested) vs. only top-level keys, but any non-empty `ext` yields
 /// ≥1 of each. Verified identical per-source on the demo tenant (NAN-1180). This
 /// is per-row `length()`, NOT `arrayJoin(JSONAllPaths)` — no row explosion.
-fn build_ext_usage_sql(logs_table: &str, ocsf: bool) -> String {
+fn build_ext_usage_sql(logs_table: &str, ocsf: bool, scope: &ScopeSet) -> String {
     // UDM path is byte-identical (the `ext` JSON column, UDM guard fields). OCSF
     // has no `ext`; its raw JSON payload lives in the `event` column, the
     // event-type analog is `class_uid` (UInt32, so `!= 0` not `!= ''`), and the
     // entity guard uses OCSF promoted columns (`src_endpoint.ip`, `user.name`,
     // `dst_endpoint.ip`, double-quoted because they contain dots). NAN-1259.
+    let source_rows = source_rows_predicate(scope);
     if ocsf {
         format!(
             r#"
@@ -1461,8 +1489,7 @@ fn build_ext_usage_sql(logs_table: &str, ocsf: bool) -> String {
             countIf(length(JSONAllPaths(event)) > 0) * 100.0 / count() AS ext_pct
         FROM {logs_table}
         WHERE timestamp >= now() - INTERVAL 24 HOUR
-          AND source_type != 'audit'
-          AND source_type != ''
+          AND {source_rows}
         GROUP BY source_type
         HAVING total_events >= 100
            AND ext_pct > 50
@@ -1480,8 +1507,7 @@ fn build_ext_usage_sql(logs_table: &str, ocsf: bool) -> String {
             countIf(length(JSONAllPaths(ext)) > 0) * 100.0 / count() AS ext_pct
         FROM {logs_table}
         WHERE timestamp >= now() - INTERVAL 24 HOUR
-          AND source_type != 'audit'
-          AND source_type != ''
+          AND {source_rows}
         GROUP BY source_type
         HAVING total_events >= 100
            AND ext_pct > 50
@@ -1497,13 +1523,115 @@ fn build_ext_usage_sql(logs_table: &str, ocsf: bool) -> String {
 mod tests {
     use super::*;
 
+    fn scope(denied: &[&str]) -> ScopeSet {
+        ScopeSet::from_denied(
+            denied
+                .iter()
+                .map(|source_type| source_type.to_string())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn every_extracted_logs_scan_uses_the_canonical_scope_predicate() {
+        let restricted = scope(&["Insider_Threat", "audit"]);
+        let expected = source_scope_sql_predicate("source_type", restricted.deny_set()).unwrap();
+
+        for (name, sql) in [
+            ("ingestion", build_ingestion_sql("logs", &restricted)),
+            (
+                "field coverage UDM",
+                build_field_coverage_sql("logs", false, &restricted),
+            ),
+            (
+                "field coverage OCSF",
+                build_field_coverage_sql("ocsf_logs", true, &restricted),
+            ),
+            (
+                "ext usage UDM",
+                build_ext_usage_sql("logs", false, &restricted),
+            ),
+            (
+                "ext usage OCSF",
+                build_ext_usage_sql("ocsf_logs", true, &restricted),
+            ),
+            (
+                "lowercase invariant",
+                build_lowercase_invariant_sql("logs", &restricted),
+            ),
+        ] {
+            assert!(
+                sql.contains(&expected),
+                "{name} must use canonical source_scope_sql_predicate, got:\n{sql}"
+            );
+            assert!(
+                sql.contains("source_type != ''"),
+                "{name} must reject unpartitioned source rows, got:\n{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn ingestion_sql_unrestricted_emits_no_scope_predicate() {
+        let sql = build_ingestion_sql("logs", &ScopeSet::unrestricted());
+        assert!(sql.contains("source_type != ''"));
+        assert!(!sql.contains("lower(source_type)"));
+        assert!(!sql.contains("NOT IN"));
+    }
+
+    #[tokio::test]
+    #[ignore = "ClickHouse-backed; runs against the local integration database"]
+    async fn ingestion_query_excludes_denied_rows_in_clickhouse() {
+        let ch = ClickHouseClient::default()
+            .with_url(
+                std::env::var("CLICKHOUSE_TEST_URL")
+                    .unwrap_or_else(|_| "http://localhost:8123".to_string()),
+            )
+            .with_user("nanosiem")
+            .with_password("nanosiem")
+            .with_database("nanosiem");
+        let table = format!("nan2153_health_scope_{}", uuid::Uuid::now_v7().simple());
+
+        ch.query(&format!(
+            "CREATE TABLE {table} (source_type String, timestamp DateTime) ENGINE = Memory"
+        ))
+        .execute()
+        .await
+        .expect("create isolated health-scope table");
+        ch.query(&format!(
+            "INSERT INTO {table} VALUES
+             ('apache', now()),
+             ('apache', now() - INTERVAL 30 HOUR),
+             ('InSiDeR_Threat', now()),
+             ('audit', now()),
+             ('', now())"
+        ))
+        .execute()
+        .await
+        .expect("seed allowed, denied, audit, and unresolved partitions");
+
+        let restricted = scope(&["insider_threat", "audit"]);
+        let result = ch
+            .query(&build_ingestion_sql(&table, &restricted))
+            .fetch_all::<(String, u64, u64)>()
+            .await
+            .expect("execute production ingestion query");
+
+        ch.query(&format!("DROP TABLE {table}"))
+            .execute()
+            .await
+            .expect("drop isolated health-scope table");
+
+        assert_eq!(result, vec![("apache".to_string(), 1, 1)]);
+    }
+
     #[test]
     fn ext_usage_sql_uses_json_aware_emptiness_check() {
         // Regression: NAN-614. The bug was `length(toString(ext)) > 2`, which
         // hits the JSON column's serialized schema rather than its payload and
         // reports ~100% ext usage for every source. The correct check counts
         // keys on the native JSON column via JSONAllPaths.
-        let sql = build_ext_usage_sql("logs", false);
+        let sql = build_ext_usage_sql("logs", false, &ScopeSet::unrestricted());
         assert!(
             sql.contains("length(JSONAllPaths(ext)) > 0"),
             "ext_pct must use JSONAllPaths-based emptiness check, got:\n{sql}"
@@ -1525,7 +1653,7 @@ mod tests {
         // NAN-1259: OCSF has no `ext` column — the raw JSON payload is `event`,
         // and the normalization guard fields are the OCSF promoted columns
         // (class_uid as the event-type analog + dotted entity columns).
-        let sql = build_ext_usage_sql("ocsf_logs", true);
+        let sql = build_ext_usage_sql("ocsf_logs", true, &ScopeSet::unrestricted());
         assert!(
             sql.contains("length(JSONAllPaths(event)) > 0"),
             "OCSF ext_pct must read the `event` JSON column, got:\n{sql}"
@@ -1553,7 +1681,7 @@ mod tests {
         // normalized sources. The finding must additionally require the
         // canonical UDM fields to be mostly empty, or it false-alarms on
         // every structured parser.
-        let sql = build_ext_usage_sql("logs", false);
+        let sql = build_ext_usage_sql("logs", false, &ScopeSet::unrestricted());
         assert!(
             sql.contains("countIf(event_type != '') * 100.0 / count() < 50"),
             "high-ext finding must require event_type to be mostly empty, got:\n{sql}"
@@ -1592,10 +1720,13 @@ mod tests {
     }
 
     #[test]
-    fn field_coverage_sql_filters_audit_and_unknown_sources() {
-        let sql = build_field_coverage_sql("logs", false);
-        assert!(sql.contains("source_type != 'audit'"));
+    fn field_coverage_sql_unrestricted_filters_only_empty_sources() {
+        let sql = build_field_coverage_sql("logs", false, &ScopeSet::unrestricted());
         assert!(sql.contains("source_type != ''"));
+        assert!(
+            !sql.contains("source_type != 'audit'"),
+            "SYSTEM collection must use its explicit unrestricted ScopeSet, got:\n{sql}"
+        );
         assert!(sql.contains("HAVING total_events >= 100"));
         // UDM coverage must read the UDM columns, byte-identical to pre-NAN-1259.
         assert!(sql.contains("countIf(src_ip != '')"));
@@ -1609,7 +1740,7 @@ mod tests {
         // NAN-1259: under OCSF the UDM columns don't exist; the four coverage
         // slots map onto the canonical OCSF promoted columns (dotted entity
         // columns double-quoted, class_uid as the event-type analog).
-        let sql = build_field_coverage_sql("ocsf_logs", true);
+        let sql = build_field_coverage_sql("ocsf_logs", true, &ScopeSet::unrestricted());
         assert!(sql.contains("FROM ocsf_logs"));
         assert!(
             sql.contains("countIf(\"src_endpoint.ip\" != '')"),
@@ -1629,12 +1760,11 @@ mod tests {
         );
         // Must not leak UDM-only columns that don't exist on ocsf_logs.
         assert!(
-            !sql.contains("countIf(src_ip != '')")
-                && !sql.contains("countIf(event_type != '')"),
+            !sql.contains("countIf(src_ip != '')") && !sql.contains("countIf(event_type != '')"),
             "OCSF coverage must not reference UDM columns, got:\n{sql}"
         );
         // Filtering/grouping is shared and must survive.
-        assert!(sql.contains("source_type != 'audit'"));
+        assert!(sql.contains("source_type != ''"));
         assert!(sql.contains("HAVING total_events >= 100"));
     }
 
@@ -1685,7 +1815,7 @@ mod tests {
         // NAN-1643: ONE aggregate scan with a countIf leg per column — never a
         // query per column — bounded to a 1h window with no GROUP BY (the
         // CH-migrations/probes resource rule: every aggregating query bounded).
-        let sql = build_lowercase_invariant_sql("logs");
+        let sql = build_lowercase_invariant_sql("logs", &ScopeSet::unrestricted());
         assert_eq!(
             sql.matches("FROM logs").count(),
             1,
@@ -1771,7 +1901,10 @@ mod tests {
             "Code: 510. DB::Exception: Update failed for dictionary ..."
         ));
         // NOT_LOADED with a load exception is unhealthy too.
-        assert!(dict_is_unhealthy("NOT_LOADED", "Code: 60. Unknown table ..."));
+        assert!(dict_is_unhealthy(
+            "NOT_LOADED",
+            "Code: 60. Unknown table ..."
+        ));
         // Benign: healthy LOADED dict, and a never-referenced lazy dict sitting
         // at NOT_LOADED with an EMPTY exception — must NOT be flagged (the
         // false-positive trap). last_exception clears on recovery, so a
@@ -1810,10 +1943,7 @@ mod tests {
         // NAN-2002: IPinfo Lite installed + enabled but never synced (or synced
         // zero records) is not yet active — report `never_synced` so the
         // analyzer stays silent about GeoIP 0% instead of flagging an outage.
-        assert_eq!(
-            native_provider_run_status(false, 0, None),
-            "never_synced"
-        );
+        assert_eq!(native_provider_run_status(false, 0, None), "never_synced");
         // Synced timestamp present but still zero records = no usable data yet.
         assert_eq!(
             native_provider_run_status(true, 0, Some("success".to_string())),
@@ -1831,9 +1961,6 @@ mod tests {
         );
         // Data present but null status: fall back to never_synced rather than
         // inventing a success.
-        assert_eq!(
-            native_provider_run_status(true, 5000, None),
-            "never_synced"
-        );
+        assert_eq!(native_provider_run_status(true, 5000, None), "never_synced");
     }
 }

@@ -407,9 +407,10 @@ impl CredentialRepository {
         .execute(&mut *tx)
         .await?;
 
-        let note = req.note.clone().unwrap_or_else(|| {
-            format!("Rolled back to v{}", req.version)
-        });
+        let note = req
+            .note
+            .clone()
+            .unwrap_or_else(|| format!("Rolled back to v{}", req.version));
 
         let version_row = sqlx::query(
             r#"
@@ -526,9 +527,7 @@ impl CredentialRepository {
             .map_err(|e| CredentialRepositoryError::EncryptionError(e.to_string()))
     }
 
-    /// Best-effort timestamp of the most recent decrypt-for-deploy. Called
-    /// from `ParserService::inject_credentials` — failures are swallowed so a
-    /// telemetry hiccup never blocks a deploy.
+    /// Best-effort timestamp of the most recent authorized credential use.
     pub async fn mark_used(&self, id: Uuid) -> Result<(), CredentialRepositoryError> {
         sqlx::query("UPDATE cloud_credentials SET last_used_at = now() WHERE id = $1")
             .bind(id)
@@ -538,8 +537,8 @@ impl CredentialRepository {
     }
 
     /// Delete a credential (and cascade its versions via the FK) only when no
-    /// parser or source configuration references it. The reference predicates
-    /// are part of the DELETE statement to avoid a check-then-act gap and return
+    /// source configuration references it. The reference predicate is part of
+    /// the DELETE statement to avoid a check-then-act gap and return
     /// a useful in-use error; restrictive foreign keys remain the final guard
     /// against concurrent and out-of-band writers.
     pub async fn delete(&self, id: Uuid) -> Result<(), CredentialRepositoryError> {
@@ -547,7 +546,6 @@ impl CredentialRepository {
         let result = sqlx::query(
             "DELETE FROM cloud_credentials cc \
              WHERE cc.id = $1 \
-               AND NOT EXISTS (SELECT 1 FROM log_sources ls WHERE ls.credential_id = cc.id) \
                AND NOT EXISTS (SELECT 1 FROM source_configurations sc WHERE sc.credential_id = cc.id)",
         )
             .bind(id)
@@ -560,9 +558,8 @@ impl CredentialRepository {
         }
         tx.rollback().await?;
 
-        let counts = sqlx::query_as::<_, (bool, i64, i64)>(
+        let counts = sqlx::query_as::<_, (bool, i64)>(
             "SELECT EXISTS(SELECT 1 FROM cloud_credentials WHERE id = $1), \
-                    (SELECT COUNT(*) FROM log_sources WHERE credential_id = $1), \
                     (SELECT COUNT(*) FROM source_configurations WHERE credential_id = $1)",
         )
         .bind(id)
@@ -573,8 +570,8 @@ impl CredentialRepository {
         }
 
         Err(CredentialRepositoryError::EncryptionError(format!(
-            "Cannot delete credential: {} log source(s) and {} source configuration(s) are using it",
-            counts.1, counts.2
+            "Cannot delete credential: {} source configuration(s) are using it",
+            counts.1
         )))
     }
 

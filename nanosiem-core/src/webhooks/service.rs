@@ -344,8 +344,9 @@ impl WebhookService {
     /// Should this alert's payload be redacted because it derives from a
     /// restricted source (NAN-1800)?
     ///
-    /// Origin attribution comes from the stored `matched_events` blob (each
-    /// event row carries the `source_type` column). Three regimes:
+    /// Origin attribution comes from the stored `matched_events` blob: raw
+    /// event rows carry `source_type`; aggregate rows carry the detection
+    /// engine's trusted `_nano_source_types` annotation. Three regimes:
     ///
     /// - **No resolver wired** (`scope_resolver = None`): status-quo — no
     ///   redaction. Not a new leak; the construction site simply hasn't been
@@ -353,16 +354,24 @@ impl WebhookService {
     /// - **Fully attributed blob**: redact iff ANY origin `source_type` is
     ///   restricted, per [`SourceScopeResolver::any_restricted`] (which is
     ///   fail-closed when the registry is unavailable).
-    /// - **Unattributed blob** (aggregate/notable results, empty array,
-    ///   non-array, or any event missing `source_type`): the origin cannot be
-    ///   proven unrestricted, so FAIL CLOSED whenever any restriction exists —
-    ///   redact if the registry is non-empty, and also when the registry is
-    ///   unavailable. An empty registry (pre-feature) never redacts.
+    /// - **Unattributed blob** (notable results, empty array, non-array, or any
+    ///   event missing both `source_type` and a trustworthy engine stamp): the
+    ///   origin cannot be proven unrestricted, so FAIL CLOSED whenever any
+    ///   restriction exists — redact if the registry is non-empty, and also
+    ///   when the registry is unavailable. An empty registry (pre-feature)
+    ///   never redacts unless an unconditional marker was still recovered.
     async fn origin_restricted(&self, matched_events: &serde_json::Value) -> bool {
         let Some(resolver) = &self.scope_resolver else {
             return false;
         };
         let (source_types, fully_attributed) = origin_source_types(matched_events);
+        // Unconditional markers win before the completeness split. Otherwise a
+        // mixed batch containing audit/unresolved evidence plus one malformed
+        // row would take the incomplete fallback and could egress when the
+        // configurable registry is empty.
+        if crate::auth::requires_unconditional_origin_redaction(&source_types) {
+            return true;
+        }
         if fully_attributed {
             resolver.any_restricted(&source_types).await
         } else {
@@ -1223,11 +1232,13 @@ impl WebhookService {
 /// blob (NAN-1800). Returns `(source_types, fully_attributed)`:
 ///
 /// - `source_types`: deduped, normalized (`trim` + `lowercase` — OCSF
-///   `source_type` is NOT ingest-lowercased) values found on the events.
+///   `source_type` is NOT ingest-lowercased) values found either in the
+///   ingest-controlled per-event field or the engine-written aggregate stamp.
 /// - `fully_attributed`: `true` only when the blob is a non-empty array whose
-///   EVERY element carries a non-empty string `source_type`. Aggregate /
-///   notable alerts (stats rows), empty arrays, and non-array blobs are NOT
-///   fully attributed — the caller must treat those fail-closed.
+///   EVERY element carries a usable per-event `source_type` or a non-empty,
+///   well-formed `_nano_source_types` stamp. Empty arrays, non-array blobs, and
+///   malformed/unattributed elements are NOT fully attributed — the caller
+///   must treat those fail-closed.
 ///
 /// Pure so the attribution semantics are unit-testable without a database.
 pub(crate) fn origin_source_types(matched_events: &serde_json::Value) -> (Vec<String>, bool) {
@@ -1240,18 +1251,72 @@ pub(crate) fn origin_source_types(matched_events: &serde_json::Value) -> (Vec<St
     let mut types: BTreeSet<String> = BTreeSet::new();
     let mut fully_attributed = true;
     for event in events {
-        match event
+        let mut event_attributed = false;
+        let mut external_source_present = false;
+
+        // NAN-2155 (codex round 3): the per-event `source_type` is
+        // ingest-controlled. A sender claiming the reserved
+        // unresolved-provenance sentinel is treated as UNATTRIBUTED (not as an
+        // unresolved origin), which is the fail-closed direction here — the
+        // caller redacts an unattributed blob whenever any restriction exists.
+        let external_source = event
             .get("source_type")
             .and_then(|v| v.as_str())
             .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
-        {
-            Some(source_type) => {
+            .filter(|s| !s.is_empty());
+        if let Some(source_type) = external_source {
+            external_source_present = true;
+            if !crate::auth::is_reserved_source_type(&source_type) {
                 types.insert(source_type);
+                event_attributed = true;
             }
-            None => fully_attributed = false,
+        }
+
+        // Only engine-stamped aggregate rows lack a non-empty external field.
+        // Ignore `_nano_source_types` beside a real (or forged reserved)
+        // per-event field: accepting both would let ingest/query-controlled data
+        // impersonate the engine annotation and suppress webhook delivery.
+        if !external_source_present {
+            // NAN-2155 (branch-wide review): aggregate rows intentionally lack the
+            // per-event field. Their authoritative origin is the engine-written
+            // annotation that also becomes `alerts.source_types`. Harvest it here
+            // so the unresolved sentinel reaches `SourceScopeResolver::any_restricted`
+            // and redacts unconditionally, even when the registry is empty.
+            if let Some(stamp) = event.get("_nano_source_types") {
+                match stamp.as_array() {
+                    Some(values) if !values.is_empty() => {
+                        let mut stamp_valid = true;
+                        for value in values {
+                            match value
+                                .as_str()
+                                .map(|s| s.trim().to_lowercase())
+                                .filter(|s| !s.is_empty())
+                            {
+                                Some(source_type) => {
+                                    // Unlike the ingest-controlled field above, the
+                                    // engine annotation is the one channel allowed
+                                    // to carry the reserved sentinel.
+                                    types.insert(source_type);
+                                }
+                                None => stamp_valid = false,
+                            }
+                        }
+                        if stamp_valid {
+                            event_attributed = true;
+                        } else {
+                            fully_attributed = false;
+                        }
+                    }
+                    // An empty stamp conveys no usable origin; a non-array stamp is
+                    // malformed. Neither may certify this event.
+                    _ => fully_attributed = false,
+                }
+            }
+        }
+
+        if !event_attributed {
+            fully_attributed = false;
         }
     }
     (types.into_iter().collect(), fully_attributed)
 }
-

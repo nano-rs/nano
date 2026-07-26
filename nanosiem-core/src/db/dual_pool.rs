@@ -396,6 +396,11 @@ pub(crate) const DISTRIBUTED_TABLES: &[&str] = &[
     "domain_prevalence_agg",
     "hash_prevalence_agg",
     "ip_prevalence_agg",
+    // NAN-2053: profile/source-attributed prevalence states. Restricted
+    // readers merge these across every shard only after source filtering.
+    "domain_prevalence_source_agg",
+    "hash_prevalence_source_agg",
+    "ip_prevalence_source_agg",
     // Per-shard prevalence SUMMARIES (AggregatingMergeTree read with uniqMerge,
     // NAN-1728 C3 / Lane L4). Without a wrapper the summary reads (rare/common
     // verdicts, D4b rescue, cache-dict pushdown) see only ~1/N of the hosts and
@@ -404,6 +409,9 @@ pub(crate) const DISTRIBUTED_TABLES: &[&str] = &[
     "hash_prevalence_summary",
     "domain_prevalence_summary",
     "ip_prevalence_summary",
+    "domain_prevalence_source_summary",
+    "hash_prevalence_source_summary",
+    "ip_prevalence_source_summary",
     // Reference tables — read-only additive wrappers (see doc above): the
     // reconciler creates `<t>_distributed` on clusters so cross-shard reads see
     // the complete scattered keyspace; writes/dict sources stay LOCAL.
@@ -421,6 +429,10 @@ pub(crate) const DISTRIBUTED_TABLES: &[&str] = &[
     "ingestion_errors",
     "identity_observations",
     "logs_per_source_5m",
+    // Profile-aware successor to logs_per_source_5m (NAN-2154). Both UDM and
+    // OCSF MVs write lane-discriminated rows; readers select exactly one lane.
+    "logs_per_source_5m_v2",
+    "parser_health_5m",
     // Observability / OTLP native-storage tables (NAN-1721 O1). Their READ SQL
     // (traces, RED charts, metrics, synthetics) routes to the `_distributed`
     // wrapper on clusters so it unions all shards, mirroring the `logs` lane.
@@ -1295,6 +1307,12 @@ mod tests {
             "hash_prevalence_summary",
             "domain_prevalence_summary",
             "ip_prevalence_summary",
+            "hash_prevalence_source_agg",
+            "domain_prevalence_source_agg",
+            "ip_prevalence_source_agg",
+            "hash_prevalence_source_summary",
+            "domain_prevalence_source_summary",
+            "ip_prevalence_source_summary",
         ] {
             assert!(
                 DISTRIBUTED_TABLES.contains(&t),
@@ -1315,6 +1333,10 @@ mod tests {
         assert_eq!(
             clustered.read("hash_prevalence_summary"),
             "nanosiem.hash_prevalence_summary_distributed"
+        );
+        assert_eq!(
+            clustered.read("parser_health_5m"),
+            "nanosiem.parser_health_5m_distributed"
         );
         // Reference table: additive read-only wrapper fans reads across shards.
         assert_eq!(

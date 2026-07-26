@@ -91,6 +91,7 @@ impl utoipa::OpenApi for SettingsApiDoc {
                 operational::get_organizational_context,
                 operational::update_organizational_context,
                 // ai_providers + risk_decay endpoints below are enterprise-only.
+                ai_providers::get_ai_availability,
                 ai_providers::list_ai_providers,
                 ai_providers::get_ai_provider,
                 ai_providers::update_ai_provider,
@@ -150,6 +151,7 @@ impl utoipa::OpenApi for SettingsApiDoc {
                     tiering::TierInfoResponse,
                     operational::OrganizationalContextResponse,
                     operational::UpdateOrganizationalContextApiRequest,
+                    ai_providers::AiAvailabilityResponse,
                     ai_providers::ProviderCredentialsResponse,
                     ai_providers::UpdateProviderCredentialsRequest,
                     ai_providers::AgentModelConfigResponse,

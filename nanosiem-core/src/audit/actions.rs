@@ -228,6 +228,8 @@ pub const MARKETPLACE_UNINSTALLED: &str = "marketplace_uninstalled";
 pub const MARKETPLACE_UPDATED: &str = "marketplace_updated";
 /// Marketplace enrichment was configured (enabled/disabled/credentials)
 pub const MARKETPLACE_CONFIGURED: &str = "marketplace_configured";
+/// Marketplace enrichment preview was attempted in the Deno sandbox
+pub const MARKETPLACE_PREVIEW_EXECUTED: &str = "marketplace_preview_executed";
 /// Marketplace enrichment data sync triggered
 pub const MARKETPLACE_SYNC_TRIGGERED: &str = "marketplace_sync_triggered";
 /// Marketplace repository was synced
@@ -475,6 +477,8 @@ pub const RULE_REPO_UPDATED: &str = "rule_repo_updated";
 pub const RULE_REPO_DELETED: &str = "rule_repo_deleted";
 /// Rule repository was synced
 pub const RULE_REPO_SYNCED: &str = "rule_repo_synced";
+/// A standalone Sigma rule was converted to nPL by the detection agent
+pub const SIGMA_CONVERTED: &str = "sigma_converted";
 
 // Detection-as-Code push target actions (NAN-1745)
 /// Push target was created
@@ -485,6 +489,8 @@ pub const DETECTION_CODE_TARGET_UPDATED: &str = "detection_code_target_updated";
 pub const DETECTION_CODE_TARGET_DELETED: &str = "detection_code_target_deleted";
 /// GitHub token was set/replaced on a push target
 pub const DETECTION_CODE_TARGET_TOKEN_SET: &str = "detection_code_target_token_set";
+/// A stored push-target credential was used to probe GitHub access
+pub const DETECTION_CODE_TARGET_CONNECTION_TESTED: &str = "detection_code_target_connection_tested";
 /// A tuning Pull Request was opened in a push target repo
 pub const DETECTION_CODE_PR_OPENED: &str = "detection_code_pr_opened";
 /// Rule was imported from repository

@@ -26,7 +26,7 @@ use super::types::{
     NewArtifactsQuery, QueryArtifactsRequest, QueryArtifactsResponse, RareArtifactsQuery,
     ScatterPlotRequest,
 };
-use super::{MAX_BULK_ARTIFACTS, parse_artifact_type, parse_time_window};
+use super::{MAX_BULK_ARTIFACTS, effective_artifact_scope, parse_artifact_type, parse_time_window};
 
 /// GET /api/prevalence/rare
 ///
@@ -72,10 +72,11 @@ pub async fn get_rare_artifacts(
     // Default 25, max 100
     let (limit, offset) = nanosiem_api_lib::Pagination::new(params.limit, params.offset)
         .resolved_capped_floored_offset(25, 100);
+    let scope = effective_artifact_scope(&auth);
 
     // Fetch one extra to determine if there are more results
     match prevalence_service
-        .get_rare_artifacts(artifact_type, time_window, limit + 1 + offset)
+        .get_rare_artifacts(artifact_type, time_window, limit + 1 + offset, &scope)
         .await
     {
         Ok(all_artifacts) => {
@@ -153,10 +154,11 @@ pub async fn get_new_artifacts(
     // Default 25, max 100
     let (limit, offset) = nanosiem_api_lib::Pagination::new(params.limit, params.offset)
         .resolved_capped_floored_offset(25, 100);
+    let scope = effective_artifact_scope(&auth);
 
     // Fetch extra to determine if there are more results
     match prevalence_service
-        .get_new_artifacts(artifact_type, since, limit + 1 + offset)
+        .get_new_artifacts(artifact_type, since, limit + 1 + offset, &scope)
         .await
     {
         Ok(all_artifacts) => {
@@ -229,6 +231,8 @@ pub async fn get_artifact_explorer(
     let logs_table = dual_pool
         .table_names()
         .read(nanosiem_core::schema::active_logs_table());
+    let viewer_scope = auth.effective_viewer_scope();
+    let artifact_scope = effective_artifact_scope(&auth);
 
     match prevalence_service
         .get_artifact_explorer(
@@ -238,6 +242,7 @@ pub async fn get_artifact_explorer(
             search,
             limit,
             offset,
+            &artifact_scope,
         )
         .await
     {
@@ -251,10 +256,13 @@ pub async fn get_artifact_explorer(
             // caller's effective source scope (per-source RBAC ∪ audit unless
             // `audit:view`). Unrestricted callers yield an empty scope —
             // byte-identical SQL.
-            let scope =
-                nanosiem_core::auth::ScopeSet::from_denied(auth.effective_source_deny_set());
             prevalence_service
-                .enrich_explorer_items(&mut response.artifacts, &logs_table, &scope, time_window)
+                .enrich_explorer_items(
+                    &mut response.artifacts,
+                    &logs_table,
+                    &viewer_scope,
+                    time_window,
+                )
                 .await;
 
             // IP-only: layer geo/ASN onto the inline context from the PG
@@ -553,6 +561,7 @@ pub async fn get_scatter_data(
     .await;
 
     let time_window = parse_time_window(request.window.as_deref());
+    let scope = effective_artifact_scope(&auth);
 
     match prevalence_service
         .get_scatter_data(
@@ -560,6 +569,7 @@ pub async fn get_scatter_data(
             &request.artifacts.domains,
             &request.artifacts.ips,
             time_window,
+            &scope,
         )
         .await
     {
@@ -588,7 +598,8 @@ struct SingleStringRow {
     request_body = QueryArtifactsRequest,
     responses(
         (status = 200, description = "Artifacts extracted from query with prevalence data", body = QueryArtifactsResponse),
-        (status = 403, description = "Forbidden - Missing permission: prevalence:view"),
+        (status = 400, description = "Invalid query (parse/extract/SQL-gen failure — never widened to all logs)"),
+        (status = 403, description = "Forbidden - Missing permission: prevalence:view or search:execute"),
         (status = 503, description = "Service unavailable - Prevalence tracking requires ClickHouse"),
         (status = 500, description = "Internal server error")
     ),
@@ -603,6 +614,17 @@ pub async fn get_query_artifacts(
         (
             StatusCode::FORBIDDEN,
             "Missing permission: prevalence:view".to_string(),
+        )
+    })?;
+    // NAN-2048: this endpoint parses a caller-supplied nPL query and executes it
+    // over the logs table — it is a search EXECUTION, not just prevalence
+    // metadata. Require search:execute too, matching POST /api/search. (The
+    // NAN-1801 source-scope predicate below is a secondary row filter, not the
+    // capability gate — it defaults open for an unscoped key.)
+    check_permission(&auth, permissions::SEARCH_EXECUTE).map_err(|_| {
+        (
+            StatusCode::FORBIDDEN,
+            "Missing permission: search:execute".to_string(),
         )
     })?;
 
@@ -664,27 +686,28 @@ pub async fn get_query_artifacts(
                                 where_clause
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    "Failed to generate WHERE clause for query '{}': {}",
-                                    request.query,
-                                    e
-                                );
-                                "1=1".to_string()
+                                // NAN-2048: never widen an invalid caller filter to
+                                // all-logs (1=1) — reject with 400 instead.
+                                return Err((
+                                    StatusCode::BAD_REQUEST,
+                                    format!("Invalid query: could not build filter: {e}"),
+                                ));
                             }
                         }
                     }
                     None => {
-                        tracing::warn!(
-                            "Could not extract search expression from query '{}'",
-                            request.query
-                        );
-                        "1=1".to_string()
+                        // NAN-2048: no filterable root search expression — reject
+                        // rather than silently scanning all logs in the window.
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            "Invalid query: no search expression to filter on".to_string(),
+                        ));
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to parse query '{}': {}", request.query, e);
-                "1=1".to_string()
+                // NAN-2048: a parse failure must 400, not fall open to all logs.
+                return Err((StatusCode::BAD_REQUEST, format!("Invalid query: {e}")));
             }
         }
     };
@@ -779,12 +802,13 @@ pub async fn get_query_artifacts(
         artifacts_truncated,
         request.query
     );
+    let prevalence_scope = effective_artifact_scope(&auth);
 
     // Look up prevalence for hashes
     let mut hash_points = Vec::new();
     if !hash_results.is_empty() {
         if let Ok(hash_data) = prevalence_service
-            .get_bulk_prevalence(&hash_results, TimeWindow::ThirtyDays)
+            .get_bulk_prevalence(&hash_results, TimeWindow::ThirtyDays, &prevalence_scope)
             .await
         {
             for data in hash_data {
@@ -805,7 +829,7 @@ pub async fn get_query_artifacts(
     let mut domain_points = Vec::new();
     if !domain_results.is_empty() {
         if let Ok(domain_data) = prevalence_service
-            .get_bulk_prevalence(&domain_results, TimeWindow::ThirtyDays)
+            .get_bulk_prevalence(&domain_results, TimeWindow::ThirtyDays, &prevalence_scope)
             .await
         {
             for data in domain_data {

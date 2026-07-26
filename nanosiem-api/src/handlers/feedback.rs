@@ -14,8 +14,10 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
+use uuid::Uuid;
 
 use nanosiem_core::auth::permissions;
 use nanosiem_core::db::repository::{
@@ -56,6 +58,59 @@ impl FeedbackApiError {
     }
 }
 
+/// NAN-2093: 403 for an API key on interactive feedback self-service. An API
+/// key's `claims.sub` is its owner, so the ownership shortcut would let any key
+/// impersonate the human owner in the support/security-reporting channel and
+/// read their submissions. Feedback self-service is interactive-session only.
+fn interactive_session_only() -> (StatusCode, Json<FeedbackApiError>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(FeedbackApiError::new(
+            "interactive_session_required",
+            "Feedback self-service requires an interactive session; API keys are not permitted.",
+        )),
+    )
+}
+
+/// Submitter-facing feedback view (NAN-2093).
+///
+/// Deliberately omits `admin_notes` — an administrator-only field written via the
+/// `users:edit`-gated update route. Reusing the internal `Feedback` model in
+/// submitter create/list responses leaked those internal triage notes back to the
+/// submitter, so self-service responses use this DTO instead.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SubmitterFeedback {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub category: String,
+    pub title: String,
+    pub description: String,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<Feedback> for SubmitterFeedback {
+    fn from(f: Feedback) -> Self {
+        Self {
+            id: f.id,
+            user_id: f.user_id,
+            category: f.category,
+            title: f.title,
+            description: f.description,
+            status: f.status,
+            created_at: f.created_at,
+            updated_at: f.updated_at,
+        }
+    }
+}
+
+/// Submitter-facing single-feedback response (omits `admin_notes`).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SubmitterFeedbackResponse {
+    pub feedback: SubmitterFeedback,
+}
+
 /// Response for single feedback
 #[derive(Debug, Serialize, ToSchema)]
 pub struct FeedbackResponse {
@@ -69,10 +124,13 @@ pub struct FeedbackListResponse {
     pub total: i64,
 }
 
-/// Response for user's own feedback list
+/// Response for user's own feedback list.
+///
+/// Uses `SubmitterFeedback` (not the internal `Feedback` model) so `admin_notes`
+/// is never serialized back to the submitter (NAN-2093).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MyFeedbackResponse {
-    pub feedback: Vec<Feedback>,
+    pub feedback: Vec<SubmitterFeedback>,
 }
 
 /// Query parameters for listing feedback
@@ -99,16 +157,23 @@ pub struct MyFeedbackQuery {
     tag = "feedback",
     request_body = CreateFeedbackRequest,
     responses(
-        (status = 201, description = "Feedback created successfully", body = FeedbackResponse),
+        (status = 201, description = "Feedback created successfully", body = SubmitterFeedbackResponse),
         (status = 400, description = "Bad request", body = FeedbackApiError),
+        (status = 403, description = "Forbidden — interactive session required (API keys not permitted)", body = FeedbackApiError),
     ),
-    security(("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn create_feedback(
     State(state): State<AppState>,
     auth: axum::Extension<AuthContext>,
     Json(request): Json<CreateFeedbackRequest>,
-) -> Result<(StatusCode, Json<FeedbackResponse>), (StatusCode, Json<FeedbackApiError>)> {
+) -> Result<(StatusCode, Json<SubmitterFeedbackResponse>), (StatusCode, Json<FeedbackApiError>)> {
+    // NAN-2093: feedback submission is human self-service; an API key's subject is
+    // its owner, so gate to interactive sessions only (no owner-subject shortcut).
+    if auth.is_api_key {
+        return Err(interactive_session_only());
+    }
+
     // Validate category
     if !["bug", "enhancement", "general"].contains(&request.category.as_str()) {
         return Err((
@@ -147,7 +212,12 @@ pub async fn create_feedback(
         (status, Json(err))
     })?;
 
-    Ok((StatusCode::CREATED, Json(FeedbackResponse { feedback })))
+    Ok((
+        StatusCode::CREATED,
+        Json(SubmitterFeedbackResponse {
+            feedback: feedback.into(),
+        }),
+    ))
 }
 
 /// List all feedback (admin view with user info)
@@ -200,14 +270,19 @@ pub async fn list_feedback(
     params(MyFeedbackQuery),
     responses(
         (status = 200, description = "User's feedback retrieved successfully", body = MyFeedbackResponse),
+        (status = 403, description = "Forbidden — interactive session required (API keys not permitted)", body = FeedbackApiError),
     ),
-    security(("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn list_my_feedback(
     State(state): State<AppState>,
     auth: axum::Extension<AuthContext>,
     Query(query): Query<MyFeedbackQuery>,
 ) -> Result<Json<MyFeedbackResponse>, (StatusCode, Json<FeedbackApiError>)> {
+    // NAN-2093: interactive-session only (see create_feedback).
+    if auth.is_api_key {
+        return Err(interactive_session_only());
+    }
     let repo = FeedbackRepository::new(state.pool.clone());
     let feedback = repo
         .list_by_user(auth.user_id(), query.limit)
@@ -217,7 +292,10 @@ pub async fn list_my_feedback(
             (status, Json(err))
         })?;
 
-    Ok(Json(MyFeedbackResponse { feedback }))
+    // NAN-2093: project to the submitter DTO so `admin_notes` is never returned.
+    Ok(Json(MyFeedbackResponse {
+        feedback: feedback.into_iter().map(SubmitterFeedback::from).collect(),
+    }))
 }
 
 /// Get a single feedback by ID
@@ -370,6 +448,8 @@ pub async fn delete_feedback(
         FeedbackResponse,
         FeedbackListResponse,
         MyFeedbackResponse,
+        SubmitterFeedback,
+        SubmitterFeedbackResponse,
     ))
 )]
 pub struct FeedbackApiDoc;

@@ -36,6 +36,8 @@ import { useToast } from '@/hooks/use-toast';
 import { Chk, StatusChip } from './chips';
 import { SourceTypeCombobox } from './SourceTypeCombobox';
 import { folderOf, type RepoRuleView, type RepoView } from './helpers';
+import { PermissionAction } from './PermissionAction';
+import type { ActionAccess } from './repository-action-policy';
 
 // ------------------------------------------------------------------
 // Side drawer shell
@@ -266,6 +268,7 @@ interface BulkImportProps {
   rules: RepoRuleView[];
   availableSourceTypes: string[];
   onConfirm: (items: BulkImportItem[]) => Promise<void> | void;
+  getImportAccess: (items: BulkImportItem[]) => ActionAccess;
   /** Live progress while a batch is in flight. `total` is the planned size. */
   progress?: {
     running: boolean;
@@ -282,6 +285,7 @@ export function BulkImportDrawer({
   rules,
   availableSourceTypes,
   onConfirm,
+  getImportAccess,
   progress,
 }: BulkImportProps) {
   const [configs, setConfigs] = useState<Record<string, BulkRowConfig>>({});
@@ -365,8 +369,8 @@ export function BulkImportDrawer({
     });
   };
 
-  const submit = () => {
-    const items: BulkImportItem[] = rules
+  const buildItems = (): BulkImportItem[] =>
+    rules
       .filter((r) => configs[r.id]?.selected)
       .map((r) => {
         const c = configs[r.id];
@@ -377,7 +381,13 @@ export function BulkImportDrawer({
           merge_to_single_source_type: c.mergeSourceType || undefined,
         };
       });
-    onConfirm(items);
+
+  const plannedItems = buildItems();
+  const importAccess = getImportAccess(plannedItems);
+
+  const submit = () => {
+    if (!importAccess.allowed) return;
+    onConfirm(plannedItems);
   };
 
   const running = !!progress?.running;
@@ -407,15 +417,17 @@ export function BulkImportDrawer({
           >
             Cancel
           </button>
-          <button
-            type="button"
-            onClick={submit}
-            disabled={running || selectedCount === 0}
-            className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
-          >
-            <Download className="w-[11px] h-[11px]" strokeWidth={2} />
-            {running ? 'Importing…' : `Import ${selectedCount}`}
-          </button>
+          <PermissionAction access={importAccess}>
+            <button
+              type="button"
+              onClick={submit}
+              disabled={running || selectedCount === 0 || !importAccess.allowed}
+              className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              <Download className="w-[11px] h-[11px]" strokeWidth={2} />
+              {running ? 'Importing…' : `Import ${selectedCount}`}
+            </button>
+          </PermissionAction>
         </div>
       }
     >

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use utoipa::{IntoParams, ToSchema};
 
-use crate::middleware::AuthContext;
+use crate::middleware::{ensure_interactive_session, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// Response for listing recent activity
@@ -91,14 +91,18 @@ fn parse_item_type(s: &str) -> Option<RecentItemType> {
     responses(
         (status = 200, description = "Recent activity retrieved successfully", body = RecentActivityResponse),
         (status = 400, description = "Bad request"),
+        (status = 403, description = "Forbidden — interactive session required (API keys not permitted)"),
     ),
-    security(("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn list_recent_activity(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Query(params): Query<ListActivityParams>,
 ) -> Result<Json<RecentActivityResponse>, ApiError> {
+    // NAN-2041: recent activity is human self-service; an API key's subject is its
+    // owner, so gate to interactive sessions only (no owner-subject shortcut).
+    ensure_interactive_session(&auth)?;
     let user_id = auth.user_id();
     let repo = RecentActivityRepository::new(state.pool.clone());
 
@@ -128,14 +132,17 @@ pub async fn list_recent_activity(
     responses(
         (status = 200, description = "Activity recorded successfully", body = serde_json::Value),
         (status = 400, description = "Bad request"),
+        (status = 403, description = "Forbidden — interactive session required (API keys not permitted)"),
     ),
-    security(("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn record_activity(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<RecordActivityRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // NAN-2041: interactive-session only (see list_recent_activity).
+    ensure_interactive_session(&auth)?;
     let user_id = auth.user_id();
     let repo = RecentActivityRepository::new(state.pool.clone());
 
@@ -175,13 +182,16 @@ pub async fn record_activity(
     tag = "recent_activity",
     responses(
         (status = 200, description = "Recent activity cleared successfully", body = serde_json::Value),
+        (status = 403, description = "Forbidden — interactive session required (API keys not permitted)"),
     ),
-    security(("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn clear_recent_activity(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // NAN-2041: interactive-session only (see list_recent_activity).
+    ensure_interactive_session(&auth)?;
     let user_id = auth.user_id();
     let repo = RecentActivityRepository::new(state.pool.clone());
 

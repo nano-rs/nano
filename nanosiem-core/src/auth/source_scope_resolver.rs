@@ -285,7 +285,18 @@ impl SourceScopeResolver {
     /// OCSF `source_type` is not ingest-lowercased. FAIL-CLOSED: if the registry
     /// is unavailable (never loaded and PostgreSQL is unreachable) this returns
     /// `true` (treat as restricted) so redaction errs toward hiding.
+    ///
+    /// NAN-2155: an UNRESOLVED or always-restricted origin
+    /// ([`UNRESOLVED_SOURCE_SENTINEL`](super::scope::UNRESOLVED_SOURCE_SENTINEL))
+    /// is restricted unconditionally, checked BEFORE any registry access. Both
+    /// the sentinel and `audit` are deliberately not registry members, so a
+    /// plain membership test would report them as unrestricted. Without this,
+    /// a "fully attributed" engine stamp could EGRESS the matched-event sample,
+    /// which is strictly worse than the unstamped behaviour it replaced.
     pub async fn any_restricted(&self, source_types: &[String]) -> bool {
+        if super::scope::requires_unconditional_origin_redaction(source_types) {
+            return true;
+        }
         match self.restricted_snapshot().await {
             Ok(set) => any_in_restricted(source_types, &set),
             // FAIL-CLOSED: registry unavailable => treat as restricted.
@@ -635,5 +646,17 @@ mod tests {
             matches!(err, SourceScopeError::Unavailable),
             "non-bypass + never-loaded registry + PG down must be Unavailable, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn write_side_sentinels_short_circuit_without_postgres() {
+        let resolver = SourceScopeResolver::new(unreachable_pool());
+
+        assert!(
+            resolver
+                .any_restricted(&[crate::auth::UNRESOLVED_SOURCE_SENTINEL.to_string()])
+                .await
+        );
+        assert!(resolver.any_restricted(&[" Audit ".to_string()]).await);
     }
 }

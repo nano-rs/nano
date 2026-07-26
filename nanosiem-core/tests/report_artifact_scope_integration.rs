@@ -12,7 +12,7 @@
 //! `cargo test -- --ignored`) exercise the persistence + predicate against a
 //! real migrated Postgres. They are also the only guard against schema drift for
 //! the new `report_runs.source_types` / `source_types_complete` columns and the
-//! runtime `sqlx` in `get_artifact_content` / `store_run_success`.
+//! runtime `sqlx` in `get_artifact_scope` / `store_run_success`.
 
 mod common;
 
@@ -110,6 +110,8 @@ async fn owner_download_refused_after_later_restriction() {
             &csv_artifact(),
             &[source.clone()],
             true,
+            false,
+            true,
         )
         .await
         .expect("store success");
@@ -118,10 +120,15 @@ async fn owner_download_refused_after_later_restriction() {
     // Fetch the artifact scope (round-trips migration 252 columns).
     let arts = repo.list_artifacts_meta(run_id).await.expect("meta");
     let artifact_id = arts[0].id;
-    let (_content, art_scope) = repo
-        .get_artifact_content(artifact_id)
+    let art_scope = repo
+        .get_artifact_scope(artifact_id)
         .await
-        .expect("artifact content");
+        .expect("artifact scope");
+    let content = repo
+        .get_artifact_bytes(artifact_id)
+        .await
+        .expect("artifact bytes after scope authorization");
+    assert_eq!(content.content, csv_artifact()[0].content);
     assert_eq!(art_scope.definition_id, def_id);
     assert!(art_scope.source_types.contains(&source));
     assert!(art_scope.source_types_complete);
@@ -191,15 +198,17 @@ async fn disjoint_manifest_still_serves_restricted_requester() {
         &csv_artifact(),
         &[format!("syslog_{sfx}")],
         true,
+        false,
+        true,
     )
     .await
     .expect("store");
 
     let arts = repo.list_artifacts_meta(run_id).await.expect("meta");
-    let (_c, art_scope) = repo
-        .get_artifact_content(arts[0].id)
+    let art_scope = repo
+        .get_artifact_scope(arts[0].id)
         .await
-        .expect("content");
+        .expect("scope");
 
     // A viewer denied `restricted` (which the manifest does not contain) may
     // still download.
@@ -265,10 +274,10 @@ async fn pre_feature_run_denies_restricted_requester() {
     .expect("insert legacy artifact");
 
     let arts = repo.list_artifacts_meta(run_id).await.expect("meta");
-    let (_c, art_scope) = repo
-        .get_artifact_content(arts[0].id)
+    let art_scope = repo
+        .get_artifact_scope(arts[0].id)
         .await
-        .expect("content");
+        .expect("scope");
     assert!(
         art_scope.source_types.is_empty() && !art_scope.source_types_complete,
         "a pre-feature run must default to an empty, incomplete manifest"
@@ -322,6 +331,8 @@ async fn get_run_carries_manifest_for_metadata_gate() {
         false,
         &csv_artifact(),
         &[source.clone()],
+        true,
+        false,
         true,
     )
     .await

@@ -5,10 +5,11 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
-use nanosiem_core::auth::permissions;
+use nanosiem_core::auth::{permissions, TargetEffect};
 use nanosiem_core::typeid::TypeIdParam;
 
 use super::{get_rule_repo_service, types::UpstreamUpdatesResponse};
+use crate::handlers::repository_target_authz::ensure_target_effects;
 use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
@@ -54,7 +55,7 @@ pub async fn get_upstream_updates(
     ),
     responses(
         (status = 200, description = "Upstream diff retrieved successfully", body = nanosiem_core::rule_repository::UpstreamDiff),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Forbidden — missing rule_repositories:view or detections:view"),
         (status = 404, description = "Not found"),
     ),
     security(("api_key" = []))
@@ -65,6 +66,11 @@ pub async fn get_upstream_diff(
     Path(detection_rule_id): Path<TypeIdParam>,
 ) -> Result<Json<nanosiem_core::rule_repository::UpstreamDiff>, ApiError> {
     ensure_permission(&auth, permissions::RULE_REPOSITORIES_VIEW)?;
+    // NAN-2103: the diff serializes the LIVE detection's `current_query` /
+    // `current_title` / `current_description`. Repository visibility authorizes
+    // the upstream/catalog half only — reading the private live object is what
+    // `GET /api/rules/{id}` gates behind `detections:view`.
+    ensure_target_effects(&auth, &[TargetEffect::DetectionView])?;
 
     let service = get_rule_repo_service(&state)?;
     let diff = service.get_upstream_diff(*detection_rule_id).await?;

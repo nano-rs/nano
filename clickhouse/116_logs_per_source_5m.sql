@@ -17,8 +17,8 @@
 --   - 5-minute bucketing: ~14k rows/day post-merge for 50 source_types. Hour
 --     windows roll up cleanly; preserves the "events_last_hour" semantics
 --     used by Dashboard / Log Source health.
---   - 7-day TTL: covers all 24h/1h/7d callers. Longer-window callers
---     (get_health_clickhouse total_events at 90d) stay on raw `logs`.
+--   - 7-day TTL: covers all 24h/1h/7d callers. Log-source detail health uses
+--     the rollup's most recent 24h instead of scanning 90d of raw `logs`.
 --   - source_type stored lowercased — every existing read site already
 --     does `lower(source_type)`, so this matches semantics without forcing
 --     callers to lowercase at read time.

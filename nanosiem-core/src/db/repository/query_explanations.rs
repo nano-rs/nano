@@ -72,20 +72,40 @@ impl QueryExplanationRepository {
         Self { pool }
     }
 
-    /// Compute the hash for a query (normalized: lowercase, trimmed)
-    pub fn compute_query_hash(query: &str) -> String {
+    /// Compute the cache key for a query (normalized: lowercase, trimmed),
+    /// bound to the caller's effective source-scope fingerprint (NAN-2049).
+    ///
+    /// The explanation record carries the generated ClickHouse SQL, which is
+    /// scope-specific (it embeds the caller's source-scope exclusion). Hashing
+    /// the query text ALONE made the cache global, so a source-restricted
+    /// principal could retrieve — and see the generated SQL of — an entry
+    /// cached under a broader-scope principal. Folding the scope fingerprint
+    /// into the key partitions the cache by effective visibility: callers with
+    /// the *same* scope still collide (so shared-URL explanations keep working
+    /// for them), while a differently-scoped caller gets a distinct key and
+    /// recomputes its own scope-correct entry. `scope_fingerprint` is a stable
+    /// string derived from the caller's sorted effective deny-set; pass `""`
+    /// for the unrestricted (empty deny-set) scope.
+    pub fn compute_query_hash(query: &str, scope_fingerprint: &str) -> String {
         let normalized = query.trim().to_lowercase();
         let mut hasher = Sha256::new();
         hasher.update(normalized.as_bytes());
+        // Domain separator so (query, scope) can't be reassociated into a
+        // different (query', scope') pair that hashes the same.
+        hasher.update([0u8]);
+        hasher.update(scope_fingerprint.as_bytes());
         hex::encode(hasher.finalize())
     }
 
-    /// Store a query explanation (upsert - updates if exists)
+    /// Store a query explanation (upsert - updates if exists), bound to the
+    /// caller's effective source-scope fingerprint (NAN-2049 — see
+    /// [`compute_query_hash`](Self::compute_query_hash)).
     pub async fn upsert(
         &self,
         data: &NewQueryExplanation,
+        scope_fingerprint: &str,
     ) -> Result<QueryExplanation, QueryExplanationError> {
-        let query_hash = Self::compute_query_hash(&data.query);
+        let query_hash = Self::compute_query_hash(&data.query, scope_fingerprint);
 
         let reasoning_steps_json = data
             .reasoning_steps
@@ -154,12 +174,16 @@ impl QueryExplanationRepository {
         Ok(row)
     }
 
-    /// Find explanation by query text
+    /// Find explanation by query text, scoped to the caller's effective
+    /// source-scope fingerprint (NAN-2049 — see
+    /// [`compute_query_hash`](Self::compute_query_hash)). A caller only ever
+    /// resolves an entry stored under its own effective scope.
     pub async fn find_by_query(
         &self,
         query: &str,
+        scope_fingerprint: &str,
     ) -> Result<QueryExplanation, QueryExplanationError> {
-        let query_hash = Self::compute_query_hash(query);
+        let query_hash = Self::compute_query_hash(query, scope_fingerprint);
         self.find_by_hash(&query_hash).await
     }
 
@@ -177,5 +201,53 @@ impl QueryExplanationRepository {
         .await?;
 
         Ok(result.rows_affected())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QueryExplanationRepository as R;
+
+    #[test]
+    fn hash_is_stable_for_same_query_and_scope() {
+        // Deterministic: identical (query, scope) always produce the same key,
+        // so same-scope callers still share the cached entry (shared URLs work).
+        assert_eq!(
+            R::compute_query_hash("error | limit 1", "sysmon\nwineventlog"),
+            R::compute_query_hash("error | limit 1", "sysmon\nwineventlog"),
+        );
+    }
+
+    #[test]
+    fn hash_is_normalized_on_query_text() {
+        // Trim + lowercase normalization is unchanged by scope binding.
+        assert_eq!(
+            R::compute_query_hash("  ERROR | LIMIT 1 ", ""),
+            R::compute_query_hash("error | limit 1", ""),
+        );
+    }
+
+    #[test]
+    fn different_scope_partitions_the_cache_key() {
+        // NAN-2049: the SAME query under DIFFERENT effective scopes must hash to
+        // DIFFERENT keys, so a source-restricted principal can never resolve an
+        // entry stored under a broader-scope principal (and vice-versa).
+        let unrestricted = R::compute_query_hash("error | limit 1", "");
+        let restricted = R::compute_query_hash("error | limit 1", "restricted_source");
+        let other_scope = R::compute_query_hash("error | limit 1", "sysmon");
+        assert_ne!(unrestricted, restricted);
+        assert_ne!(unrestricted, other_scope);
+        assert_ne!(restricted, other_scope);
+    }
+
+    #[test]
+    fn scope_binding_cannot_collide_with_a_longer_query() {
+        // The domain separator prevents a (query, scope) pair from being
+        // reassociated into a different (query', scope') that hashes the same —
+        // e.g. query "a" + scope "b" must not equal query "a\0b" + scope "".
+        assert_ne!(
+            R::compute_query_hash("a", "b"),
+            R::compute_query_hash("a\u{0}b", ""),
+        );
     }
 }

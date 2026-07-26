@@ -21,6 +21,8 @@ pub(crate) mod helpers;
 mod retro_hunt;
 mod rules;
 #[cfg(test)]
+mod source_stamp_tests;
+#[cfg(test)]
 mod tests;
 
 // Audit D13: the real-time SignalProcessor shares the scheduled path's
@@ -215,6 +217,18 @@ pub struct DetectionService {
     /// is already schema-aware through `search_service` (Phase 3a); this field
     /// covers the entity-extraction half of the scheduled path.
     pub(super) active_profile: Arc<dyn crate::schema::SchemaProfile>,
+    /// NAN-2155: restricted-source registry used to build the FAIL-CLOSED
+    /// `source_types` stamp for aggregate matches
+    /// (`annotate_source_types_for_scoping`).
+    ///
+    /// Self-built from the PG pool, exactly like [`FindingLogger`]'s copy — no
+    /// external wiring, and the resolver is Arc-backed so cloning is cheap.
+    /// Reading the registry THROUGH the resolver (rather than issuing a raw
+    /// `SELECT`) is the point of the field: the resolver RETAINS its last-known
+    /// registry past a PostgreSQL failure, so a transient blip degrades to the
+    /// same deny-all-restricted stamp the read side degrades to, instead of
+    /// writing an empty (visible-to-everyone) stamp that can never be repaired.
+    pub(super) source_scopes: crate::auth::source_scope_resolver::SourceScopeResolver,
 }
 
 impl DetectionService {
@@ -284,6 +298,9 @@ impl DetectionService {
             rule_repo: DetectionRuleRepository::new(pg_pool.clone()),
             alert_repo: AlertRepository::new(pg_pool.clone()),
             search_service,
+            source_scopes: crate::auth::source_scope_resolver::SourceScopeResolver::new(
+                pg_pool.clone(),
+            ),
             finding_logger: Some(finding_logger),
             config: DetectionServiceConfig::default(),
             score_calculator: ScoreCalculator::new().with_profile(profile.clone()),

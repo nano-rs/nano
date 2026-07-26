@@ -718,6 +718,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn health_report_source_envelope_unions_known_lanes_but_stays_incomplete() {
+        let mut metrics = base_zero_metrics_fixture();
+        metrics.ingestion.source_volumes.push(SourceVolumeMetric {
+            source_type: " Windows_Event ".to_string(),
+            count_24h: 1,
+            count_prior_24h: 0,
+            change_pct: 100.0,
+        });
+        metrics
+            .ingestion
+            .silent_sources
+            .push("AWS_CloudTrail".to_string());
+        metrics.parsing.field_coverage.push(FieldCoverageMetric {
+            source_type: "windows_event".to_string(),
+            total_events: 1,
+            src_ip_filled_pct: 100.0,
+            user_filled_pct: 100.0,
+            event_type_filled_pct: 100.0,
+            message_filled_pct: 100.0,
+        });
+        metrics
+            .enrichment
+            .per_source_coverage
+            .push(EnrichmentCoverageMetric {
+                source_type: "apache".to_string(),
+                total_events: 1,
+                geoip_pct: 100.0,
+                ioc_pct: 0.0,
+                identity_pct: 0.0,
+            });
+
+        let provenance = metrics.source_provenance();
+        assert_eq!(
+            provenance.source_types(),
+            &[
+                "apache".to_string(),
+                "aws_cloudtrail".to_string(),
+                "windows_event".to_string()
+            ]
+        );
+        assert!(
+            !provenance.is_complete(),
+            "global scores and report prose are not source-partition-attributed yet"
+        );
+    }
+
     fn detection_with(alerting_rules: i64, matches: i64) -> DetectionMetrics {
         let mut rules_by_mode = vec![RulesByMode {
             mode: "live".to_string(),

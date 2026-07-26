@@ -14,25 +14,56 @@ use nanosiem_core::{
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
-use super::SearchResultResponse;
+use super::{SearchResultResponse, require_search_execute};
 use crate::error::ErrorResponse;
 use crate::{SearchState, error::SearchError, metrics::record_search_query};
 
-async fn reserve_query_owner(
+/// Reserve `request_id` for the CREDENTIAL that is starting the query.
+///
+/// NAN-2100: the reserved identity is
+/// [`AuthContext::credential_principal_id`](crate::AuthContext::credential_principal_id)
+/// — the api-key id for api-key auth, the user id for an interactive session.
+/// `cancel_search` compares the same accessor, so one credential can never
+/// cancel another's search merely because they share a human owner. Read it
+/// through the accessor rather than `claims.sub`: this service's `claims.sub`
+/// happens to already be the key id (NAN-2043), but `nanosiem-api-lib`'s
+/// `AuthContext` sets it to the key's OWNER, and this boundary must not depend
+/// on which convention a given context uses.
+pub(crate) async fn reserve_query_owner(
     state: &SearchState,
     request_id: String,
-    user_id: uuid::Uuid,
+    principal_id: uuid::Uuid,
 ) -> Result<(), SearchError> {
-    match state.reserve_query_owner(&request_id, user_id).await {
+    let in_use = || SearchError::BadRequest("request_id is already in use".to_string());
+    match state.reserve_query_owner(&request_id, principal_id).await {
+        // NAN-2100: the LOCAL reservation is authoritative on its own in a
+        // single-instance deployment (no shared registry) and whenever the
+        // shared one is degraded, so its conflict verdict must be honored in
+        // both arms — not just Redis's. Reserving over another credential's
+        // in-flight id would let that credential cancel this query.
         Ok(true) => {
-            state.search.query_tracker().reserve_request(request_id, user_id);
-            Ok(())
+            if state
+                .search
+                .query_tracker()
+                .reserve_request(request_id, principal_id)
+            {
+                Ok(())
+            } else {
+                Err(in_use())
+            }
         }
-        Ok(false) => Err(SearchError::BadRequest("request_id is already in use".to_string())),
+        Ok(false) => Err(in_use()),
         Err(error) => {
             tracing::warn!(%error, %request_id, "Shared query ownership unavailable; using local ownership");
-            state.search.query_tracker().reserve_request(request_id, user_id);
-            Ok(())
+            if state
+                .search
+                .query_tracker()
+                .reserve_request(request_id, principal_id)
+            {
+                Ok(())
+            } else {
+                Err(in_use())
+            }
         }
     }
 }
@@ -88,6 +119,10 @@ pub async fn search(
     use crate::cache::cache_status_headers;
     use nanosiem_core::search::QueryPriority;
 
+    // NAN-2028: gate on search:execute (matching every sibling handler) before
+    // any work — an under-scoped API key must not run piped searches.
+    require_search_execute(&auth)?;
+
     // NAN-1799: compose the effective deny-set (per-user source scope ∪ audit
     // gate) ONCE, before the cache lookup — the scope is folded into the cache
     // key, and the service injects the exclusion into the executed SQL. This
@@ -95,7 +130,8 @@ pub async fn search(
     let scope = effective_scope(&auth);
 
     if let Some(request_id) = request.request_id.clone() {
-        reserve_query_owner(&state, request_id, auth.claims.sub).await?;
+        // NAN-2100: reserve under the CREDENTIAL (see `reserve_query_owner`).
+        reserve_query_owner(&state, request_id, auth.credential_principal_id()).await?;
     }
 
     let user_id = auth.claims.sub;
@@ -209,24 +245,45 @@ pub async fn cancel_search(
     axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     Path(request_id): Path<String>,
 ) -> Result<Json<CancelSearchResponse>, SearchError> {
+    // NAN-2100: cancellation is a destructive search-plane operation — it issues
+    // ClickHouse `KILL QUERY` against the data/count/histogram/field-stats ids
+    // and fans out across replicas. It must take the SAME capability gate as
+    // every other search route, BEFORE any registry lookup or engine call, so
+    // revoking `search:execute` also revokes the ability to terminate searches.
+    require_search_execute(&auth)?;
+
     tracing::info!("Received cancel request for request_id: {}", request_id);
 
     let can_admin_cancel = auth.claims.has_permission(permissions::SETTINGS_SYSTEM);
     if !can_admin_cancel {
-        let local_owner = state.search.query_tracker().get(&request_id)
-            .and_then(|info| info.owner_user_id);
+        // NAN-2100: compare the CREDENTIAL that started the query, resolved
+        // through the named accessor rather than raw `claims.sub` (see
+        // `AuthContext::credential_principal_id`). One human's separate api keys
+        // are separate principals: a zero-permission key must not be able to
+        // kill work started by a more privileged key of the same owner.
+        // Interactive sessions of one human deliberately remain a SINGLE
+        // principal — the authorization subject is the user, and per-session
+        // isolation is not part of this boundary.
+        let principal = auth.credential_principal_id();
+        let local_owner = state
+            .search
+            .query_tracker()
+            .get(&request_id)
+            .and_then(|info| info.owner_principal_id);
         let owner = if local_owner.is_some() {
             local_owner
         } else {
             match state.shared_query_owner(&request_id).await {
                 Ok(owner) => owner,
+                // Fail closed: an unavailable ownership registry is not
+                // permission to cancel. `None` never matches a principal.
                 Err(error) => {
                     tracing::warn!(%error, %request_id, "Shared query ownership unavailable during cancellation");
                     None
                 }
             }
         };
-        if owner != Some(auth.claims.sub) {
+        if owner != Some(principal) {
             return Ok(Json(CancelSearchResponse { cancelled: false }));
         }
     }
@@ -343,6 +400,9 @@ pub async fn explain(
     axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     Json(request): Json<ExplainRequest>,
 ) -> Result<Json<ExplainResponse>, SearchError> {
+    // NAN-2028: explain() returns the generated ClickHouse SQL, so it takes the
+    // same search:execute gate as search().
+    require_search_execute(&auth)?;
     // NAN-1799: pass the composed scope so "Inspect SQL" renders the exact
     // gated SQL the executed path runs for this caller.
     let scope = effective_scope(&auth);
@@ -429,6 +489,10 @@ pub async fn fetch_log(
     axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     Json(request): Json<FetchLogRequest>,
 ) -> Result<Json<FetchLogResponse>, SearchError> {
+    // NAN-2028: fetch-by-id is a search-surface read (returns a full log event),
+    // so it takes the same search:execute gate — effective_scope below is a
+    // deny-set that defaults OPEN and is not an authz check on its own.
+    require_search_execute(&auth)?;
     // NAN-694 / NAN-1799: callers must not retrieve denied rows by direct id —
     // audit (without audit:view) or any source-scope-denied source_type. The
     // composed ScopeSet is applied at the SQL layer to match the rest of the
@@ -484,6 +548,8 @@ pub async fn prevalence_artifacts(
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<SearchRequest>,
 ) -> Result<(axum::http::HeaderMap, Json<PrevalenceScatterData>), SearchError> {
+    // NAN-2028: runs a query over the log store — same search:execute gate.
+    require_search_execute(&auth)?;
     // NAN-1799: the service injects the composed deny-set into the nPL path
     // itself — no more pre-rewrite of request.query here.
     let scope = effective_scope(&auth);
@@ -563,6 +629,8 @@ pub async fn field_stats_for_query(
 ) -> Result<(axum::http::HeaderMap, Json<FieldStatsResponse>), SearchError> {
     use nanosiem_core::search::QueryPriority;
 
+    // NAN-2028: runs a query over the log store — same search:execute gate.
+    require_search_execute(&auth)?;
     // NAN-1799: the service injects the composed deny-set into the nPL path
     // itself — no more pre-rewrite of the query here.
     let scope = effective_scope(&auth);
@@ -607,7 +675,8 @@ pub async fn field_stats_for_query(
     // can authorize killing the derived `{request_id}-fstats` query even
     // after the main search has completed and unregistered the id.
     if let Some(rid) = request.request_id.clone() {
-        reserve_query_owner(&state, rid, auth.claims.sub).await?;
+        // NAN-2100: reserve under the CREDENTIAL (see `reserve_query_owner`).
+        reserve_query_owner(&state, rid, auth.credential_principal_id()).await?;
     }
 
     // NAN-1427: admission-gated, with the derived companion query_id and
@@ -666,6 +735,8 @@ pub async fn field_values(
 ) -> Result<(axum::http::HeaderMap, Json<FieldValuesResponse>), SearchError> {
     let start = Instant::now();
 
+    // NAN-2028: returns log-derived field values — same search:execute gate.
+    require_search_execute(&auth)?;
     // NAN-1799: the service injects the composed deny-set into the nPL path
     // itself — no more pre-rewrite of the query here.
     let scope = effective_scope(&auth);
@@ -811,4 +882,43 @@ pub struct FieldStatsResponse {
     pub fields: Vec<nanosiem_core::search::FieldInfo>,
     /// Total number of events in the time range
     pub total_events: u64,
+}
+
+// NAN-2030: the `require_search_execute` gate + its under-scoped-key regression
+// test now live in `handlers/mod.rs` and `handlers/authz_guard.rs` so every
+// handler shares one gate under one contract.
+
+#[cfg(test)]
+mod field_values_endpoint_tests {
+    /// NAN-2149: the search drill-in endpoint must keep delegating field
+    /// resolution to SearchService. Resolving a column in the handler would
+    /// bypass the shared OCSF class-split/enum display expression and diverge
+    /// from GET /api/fields/{name}/values.
+    #[test]
+    fn search_field_values_endpoint_delegates_to_shared_service_path() {
+        let src = include_str!("search.rs");
+        const MARKER: &str = "pub async fn ";
+        let start = src
+            .find(&format!("{MARKER}field_values("))
+            .expect("field_values handler not found");
+        let end = src
+            .match_indices(MARKER)
+            .map(|(i, _)| i)
+            .find(|&i| i > start)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+
+        assert!(
+            body.contains(".get_field_values("),
+            "POST /api/search/field-values must delegate to SearchService"
+        );
+        assert!(
+            body.contains("request.dataset.as_deref()"),
+            "field-values must preserve the request's dataset/profile selector"
+        );
+        assert!(
+            !body.contains("field_access_expr"),
+            "the endpoint must not grow its own schema-resolution path"
+        );
+    }
 }

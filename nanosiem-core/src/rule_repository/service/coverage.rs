@@ -5,6 +5,8 @@
 //! Handles refreshing coverage data from ClickHouse and analyzing
 //! rule coverage across repositories.
 
+use super::super::coverage::LiveInventoryAccess;
+
 use super::super::error::RuleRepositoryError;
 use super::super::models::{CoverageAnalysis, CoverageFilter, RepositoryRuleFilter};
 use super::RuleRepositoryService;
@@ -23,10 +25,16 @@ impl RuleRepositoryService {
             .map_err(|e| RuleRepositoryError::CoverageAnalysis(e.to_string()))
     }
 
-    /// Get coverage analysis for a repository
+    /// Get coverage analysis for a repository, scoped to the caller.
+    ///
+    /// NAN-2081: the shared coverage cache is raw live telemetry. `access`
+    /// carries BOTH gates — the caller's live-data capability and, when present,
+    /// their effective per-source deny set — so the analysis never reveals a
+    /// source the caller could not enumerate directly.
     pub async fn get_coverage_analysis(
         &self,
         filter: CoverageFilter,
+        access: &LiveInventoryAccess<'_>,
     ) -> Result<CoverageAnalysis, RuleRepositoryError> {
         let filter = filter.normalized();
 
@@ -50,6 +58,6 @@ impl RuleRepositoryService {
         };
 
         let analyzer = self.coverage_analyzer.read().await;
-        Ok(analyzer.analyze_coverage(&rules, &filter))
+        Ok(analyzer.analyze_coverage(&rules, &filter, access))
     }
 }

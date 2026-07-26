@@ -17,7 +17,7 @@ impl LogSourceRepository {
         let mut query = String::from(
             r#"
             SELECT
-                id, name, description, namespace, timezone, source_type, source_config, credential_id,
+                id, name, description, namespace, timezone, source_type,
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values,
                 validated, validation_error, deployed, deployed_at, enabled,
@@ -25,7 +25,6 @@ impl LogSourceRepository {
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
                 extension_vrl, extension_enabled,
-                parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
                 dispatch_source_config_id,
                 created_at, updated_at
@@ -105,7 +104,7 @@ impl LogSourceRepository {
         let rows = sqlx::query(
             r#"
             SELECT
-                ls.id, ls.name, ls.description, ls.namespace, ls.timezone, ls.source_type, ls.source_config, ls.credential_id,
+                ls.id, ls.name, ls.description, ls.namespace, ls.timezone, ls.source_type,
                 ls.parser_vrl, ls.output_fields, ls.category, ls.vendor, ls.product, ls.icon, ls.color,
                 ls.match_field, ls.match_pattern, ls.match_values,
                 ls.validated, ls.validation_error, ls.deployed, ls.deployed_at, ls.enabled,
@@ -113,7 +112,6 @@ impl LogSourceRepository {
                 ls.stale_alert_enabled, ls.stale_threshold_minutes,
                 ls.sampling_ratio, ls.sampling_exclude_condition,
                 ls.extension_vrl, ls.extension_enabled,
-                ls.parser_only,
                 ls.source_parser_repository_id, ls.source_parser_path, ls.source_parser_linked,
                 ls.dispatch_source_config_id,
                 sc.config_type AS dispatch_source_config_type,
@@ -134,7 +132,7 @@ impl LogSourceRepository {
         let rows = sqlx::query(
             r#"
             SELECT
-                id, name, description, namespace, timezone, source_type, source_config, credential_id,
+                id, name, description, namespace, timezone, source_type,
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values,
                 validated, validation_error, deployed, deployed_at, enabled,
@@ -142,7 +140,6 @@ impl LogSourceRepository {
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
                 extension_vrl, extension_enabled,
-                parser_only,
                 kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
                 dispatch_source_config_id,
@@ -163,7 +160,7 @@ impl LogSourceRepository {
         let rows = sqlx::query(
             r#"
             SELECT
-                id, name, description, namespace, timezone, source_type, source_config, credential_id,
+                id, name, description, namespace, timezone, source_type,
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values,
                 validated, validation_error, deployed, deployed_at, enabled,
@@ -171,7 +168,6 @@ impl LogSourceRepository {
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
                 extension_vrl, extension_enabled,
-                parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
                 dispatch_source_config_id,
                 created_at, updated_at
@@ -193,7 +189,7 @@ impl LogSourceRepository {
         let row = sqlx::query(
             r#"
             SELECT
-                ls.id, ls.name, ls.description, ls.namespace, ls.timezone, ls.source_type, ls.source_config, ls.credential_id,
+                ls.id, ls.name, ls.description, ls.namespace, ls.timezone, ls.source_type,
                 ls.parser_vrl, ls.output_fields, ls.category, ls.vendor, ls.product, ls.icon, ls.color,
                 ls.match_field, ls.match_pattern, ls.match_values,
                 ls.validated, ls.validation_error, ls.deployed, ls.deployed_at, ls.enabled,
@@ -201,7 +197,6 @@ impl LogSourceRepository {
                 ls.stale_alert_enabled, ls.stale_threshold_minutes,
                 ls.sampling_ratio, ls.sampling_exclude_condition,
                 ls.extension_vrl, ls.extension_enabled,
-                ls.parser_only,
                 ls.kind, ls.enrich_kind, ls.enrich_source, ls.target_table, ls.normalize_vrl,
                 ls.source_parser_repository_id, ls.source_parser_path, ls.source_parser_linked,
                 ls.dispatch_source_config_id,
@@ -225,7 +220,7 @@ impl LogSourceRepository {
         let row = sqlx::query(
             r#"
             SELECT
-                id, name, description, namespace, timezone, source_type, source_config, credential_id,
+                id, name, description, namespace, timezone, source_type,
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values,
                 validated, validation_error, deployed, deployed_at, enabled,
@@ -233,7 +228,6 @@ impl LogSourceRepository {
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
                 extension_vrl, extension_enabled,
-                parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
                 dispatch_source_config_id,
                 created_at, updated_at
@@ -264,14 +258,14 @@ impl LogSourceRepository {
         let row = sqlx::query(
             r#"
             INSERT INTO log_sources (
-                name, description, namespace, timezone, source_type, source_config, credential_id,
+                name, description, namespace, timezone, source_type,
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values, dispatch_source_config_id,
                 lifecycle_status
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-                COALESCE($19, 'active'))
-            RETURNING id, name, description, namespace, timezone, source_type, source_config, credential_id,
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                COALESCE($17, 'active'))
+            RETURNING id, name, description, namespace, timezone, source_type,
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values,
                 validated, validation_error, deployed, deployed_at, enabled,
@@ -279,7 +273,6 @@ impl LogSourceRepository {
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
                 extension_vrl, extension_enabled,
-                parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
                 dispatch_source_config_id,
                 created_at, updated_at
@@ -290,8 +283,6 @@ impl LogSourceRepository {
         .bind(&new.namespace)
         .bind(&new.timezone)
         .bind(&new.source_type)
-        .bind(&new.source_config)
-        .bind(&new.credential_id)
         .bind(&new.parser_vrl)
         .bind(&new.output_fields)
         .bind(&new.category)
@@ -337,8 +328,6 @@ impl LogSourceRepository {
         // Reset deployed status if deployment-affecting fields are being changed
         // This ensures the UI shows "Deploy" instead of "Undeploy" after config changes
         let config_changed = update.source_type.is_some()
-            || update.source_config.is_some()
-            || update.credential_id.is_some()
             || update.dispatch_source_config_id.is_some()
             || update.parser_vrl.is_some()
             || update.output_fields.is_some()
@@ -359,41 +348,40 @@ impl LogSourceRepository {
                 namespace = COALESCE($4, namespace),
                 timezone = COALESCE($5, timezone),
                 source_type = COALESCE($6, source_type),
-                source_config = COALESCE($7, source_config),
-                credential_id = COALESCE($8, credential_id),
-                parser_vrl = COALESCE($9, parser_vrl),
-                output_fields = COALESCE($10, output_fields),
-                category = COALESCE($11, category),
-                vendor = COALESCE($12, vendor),
-                product = COALESCE($13, product),
-                icon = COALESCE($14, icon),
-                color = COALESCE($15, color),
-                match_field = COALESCE($16, match_field),
-                match_pattern = COALESCE($17, match_pattern),
-                match_values = COALESCE($18, match_values),
-                enabled = COALESCE($19, enabled),
-                deployed = CASE WHEN $20 THEN false ELSE deployed END,
-                stale_alert_enabled = COALESCE($21, stale_alert_enabled),
-                stale_threshold_minutes = COALESCE($22, stale_threshold_minutes),
-                sampling_ratio = COALESCE($23, sampling_ratio),
-                sampling_exclude_condition = COALESCE($24, sampling_exclude_condition),
+                parser_vrl = COALESCE($7, parser_vrl),
+                output_fields = COALESCE($8, output_fields),
+                category = COALESCE($9, category),
+                vendor = COALESCE($10, vendor),
+                product = COALESCE($11, product),
+                icon = COALESCE($12, icon),
+                color = COALESCE($13, color),
+                match_field = COALESCE($14, match_field),
+                match_pattern = COALESCE($15, match_pattern),
+                match_values = COALESCE($16, match_values),
+                enabled = COALESCE($17, enabled),
+                deployed = CASE WHEN $18 THEN false ELSE deployed END,
+                stale_alert_enabled = COALESCE($19, stale_alert_enabled),
+                stale_threshold_minutes = COALESCE($20, stale_threshold_minutes),
+                sampling_ratio = COALESCE($21, sampling_ratio),
+                sampling_exclude_condition = COALESCE($22, sampling_exclude_condition),
                 extension_vrl = CASE
-                    WHEN $25::text IS NULL THEN extension_vrl
-                    WHEN $25 = '' THEN NULL
-                    ELSE $25
+                    WHEN $23::text IS NULL THEN extension_vrl
+                    WHEN $23 = '' THEN NULL
+                    ELSE $23
                 END,
-                extension_enabled = COALESCE($26, extension_enabled),
-                dispatch_source_config_id = COALESCE($27, dispatch_source_config_id),
+                extension_enabled = COALESCE($24, extension_enabled),
+                dispatch_source_config_id = COALESCE($25, dispatch_source_config_id),
                 -- NAN-1151: let upstream-update/apply refresh an enrichment
                 -- parser's mapping VRL (enrichment parsers carry normalize_vrl,
                 -- not parser_vrl).
-                normalize_vrl = COALESCE($28, normalize_vrl)
+                normalize_vrl = COALESCE($26, normalize_vrl)
                 -- NAN-1920: lifecycle_status is deliberately NOT set here — it is
                 -- server-controlled (create + deploy path only), never via this
                 -- generic update, so a client can't pre-flip a draft to bypass
                 -- the tier cap.
             WHERE id = $1
-            RETURNING id, name, description, namespace, timezone, source_type, source_config, credential_id,
+              AND ($27::timestamptz IS NULL OR updated_at = $27)
+            RETURNING id, name, description, namespace, timezone, source_type,
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values,
                 validated, validation_error, deployed, deployed_at, enabled,
@@ -401,7 +389,6 @@ impl LogSourceRepository {
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
                 extension_vrl, extension_enabled,
-                parser_only,
                 kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
                 dispatch_source_config_id,
@@ -414,8 +401,6 @@ impl LogSourceRepository {
         .bind(&update.namespace)
         .bind(&update.timezone)
         .bind(&update.source_type)
-        .bind(&update.source_config)
-        .bind(&update.credential_id)
         .bind(&update.parser_vrl)
         .bind(&update.output_fields)
         .bind(&update.category)
@@ -436,10 +421,29 @@ impl LogSourceRepository {
         .bind(&update.extension_enabled)
         .bind(&update.dispatch_source_config_id)
         .bind(&update.normalize_vrl)
-        .fetch_one(&self.pool)
+        .bind(update.expected_updated_at)
+        .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row_to_log_source(&row))
+        match row {
+            Some(row) => Ok(row_to_log_source(&row)),
+            None => {
+                // The atomic UPDATE can miss because the row was deleted after
+                // the initial existence check or because expected_updated_at
+                // is stale. This probe only classifies the error; it cannot
+                // weaken the compare-and-swap that guarded the write.
+                let exists: bool =
+                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM log_sources WHERE id = $1)")
+                        .bind(id)
+                        .fetch_one(&self.pool)
+                        .await?;
+                if exists {
+                    Err(LogSourceRepositoryError::StaleVersion(id))
+                } else {
+                    Err(LogSourceRepositoryError::NotFound(id.to_string()))
+                }
+            }
+        }
     }
 
     /// Delete a log source

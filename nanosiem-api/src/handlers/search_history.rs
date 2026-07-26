@@ -20,7 +20,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::handlers::AuditExt;
-use crate::middleware::{ensure_permission, AuthContext};
+use crate::middleware::{ensure_interactive_session, ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 use nanosiem_core::typeid::TypeIdParam;
 
@@ -77,14 +77,18 @@ pub struct SetHistoryEnabledRequest {
     params(ListHistoryParams),
     responses(
         (status = 200, description = "Search history entries", body = ListHistoryResponse),
+        (status = 403, description = "Forbidden — interactive session required (API keys not permitted)"),
     ),
-    security(("bearer_auth" = []), ("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn list_history(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Query(params): Query<ListHistoryParams>,
 ) -> Result<Json<ListHistoryResponse>, ApiError> {
+    // NAN-2092: search history is human self-service; an API key's subject is its
+    // owner, so gate to interactive sessions only (no owner-subject shortcut).
+    ensure_interactive_session(&auth)?;
     ensure_permission(&auth, permissions::SEARCH_VIEW)?;
 
     let user_id = auth.user_id();
@@ -129,14 +133,17 @@ pub async fn list_history(
     responses(
         (status = 200, description = "History entry created", body = SearchHistoryResponse),
         (status = 400, description = "Search history is disabled"),
+        (status = 403, description = "Forbidden — interactive session required (API keys not permitted)"),
     ),
-    security(("bearer_auth" = []), ("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn add_history(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<AddHistoryRequest>,
 ) -> Result<Json<SearchHistoryResponse>, ApiError> {
+    // NAN-2092: interactive-session only (see list_history).
+    ensure_interactive_session(&auth)?;
     ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
 
     let user_id = auth.user_id();
@@ -203,9 +210,10 @@ pub async fn add_history(
     ),
     responses(
         (status = 200, description = "History entry deleted"),
+        (status = 403, description = "Forbidden — interactive session required (API keys not permitted)"),
         (status = 404, description = "History entry not found"),
     ),
-    security(("bearer_auth" = []), ("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn delete_history_entry(
     State(state): State<AppState>,
@@ -213,6 +221,8 @@ pub async fn delete_history_entry(
     Extension(client): Extension<ClientContext>,
     Path(entry_id): Path<TypeIdParam>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // NAN-2092: interactive-session only (see list_history).
+    ensure_interactive_session(&auth)?;
     // Mutating your history requires execute (the permission that creates it),
     // not just view — a view-only identity has no history to erase (NAN-1366).
     ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
@@ -249,14 +259,17 @@ pub async fn delete_history_entry(
     tag = "search_history",
     responses(
         (status = 200, description = "All history entries cleared"),
+        (status = 403, description = "Forbidden — interactive session required (API keys not permitted)"),
     ),
-    security(("bearer_auth" = []), ("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn clear_history(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Extension(client): Extension<ClientContext>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // NAN-2092: interactive-session only (see list_history).
+    ensure_interactive_session(&auth)?;
     // Mutating your history requires execute (the permission that creates it),
     // not just view — a view-only identity has no history to erase (NAN-1366).
     ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
@@ -291,8 +304,9 @@ pub async fn clear_history(
     request_body = SetHistoryEnabledRequest,
     responses(
         (status = 200, description = "History settings updated"),
+        (status = 403, description = "Forbidden — interactive session required (API keys not permitted)"),
     ),
-    security(("bearer_auth" = []), ("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn set_history_enabled(
     State(state): State<AppState>,
@@ -300,6 +314,8 @@ pub async fn set_history_enabled(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<SetHistoryEnabledRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // NAN-2092: interactive-session only (see list_history).
+    ensure_interactive_session(&auth)?;
     // Toggling tracking requires execute (the permission that creates history),
     // not just view — disabling it is the primary evasion lever (NAN-1366).
     ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;

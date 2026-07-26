@@ -58,6 +58,18 @@ impl RoleApiError {
                 (StatusCode::FORBIDDEN, "cannot_delete_system_role")
             }
             RoleRepositoryError::RoleInUse => (StatusCode::CONFLICT, "role_in_use"),
+            RoleRepositoryError::RoleInUseByPlaybookAcl => {
+                (StatusCode::CONFLICT, "role_in_use_by_playbook_acl")
+            }
+            RoleRepositoryError::WouldOrphanPlaybookAcl => {
+                (StatusCode::CONFLICT, "would_orphan_playbook_acl")
+            }
+            RoleRepositoryError::ReservedRoleName(_) => {
+                (StatusCode::BAD_REQUEST, "reserved_role_name")
+            }
+            RoleRepositoryError::GrantAuthorityChanged => {
+                (StatusCode::CONFLICT, "grant_authority_changed")
+            }
             RoleRepositoryError::DatabaseError(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "database_error")
             }
@@ -191,8 +203,9 @@ pub async fn get_role(
     request_body = CreateRoleRequest,
     responses(
         (status = 201, description = "Role successfully created", body = RoleWithPermissions),
+        (status = 400, description = "Reserved or invalid role name", body = RoleApiError),
         (status = 403, description = "Permission denied", body = RoleApiError),
-        (status = 409, description = "Role name already exists", body = RoleApiError),
+        (status = 409, description = "Role name exists or grant authority changed", body = RoleApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -205,10 +218,26 @@ pub async fn create_role(
     check_permission(&auth, perm_constants::ROLES_CREATE)
         .map_err(|(s, j)| (s, Json(RoleApiError::new(&j.error, &j.message))))?;
 
-    let role = state.role_repo.create_role(&request).await.map_err(|e| {
-        let (status, err) = RoleApiError::from_repo_error(&e);
-        (status, Json(err))
-    })?;
+    // NAN-2121: roles:create authorizes creating the role object, NOT granting
+    // the permissions it carries. Deny unless the caller holds every permission
+    // it is assigning (prevents minting an Admin-equivalent role).
+    let grant_stamp = crate::handlers::grant_authz::ensure_can_grant_permissions(
+        &auth,
+        &state.pool,
+        perm_constants::ROLES_CREATE,
+        &request.permissions,
+    )
+    .await
+    .map_err(|g| (g.status, Json(RoleApiError::new(g.code, &g.message))))?;
+
+    let role = state
+        .role_repo
+        .create_role_authorized(&request, grant_stamp)
+        .await
+        .map_err(|e| {
+            let (status, err) = RoleApiError::from_repo_error(&e);
+            (status, Json(err))
+        })?;
 
     let permissions = state
         .role_repo
@@ -251,9 +280,10 @@ pub async fn create_role(
     request_body = UpdateRoleRequest,
     responses(
         (status = 200, description = "Role successfully updated", body = RoleWithPermissions),
+        (status = 400, description = "Reserved or invalid role name", body = RoleApiError),
         (status = 403, description = "Permission denied or cannot modify system role", body = RoleApiError),
         (status = 404, description = "Role not found", body = RoleApiError),
-        (status = 409, description = "Role name already exists", body = RoleApiError),
+        (status = 409, description = "Role name exists or grant authority changed", body = RoleApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -267,14 +297,36 @@ pub async fn update_role(
     check_permission(&auth, perm_constants::ROLES_EDIT)
         .map_err(|(s, j)| (s, Json(RoleApiError::new(&j.error, &j.message))))?;
 
-    let role = state
-        .role_repo
-        .update_role(*id, &request)
-        .await
-        .map_err(|e| {
-            let (status, err) = RoleApiError::from_repo_error(&e);
-            (status, Json(err))
-        })?;
+    // NAN-2121: deny unless the caller holds every permission it is assigning to
+    // the role (roles:edit is not authority to grant arbitrary privileges).
+    let grant_stamp = if let Some(ref permissions) = request.permissions {
+        Some(
+            crate::handlers::grant_authz::ensure_can_grant_permissions(
+                &auth,
+                &state.pool,
+                perm_constants::ROLES_EDIT,
+                permissions,
+            )
+            .await
+            .map_err(|g| (g.status, Json(RoleApiError::new(g.code, &g.message))))?,
+        )
+    } else {
+        None
+    };
+
+    let role = match grant_stamp {
+        Some(stamp) => {
+            state
+                .role_repo
+                .update_role_authorized(*id, &request, stamp)
+                .await
+        }
+        None => state.role_repo.update_role(*id, &request).await,
+    }
+    .map_err(|e| {
+        let (status, err) = RoleApiError::from_repo_error(&e);
+        (status, Json(err))
+    })?;
 
     let permissions = state
         .role_repo

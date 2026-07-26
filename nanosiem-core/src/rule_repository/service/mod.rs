@@ -17,8 +17,14 @@ mod browse;
 mod coverage;
 mod crud;
 pub(crate) mod helpers;
-mod import;
+pub(crate) mod import;
 mod sync;
+
+#[cfg(test)]
+#[path = "import_authz_tests.rs"]
+mod import_authz_tests;
+
+pub use import::{RuleImportAction, RuleImportPlan};
 
 use sqlx::PgPool;
 use std::sync::Arc;

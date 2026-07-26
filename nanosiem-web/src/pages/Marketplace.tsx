@@ -24,6 +24,7 @@ import {
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
 import { useCapabilities } from '@/hooks/use-capabilities';
+import { useAuth } from '@/contexts/AuthContext';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { api } from '@/lib/api';
@@ -93,6 +94,7 @@ export function Marketplace() {
   useBreadcrumbTitle('Marketplace');
 
   const { capabilities } = useCapabilities();
+  const { hasAllPermissions, user } = useAuth();
   const { toast } = useToast();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -145,21 +147,25 @@ export function Marketplace() {
   // catalog/repos load so the grid renders immediately, and cache aggressively
   // on both sides:
   //
-  // - Server-side (NAN-609): a Dragonfly-backed shared cache (6h TTL) so a
-  //   slow recompute on one replica warms every user's hero on every replica.
-  //   `computed_at` in the response stamps the hero with "as of HH:MM".
+  // - Server-side (NAN-609/NAN-2061): a Dragonfly-backed, effective-source-scope
+  //   partitioned cache (6h TTL), shared across replicas. `computed_at` in the
+  //   response stamps the hero with "as of HH:MM".
   // - Client-side: a long React Query staleTime so navigating between pages
   //   in the same tab doesn't even hit the (already cheap) GET endpoint.
   //
   // The manual-refresh button calls the dedicated POST refresh endpoint —
-  // that invalidates the *server-side* cache for everyone, then writes the
-  // freshly-computed payload back into the React Query cache.
+  // that invalidates only the caller's effective-scope partition, then writes
+  // the freshly-computed payload back into the React Query cache.
   const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
   const queryClient = useQueryClient();
-  const COVERAGE_QUERY_KEY = ['marketplace', 'coverage'] as const;
+  // Keep the browser cache caller-bound as well; the server applies the
+  // finer-grained effective-source-scope partition.
+  const COVERAGE_QUERY_KEY = ['marketplace', 'coverage', user?.id] as const;
+  const canViewCoverage = hasAllPermissions(['enrichments:view', 'search:execute']);
   const coverageQuery = useQuery({
     queryKey: COVERAGE_QUERY_KEY,
     queryFn: () => api.marketplace.getCoverage(),
+    enabled: canViewCoverage,
     staleTime: SIX_HOURS_MS,
     gcTime: SIX_HOURS_MS,
     retry: false,
@@ -389,28 +395,29 @@ export function Marketplace() {
       {stats && <StatsStrip stats={stats} />}
 
       {/* Coverage hero — fetched independently from catalog/repos. The
-          server returns a 6h-shared Dragonfly cache hit, so the typical
-          load is sub-millisecond; the manual-refresh button calls the
-          dedicated POST endpoint which invalidates the shared cache for
-          everyone. Skeleton renders while the very first fetch is in
-          flight so the catalog grid is unblocked. */}
-      <div className="mt-4">
-        <CoverageHero
-          coverage={coverageQuery.data ?? null}
-          isLoading={coverageQuery.isLoading}
-          isFetching={coverageQuery.isFetching || coverageRefreshMutation.isPending}
-          isError={coverageQuery.isError}
-          onRefresh={() => {
-            // Don't double-fire while a refresh is already in flight.
-            if (coverageRefreshMutation.isPending) return;
-            coverageRefreshMutation.mutate();
-          }}
-          onAddMissing={(name) => {
-            setSearchQuery(name);
-            document.getElementById('marketplace-search')?.focus();
-          }}
-        />
-      </div>
+          server returns a 6h effective-scope-partitioned Dragonfly cache
+          hit, so the typical load is sub-millisecond; the manual-refresh
+          button invalidates only the caller's partition. Skeleton renders
+          while the first fetch is in flight so the catalog grid is unblocked. */}
+      {canViewCoverage && (
+        <div className="mt-4">
+          <CoverageHero
+            coverage={coverageQuery.data ?? null}
+            isLoading={coverageQuery.isLoading}
+            isFetching={coverageQuery.isFetching || coverageRefreshMutation.isPending}
+            isError={coverageQuery.isError}
+            onRefresh={() => {
+              // Don't double-fire while a refresh is already in flight.
+              if (coverageRefreshMutation.isPending) return;
+              coverageRefreshMutation.mutate();
+            }}
+            onAddMissing={(name) => {
+              setSearchQuery(name);
+              document.getElementById('marketplace-search')?.focus();
+            }}
+          />
+        </div>
+      )}
 
       {/* Repo sources — hidden in air-gap mode (GitHub-backed, egress-only).
           A side-load banner takes its place so the surface stays honest. */}

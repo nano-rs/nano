@@ -39,6 +39,56 @@ impl ReportSourceType {
     }
 }
 
+/// Whether a stored run/artifact must be protected by `search:sql`.
+///
+/// Successful runs created after NAN-2066 carry a complete true/false stamp.
+/// Pre-feature dashboard runs are incomplete and therefore require
+/// `search:sql` fail-closed; search reports never enter the raw-SQL panel path.
+pub fn report_run_requires_search_sql(
+    source_type: ReportSourceType,
+    requires_search_sql: bool,
+    requirement_complete: bool,
+) -> bool {
+    source_type == ReportSourceType::Dashboard && (requires_search_sql || !requirement_complete)
+}
+
+#[cfg(test)]
+mod search_sql_requirement_tests {
+    use super::{report_run_requires_search_sql, ReportSourceType};
+
+    #[test]
+    fn dashboard_artifact_requirement_is_frozen_and_incomplete_history_fails_closed() {
+        assert!(report_run_requires_search_sql(
+            ReportSourceType::Dashboard,
+            true,
+            true,
+        ));
+        assert!(!report_run_requires_search_sql(
+            ReportSourceType::Dashboard,
+            false,
+            true,
+        ));
+        assert!(report_run_requires_search_sql(
+            ReportSourceType::Dashboard,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn search_reports_never_inherit_the_dashboard_sql_gate() {
+        for (requires_search_sql, requirement_complete) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            assert!(!report_run_requires_search_sql(
+                ReportSourceType::Search,
+                requires_search_sql,
+                requirement_complete,
+            ));
+        }
+    }
+}
+
 /// Terminal (and in-flight) run status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -195,6 +245,15 @@ pub struct ReportRun {
     #[serde(skip)]
     #[schema(ignore)]
     pub source_types_complete: bool,
+    /// NAN-2066: frozen positive-capability requirement of this run's artifacts.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub requires_search_sql: bool,
+    /// Whether [`requires_search_sql`](Self::requires_search_sql) is a complete
+    /// decision from the exact dashboard snapshot that produced the artifacts.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub search_sql_requirement_complete: bool,
 }
 
 /// Database row for a run (no artifacts joined).
@@ -217,6 +276,10 @@ pub struct ReportRunRow {
     pub source_types: Vec<String>,
     #[sqlx(default)]
     pub source_types_complete: bool,
+    #[sqlx(default)]
+    pub requires_search_sql: bool,
+    #[sqlx(default)]
+    pub search_sql_requirement_complete: bool,
 }
 
 impl From<ReportRunRow> for ReportRun {
@@ -236,13 +299,28 @@ impl From<ReportRunRow> for ReportRun {
             artifacts: Vec::new(),
             source_types: row.source_types,
             source_types_complete: row.source_types_complete,
+            requires_search_sql: row.requires_search_sql,
+            search_sql_requirement_complete: row.search_sql_requirement_complete,
         }
     }
 }
 
-/// F-31: the download-authorization facts about the run that owns an artifact —
-/// returned alongside the bytes so the handler can apply
-/// [`crate::reports::report_artifact_download_allowed`].
+/// Minimal authorization facts loaded before a run's artifact metadata.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ReportRunAuthorizationScope {
+    pub definition_id: Uuid,
+    pub has_artifacts: bool,
+    #[sqlx(default)]
+    pub requires_search_sql: bool,
+    #[sqlx(default)]
+    pub search_sql_requirement_complete: bool,
+}
+
+/// F-31: the download-authorization facts about the run that owns an artifact.
+///
+/// Loaded separately before the bytes so the handler can apply
+/// [`crate::reports::report_artifact_download_allowed`] and all current
+/// capability/object gates without materializing protected BYTEA first.
 #[derive(Debug, Clone)]
 pub struct ArtifactScope {
     /// The definition that owns the artifact's run (for the ownership check).
@@ -251,6 +329,11 @@ pub struct ArtifactScope {
     pub source_types: Vec<String>,
     /// Whether the manifest is complete/trustworthy.
     pub source_types_complete: bool,
+    /// NAN-2066: whether the frozen artifact was produced through raw SQL.
+    pub requires_search_sql: bool,
+    /// Whether the SQL requirement is complete/trustworthy. `false` is
+    /// fail-closed for dashboard artifacts created before migration 274.
+    pub search_sql_requirement_complete: bool,
 }
 
 /// Artifact metadata (excludes the `content` bytea).

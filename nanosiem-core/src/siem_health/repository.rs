@@ -6,6 +6,8 @@ use sqlx::{PgPool, Row};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::auth::SourceProvenance;
+
 use super::types::{SiemHealthReport, SiemHealthReportSummary};
 
 #[derive(Error, Debug)]
@@ -41,6 +43,7 @@ impl SiemHealthRepository {
         metrics: &serde_json::Value,
         recommendations: &serde_json::Value,
         dimension_details: &serde_json::Value,
+        provenance: &SourceProvenance,
         triggered_by: Option<Uuid>,
         duration_ms: Option<i32>,
     ) -> Result<SiemHealthReport, SiemHealthRepositoryError> {
@@ -49,12 +52,14 @@ impl SiemHealthRepository {
             INSERT INTO siem_health_reports
                 (overall_score, overall_status, ingestion_score, parsing_score, detection_score,
                  enrichment_score, alerting_score,
-                 summary, metrics, recommendations, dimension_details, triggered_by, duration_ms)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                 summary, metrics, recommendations, dimension_details,
+                 source_types, source_types_complete, triggered_by, duration_ms)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             RETURNING id, overall_score, overall_status, ingestion_score, parsing_score,
                       detection_score, enrichment_score, alerting_score,
                       summary, metrics, recommendations, dimension_details,
-                      triggered_by, created_at, duration_ms
+                      triggered_by, created_at, duration_ms,
+                      source_types, source_types_complete
             "#,
         )
         .bind(overall_score)
@@ -68,6 +73,8 @@ impl SiemHealthRepository {
         .bind(metrics)
         .bind(recommendations)
         .bind(dimension_details)
+        .bind(provenance.source_types())
+        .bind(provenance.is_complete())
         .bind(triggered_by)
         .bind(duration_ms)
         .fetch_one(&self.pool)
@@ -83,7 +90,8 @@ impl SiemHealthRepository {
             SELECT id, overall_score, overall_status, ingestion_score, parsing_score,
                    detection_score, enrichment_score, alerting_score,
                    summary, metrics, recommendations, dimension_details,
-                   triggered_by, created_at, duration_ms
+                   triggered_by, created_at, duration_ms,
+                   source_types, source_types_complete
             FROM siem_health_reports
             ORDER BY created_at DESC
             LIMIT 1
@@ -102,7 +110,8 @@ impl SiemHealthRepository {
             SELECT id, overall_score, overall_status, ingestion_score, parsing_score,
                    detection_score, enrichment_score, alerting_score,
                    summary, metrics, recommendations, dimension_details,
-                   triggered_by, created_at, duration_ms
+                   triggered_by, created_at, duration_ms,
+                   source_types, source_types_complete
             FROM siem_health_reports
             WHERE id = $1
             "#,
@@ -178,6 +187,8 @@ impl SiemHealthRepository {
             triggered_by: row.get("triggered_by"),
             created_at: row.get("created_at"),
             duration_ms: row.get("duration_ms"),
+            source_types: row.get("source_types"),
+            source_types_complete: row.get("source_types_complete"),
         }
     }
 }

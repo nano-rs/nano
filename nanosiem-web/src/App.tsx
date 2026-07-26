@@ -902,7 +902,7 @@ function ProtectedAppRoutes() {
           {/* Settings — landing page for the dedicated /settings shell (NAN-537).
               Visible to anyone with at least one settings:* permission. */}
           <Route path="/settings" element={
-            <PermissionRoute anyPermission={['settings:view', 'settings:system', 'settings:ai', 'settings:retention', 'settings:webhooks', 'users:view', 'groups:view', 'roles:view', 'apikeys:view', 'audit:view']} element={
+            <PermissionRoute anyPermission={['settings:view', 'settings:system', 'settings:ai', 'settings:ai_providers', 'settings:agent_models', 'settings:retention', 'settings:webhooks', 'users:view', 'groups:view', 'roles:view', 'apikeys:view', 'audit:view']} element={
               <Suspense fallback={<SettingsLoadingFallback />}>
                 <SettingsLandingPage key={resetKey} />
               </Suspense>
@@ -939,7 +939,7 @@ function ProtectedAppRoutes() {
             } />
           } />
           <Route path="/settings/ai" element={
-            <PermissionRoute permission="settings:ai" element={
+            <PermissionRoute anyPermission={['settings:ai', 'settings:ai_providers', 'settings:agent_models']} element={
               <Suspense fallback={<SettingsLoadingFallback />}>
                 <MelodSettings key={resetKey} />
               </Suspense>

@@ -6,6 +6,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::auth::{ArtifactScope, ScopeSet, SourceProvenance};
+
 /// Overall health status
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -63,6 +65,15 @@ pub struct SiemHealthReport {
     pub triggered_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub duration_ms: Option<i32>,
+    /// Internal conservative envelope for future source-scoped report reads.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub source_types: Vec<String>,
+    /// False until every global score, recommendation, and prose block can be
+    /// tied to source-partitioned inputs (NAN-2153 / NAN-2089).
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub source_types_complete: bool,
 }
 
 /// Summary of a report (for list views, without full metrics/details)
@@ -91,6 +102,97 @@ pub struct CollectedMetrics {
     pub detection: DetectionMetrics,
     pub alerting: AlertingMetrics,
     pub collected_at: DateTime<Utc>,
+}
+
+impl CollectedMetrics {
+    /// Union every source identity exposed by today's per-source collectors.
+    ///
+    /// This remains deliberately incomplete: detection and alerting totals,
+    /// fleet-wide enrichment rates, integrity probes, recommendations, and
+    /// generated prose are not yet partition-attributed. Persisting the known
+    /// envelope is useful to the follow-up migrations, but claiming it is the
+    /// complete report provenance would be a source-scoped fail-open.
+    pub fn source_provenance(&self) -> SourceProvenance {
+        let source_types = self
+            .ingestion
+            .source_volumes
+            .iter()
+            .map(|metric| metric.source_type.as_str())
+            .chain(self.ingestion.silent_sources.iter().map(String::as_str))
+            .chain(
+                self.parsing
+                    .field_coverage
+                    .iter()
+                    .map(|metric| metric.source_type.as_str()),
+            )
+            .chain(
+                self.parsing
+                    .high_ext_sources
+                    .iter()
+                    .map(|metric| metric.source_type.as_str()),
+            )
+            .chain(
+                self.enrichment
+                    .per_source_coverage
+                    .iter()
+                    .map(|metric| metric.source_type.as_str()),
+            );
+        SourceProvenance::incomplete(source_types)
+    }
+
+    /// Retain the source-partitioned metrics visible to a current viewer.
+    ///
+    /// Health reports are durable SYSTEM artifacts, so this is applied after a
+    /// stored report is loaded as well as at viewer-triggered collection time.
+    /// Each keyed row is treated as a complete single-source artifact through
+    /// the shared provenance classifier. Blank/unresolved source identities
+    /// therefore fail closed for a restricted viewer.
+    ///
+    /// The ingestion totals are exact sums of `source_volumes` and are
+    /// recomputed after filtering. Other fleet/global fields are not derivable
+    /// from the persisted top-N partitions and remain unchanged for NAN-2089 to
+    /// handle together with narrative, recommendations, and scores.
+    pub fn retain_source_partitions(&mut self, scope: &ScopeSet) {
+        if !scope.is_restricted() {
+            return;
+        }
+
+        let artifact_scope = ArtifactScope::from_scope(scope);
+        let is_visible = |source_type: &str| {
+            artifact_scope.allows_provenance(&SourceProvenance::complete([source_type]))
+        };
+
+        self.ingestion
+            .source_volumes
+            .retain(|metric| is_visible(&metric.source_type));
+        self.ingestion
+            .silent_sources
+            .retain(|source_type| is_visible(source_type));
+        self.ingestion.total_events_24h = self
+            .ingestion
+            .source_volumes
+            .iter()
+            .fold(0_u64, |total, metric| {
+                total.saturating_add(metric.count_24h)
+            });
+        self.ingestion.total_events_prior_24h = self
+            .ingestion
+            .source_volumes
+            .iter()
+            .fold(0_u64, |total, metric| {
+                total.saturating_add(metric.count_prior_24h)
+            });
+
+        self.parsing
+            .field_coverage
+            .retain(|metric| is_visible(&metric.source_type));
+        self.parsing
+            .high_ext_sources
+            .retain(|metric| is_visible(&metric.source_type));
+        self.enrichment
+            .per_source_coverage
+            .retain(|metric| is_visible(&metric.source_type));
+    }
 }
 
 /// Ingestion health metrics

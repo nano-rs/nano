@@ -7,3 +7,27 @@ inputs = ["apache_http_server__ocsf__output", "aws_cloudtrail__ocsf__output", "c
 source = '''
 . = .
 '''
+
+# NAN-2164: reduce every pre-sampling parser attempt to a tiny health row.
+[transforms.db_parser_health]
+type = "remap"
+inputs = ["apache_http_server__ocsf__output", "aws_cloudtrail__ocsf__output", "conduit_mitm_proxy__ocsf__output", "microsoft_sysmon__json__ocsf__output", "windows_event_log__ocsf__output", "apache_http_server__ocsf__ocsf_prepare", "aws_cloudtrail__ocsf__ocsf_prepare", "conduit_mitm_proxy__ocsf__ocsf_prepare", "microsoft_sysmon__json__ocsf__ocsf_prepare", "windows_event_log__ocsf__ocsf_prepare"]
+drop_on_abort = true
+drop_on_error = true
+source = '''
+metadata_val, metadata_err = parse_json(.metadata)
+if metadata_err != null || !is_object(metadata_val) { metadata_val = {} }
+parser_id = to_string(._nano_parser_id) ?? ""
+if parser_id == "" { parser_id = to_string(metadata_val.parser_id) ?? "" }
+if parser_id == "" { abort }
+source_type = downcase(to_string(.source_type) ?? "unknown")
+if source_type == "" { source_type = "unknown" }
+failed = to_bool(._nano_parser_failure) ?? false
+parse_failure = if failed { 1 } else { 0 }
+. = {
+    "parser_id": parser_id,
+    "source_type": source_type,
+    "observed_at": now(),
+    "parse_failure": parse_failure
+}
+'''

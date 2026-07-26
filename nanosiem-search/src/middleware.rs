@@ -90,6 +90,13 @@ pub struct AuthContext {
     pub is_api_key: bool,
     /// API key ID if authenticated via API key
     pub api_key_id: Option<Uuid>,
+    /// NAN-2145: the api key's OWNER user id (`created_by`), for API-key
+    /// principals. `None` for JWT sessions (the owner IS `claims.sub`) and for
+    /// keys with no recorded owner. This is DISTINCT from `claims.sub`, which is
+    /// the KEY id for API keys (NAN-2043, so a key does not inherit owner group
+    /// grants for source-scope). Use `ownership_user_id()` — never `claims.sub`
+    /// — when writing/filtering a `users(id)` ownership FK (e.g. saved searches).
+    pub api_key_owner: Option<Uuid>,
     /// Per-user SOURCE-scope deny set — the restricted `source_type`s this
     /// principal may NOT read. Populated fail-closed by `SourceScopeResolver`
     /// in `auth_middleware`; defaults to unrestricted (`ScopeSet::default()`)
@@ -105,6 +112,7 @@ impl AuthContext {
             claims,
             is_api_key: false,
             api_key_id: None,
+            api_key_owner: None,
             denied_sources: nanosiem_core::auth::ScopeSet::default(),
         }
     }
@@ -127,7 +135,47 @@ impl AuthContext {
             },
             is_api_key: true,
             api_key_id: Some(info.id),
+            api_key_owner: info.user_id,
             denied_sources: nanosiem_core::auth::ScopeSet::default(),
+        }
+    }
+
+    /// NAN-2145: the real `users(id)` to use as the RESOURCE OWNER for this
+    /// principal — the api key's owner for API keys, or `claims.sub` for JWT
+    /// sessions. Returns `None` only for an API key with no recorded owner
+    /// (callers must fail closed rather than write a key id into a user FK).
+    ///
+    /// Keep using `claims.sub` for authorization, source-scope, and audit —
+    /// this is ONLY for the ownership relationship, and must not reintroduce
+    /// owner group/source-scope inheritance (NAN-2043).
+    pub fn ownership_user_id(&self) -> Option<Uuid> {
+        if self.is_api_key {
+            self.api_key_owner
+        } else {
+            Some(self.claims.sub)
+        }
+    }
+
+    /// NAN-2100: the CREDENTIAL that is acting — the api-key id for api-key
+    /// auth, the user id for an interactive session.
+    ///
+    /// This is the identity that query-ownership records (`QueryTracker` /
+    /// the shared Redis owner registry) are keyed on, so `DELETE
+    /// /api/search/{request_id}` can permit cancellation only by the exact
+    /// credential that started the query. In THIS service `claims.sub` is
+    /// already the key id for api keys (NAN-2043) — unlike `nanosiem-api-lib`'s
+    /// `AuthContext`, where `claims.sub` is the key's human OWNER and several
+    /// owner-subject-confusion findings originated. Reading the credential
+    /// through a named accessor keeps the cancel boundary correct even if the
+    /// two contexts' `sub` conventions ever converge: a key must never inherit
+    /// the authority of its owner's session or of the owner's other keys.
+    pub fn credential_principal_id(&self) -> Uuid {
+        if self.is_api_key {
+            // `api_key_id` is always `Some` on an api-key context; the fallback
+            // is defensive and, today, identical (`claims.sub` == key id).
+            self.api_key_id.unwrap_or(self.claims.sub)
+        } else {
+            self.claims.sub
         }
     }
 }
@@ -743,4 +791,61 @@ fn ip_denied_response(ip: &str) -> Response {
         },
     };
     (StatusCode::FORBIDDEN, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn api_key_info(id: Uuid, owner: Option<Uuid>) -> ApiKeyInfo {
+        ApiKeyInfo {
+            id,
+            name: "automation".to_string(),
+            permissions: vec![],
+            user_id: owner,
+        }
+    }
+
+    /// NAN-2145: an API key's authorization principal (`claims.sub`) is the KEY
+    /// id (NAN-2043), but the RESOURCE OWNER is the key's `user_id`. Using the
+    /// key id as the `saved_searches.user_id` FK 500'd create; ownership must
+    /// resolve to the owner while authz/source-scope stay key-scoped.
+    #[test]
+    fn ownership_user_id_uses_key_owner_not_key_id_for_api_keys() {
+        let owner = Uuid::now_v7();
+        let key_id = Uuid::now_v7();
+        let ctx = AuthContext::from_api_key(&api_key_info(key_id, Some(owner)));
+        assert_eq!(ctx.claims.sub, key_id, "authz principal stays the key id");
+        assert_eq!(
+            ctx.ownership_user_id(),
+            Some(owner),
+            "ownership resolves to the key owner"
+        );
+    }
+
+    /// Fail closed rather than write a key id into a user FK.
+    #[test]
+    fn ownership_user_id_fails_closed_for_ownerless_key() {
+        let ctx = AuthContext::from_api_key(&api_key_info(Uuid::now_v7(), None));
+        assert_eq!(ctx.ownership_user_id(), None);
+    }
+
+    /// For a JWT session the owner IS `claims.sub` (behavior unchanged).
+    #[test]
+    fn ownership_user_id_is_sub_for_jwt_sessions() {
+        let sub = Uuid::now_v7();
+        let claims = TokenClaims {
+            iss: "iss".to_string(),
+            aud: "aud".to_string(),
+            sub,
+            roles: vec![],
+            permissions: vec![],
+            exp: i64::MAX,
+            iat: 0,
+            jti: Uuid::now_v7(),
+            purpose: "access".to_string(),
+        };
+        let ctx = AuthContext::from_jwt(claims);
+        assert_eq!(ctx.ownership_user_id(), Some(sub));
+    }
 }

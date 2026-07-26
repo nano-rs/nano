@@ -7,6 +7,7 @@
 //! distributed scheduler reuses the scheduled-jobs SKIP LOCKED claiming pattern;
 //! completed runs notify the owner in-app and fire a `report_ready` webhook.
 
+pub mod authz;
 pub mod render;
 pub mod repository;
 pub mod service;
@@ -19,7 +20,12 @@ pub use render::PanelOutput;
 pub use repository::{ReportRepository, ReportRepositoryError};
 pub use service::{report_artifact_download_allowed, ReportError, ReportService};
 pub use types::{
-    ArtifactScope, ClaimedReportDefinition, NewReportDefinition, RenderedArtifact,
-    ReportArtifactContent, ReportArtifactMeta, ReportDefinition, ReportRun, ReportRunStatus,
-    ReportSourceType, UpdateReportDefinition,
+    report_run_requires_search_sql, ArtifactScope, ClaimedReportDefinition, NewReportDefinition,
+    RenderedArtifact, ReportArtifactContent, ReportArtifactMeta, ReportDefinition, ReportRun,
+    ReportRunAuthorizationScope, ReportRunStatus, ReportSourceType, UpdateReportDefinition,
+};
+pub use authz::{
+    dashboard_executes_search_sql, dashboard_panel_executes_search_sql,
+    required_report_permissions, ReportAuthorizationError, ReportAuthorizationIntent,
+    ReportAuthorizer, ReportDashboardAuthorization, ReportExecutionAuthorization,
 };

@@ -690,22 +690,26 @@ function RuleConditionsCard({ data }: { data: import('@/lib/api/types').RulePred
         </div>
       )}
       {data.pipe_stages.length > 0 && (
-        <div className="px-3 py-2 border-t border-border flex items-center gap-1.5 flex-wrap">
-          <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-semibold">
+        <div className="px-3 py-2 border-t border-border flex items-start gap-1.5 flex-wrap">
+          <span className="h-[18px] inline-flex items-center font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-semibold">
             Pipeline
           </span>
           {data.pipe_stages.map((stage, i) => (
             <span
               key={`stage-${i}-${stage.command}`}
-              className="inline-flex items-center gap-1 h-[18px] px-1.5 rounded-sm font-mono text-[10px] font-medium"
+              className="inline-flex min-w-0 max-w-full items-start gap-1 min-h-[18px] px-1.5 py-[2px] rounded-sm font-mono text-[10px] leading-[14px] font-medium"
               style={{
                 background: 'color-mix(in srgb, var(--primary) 12%, transparent)',
                 color: 'var(--primary)',
               }}
               title={stage.args || stage.command}
             >
-              {stage.command}
-              {stage.args && <span className="text-foreground/70">{stage.args}</span>}
+              <span className="shrink-0">{stage.command}</span>
+              {stage.args && (
+                <span className="min-w-0 whitespace-normal break-words text-foreground/70">
+                  {stage.args}
+                </span>
+              )}
             </span>
           ))}
         </div>
@@ -830,7 +834,7 @@ export function MatchesDetail({
               ) : hasMultipleEvents ? (
                 <>Detection fired against <span className="font-mono text-primary">{view.entity.label}</span></>
               ) : (
-                <>Single-event match: <span className="font-mono">{view.topActionName || '—'}</span></>
+                <>Single-event match: <span className="font-mono">{view.topActionName || 'Matched event'}</span></>
               )}
             </h2>
             <p className="mt-1 text-[12px] text-muted-foreground leading-[1.55]">

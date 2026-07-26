@@ -2202,9 +2202,12 @@ GROUP BY user, time_bucket;
 -- (metadata.product.name) instead of a single opaque 'unknown' bucket. bytes
 -- sums the materialized event_bytes (see the TELEMETRY column above).
 CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_logs_per_source_5m_mv
-TO nanosiem.logs_per_source_5m
+TO nanosiem.logs_per_source_5m_v2
 (
+    `schema_profile` LowCardinality(String),
     `source_type` LowCardinality(String),
+    `scope_source_type` LowCardinality(String),
+    `scope_source_type_complete` UInt8,
     `bucket_start` DateTime,
     `events` UInt64,
     `bytes` UInt64,
@@ -2212,15 +2215,31 @@ TO nanosiem.logs_per_source_5m
     `first_event_at` DateTime64(6, 'UTC')
 )
 AS SELECT
-    if(source_type != '' AND source_type != 'unknown', lower(source_type),
-       if(`metadata.product.name` != '', lower(`metadata.product.name`), 'unknown')) AS source_type,
+    'ocsf' AS schema_profile,
+    if(raw_source_type != '' AND raw_source_type != 'unknown', raw_source_type,
+       if(product_name != '', product_name, 'unknown')) AS source_type,
+    raw_source_type AS scope_source_type,
+    toUInt8(1) AS scope_source_type_complete,
     toStartOfFiveMinute(timestamp) AS bucket_start,
     count() AS events,
     sum(event_bytes) AS bytes,
     max(timestamp) AS last_event_at,
     min(timestamp) AS first_event_at
-FROM nanosiem.ocsf_logs
-GROUP BY source_type, bucket_start;
+FROM
+(
+    SELECT
+        timestamp,
+        event_bytes,
+        lower(source_type) AS raw_source_type,
+        lower(`metadata.product.name`) AS product_name
+    FROM nanosiem.ocsf_logs
+)
+GROUP BY
+    schema_profile,
+    source_type,
+    scope_source_type,
+    scope_source_type_complete,
+    bucket_start;
 
 -- =============================================================================
 -- CLASS-SPLIT UNIFIED COLUMNS — EXISTING-TENANT OVERLAY  (NAN-1333)
@@ -2291,3 +2310,96 @@ ALTER TABLE nanosiem.ocsf_logs MATERIALIZE INDEX idx_user_unified_words;
 ALTER TABLE nanosiem.ocsf_logs MATERIALIZE INDEX idx_url_domain_unified_words;
 ALTER TABLE nanosiem.ocsf_logs MATERIALIZE INDEX idx_url_unified_words;
 ALTER TABLE nanosiem.ocsf_logs MATERIALIZE INDEX idx_src_host_unified_words;
+
+-- =============================================================================
+-- NAN-2053: profile/source-attributed prevalence producers
+-- =============================================================================
+-- Numbered migrations run before this profile overlay on a fresh OCSF install.
+-- Migration 170 creates the shared source-attributed targets but necessarily
+-- skips these views until ocsf_logs exists. Re-declare them here so fresh OCSF
+-- and upgraded OCSF installations converge to the same producer set.
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.hash_prevalence_source_ocsf_mv
+TO nanosiem.hash_prevalence_source_agg AS
+SELECT
+    'ocsf' AS schema_profile,
+    lower(trimBoth(source_type)) AS source_type,
+    lower(hash_value) AS file_hash,
+    multiIf(length(hash_value) = 32, 'md5', length(hash_value) = 40, 'sha1',
+            length(hash_value) = 64, 'sha256', 'unknown') AS hash_type,
+    toStartOfHour(timestamp) AS time_bucket,
+    uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`,
+                 if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))) AS host_count,
+    min(timestamp) AS first_seen,
+    max(timestamp) AS last_seen,
+    count() AS total_count
+FROM nanosiem.ocsf_logs
+ARRAY JOIN [`file.hashes.sha256`,
+            if(lower(`process.file.hashes.sha256`) != lower(`file.hashes.sha256`),
+               `process.file.hashes.sha256`, '')] AS hash_value
+WHERE hash_value != ''
+  AND length(hash_value) IN (32, 40, 64)
+  AND match(hash_value, '^[a-fA-F0-9]+$')
+GROUP BY schema_profile, source_type, file_hash, hash_type, time_bucket;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.domain_prevalence_source_ocsf_mv
+TO nanosiem.domain_prevalence_source_agg AS
+SELECT
+    'ocsf' AS schema_profile,
+    lower(trimBoth(source_type)) AS source_type,
+    lower(domain_value) AS domain,
+    if(length(splitByChar('.', domain_value)) > 2, 1, 0) AS is_subdomain,
+    toStartOfHour(timestamp) AS time_bucket,
+    uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`,
+                 if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))) AS source_host_count,
+    min(timestamp) AS first_seen,
+    max(timestamp) AS last_seen,
+    count() AS total_count
+FROM nanosiem.ocsf_logs
+ARRAY JOIN [
+    `dst_endpoint.hostname`,
+    if(lower(`query.hostname`) != lower(`dst_endpoint.hostname`), `query.hostname`, ''),
+    if(lower(`url.hostname`) != lower(`dst_endpoint.hostname`)
+       AND lower(`url.hostname`) != lower(`query.hostname`), `url.hostname`, '')
+] AS domain_value
+WHERE domain_value != ''
+  AND position(domain_value, '.') > 0
+  AND NOT match(domain_value, '^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$')
+  AND NOT position(domain_value, ':') > 0
+  AND match(domain_value, '^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$')
+  AND length(splitByChar('.', domain_value)[-1]) >= 2
+  AND NOT match(splitByChar('.', domain_value)[-1], '^[0-9]+$')
+  AND length(domain_value) <= 253
+  AND lower(splitByChar('.', domain_value)[-1]) NOT IN
+      ('local', 'corp', 'internal', 'lan', 'home', 'localdomain', 'intranet', 'private', 'arpa')
+GROUP BY schema_profile, source_type, domain, is_subdomain, time_bucket;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ip_prevalence_source_ocsf_mv
+TO nanosiem.ip_prevalence_source_agg AS
+SELECT
+    'ocsf' AS schema_profile,
+    lower(trimBoth(source_type)) AS source_type,
+    ip_tuple.1 AS ip,
+    ip_tuple.2 AS direction,
+    if(match(ip, '^10\\.') OR match(ip, '^172\\.(1[6-9]|2[0-9]|3[0-1])\\.')
+       OR match(ip, '^192\\.168\\.') OR match(ip, '^127\\.')
+       OR match(ip, '^169\\.254\\.'), 1, 0) AS is_private,
+    toStartOfHour(timestamp) AS time_bucket,
+    uniqState(ip_tuple.3) AS source_host_count,
+    min(timestamp) AS first_seen,
+    max(timestamp) AS last_seen,
+    count() AS total_count
+FROM nanosiem.ocsf_logs
+ARRAY JOIN [
+    (`dst_endpoint.ip`, 'dest',
+     if(`src_endpoint.hostname` != '', `src_endpoint.hostname`,
+        if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))),
+    (if(`src_endpoint.ip` != `dst_endpoint.ip`, `src_endpoint.ip`, ''), 'src',
+     if(`dst_endpoint.hostname` != '', `dst_endpoint.hostname`,
+        if(`dst_endpoint.ip` != '', `dst_endpoint.ip`, 'unknown')))
+] AS ip_tuple
+WHERE ip != ''
+  AND match(ip, '^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$')
+  AND NOT match(ip, '^127\\.')
+  AND NOT match(ip, '^169\\.254\\.')
+GROUP BY schema_profile, source_type, ip, direction, is_private, time_bucket;

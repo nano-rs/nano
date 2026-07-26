@@ -36,12 +36,12 @@ use crate::{
 /// Mirrors the dashboards panel-query composition. An unrestricted caller
 /// with `audit:view` yields an empty deny set, and every repository query
 /// stays byte-identical to the pre-scoping SQL.
+///
+/// NAN-2055: the composition now lives on `AuthContext` so every log-reading
+/// surface shares one definition; this stays as a local alias for the call
+/// sites below.
 fn effective_viewer_scope(auth: &AuthContext) -> nanosiem_core::auth::ScopeSet {
-    let mut deny = auth.denied_sources.deny_set().clone();
-    if !auth.has_permission(permissions::AUDIT_VIEW) {
-        deny.insert("audit".to_string());
-    }
-    nanosiem_core::auth::ScopeSet::from_denied(deny)
+    auth.effective_viewer_scope()
 }
 
 /// Resolve the authenticated user into a stable display string for the
@@ -986,18 +986,15 @@ pub async fn alert_velocity(
     // from denied sources — apply the same per-source deny filter as the list.
     // Empty deny set (unrestricted + audit:view) emits the pre-scoping SQL
     // byte-identically with no extra bind.
+    // NAN-2155: the shared normalizer also denies the unresolved-provenance
+    // sentinel for a restricted caller, so an unattributable alert does not
+    // show up as a bar in their velocity histogram.
     let scope = effective_viewer_scope(&auth);
-    let deny_vec: Option<Vec<String>> = if scope.deny_set().is_empty() {
+    let denied = nanosiem_core::auth::deny_bind_values(scope.deny_set());
+    let deny_vec: Option<Vec<String>> = if denied.is_empty() {
         None
     } else {
-        Some(
-            scope
-                .deny_set()
-                .iter()
-                .map(|s| s.trim().to_lowercase())
-                .filter(|s| !s.is_empty())
-                .collect(),
-        )
+        Some(denied)
     };
     let scope_sql = if deny_vec.is_some() {
         "\n              AND ($4::text[] = '{}' OR NOT (source_types && $4::text[]))"

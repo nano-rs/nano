@@ -20,6 +20,11 @@ mod search;
 mod search_jobs;
 mod streaming;
 
+// Fail-closed authorization contract for these handlers (NAN-2030): unit-tests
+// the shared gate and source-scans every handler for a search:execute decision.
+#[cfg(test)]
+mod authz_guard;
+
 use nanosiem_core::{
     SearchResponse,
     search::{AdminSearchJobSummary, AdmissionStats, QueryPriority, SearchJobSummary},
@@ -28,6 +33,33 @@ use serde::Serialize;
 use utoipa::OpenApi;
 
 use crate::error::ErrorResponse;
+
+/// Shared `search:execute` capability gate for the search microservice
+/// (NAN-2028 / NAN-2030). Authentication (a valid token) is NOT authorization:
+/// `auth_middleware` only proves *who* the caller is, so every handler that
+/// reads log or OTEL data MUST call this as its first statement to prove the
+/// caller *may* search. Consolidated here (it was duplicated in `search.rs` and
+/// `assets.rs`) so there is exactly one gate — and `authz_guard.rs` can assert,
+/// at test time, that every data handler performs it.
+///
+/// The source-scope deny-set (`search::effective_scope`) is NOT a substitute: it
+/// defaults OPEN, so an unscoped key denies nothing but `audit`. Source scope
+/// narrows *which* sources an already-authorized caller sees; it never decides
+/// *whether* the caller may search at all.
+pub(crate) fn require_search_execute(
+    auth: &crate::AuthContext,
+) -> Result<(), crate::error::SearchError> {
+    if auth
+        .claims
+        .has_permission(nanosiem_core::auth::permissions::SEARCH_EXECUTE)
+    {
+        Ok(())
+    } else {
+        Err(crate::error::SearchError::Forbidden(
+            "This operation requires the search:execute permission".to_string(),
+        ))
+    }
+}
 
 // Re-export all handler functions
 pub use asset_dossier::get_asset_dossier;

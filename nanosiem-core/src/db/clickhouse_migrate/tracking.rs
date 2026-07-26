@@ -225,6 +225,8 @@ impl ClickHouseMigrator {
         ("110", "prevalence_summary_tables"),
         ("111", "filter_internal_tlds_domain_prevalence"),
         ("112", "fix_prevalence_dict_layout"),
+        ("168", "parser_health_5m"),
+        ("169", "profile_aware_logs_per_source_5m"),
     ];
 
     /// Seed all baseline migration versions into `_migrations`.

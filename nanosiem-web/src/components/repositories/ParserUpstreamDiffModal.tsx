@@ -18,11 +18,20 @@ import { Loader2, Check, X, Minus, Plus, ArrowUpCircle, Rocket } from 'lucide-re
 import { api } from '@/lib/api';
 import { useToast } from '@/hooks/use-toast';
 import { useDeployLogSource } from '@/hooks/use-api';
+import { PermissionAction } from './PermissionAction';
+import {
+  repositoryQueryEnabled,
+  type ActionAccess,
+} from './repository-action-policy';
 
 interface ParserUpstreamDiffModalProps {
   logSourceId: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  diffAccess: ActionAccess;
+  dismissAccess: ActionAccess;
+  applyAccess: ActionAccess;
+  deployAccess: ActionAccess;
 }
 
 interface DiffLine {
@@ -125,6 +134,10 @@ export function ParserUpstreamDiffModal({
   logSourceId,
   open,
   onOpenChange,
+  diffAccess,
+  dismissAccess,
+  applyAccess,
+  deployAccess,
 }: ParserUpstreamDiffModalProps) {
   const { toast } = useToast();
   const queryClient = useQueryClient();
@@ -135,7 +148,7 @@ export function ParserUpstreamDiffModal({
   const { data: diff, isLoading } = useQuery({
     queryKey: ['parser-upstream-diff', logSourceId],
     queryFn: () => api.parserRepositories.getUpstreamDiff(logSourceId),
-    enabled: open,
+    enabled: repositoryQueryEnabled(diffAccess, open),
   });
 
   const dismissMutation = useMutation({
@@ -205,7 +218,11 @@ export function ParserUpstreamDiffModal({
           </DialogDescription>
         </DialogHeader>
 
-        {appliedNeedsDeploy ? (
+        {!diffAccess.allowed ? (
+          <div className="py-8 text-center text-sm text-muted-foreground">
+            {diffAccess.reason}
+          </div>
+        ) : appliedNeedsDeploy ? (
           <div className="py-6 space-y-4">
             <div className="p-4 bg-amber-500/10 border border-amber-500/30 rounded-xl flex items-start gap-3">
               <Rocket className="h-5 w-5 text-amber-500 mt-0.5 flex-shrink-0" />
@@ -268,7 +285,11 @@ export function ParserUpstreamDiffModal({
         )}
 
         <DialogFooter className="flex-shrink-0">
-          {appliedNeedsDeploy ? (
+          {!diffAccess.allowed ? (
+            <Button variant="outline" onClick={() => handleClose(false)}>
+              Close
+            </Button>
+          ) : appliedNeedsDeploy ? (
             <>
               <Button
                 variant="outline"
@@ -279,46 +300,61 @@ export function ParserUpstreamDiffModal({
               >
                 Go to Source
               </Button>
-              <Button
-                onClick={handleDeployNow}
-                disabled={deploying}
-              >
-                {deploying ? (
-                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                ) : (
-                  <Rocket className="w-4 h-4 mr-2" />
-                )}
-                Deploy Now
-              </Button>
+              <PermissionAction access={deployAccess}>
+                <Button
+                  onClick={handleDeployNow}
+                  disabled={deploying || !deployAccess.allowed}
+                >
+                  {deploying ? (
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  ) : (
+                    <Rocket className="w-4 h-4 mr-2" />
+                  )}
+                  Deploy Now
+                </Button>
+              </PermissionAction>
             </>
           ) : (
             <>
               <Button variant="outline" onClick={() => handleClose(false)}>
                 Close
               </Button>
-              <Button
-                variant="ghost"
-                onClick={() => dismissMutation.mutate()}
-                disabled={dismissMutation.isPending || applyMutation.isPending}
-              >
-                {dismissMutation.isPending ? (
-                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                ) : (
-                  <X className="w-4 h-4 mr-2" />
-                )}
-                Dismiss
-              </Button>
-              <Button
-                onClick={() => applyMutation.mutate()}
-                disabled={applyMutation.isPending || dismissMutation.isPending || vrlMatch}
-              >
-                {applyMutation.isPending ? (
-                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                ) : (
-                  <ArrowUpCircle className="w-4 h-4 mr-2" />
-                )}
-                Apply Update
-              </Button>
+              <PermissionAction access={dismissAccess}>
+                <Button
+                  variant="ghost"
+                  onClick={() => dismissMutation.mutate()}
+                  disabled={
+                    dismissMutation.isPending ||
+                    applyMutation.isPending ||
+                    !dismissAccess.allowed
+                  }
+                >
+                  {dismissMutation.isPending ? (
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  ) : (
+                    <X className="w-4 h-4 mr-2" />
+                  )}
+                  Dismiss
+                </Button>
+              </PermissionAction>
+              <PermissionAction access={applyAccess}>
+                <Button
+                  onClick={() => applyMutation.mutate()}
+                  disabled={
+                    applyMutation.isPending ||
+                    dismissMutation.isPending ||
+                    vrlMatch ||
+                    !applyAccess.allowed
+                  }
+                >
+                  {applyMutation.isPending ? (
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  ) : (
+                    <ArrowUpCircle className="w-4 h-4 mr-2" />
+                  )}
+                  Apply Update
+                </Button>
+              </PermissionAction>
             </>
           )}
         </DialogFooter>

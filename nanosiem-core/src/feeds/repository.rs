@@ -960,22 +960,29 @@ impl FeedRepository {
         ch_client: &ClickHouseClient,
         deny_set: &BTreeSet<String>,
     ) -> Result<Vec<(String, i64)>, FeedRepositoryError> {
-        let rollup = self.table_names.read("logs_per_source_5m");
+        let rollup = self.table_names.read("logs_per_source_5m_v2");
         // NAN-1801: per-source enumeration — a denied source must not appear
         // at all (existence + volume leak). Empty deny set emits nothing.
-        let scope_and = source_scope_sql_predicate("source_type", deny_set)
-            .map(|pred| format!(" AND {pred}"))
-            .unwrap_or_default();
+        let scope_and = if deny_set.is_empty() {
+            String::new()
+        } else {
+            let predicate = source_scope_sql_predicate("scope_source_type", deny_set)
+                .expect("a non-empty deny set always renders a predicate");
+            format!(" AND scope_source_type_complete = 1 AND {predicate}")
+        };
         let sql = format!(
             "SELECT \
                 source_type AS sourcetype, \
                 sum(events) AS count \
              FROM {} \
-             WHERE bucket_start > now() - INTERVAL 7 DAY{} \
+             WHERE bucket_start > now() - INTERVAL 7 DAY \
+               AND schema_profile = '{}'{} \
              GROUP BY source_type \
              ORDER BY count DESC \
              LIMIT 100",
-            rollup, scope_and
+            rollup,
+            crate::schema::active_log_telemetry_profile(),
+            scope_and
         );
 
         debug!("ClickHouse discovered sourcetypes query: {}", sql);

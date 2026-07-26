@@ -1734,11 +1734,10 @@ export interface Parser {
   name: string;
   description?: string;
   source_type: string;
-  source_config: Record<string, unknown>;
   parser_vrl: string;
   output_fields?: Record<string, unknown>;
   feed_id?: string;
-  credential_id?: string;
+  dispatch_source_config_id?: string;
   enabled: boolean;
   validated: boolean;
   validation_error?: string;
@@ -1750,11 +1749,10 @@ export interface CreateParserRequest {
   name: string;
   description?: string;
   source_type: string;
-  source_config: Record<string, unknown>;
   parser_vrl: string;
   output_fields?: Record<string, unknown>;
   feed_id?: string;
-  credential_id?: string;
+  dispatch_source_config_id?: string;
 }
 
 export interface UpdateParserRequest extends Partial<CreateParserRequest> {
@@ -1811,6 +1809,11 @@ export interface EnhancedDeploymentResponse {
 }
 
 // AI Provider Credentials types (LiteLLM multi-provider support)
+export interface AiAvailability {
+  connected: boolean;
+  model_available: boolean;
+}
+
 export interface ProviderCredentials {
   provider: string;
   display_name: string;
@@ -4977,8 +4980,6 @@ export interface LogSource {
   /** IANA timezone name for timestamps without offset info (e.g., "America/New_York") */
   timezone: string;
   source_type: string;
-  source_config: Record<string, unknown>;
-  credential_id?: string;
   /**
    * NAN-928: deployed source-configuration whose routing transform feeds
    * events into this parser. Set when the user picked a fetch-source config
@@ -4988,8 +4989,7 @@ export interface LogSource {
   /**
    * NAN-1084: derived transport label (e.g. "kafka", "gcp_pubsub") sourced
    * from the joined source_configurations row. Populated by list/detail
-   * endpoints that join source_configurations; absent for legacy parser-
-   * owned sources, in which case the UI falls back to `source_type`.
+   * endpoints that join source_configurations.
    */
   dispatch_source_config_type?: string | null;
   parser_vrl: string;
@@ -5024,7 +5024,6 @@ export interface LogSource {
   extension_vrl?: string | null;
   /** When false, extension_vrl is persisted but not deployed (NAN-874). */
   extension_enabled?: boolean;
-  parser_only: boolean;
   source_parser_repository_id?: string;
   source_parser_path?: string;
   source_parser_linked: boolean;
@@ -5040,8 +5039,6 @@ export interface NewLogSource {
   /** IANA timezone for timestamps without offset info. Defaults to "UTC". */
   timezone?: string;
   source_type: string;
-  source_config: Record<string, unknown>;
-  credential_id?: string;
   /**
    * NAN-928 dispatch link. NAN-1906: set on onboarding so the Log Sources
    * list/detail render the real transport (via the NAN-1084 JOIN →
@@ -5076,8 +5073,6 @@ export interface UpdateLogSource {
   /** IANA timezone for timestamps without offset info */
   timezone?: string;
   source_type?: string;
-  source_config?: Record<string, unknown>;
-  credential_id?: string;
   /** NAN-928/NAN-1906 dispatch link — see NewLogSource. */
   dispatch_source_config_id?: string | null;
   parser_vrl?: string;
@@ -5103,6 +5098,8 @@ export interface UpdateLogSource {
   extension_vrl?: string;
   /** Toggle whether extension_vrl is included in deploys (NAN-874). */
   extension_enabled?: boolean;
+  /** Last-seen version; stale conditional updates return HTTP 409. */
+  expected_updated_at?: string;
 }
 
 export interface LogSourceHealth {
@@ -5121,6 +5118,8 @@ export interface LogSourceHealth {
   avg_event_size_bytes: number;
   error_rate_24h: number;
   parse_errors_24h: number;
+  parse_attempts_24h: number;
+  parse_success_rate_24h: number | null;
 }
 
 export interface IngestionHistoryPoint {
@@ -5327,6 +5326,8 @@ export interface UpdateSourceConfiguration {
   connection_config?: Record<string, unknown>;
   credential_id?: string;
   enabled?: boolean;
+  /** Last-seen version; stale conditional updates return HTTP 409. */
+  expected_updated_at?: string;
 }
 
 export interface SourceConfigDeployment {
@@ -7395,7 +7396,18 @@ export interface DryResolveResponse {
 /** Per-role ACL row. */
 export interface PlaybookPermission {
   playbook_id: string;
+  /**
+   * Display label. Authoritative ONLY for the reserved synthetic principals
+   * (`api_key`, `demo_analyst`), which carry `role_id: null`.
+   */
   role: string;
+  /**
+   * NAN-2097: the stable ACL key for a real role. `null` only for the synthetic
+   * principals above. Keying on the id rather than the name is what makes an
+   * entry survive a role rename and stops a later role reusing the name from
+   * capturing the grant.
+   */
+  role_id?: string | null;
   can_view: boolean;
   can_run: boolean;
   can_edit: boolean;

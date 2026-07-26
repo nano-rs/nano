@@ -6,9 +6,10 @@
 //! the active suppressions are loaded by the scheduler and injected into the
 //! AI system prompt so the same class doesn't reappear on the next run.
 //!
-//! Read endpoints require authentication only (operators viewing the page);
-//! mutations require `settings:system` to match the existing /health admin
-//! gate (manual trigger uses the same permission).
+//! Both reads and mutations require `settings:system` (NAN-2036). Suppression
+//! records expose finding titles, operator rationale, and named system
+//! weaknesses, so they must not be an auth-only side channel — they match the
+//! /health admin gate that the manual trigger and mutations already use.
 
 use axum::{
     Extension, Json,
@@ -112,14 +113,20 @@ pub async fn create_suppression(
     params(ListSuppressionsParams),
     responses(
         (status = 200, description = "List of suppressions, oldest-first when active-only, newest-first when including deactivated", body = ListSuppressionsResponse),
+        (status = 403, description = "Insufficient permissions"),
     ),
     security(("api_key" = []))
 )]
 pub async fn list_suppressions(
     State(state): State<AppState>,
-    Extension(_auth): Extension<AuthContext>,
+    Extension(auth): Extension<AuthContext>,
     Query(params): Query<ListSuppressionsParams>,
 ) -> Result<Json<ListSuppressionsResponse>, ApiError> {
+    // NAN-2036: suppression rows expose finding titles + operator rationale, so
+    // reads require settings:system too — matching create/deactivate and the rest
+    // of the /health admin surface. This route was previously auth-only.
+    crate::middleware::ensure_permission(&auth, nanosiem_core::auth::permissions::SETTINGS_SYSTEM)?;
+
     let repo = SuppressionRepository::new(state.pool.clone());
     let suppressions = if params.include_deactivated {
         repo.list_all().await

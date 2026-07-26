@@ -105,6 +105,7 @@ pub async fn get_log_source(
         (status = 200, description = "Log source created", body = LogSource),
         (status = 403, description = "Forbidden"),
         (status = 400, description = "Bad request"),
+        (status = 422, description = "Validation failed — invalid timezone, namespace, source type, or match_field (NAN-2158: match_field names a SQL column and must contain only letters, digits, '_' and '.')"),
     ),
     security(("api_key" = []))
 )]
@@ -198,6 +199,8 @@ async fn enforce_data_source_limit(state: &AppState) -> Result<(), ApiError> {
         (status = 200, description = "Log source updated", body = LogSource),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
+        (status = 409, description = "expected_updated_at is stale; reload before retrying"),
+        (status = 422, description = "Validation failed — invalid timezone, source type, normalize_vrl, or match_field (NAN-2158: match_field names a SQL column and must contain only letters, digits, '_' and '.')"),
     ),
     security(("api_key" = []))
 )]
@@ -493,7 +496,17 @@ pub async fn get_log_source_health(
 ) -> Result<Json<LogSourceHealth>, ApiError> {
     ensure_permission(&auth, LOG_SOURCES_VIEW)?;
 
-    let health = state.log_source_service.get_health(*id).await?;
+    // NAN-2059: `log_sources:view` authorizes reading the CONFIG; it does not
+    // authorize reading the DATA the source ingested. Telemetry here is derived
+    // from the logs table, so it carries the caller's effective source scope.
+    // A denied source yields no matching rows → a zeroed `NoData` record, the
+    // same response an allowed-but-idle source produces. The config row itself
+    // stays listable, so this deliberately does NOT 404 (that would be a new
+    // existence signal on a resource the caller can already enumerate).
+    let health = state
+        .log_source_service
+        .get_health(*id, &auth.effective_viewer_scope())
+        .await?;
     Ok(Json(health))
 }
 
@@ -524,9 +537,11 @@ pub async fn get_all_ingestion_history(
 ) -> Result<Json<Vec<IngestionHistoryPoint>>, ApiError> {
     ensure_permission(&auth, LOG_SOURCES_VIEW)?;
 
+    // NAN-2059: same boundary as per-source health — denied source types are
+    // omitted from the per-source ingestion series entirely.
     let history = state
         .log_source_service
-        .get_all_ingestion_history(params.hours)
+        .get_all_ingestion_history(params.hours, &auth.effective_viewer_scope())
         .await?;
     Ok(Json(history))
 }
@@ -673,7 +688,7 @@ pub struct TestVrlLiveRequest {
     request_body = TestVrlLiveRequest,
     responses(
         (status = 200, description = "VRL test results comparing current vs new parse", body = Vec<LiveTestResult>),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Missing log_sources:view or search:execute permission"),
     ),
     security(("api_key" = []))
 )]
@@ -684,6 +699,20 @@ pub async fn test_vrl_live(
 ) -> Result<Json<Vec<LiveTestResult>>, ApiError> {
     ensure_permission(&auth, LOG_SOURCES_VIEW)?;
 
+    // NAN-2058: this returns UNREDACTED raw events in `LiveTestResult.input`,
+    // for any caller-supplied `source_type`. It is an alternate raw-log read
+    // surface and must be no more permissive than canonical search: same
+    // capability (`search:execute`) and same effective source scope, so the
+    // audit feed and restricted sources are unreachable here exactly as they
+    // are through `/api/search`. Before this, `log_sources:view` alone returned
+    // raw `audit` records to a key that `/api/search` 403s.
+    //
+    // Deliberately NOT raised to `log_sources:edit`: the finding floats that as
+    // a "strongly consider", but parity with canonical search is the principled
+    // line, and ReadOnly analysts legitimately use the test lab. The disclosure
+    // is now exactly what `/api/search` would give the same caller.
+    ensure_permission(&auth, nanosiem_core::auth::permissions::SEARCH_EXECUTE)?;
+
     let limit = request.limit.unwrap_or(10);
     let results = state
         .log_source_service
@@ -692,6 +721,7 @@ pub async fn test_vrl_live(
             request.current_vrl.as_deref(),
             &request.source_type,
             limit,
+            &auth.effective_viewer_scope(),
         )
         .await
         .map_err(|e| ApiError::InternalError(format!("Live test failed: {}", e)))?;

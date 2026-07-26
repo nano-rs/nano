@@ -58,7 +58,20 @@ fn map_scope_err(e: RepoSourceScopeError) -> ApiError {
         RepoSourceScopeError::NotFound(s) => {
             ApiError::NotFound(format!("Restricted source type not found: {s}"))
         }
-        RepoSourceScopeError::Database(e) => ApiError::InternalError(format!("Database error: {e}")),
+        RepoSourceScopeError::GrantAuthorityChanged => ApiError::Conflict(
+            "Authorization changed while the request was being validated; retry.".to_string(),
+        ),
+        RepoSourceScopeError::Database(e) => {
+            ApiError::InternalError(format!("Database error: {e}"))
+        }
+    }
+}
+
+fn map_grant_err(e: crate::handlers::grant_authz::GrantErr) -> ApiError {
+    match e.status {
+        StatusCode::BAD_REQUEST => ApiError::BadRequest(e.message),
+        StatusCode::FORBIDDEN => ApiError::Forbidden(e.message),
+        _ => ApiError::InternalError(e.message),
     }
 }
 
@@ -74,6 +87,16 @@ fn normalize_source_type(raw: &str) -> Result<String, ApiError> {
     if normalized.len() > MAX_SOURCE_TYPE_LEN {
         return Err(ApiError::BadRequest(format!(
             "source_type must be at most {MAX_SOURCE_TYPE_LEN} characters"
+        )));
+    }
+    // NAN-2155: the unresolved-provenance sentinel is an internal marker, never
+    // a real source. Registering it would make every non-bypass principal
+    // "restricted" (the registry would be non-empty on a deployment that
+    // configured nothing), and granting it to a group would hand that group
+    // visibility of every row the engine could not attribute.
+    if nanosiem_core::auth::is_reserved_source_type(&normalized) {
+        return Err(ApiError::BadRequest(format!(
+            "'{normalized}' is a reserved internal marker and cannot be used as a source_type"
         )));
     }
     Ok(normalized)
@@ -168,6 +191,7 @@ pub async fn list_restricted(
         (status = 200, description = "Source type registered as restricted", body = RestrictedSourceType),
         (status = 400, description = "Invalid source_type"),
         (status = 403, description = "Forbidden - missing source_scopes:manage"),
+        (status = 409, description = "Grant authority changed; retry the request"),
     ),
     security(("api_key" = []))
 )]
@@ -185,10 +209,18 @@ pub async fn add_restricted(
         .as_deref()
         .map(str::trim)
         .filter(|d| !d.is_empty());
+    let grant_stamp = crate::handlers::grant_authz::ensure_can_grant_permissions(
+        &auth,
+        &state.pool,
+        permissions::SOURCE_SCOPES_MANAGE,
+        &[],
+    )
+    .await
+    .map_err(map_grant_err)?;
 
     let created = state
         .source_scope_repo
-        .add_restricted(&source_type, description, Some(auth.user_id()))
+        .add_restricted_authorized(&source_type, description, Some(auth.user_id()), grant_stamp)
         .await
         .map_err(map_scope_err)?;
 
@@ -223,6 +255,7 @@ pub async fn add_restricted(
         (status = 204, description = "Source type un-restricted"),
         (status = 403, description = "Forbidden - missing source_scopes:manage"),
         (status = 404, description = "Source type was not restricted"),
+        (status = 409, description = "Grant authority changed; retry the request"),
     ),
     security(("api_key" = []))
 )]
@@ -235,10 +268,14 @@ pub async fn remove_restricted(
     ensure_permission(&auth, permissions::SOURCE_SCOPES_MANAGE)?;
 
     let source_type = normalize_source_type(&source_type)?;
+    let grant_stamp =
+        crate::handlers::grant_authz::ensure_can_mutate_source(&auth, &state.pool, &source_type)
+            .await
+            .map_err(map_grant_err)?;
 
     state
         .source_scope_repo
-        .remove_restricted(&source_type)
+        .remove_restricted_authorized(&source_type, grant_stamp)
         .await
         .map_err(map_scope_err)?;
 
@@ -308,6 +345,7 @@ pub async fn list_grants(
         (status = 200, description = "Grant created", body = SourceTypeGrant),
         (status = 400, description = "Invalid source_type"),
         (status = 403, description = "Forbidden - missing source_scopes:manage"),
+        (status = 409, description = "Grant authority changed; retry the request"),
         (status = 500, description = "source_type is not registered as restricted"),
     ),
     security(("api_key" = []))
@@ -321,10 +359,19 @@ pub async fn add_grant(
     ensure_permission(&auth, permissions::SOURCE_SCOPES_MANAGE)?;
 
     let source_type = normalize_source_type(&req.source_type)?;
+    let grant_stamp =
+        crate::handlers::grant_authz::ensure_can_mutate_source(&auth, &state.pool, &source_type)
+            .await
+            .map_err(map_grant_err)?;
 
     let grant = state
         .source_scope_repo
-        .add_grant(&source_type, req.group_id, Some(auth.user_id()))
+        .add_grant_authorized(
+            &source_type,
+            req.group_id,
+            Some(auth.user_id()),
+            grant_stamp,
+        )
         .await
         .map_err(map_scope_err)?;
 
@@ -334,7 +381,11 @@ pub async fn add_grant(
         AuditEvent::builder(AuditSource::SourceScope, SOURCE_SCOPE_GRANTED)
             .actor(Some(auth.user_id()), None)
             .api_key(auth.api_key_id, auth.api_key_name.clone())
-            .resource("source_scope", Some(req.group_id), Some(source_type.clone()))
+            .resource(
+                "source_scope",
+                Some(req.group_id),
+                Some(source_type.clone()),
+            )
             .details(serde_json::json!({
                 "source_type": source_type,
                 "group_id": req.group_id,
@@ -361,6 +412,7 @@ pub async fn add_grant(
         (status = 204, description = "Grant revoked"),
         (status = 403, description = "Forbidden - missing source_scopes:manage"),
         (status = 404, description = "No such grant"),
+        (status = 409, description = "Grant authority changed; retry the request"),
     ),
     security(("api_key" = []))
 )]
@@ -373,10 +425,18 @@ pub async fn remove_grant(
     ensure_permission(&auth, permissions::SOURCE_SCOPES_MANAGE)?;
 
     let source_type = normalize_source_type(&source_type)?;
+    let grant_stamp = crate::handlers::grant_authz::ensure_can_grant_permissions(
+        &auth,
+        &state.pool,
+        permissions::SOURCE_SCOPES_MANAGE,
+        &[],
+    )
+    .await
+    .map_err(map_grant_err)?;
 
     state
         .source_scope_repo
-        .remove_grant(&source_type, group_id)
+        .remove_grant_authorized(&source_type, group_id, grant_stamp)
         .await
         .map_err(map_scope_err)?;
 

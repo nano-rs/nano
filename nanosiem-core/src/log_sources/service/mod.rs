@@ -11,7 +11,7 @@
 //! - `deployment` — Deploy, undeploy, deploy_all operations
 //! - `health` — Health metrics and ingestion history
 //! - `versioning` — Version management, publish, revert, draft status
-//! - `helpers` — Credential injection and conversion utilities
+//! - `helpers` — Parser conversion utilities
 
 mod crud;
 mod deployment;
@@ -21,6 +21,10 @@ mod status;
 mod validation;
 mod versioning;
 
+#[cfg(test)]
+#[path = "match_field_tests.rs"]
+mod match_field_tests;
+
 use clickhouse::Client as ClickHouseClient;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -29,23 +33,22 @@ use thiserror::Error;
 use super::repository::{LogSourceRepository, LogSourceRepositoryError};
 use super::version_repository::{LogSourceVersionError, LogSourceVersionRepository};
 use crate::db::DualPool;
-use crate::parsers::{
-    CredentialRepository, CredentialRepositoryError, VectorConfigError, VectorConfigManager,
-    VrlValidator,
-};
+use crate::parsers::{VectorConfigError, VectorConfigManager, VrlValidator};
 
 #[derive(Error, Debug)]
 pub enum LogSourceServiceError {
     #[error("Repository error: {0}")]
     RepositoryError(#[from] LogSourceRepositoryError),
-    #[error("Credential error: {0}")]
-    CredentialError(#[from] CredentialRepositoryError),
     #[error("Invalid VRL: {0}")]
     InvalidVrl(String),
     #[error("Invalid source type: {0}")]
     InvalidSourceType(String),
     #[error("Invalid source config: {0}")]
     InvalidSourceConfig(String),
+    /// NAN-2158: `match_field` names a COLUMN in generated ClickHouse SQL, so a
+    /// non-identifier value is an injection payload, not a typo.
+    #[error("Invalid match_field: {0}")]
+    InvalidMatchField(String),
     #[error("Log source must be validated before enabling")]
     NotValidated,
     #[error("Vector config error: {0}")]
@@ -107,10 +110,6 @@ impl LogSourceService {
         } else {
             LogSourceRepository::new(self.pool.clone())
         }
-    }
-
-    fn credential_repository(&self) -> CredentialRepository {
-        CredentialRepository::new(self.pool.clone())
     }
 
     fn version_repository(&self) -> LogSourceVersionRepository {

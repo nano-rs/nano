@@ -18,6 +18,7 @@ pub mod distributed_scheduler;
 pub mod error;
 pub mod event_envelope;
 pub mod findings;
+pub mod match_scope;
 pub mod materialized_view;
 pub mod query_enrichment;
 pub mod risk;

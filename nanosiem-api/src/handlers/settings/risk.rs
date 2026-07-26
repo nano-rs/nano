@@ -18,6 +18,12 @@
 //!   The `system_settings.risk_notable_*` columns remain the storage for the
 //!   threshold numbers (the rule query is generated FROM them), so the card's
 //!   contract (`RiskNotableConfig`) is unchanged.
+//!
+//! NAN-2114: every handler in this module gates on `risk:configure`
+//! (`permissions::RISK_CONFIGURE`) — the capability the frontend already treats
+//! as the authority for the Risk Scoring settings page. The near-duplicate
+//! `settings:risk` was never the UI-advertised authority and is no longer
+//! enforced here, so the catalog/frontend and the route policy now agree.
 
 use axum::{extract::State, Extension, Json};
 use nanosiem_core::audit::{AuditEvent, AuditSource, ClientContext, RISK_CONFIG_UPDATED};
@@ -95,7 +101,7 @@ pub async fn get_risk_config(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<RiskConfigResponse>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_RISK)?;
+    ensure_permission(&auth, permissions::RISK_CONFIGURE)?;
 
     let risk_weight = get_risk_weight_from_db(&state.pool).await?;
     Ok(Json(RiskConfigResponse { risk_weight }))
@@ -128,7 +134,7 @@ pub async fn update_risk_config(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<UpdateRiskConfigRequest>,
 ) -> Result<Json<RiskConfigResponse>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_RISK)?;
+    ensure_permission(&auth, permissions::RISK_CONFIGURE)?;
 
     use nanosiem_core::detection::risk::ScoreCalculator;
 
@@ -209,7 +215,7 @@ pub async fn get_risk_decay_config(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<RiskDecayConfigResponse>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_RISK)?;
+    ensure_permission(&auth, permissions::RISK_CONFIGURE)?;
 
     let config = state
         .risk_service
@@ -251,7 +257,7 @@ pub async fn update_risk_decay_config(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<UpdateRiskDecayConfigRequest>,
 ) -> Result<Json<RiskDecayConfigResponse>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_RISK)?;
+    ensure_permission(&auth, permissions::RISK_CONFIGURE)?;
 
     use nanosiem_core::risk::types::RiskDecayConfig;
 
@@ -320,7 +326,7 @@ pub async fn get_risk_notable_config(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<nanosiem_core::risk::RiskNotableConfig>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_RISK)?;
+    ensure_permission(&auth, permissions::RISK_CONFIGURE)?;
 
     let mut config = state
         .risk_service
@@ -390,7 +396,7 @@ pub async fn update_risk_notable_config(
     Extension(client): Extension<ClientContext>,
     Json(config): Json<nanosiem_core::risk::RiskNotableConfig>,
 ) -> Result<Json<nanosiem_core::risk::RiskNotableConfig>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_RISK)?;
+    ensure_permission(&auth, permissions::RISK_CONFIGURE)?;
 
     // The rule's alert_cooldown_minutes is CHECK-bounded at 7 days
     // (migration 248); reject up front instead of 500ing on the constraint.

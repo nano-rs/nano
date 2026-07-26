@@ -41,6 +41,11 @@ import {
   applySourceTypeMappings,
   type RepoRuleView,
 } from './helpers';
+import { PermissionAction } from './PermissionAction';
+import {
+  repositoryQueryEnabled,
+  type ActionAccess,
+} from './repository-action-policy';
 
 // ------------------------------------------------------------------
 // Public props
@@ -58,6 +63,12 @@ interface PreviewProps {
   /** Called for non-import row actions (open imported, remove deleted, …). */
   onAction: (rule: RepoRuleView) => void;
   importing?: boolean;
+  previewAccess: ActionAccess;
+  diffAccess: ActionAccess;
+  dismissAccess: ActionAccess;
+  getImportAccess: (mode: ImportMode) => ActionAccess;
+  primaryActionAccess: ActionAccess;
+  inventoryAccess: ActionAccess;
 }
 
 type ImportMode = 'staging' | 'live' | 'alerting';
@@ -87,6 +98,12 @@ export function RepoPreview({
   onImport,
   onAction,
   importing,
+  previewAccess,
+  diffAccess,
+  dismissAccess,
+  getImportAccess,
+  primaryActionAccess,
+  inventoryAccess,
 }: PreviewProps) {
   const [tab, setTab] = useState<'overview' | 'yaml' | 'diff' | 'source'>('overview');
 
@@ -108,17 +125,20 @@ export function RepoPreview({
       repositoryId && rule
         ? api.ruleRepositories.previewImport(repositoryId, rule.raw.file_path)
         : Promise.resolve(null),
-    enabled: !!repositoryId && !!rule && isAvailable,
+    enabled: repositoryQueryEnabled(
+      previewAccess,
+      !!repositoryId && !!rule && isAvailable,
+    ),
     staleTime: 30 * 1000,
   });
 
   const requiredTypes = preview?.required_source_types ?? [];
   const missingTypes = useMemo(() => {
-    if (!preview) return [];
+    if (!preview || !inventoryAccess.allowed) return [];
     return preview.required_source_types.filter(
       (st) => !availableSourceTypes.some((a) => a.toLowerCase() === st.toLowerCase()),
     );
-  }, [preview, availableSourceTypes]);
+  }, [preview, availableSourceTypes, inventoryAccess.allowed]);
   const hasMultipleSourceTypes = requiredTypes.length > 1;
 
   // Reset when selected rule changes.
@@ -166,6 +186,7 @@ export function RepoPreview({
   const allMapped = mergeMode
     ? !!mergedSourceType
     : missingTypes.length === 0 || missingTypes.every((m) => mappings[m]);
+  const importAccess = getImportAccess(mode);
 
   const handleImport = () => {
     let customNpl: string | undefined;
@@ -238,13 +259,27 @@ export function RepoPreview({
           {[
             { id: 'overview', label: 'Overview' },
             { id: 'yaml', label: 'YAML' },
-            { id: 'diff', label: 'Diff', disabled: !hasDiff },
-            { id: 'source', label: 'Source mapping', disabled: !isAvailable },
+            {
+              id: 'diff',
+              label: 'Diff',
+              disabled: !hasDiff || !diffAccess.allowed,
+              title: hasDiff && !diffAccess.allowed ? diffAccess.reason ?? undefined : undefined,
+            },
+            {
+              id: 'source',
+              label: 'Source mapping',
+              disabled: !isAvailable || !inventoryAccess.allowed,
+              title:
+                isAvailable && !inventoryAccess.allowed
+                  ? inventoryAccess.reason ?? undefined
+                  : undefined,
+            },
           ].map((t) => (
             <button
               key={t.id}
               type="button"
               disabled={t.disabled}
+              title={'title' in t ? t.title : undefined}
               onClick={() => setTab(t.id as typeof tab)}
               className={cn(
                 'px-2.5 h-[28px] text-[11.5px] border-b-[1.5px] transition font-medium',
@@ -278,13 +313,19 @@ export function RepoPreview({
             mappings={mappings}
             isAvailable={isAvailable}
             ruleFormat={ruleFormat}
+            inventoryAccess={inventoryAccess}
           />
         )}
         {tab === 'yaml' && (
           <YamlTab yaml={rule.raw.raw_content || rule.raw.converted_npl || ''} />
         )}
-        {tab === 'diff' && hasDiff && (
-          <DiffTab rule={rule} onAdopt={() => onAction(rule)} />
+        {tab === 'diff' && hasDiff && diffAccess.allowed && (
+          <DiffTab
+            rule={rule}
+            onAdopt={() => onAction(rule)}
+            diffAccess={diffAccess}
+            dismissAccess={dismissAccess}
+          />
         )}
         {tab === 'source' && isAvailable && (
           <SourceMappingTab
@@ -336,18 +377,24 @@ export function RepoPreview({
               mode={mode}
               onMode={setMode}
             />
-            <button
-              type="button"
-              onClick={handleImport}
-              disabled={importing || !allMapped}
-              className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
-            >
-              <Download className="w-[12px] h-[12px]" strokeWidth={2} />
-              {importing ? 'Importing…' : 'Import rule'}
-            </button>
+            <PermissionAction access={importAccess}>
+              <button
+                type="button"
+                onClick={handleImport}
+                disabled={importing || !allMapped || !importAccess.allowed}
+                className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                <Download className="w-[12px] h-[12px]" strokeWidth={2} />
+                {importing ? 'Importing…' : 'Import rule'}
+              </button>
+            </PermissionAction>
           </>
         ) : (
-          <PrimaryActionBtn rule={rule} onAction={() => onAction(rule)} />
+          <PrimaryActionBtn
+            rule={rule}
+            onAction={() => onAction(rule)}
+            access={primaryActionAccess}
+          />
         )}
       </div>
     </div>
@@ -370,6 +417,7 @@ function OverviewTab({
   mappings,
   isAvailable,
   ruleFormat,
+  inventoryAccess,
 }: {
   rule: RepoRuleView;
   preview: import('@/lib/api/rule-repositories').ImportPreview | null | undefined;
@@ -382,6 +430,7 @@ function OverviewTab({
   mappings: Record<string, string>;
   isAvailable: boolean;
   ruleFormat: 'sigma' | 'nanosiem';
+  inventoryAccess: ActionAccess;
 }) {
   const isSigma = ruleFormat === 'sigma';
   const description = preview?.proposed_description ?? rule.desc;
@@ -524,6 +573,22 @@ function OverviewTab({
       {previewLoading && (
         <div className="text-[10.5px] text-muted-foreground font-mono">
           Loading preview…
+        </div>
+      )}
+
+      {isAvailable && !inventoryAccess.allowed && (
+        <div className="rounded-md border border-warning/30 bg-warning/5 px-3 py-2.5">
+          <div className="flex items-center gap-1.5 text-[11.5px] font-medium text-warning mb-1">
+            <AlertTriangle className="w-[12px] h-[12px]" strokeWidth={2} />
+            Source coverage unavailable
+          </div>
+          <div className="text-[10.5px] text-foreground/70 leading-relaxed">
+            Your role cannot inspect the source inventory, so coverage was not evaluated.
+            This does not mean that no matching sources are ingesting.
+          </div>
+          <div className="text-[10px] text-muted-foreground mt-1">
+            {inventoryAccess.reason}
+          </div>
         </div>
       )}
 
@@ -927,7 +992,17 @@ function FunnelSvg() {
 // rule. Adopt → editor; Dismiss → dismissUpstreamChanges.
 // ------------------------------------------------------------------
 
-function DiffTab({ rule, onAdopt }: { rule: RepoRuleView; onAdopt: () => void }) {
+function DiffTab({
+  rule,
+  onAdopt,
+  diffAccess,
+  dismissAccess,
+}: {
+  rule: RepoRuleView;
+  onAdopt: () => void;
+  diffAccess: ActionAccess;
+  dismissAccess: ActionAccess;
+}) {
   const detectionRuleId = rule.raw.linked_detection_rule_id;
   const { toast } = useToast();
   const queryClient = useQueryClient();
@@ -938,7 +1013,7 @@ function DiffTab({ rule, onAdopt }: { rule: RepoRuleView; onAdopt: () => void })
       detectionRuleId
         ? api.ruleRepositories.getUpstreamDiff(detectionRuleId)
         : Promise.resolve(null),
-    enabled: !!detectionRuleId,
+    enabled: repositoryQueryEnabled(diffAccess, !!detectionRuleId),
   });
 
   const dismissMutation = useMutation({
@@ -1019,14 +1094,16 @@ function DiffTab({ rule, onAdopt }: { rule: RepoRuleView; onAdopt: () => void })
       <DiffViewer oldText={diff.current_query} newText={diff.upstream_query} />
 
       <div className="flex items-center gap-2 pt-1">
-        <button
-          type="button"
-          onClick={() => dismissMutation.mutate()}
-          disabled={dismissMutation.isPending}
-          className="h-[26px] px-2.5 rounded-md border border-border bg-card hover:bg-muted text-[11px] text-muted-foreground hover:text-foreground"
-        >
-          Dismiss
-        </button>
+        <PermissionAction access={dismissAccess}>
+          <button
+            type="button"
+            onClick={() => dismissMutation.mutate()}
+            disabled={dismissMutation.isPending || !dismissAccess.allowed}
+            className="h-[26px] px-2.5 rounded-md border border-border bg-card hover:bg-muted text-[11px] text-muted-foreground hover:text-foreground disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            Dismiss
+          </button>
+        </PermissionAction>
         <span className="flex-1" />
         <button
           type="button"
@@ -1315,53 +1392,72 @@ function ImportSettingsPopover({
 // Primary action — non-import statuses
 // ------------------------------------------------------------------
 
-function PrimaryActionBtn({ rule, onAction }: { rule: RepoRuleView; onAction: () => void }) {
+function PrimaryActionBtn({
+  rule,
+  onAction,
+  access,
+}: {
+  rule: RepoRuleView;
+  onAction: () => void;
+  access: ActionAccess;
+}) {
   if (rule.status === 'IMPORTED') {
     return (
-      <button
-        type="button"
-        onClick={onAction}
-        className="h-[28px] px-3 rounded-md border border-border bg-card hover:bg-muted text-[11.5px] font-medium text-foreground/80 flex items-center gap-1.5"
-      >
-        <ExternalLink className="w-[12px] h-[12px]" strokeWidth={1.5} />
-        Open in editor
-      </button>
+      <PermissionAction access={access}>
+        <button
+          type="button"
+          onClick={onAction}
+          disabled={!access.allowed}
+          className="h-[28px] px-3 rounded-md border border-border bg-card hover:bg-muted text-[11.5px] font-medium text-foreground/80 flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
+        >
+          <ExternalLink className="w-[12px] h-[12px]" strokeWidth={1.5} />
+          Open in editor
+        </button>
+      </PermissionAction>
     );
   }
   if (rule.status === 'DELETED') {
     return (
-      <button
-        type="button"
-        onClick={onAction}
-        className="h-[28px] px-3 rounded-md bg-destructive/10 border border-destructive/30 text-destructive text-[11.5px] font-medium hover:bg-destructive/15"
-      >
-        Remove from library
-      </button>
+      <PermissionAction access={access}>
+        <button
+          type="button"
+          onClick={onAction}
+          disabled={!access.allowed}
+          className="h-[28px] px-3 rounded-md bg-destructive/10 border border-destructive/30 text-destructive text-[11.5px] font-medium hover:bg-destructive/15 disabled:opacity-60 disabled:cursor-not-allowed"
+        >
+          Review removal
+        </button>
+      </PermissionAction>
     );
   }
   if (rule.status === 'DRIFT') {
     return (
-      <button
-        type="button"
-        onClick={onAction}
-        className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium"
-      >
-        Resolve drift
-      </button>
+      <PermissionAction access={access}>
+        <button
+          type="button"
+          onClick={onAction}
+          disabled={!access.allowed}
+          className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium disabled:opacity-60 disabled:cursor-not-allowed"
+        >
+          Resolve drift
+        </button>
+      </PermissionAction>
     );
   }
   if (rule.status === 'UPDATED') {
     return (
-      <button
-        type="button"
-        onClick={onAction}
-        className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium flex items-center gap-1.5"
-      >
-        <ArrowUpRight className="w-[12px] h-[12px]" strokeWidth={2} />
-        Update
-      </button>
+      <PermissionAction access={access}>
+        <button
+          type="button"
+          onClick={onAction}
+          disabled={!access.allowed}
+          className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
+        >
+          <ArrowUpRight className="w-[12px] h-[12px]" strokeWidth={2} />
+          Open in editor
+        </button>
+      </PermissionAction>
     );
   }
   return null;
 }
-

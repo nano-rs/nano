@@ -12,16 +12,17 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::auth::{TargetEffect, TargetGrants};
 use crate::log_sources::{LogSourceRepository, NewLogSource, UpdateLogSource};
 use crate::log_telemetry::repository::is_safe_source_type;
 use crate::rule_repository::GitHubClient;
 
 use super::error::ParserRepositoryError;
 use super::models::{
-    ApplyUpstreamUpdateResult, BulkApplyUpstreamResult, BundleImportResult,
-    NewParserRepository, ParserImport, ParserImportPreview, ParserImportRequest, ParserImportType,
-    ParserRepository, RepositoryParser, RepositoryParserFilter, SyncResult, SyncStatus,
-    UpdateParserRepository, UpstreamParserDiff,
+    ApplyUpstreamUpdateResult, BulkApplyUpstreamResult, BundleImportResult, NewParserRepository,
+    ParserImport, ParserImportPreview, ParserImportRequest, ParserImportType, ParserRepository,
+    RepositoryParser, RepositoryParserFilter, SyncResult, SyncStatus, UpdateParserRepository,
+    UpstreamParserDiff,
 };
 use super::repository::{
     ParserImportsRepository, ParserRepositoryRepository, RepositoryParsersRepository,
@@ -36,6 +37,55 @@ const ALLOWED_REPOSITORIES: &[&str] = &["nano-rs/parsers"];
 /// first bundle upload; never network-synced.
 const AIRGAP_REPOSITORY_SLUG: &str = "airgap-parsers";
 const AIRGAP_REPOSITORY_NAME: &str = "Air-gapped Parser Bundles";
+
+/// Outcome-aware authorization plan for one parser import (NAN-2117).
+///
+/// Preflighted by [`ParserRepositoryService::plan_import`] so a handler can
+/// enforce the complete capability policy — and reject a whole batch — before
+/// any database write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParserImportPlan {
+    /// False when the parser is already imported: `import_parser` returns
+    /// `AlreadyImported` and writes nothing, so no capability is consumed.
+    pub creates_log_source: bool,
+    /// True when the import will accept (or auto-resolve) a dispatch
+    /// source-configuration and can therefore insert an identity routing rule
+    /// into that config's routing table.
+    pub mutates_source_config: bool,
+}
+
+impl ParserImportPlan {
+    /// The target-resource capabilities this import will consume.
+    pub fn required_effects(&self) -> Vec<TargetEffect> {
+        let mut effects = Vec::new();
+        if self.creates_log_source {
+            effects.push(TargetEffect::LogSourceCreate);
+        }
+        if self.mutates_source_config {
+            effects.push(TargetEffect::SourceConfigEdit);
+        }
+        effects
+    }
+}
+
+/// What a completed parser import actually wrote.
+///
+/// The routing-rule insert is deduped and best-effort, so the caller cannot
+/// infer it from the plan — audit records must reflect what happened, not what
+/// was authorized (NAN-2117).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParserImportResult {
+    /// The log source that was created.
+    pub log_source_id: Uuid,
+    /// Its display name — what the canonical `POST /api/log-sources` audit
+    /// records as the resource name, and what audit search matches on.
+    pub log_source_name: String,
+    /// The identity routing rule inserted on the dispatch source-configuration,
+    /// if one was actually created (absent when no dispatch config resolved, the
+    /// rule already existed, the parser is an enrichment flavor, or the
+    /// non-fatal insert failed).
+    pub routing_rule_id: Option<Uuid>,
+}
 
 /// Configuration for the parser repository service
 #[derive(Debug, Clone)]
@@ -245,10 +295,7 @@ impl ParserRepositoryService {
     ///
     /// Leader-owned schedulers use this form so aborting the scheduler also
     /// cancels every in-flight network, parse, and status-write future.
-    pub async fn sync_repository(
-        &self,
-        id: Uuid,
-    ) -> Result<SyncResult, ParserRepositoryError> {
+    pub async fn sync_repository(&self, id: Uuid) -> Result<SyncResult, ParserRepositoryError> {
         let repo = self.get_repository(id).await?;
         if !repo.enabled {
             return Err(ParserRepositoryError::RepositoryDisabled);
@@ -337,8 +384,7 @@ impl ParserRepositoryService {
                 enrichments_tree
                     .iter()
                     .filter(|entry| {
-                        entry.path.ends_with("/parser.yaml")
-                            || entry.path.ends_with("/parser.yml")
+                        entry.path.ends_with("/parser.yaml") || entry.path.ends_with("/parser.yml")
                     })
                     .map(|e| (e, enrichments_path)),
             )
@@ -483,10 +529,15 @@ impl ParserRepositoryService {
             "Parser repository sync completed"
         );
 
-        // Re-sync match_values for all imported log sources from upstream YAML
-        if let Err(e) = self.fixup_imported_match_values().await {
-            warn!("Failed to fixup imported match_values during sync: {}", e);
-        }
+        // NAN-2120: sync is CATALOG-ONLY. It used to finish by calling the
+        // global `fixup_imported_match_values()`, which rewrote
+        // `log_sources.match_values` for every imported parser across every
+        // repository — live ingestion-routing metadata — as an unauthorized side
+        // effect of a `parser_repositories:sync` request (and of the leader's
+        // scheduled sync). The upsert loop above already marks each linked
+        // import `upstream_changed`; the operator applies that to the live log
+        // source explicitly via apply-upstream-update / fixup-match-values,
+        // where the target edit capabilities are enforced.
 
         Ok(result)
     }
@@ -568,13 +619,89 @@ impl ParserRepositoryService {
     // Import Parser as Log Source
     // =========================================================================
 
+    /// Preflight what [`Self::import_parser`] would do to live resources,
+    /// **without writing anything** (NAN-2117).
+    ///
+    /// Performs a strict subset of `import_parser`'s reads so a handler can
+    /// enforce the composite `log_sources:create` + `source_configs:edit` policy
+    /// (and reject a whole batch) before the first mutation. Errors raised here
+    /// are raised identically by `import_parser` at the same point, before any
+    /// write.
+    pub async fn plan_import(
+        &self,
+        repo_id: Uuid,
+        path: &str,
+        req: &ParserImportRequest,
+    ) -> Result<ParserImportPlan, ParserRepositoryError> {
+        let _ = self.get_repository(repo_id).await?;
+        let parser = self.get_parser(repo_id, path).await?;
+
+        let existing = self
+            .imports_repository
+            .find_by_repository_parser(parser.id)
+            .await
+            .map_err(|e| ParserRepositoryError::Internal(e.to_string()))?;
+        if !existing.is_empty() {
+            // `import_parser` short-circuits with AlreadyImported and writes
+            // nothing.
+            return Ok(ParserImportPlan {
+                creates_log_source: false,
+                mutates_source_config: false,
+            });
+        }
+
+        // Enrichment parsers route through the enrichment lane, never through a
+        // source-config routing rule.
+        let is_enrichment = parser.kind == "enrichment";
+        let dispatch_source_config_id = self.resolve_dispatch_source_config(req).await?;
+
+        Ok(ParserImportPlan {
+            creates_log_source: true,
+            mutates_source_config: !is_enrichment && dispatch_source_config_id.is_some(),
+        })
+    }
+
+    /// Resolve the dispatch source-configuration an import will bind to.
+    ///
+    /// Either the caller's explicit `dispatch_source_config_id`, or (NAN-1270)
+    /// the first deployed source-config whose `config_type` matches the parser's
+    /// `ingestion_method`. Shared by [`Self::plan_import`] and
+    /// [`Self::import_parser`] so the preflight cannot disagree with the write
+    /// path about whether a source config is touched.
+    async fn resolve_dispatch_source_config(
+        &self,
+        req: &ParserImportRequest,
+    ) -> Result<Option<Uuid>, ParserRepositoryError> {
+        if let Some(id) = req.dispatch_source_config_id {
+            return Ok(Some(id));
+        }
+        let ingestion_method = req.ingestion_method.as_deref().unwrap_or("routed");
+        let config_type = Self::config_type_for_ingestion_method(ingestion_method);
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM source_configurations WHERE config_type = $1 \
+             ORDER BY created_at ASC LIMIT 1",
+        )
+        .bind(config_type)
+        .fetch_optional(&self.pg_pool)
+        .await
+        .map_err(ParserRepositoryError::Database)
+    }
+
+    /// Import a repository parser as a live log source.
+    ///
+    /// `grants` carries the target-resource capabilities the caller was verified
+    /// to hold (NAN-2117). They are re-checked here, immediately before the
+    /// writes, so a race that changes the resolved dispatch config cannot
+    /// launder a missing `source_configs:edit`. Internal SYSTEM callers pass
+    /// [`TargetGrants::system`]; anything else must pass a principal-derived set.
     pub async fn import_parser(
         &self,
         repo_id: Uuid,
         path: &str,
         req: &ParserImportRequest,
         user_id: Option<Uuid>,
-    ) -> Result<Uuid, ParserRepositoryError> {
+        grants: &TargetGrants,
+    ) -> Result<ParserImportResult, ParserRepositoryError> {
         let repo = self.get_repository(repo_id).await?;
         let parser = self.get_parser(repo_id, path).await?;
 
@@ -590,6 +717,14 @@ impl ParserRepositoryService {
                 import_type: existing[0].import_type.clone(),
             });
         }
+
+        // NAN-2117: this creates a first-class, validated, active `log_sources`
+        // row — exactly what `POST /api/log-sources` gates behind
+        // `log_sources:create`. `parser_repositories:import` authorizes the
+        // catalog read, never the target creation.
+        grants
+            .ensure(TargetEffect::LogSourceCreate)
+            .map_err(|effect| ParserRepositoryError::Forbidden(effect.permission().to_string()))?;
 
         // NAN-1149: an enrichment parser (kind = "enrichment") deploys as a
         // `kind='enrichment'` log_sources row carrying the per-source normalize
@@ -640,20 +775,22 @@ impl ParserRepositoryService {
         // config_type matches this parser's ingestion_method so every import
         // path behaves identically. NULL only if none is deployed for that
         // method (the "create/deploy a source config first" case).
-        let dispatch_source_config_id = match req.dispatch_source_config_id {
-            Some(id) => Some(id),
-            None => {
-                let config_type = Self::config_type_for_ingestion_method(&ingestion_method);
-                sqlx::query_scalar::<_, Uuid>(
-                    "SELECT id FROM source_configurations WHERE config_type = $1 \
-                     ORDER BY created_at ASC LIMIT 1",
-                )
-                .bind(config_type)
-                .fetch_optional(&self.pg_pool)
-                .await
-                .map_err(ParserRepositoryError::Database)?
-            }
-        };
+        let dispatch_source_config_id = self.resolve_dispatch_source_config(req).await?;
+
+        // NAN-2117: binding the new log source to a source-configuration and
+        // inserting its identity routing rule mutates a separately administered
+        // resource — `POST /api/source-configurations/{id}/rules` requires
+        // `source_configs:edit`. Enforce it here whether the caller pinned the
+        // config explicitly or the auto-resolution picked one for them, and
+        // before ANY write so a denial cannot leave a half-wired log source.
+        // Enrichment imports route via the enrichment lane, not routing rules.
+        if !is_enrichment && dispatch_source_config_id.is_some() {
+            grants
+                .ensure(TargetEffect::SourceConfigEdit)
+                .map_err(|effect| {
+                    ParserRepositoryError::Forbidden(effect.permission().to_string())
+                })?;
+        }
 
         // Primary source_type for the auto-created routing rule (below). Captured
         // before `match_values` is moved into the NewLogSource.
@@ -671,13 +808,12 @@ impl ParserRepositoryService {
         // (ingestion_method=kafka, dispatch_source_config_id=<aws_s3 id>)
         // would be accepted.
         if let Some(dispatch_id) = dispatch_source_config_id {
-            let row: Option<(String,)> = sqlx::query_as(
-                "SELECT config_type FROM source_configurations WHERE id = $1",
-            )
-            .bind(dispatch_id)
-            .fetch_optional(&self.pg_pool)
-            .await
-            .map_err(ParserRepositoryError::Database)?;
+            let row: Option<(String,)> =
+                sqlx::query_as("SELECT config_type FROM source_configurations WHERE id = $1")
+                    .bind(dispatch_id)
+                    .fetch_optional(&self.pg_pool)
+                    .await
+                    .map_err(ParserRepositoryError::Database)?;
             let config_type = row.map(|(ct,)| ct).ok_or_else(|| {
                 ParserRepositoryError::InvalidRequest(format!(
                     "dispatch_source_config_id {dispatch_id} does not match any source-configuration",
@@ -697,10 +833,8 @@ impl ParserRepositoryService {
             namespace: "default".to_string(),
             timezone: "UTC".to_string(),
             source_type: ingestion_method,
-            source_config: serde_json::json!({}),
             parser_vrl,
             output_fields: None,
-            credential_id: None,
             dispatch_source_config_id,
             category: parser.category.clone(),
             vendor: parser.vendor.clone(),
@@ -717,13 +851,10 @@ impl ParserRepositoryService {
             lifecycle_status: None,
         };
 
-        // NAN-950: do the three writes (log_sources INSERT, log_sources
-        // UPDATE for parser-only flags, parser_imports INSERT) inside one
+        // NAN-950: do the log_sources and parser_imports writes inside one
         // sqlx transaction so an API crash between statements can't leave
         // a half-imported log_source — pre-NAN-950 the orphan had
-        // `parser_only = false` and the deploy enumerator picked it up
-        // as a "normal" parser, which with NAN-928's dispatch_source_config_id
-        // dispatched from a real source-config and produced broken state.
+        // the import metadata missing and produced broken state.
         //
         // We bypass LogSourceRepository::create + ParserImportsRepository::create
         // for this path because they each take `&PgPool`; the transaction
@@ -741,9 +872,13 @@ impl ParserRepositoryService {
         // the synced parser's routing + normalize VRL into the lane generator.
         let ls_kind = if is_enrichment { "enrichment" } else { "log" };
         let enrich_kind = is_enrichment.then(|| parser.enrich_kind.clone()).flatten();
-        let enrich_source = is_enrichment.then(|| parser.enrich_source.clone()).flatten();
+        let enrich_source = is_enrichment
+            .then(|| parser.enrich_source.clone())
+            .flatten();
         let target_table = is_enrichment.then(|| parser.target_table.clone()).flatten();
-        let normalize_vrl = is_enrichment.then(|| parser.normalize_vrl.clone()).flatten();
+        let normalize_vrl = is_enrichment
+            .then(|| parser.normalize_vrl.clone())
+            .flatten();
 
         let mut tx = self
             .pg_pool
@@ -753,13 +888,11 @@ impl ParserRepositoryService {
 
         // Duplicate-name check — must be inside the transaction so two
         // concurrent imports of the same parser can't both pass.
-        let existing: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM log_sources WHERE name = $1",
-        )
-        .bind(&new_log_source.name)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(ParserRepositoryError::Database)?;
+        let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM log_sources WHERE name = $1")
+            .bind(&new_log_source.name)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(ParserRepositoryError::Database)?;
         if existing > 0 {
             return Err(ParserRepositoryError::LogSourceService(format!(
                 "Log source with name '{}' already exists",
@@ -767,24 +900,23 @@ impl ParserRepositoryService {
             )));
         }
 
-        // Single INSERT that already sets parser_only=true / validated=true
-        // / source_parser_* — collapses the original INSERT + UPDATE into
-        // one round-trip while inside the transaction.
+        // Single INSERT sets validated/source_parser_* in one round-trip while
+        // inside the transaction.
         let log_source_id: Uuid = sqlx::query_scalar(
             r#"
             INSERT INTO log_sources (
-                name, description, namespace, timezone, source_type, source_config, credential_id,
+                name, description, namespace, timezone, source_type,
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values, dispatch_source_config_id,
-                parser_only, validated, validation_error,
+                validated, validation_error,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
                 kind, enrich_kind, enrich_source, target_table, normalize_vrl
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                    $15, $16, $17, $18,
-                    true, true, NULL,
-                    $19, $20, $21,
-                    $22, $23, $24, $25, $26)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                    $13, $14, $15, $16,
+                    true, NULL,
+                    $17, $18, $19,
+                    $20, $21, $22, $23, $24)
             RETURNING id
             "#,
         )
@@ -793,8 +925,6 @@ impl ParserRepositoryService {
         .bind(&new_log_source.namespace)
         .bind(&new_log_source.timezone)
         .bind(&new_log_source.source_type)
-        .bind(&new_log_source.source_config)
-        .bind(&new_log_source.credential_id)
         .bind(&new_log_source.parser_vrl)
         .bind(&new_log_source.output_fields)
         .bind(&new_log_source.category)
@@ -838,15 +968,14 @@ impl ParserRepositoryService {
         .await
         .map_err(ParserRepositoryError::Database)?;
 
-        tx.commit()
-            .await
-            .map_err(ParserRepositoryError::Database)?;
+        tx.commit().await.map_err(ParserRepositoryError::Database)?;
 
         // NAN-1270: create the identity routing rule on the dispatch source
         // config (source_type -> same source_type), mirroring what the
         // single-import UI did out-of-band. Best-effort + deduped: a missing
         // rule no longer silently differs between single and batch import.
         // Enrichment imports route via the enrichment lane, not source_type.
+        let mut routing_rule_id: Option<Uuid> = None;
         if !is_enrichment {
             if let (Some(cfg_id), Some(src_type)) =
                 (dispatch_source_config_id, primary_source_type.as_deref())
@@ -869,19 +998,26 @@ impl ParserRepositoryService {
                     .fetch_one(&self.pg_pool)
                     .await
                     .unwrap_or(100);
-                    if let Err(e) = sqlx::query(
+                    // NAN-2117: RETURNING the id so the caller audits the routing
+                    // rule that was ACTUALLY created — this insert is deduped
+                    // above and non-fatal below, so "a dispatch config resolved"
+                    // is not evidence that a rule appeared.
+                    match sqlx::query_scalar::<_, Uuid>(
                         "INSERT INTO routing_rules \
                          (source_configuration_id, priority, match_field, match_type, match_value, target_source_type) \
-                         VALUES ($1, $2, 'source_type', 'exact', $3, $3)",
+                         VALUES ($1, $2, 'source_type', 'exact', $3, $3) RETURNING id",
                     )
                     .bind(cfg_id)
                     .bind(next_priority)
                     .bind(src_type)
-                    .execute(&self.pg_pool)
+                    .fetch_one(&self.pg_pool)
                     .await
                     {
-                        warn!(log_source_id = %log_source_id, source_type = %src_type, error = %e,
-                            "Imported parser: failed to auto-create routing rule (non-fatal)");
+                        Ok(id) => routing_rule_id = Some(id),
+                        Err(e) => {
+                            warn!(log_source_id = %log_source_id, source_type = %src_type, error = %e,
+                                "Imported parser: failed to auto-create routing rule (non-fatal)");
+                        }
                     }
                 }
             }
@@ -895,7 +1031,11 @@ impl ParserRepositoryService {
             "Parser imported as log source"
         );
 
-        Ok(log_source_id)
+        Ok(ParserImportResult {
+            log_source_id,
+            log_source_name: new_log_source.name,
+            routing_rule_id,
+        })
     }
 
     /// Map a parser `ingestion_method` to the `source_configurations.config_type`
@@ -919,6 +1059,7 @@ impl ParserRepositoryService {
         paths: &[String],
         import_type: &ParserImportType,
         user_id: Option<Uuid>,
+        grants: &TargetGrants,
     ) -> Result<Vec<Result<Uuid, String>>, ParserRepositoryError> {
         let mut results = Vec::new();
 
@@ -929,8 +1070,11 @@ impl ParserRepositoryService {
                 ingestion_method: None, // Defaults to "routed"
                 dispatch_source_config_id: None,
             };
-            match self.import_parser(repo_id, path, &req, user_id).await {
-                Ok(id) => results.push(Ok(id)),
+            match self
+                .import_parser(repo_id, path, &req, user_id, grants)
+                .await
+            {
+                Ok(result) => results.push(Ok(result.log_source_id)),
                 Err(ParserRepositoryError::AlreadyImported { .. }) => {
                     results.push(Err("Already imported".to_string()));
                 }
@@ -947,10 +1091,22 @@ impl ParserRepositoryService {
     // Remove All Imported
     // =========================================================================
 
+    /// Delete every log source imported from `repo_id`.
+    ///
+    /// NAN-2111: `parser_repositories:manage` authorizes managing the repository
+    /// catalog, not mass-deleting the first-class log sources it produced —
+    /// `DELETE /api/log-sources/{id}` requires `log_sources:delete`. The check
+    /// runs before the imports are even loaded so a denied caller learns nothing
+    /// about how many targets exist.
     pub async fn remove_all_imported(
         &self,
         repo_id: Uuid,
+        grants: &TargetGrants,
     ) -> Result<(i32, i32), ParserRepositoryError> {
+        grants
+            .ensure(TargetEffect::LogSourceDelete)
+            .map_err(|effect| ParserRepositoryError::Forbidden(effect.permission().to_string()))?;
+
         let imports = self
             .imports_repository
             .list_for_repository(repo_id)
@@ -1084,11 +1240,29 @@ impl ParserRepositoryService {
     }
 
     /// Apply upstream parser update to a log source.
-    /// Updates the VRL code and clears the upstream_changed flag.
+    ///
+    /// Updates the VRL code + description, re-syncs `match_values` from the
+    /// upstream YAML, and clears the `upstream_changed` flag.
+    ///
+    /// NAN-2120: this is now the ONE authorized path that keeps routing metadata
+    /// in step with the parser it deploys. Repository sync used to do it as a
+    /// global, principal-free side effect; here it is per-target, operator-
+    /// initiated, and gated on the same `parsers:edit` + `log_sources:edit` the
+    /// canonical log-source route requires. Unlike the old global fixup it also
+    /// PRESERVES the operator's primary alias instead of recomputing it as
+    /// `None` — recomputing is what silently orphaned source-config routing
+    /// rules that pointed at the previous primary.
     pub async fn apply_upstream_update(
         &self,
         log_source_id: Uuid,
+        grants: &TargetGrants,
     ) -> Result<ApplyUpstreamUpdateResult, ParserRepositoryError> {
+        for effect in [TargetEffect::ParserEdit, TargetEffect::LogSourceEdit] {
+            grants.ensure(effect).map_err(|effect| {
+                ParserRepositoryError::Forbidden(effect.permission().to_string())
+            })?;
+        }
+
         let ls_repo = self.log_source_repository.as_ref().ok_or_else(|| {
             ParserRepositoryError::Internal("Log source repository not available".to_string())
         })?;
@@ -1120,9 +1294,7 @@ impl ParserRepositoryService {
         } else {
             repo_parser.parser_vrl.clone()
         }
-        .ok_or_else(|| {
-            ParserRepositoryError::Internal("Upstream parser has no VRL".to_string())
-        })?;
+        .ok_or_else(|| ParserRepositoryError::Internal("Upstream parser has no VRL".to_string()))?;
 
         // Get current log source to check deployed state
         let log_source = ls_repo
@@ -1140,6 +1312,33 @@ impl ParserRepositoryService {
         // Also update description if upstream has one
         if let Some(ref desc) = repo_parser.description {
             update.description = Some(desc.clone());
+        }
+
+        // NAN-2120: re-sync `match_values` from the upstream YAML here, where
+        // `run_sync` used to do it globally and unauthorized. Enrichment parsers
+        // route via the enrichment lane, so they carry no match_values.
+        if !is_enrichment {
+            let parsed_yaml = super::yaml_parser::parse_parser_yaml(&repo_parser.raw_content).ok();
+            let yaml_match_values = parsed_yaml
+                .as_ref()
+                .and_then(|y| y.match_values.clone())
+                .unwrap_or_default();
+            // The current primary is the alias existing `routing_rules` point
+            // at — feed it back in as the override so accepting an upstream
+            // update adds new aliases without silently dropping the operator's
+            // primary and orphaning its routing rule.
+            let existing_primary = log_source
+                .match_values
+                .as_ref()
+                .and_then(|values| values.first().cloned());
+            let resolved = Self::resolve_match_values(
+                existing_primary.as_deref(),
+                &yaml_match_values,
+                parsed_yaml.as_ref().map(|y| y.name.as_str()),
+            );
+            if !resolved.is_empty() && log_source.match_values.as_ref() != Some(&resolved) {
+                update.match_values = Some(resolved);
+            }
         }
 
         ls_repo
@@ -1167,10 +1366,20 @@ impl ParserRepositoryService {
     }
 
     /// Apply all pending upstream updates for a repository.
+    ///
+    /// NAN-2120: same composite capability policy as the single-target variant,
+    /// enforced up front so a denied caller never starts the loop.
     pub async fn apply_all_upstream_updates(
         &self,
         repo_id: Uuid,
+        grants: &TargetGrants,
     ) -> Result<BulkApplyUpstreamResult, ParserRepositoryError> {
+        for effect in [TargetEffect::ParserEdit, TargetEffect::LogSourceEdit] {
+            grants.ensure(effect).map_err(|effect| {
+                ParserRepositoryError::Forbidden(effect.permission().to_string())
+            })?;
+        }
+
         let updates = self.get_upstream_updates(repo_id).await?;
 
         let mut results = Vec::new();
@@ -1178,7 +1387,10 @@ impl ParserRepositoryService {
         let mut failed = 0u32;
 
         for update in updates {
-            match self.apply_upstream_update(update.log_source_id).await {
+            match self
+                .apply_upstream_update(update.log_source_id, grants)
+                .await
+            {
                 Ok(result) => {
                     updated += 1;
                     results.push(result);
@@ -1224,20 +1436,46 @@ impl ParserRepositoryService {
     // Match values fixup
     // =========================================================================
 
-    /// Re-sync match_values from upstream YAML for all imported log sources.
-    /// This fixes log sources that were imported before match_values threading was added.
-    pub async fn fixup_imported_match_values(&self) -> Result<u32, ParserRepositoryError> {
+    /// Re-sync match_values from upstream YAML for the log sources imported from
+    /// ONE repository. Fixes log sources imported before match_values threading
+    /// was added.
+    ///
+    /// NAN-2120: this is a **live parser-routing mutation**, not a catalog
+    /// operation — it rewrites `log_sources.match_values`, which decides which
+    /// upstream source-type aliases activate a parser. Three things changed:
+    ///
+    /// * it requires the canonical parser AND log-source edit capabilities in
+    ///   addition to whatever repository permission got the caller here;
+    /// * it is scoped to `repo_id` instead of every import in the tenant; and
+    /// * it is no longer invoked as an automatic side effect of repository sync
+    ///   — `run_sync` marks linked imports `upstream_changed` and the operator
+    ///   applies the change explicitly.
+    ///
+    /// Returns the IDs of the log sources that were ACTUALLY rewritten, so the
+    /// caller can emit one per-target audit record naming each changed object
+    /// rather than a single opaque repository-level count.
+    pub async fn fixup_imported_match_values(
+        &self,
+        repo_id: Uuid,
+        grants: &TargetGrants,
+    ) -> Result<Vec<Uuid>, ParserRepositoryError> {
+        for effect in [TargetEffect::ParserEdit, TargetEffect::LogSourceEdit] {
+            grants.ensure(effect).map_err(|effect| {
+                ParserRepositoryError::Forbidden(effect.permission().to_string())
+            })?;
+        }
+
         let ls_repo = self.log_source_repository.as_ref().ok_or_else(|| {
             ParserRepositoryError::Internal("Log source repository not available".to_string())
         })?;
 
         let rows = self
             .imports_repository
-            .list_with_raw_content()
+            .list_with_raw_content(repo_id)
             .await
             .map_err(|e| ParserRepositoryError::Internal(e.to_string()))?;
 
-        let mut updated = 0u32;
+        let mut updated: Vec<Uuid> = Vec::new();
         for (log_source_id, raw_content) in &rows {
             let parsed = match super::yaml_parser::parse_parser_yaml(raw_content) {
                 Ok(p) => p,
@@ -1249,11 +1487,8 @@ impl ParserRepositoryService {
             // across syncs, so we pass None — the parser's name (from the
             // YAML's `name:` field) is what we anchor on. NAN-920.
             let yaml_match_values = parsed.match_values.clone().unwrap_or_default();
-            let resolved = Self::resolve_match_values(
-                None,
-                &yaml_match_values,
-                Some(parsed.name.as_str()),
-            );
+            let resolved =
+                Self::resolve_match_values(None, &yaml_match_values, Some(parsed.name.as_str()));
             if resolved.is_empty() {
                 continue;
             }
@@ -1269,11 +1504,15 @@ impl ParserRepositoryService {
                 );
                 continue;
             }
-            updated += 1;
+            updated.push(*log_source_id);
         }
 
-        if updated > 0 {
-            info!("Fixed match_values for {} imported log sources", updated);
+        if !updated.is_empty() {
+            info!(
+                repo_id = %repo_id,
+                updated = updated.len(),
+                "Fixed match_values for imported log sources"
+            );
         }
         Ok(updated)
     }
@@ -1292,12 +1531,24 @@ impl ParserRepositoryService {
         parser: &RepositoryParser,
         path: &str,
     ) -> Result<(), ParserRepositoryError> {
-        if parser.normalize_vrl.as_deref().unwrap_or("").trim().is_empty() {
+        if parser
+            .normalize_vrl
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
             return Err(ParserRepositoryError::InvalidRequest(format!(
                 "enrichment parser '{path}' has no normalize_vrl; nothing to deploy",
             )));
         }
-        if parser.target_table.as_deref().unwrap_or("").trim().is_empty() {
+        if parser
+            .target_table
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
             return Err(ParserRepositoryError::InvalidRequest(format!(
                 "enrichment parser '{path}' has no target_table; cannot route its writes",
             )));
@@ -1540,7 +1791,11 @@ mod tests {
     fn resolve_match_values_unions_ui_override_and_yaml_aliases() {
         let result = ParserRepositoryService::resolve_match_values(
             Some("apache_http_server"),
-            &["apache".into(), "apache_access".into(), "apache_error".into()],
+            &[
+                "apache".into(),
+                "apache_access".into(),
+                "apache_error".into(),
+            ],
             Some("apache_http_server"),
         );
         assert_eq!(
@@ -1563,7 +1818,10 @@ mod tests {
             &["apache".into(), "apache_access".into()],
             Some("apache"),
         );
-        assert_eq!(result, vec!["apache".to_string(), "apache_access".to_string()]);
+        assert_eq!(
+            result,
+            vec!["apache".to_string(), "apache_access".to_string()]
+        );
     }
 
     /// Fixup path: no UI override (None), parser name + YAML aliases.
@@ -1614,18 +1872,32 @@ mod tests {
 
     #[test]
     fn is_dispatch_compatible_accepts_canonical_pair_for_each_pull_source() {
-        assert!(ParserRepositoryService::is_dispatch_compatible("kafka", "kafka"));
-        assert!(ParserRepositoryService::is_dispatch_compatible("aws_s3", "aws_s3"));
-        assert!(ParserRepositoryService::is_dispatch_compatible("gcp_pubsub", "gcp_pubsub"));
-        assert!(ParserRepositoryService::is_dispatch_compatible("splunk_hec", "splunk_hec"));
+        assert!(ParserRepositoryService::is_dispatch_compatible(
+            "kafka", "kafka"
+        ));
+        assert!(ParserRepositoryService::is_dispatch_compatible(
+            "aws_s3", "aws_s3"
+        ));
+        assert!(ParserRepositoryService::is_dispatch_compatible(
+            "gcp_pubsub",
+            "gcp_pubsub"
+        ));
+        assert!(ParserRepositoryService::is_dispatch_compatible(
+            "splunk_hec",
+            "splunk_hec"
+        ));
     }
 
     #[test]
     fn is_dispatch_compatible_accepts_always_on_sources() {
         // http maps to ingestion_method "routed" (matches SOURCE_TYPE_MAP).
-        assert!(ParserRepositoryService::is_dispatch_compatible("http", "routed"));
+        assert!(ParserRepositoryService::is_dispatch_compatible(
+            "http", "routed"
+        ));
         // vector is identity.
-        assert!(ParserRepositoryService::is_dispatch_compatible("vector", "vector"));
+        assert!(ParserRepositoryService::is_dispatch_compatible(
+            "vector", "vector"
+        ));
     }
 
     #[test]
@@ -1633,10 +1905,21 @@ mod tests {
         // Stored canonical form is "aws_s3"/"gcp_pubsub"/"splunk_hec"; legacy
         // ingest paths used "s3"/"pubsub"/"splunk"/"hec". from_str on
         // SourceConfigType accepts both; the dispatch check must too.
-        assert!(ParserRepositoryService::is_dispatch_compatible("s3", "aws_s3"));
-        assert!(ParserRepositoryService::is_dispatch_compatible("pubsub", "gcp_pubsub"));
-        assert!(ParserRepositoryService::is_dispatch_compatible("splunk", "splunk_hec"));
-        assert!(ParserRepositoryService::is_dispatch_compatible("hec", "splunk_hec"));
+        assert!(ParserRepositoryService::is_dispatch_compatible(
+            "s3", "aws_s3"
+        ));
+        assert!(ParserRepositoryService::is_dispatch_compatible(
+            "pubsub",
+            "gcp_pubsub"
+        ));
+        assert!(ParserRepositoryService::is_dispatch_compatible(
+            "splunk",
+            "splunk_hec"
+        ));
+        assert!(ParserRepositoryService::is_dispatch_compatible(
+            "hec",
+            "splunk_hec"
+        ));
     }
 
     #[test]
@@ -1644,14 +1927,32 @@ mod tests {
         // The exact silent-failure mode NAN-928 set out to eliminate —
         // FK passes, parser filters on `<s3_config>_route`, receives zero
         // events. The reverse must also reject.
-        assert!(!ParserRepositoryService::is_dispatch_compatible("aws_s3", "kafka"));
-        assert!(!ParserRepositoryService::is_dispatch_compatible("kafka", "aws_s3"));
+        assert!(!ParserRepositoryService::is_dispatch_compatible(
+            "aws_s3", "kafka"
+        ));
+        assert!(!ParserRepositoryService::is_dispatch_compatible(
+            "kafka", "aws_s3"
+        ));
     }
 
     #[test]
     fn is_dispatch_compatible_rejects_all_cross_pairs() {
-        let drivers = ["kafka", "aws_s3", "gcp_pubsub", "splunk_hec", "http", "vector"];
-        let methods = ["kafka", "aws_s3", "gcp_pubsub", "splunk_hec", "routed", "vector"];
+        let drivers = [
+            "kafka",
+            "aws_s3",
+            "gcp_pubsub",
+            "splunk_hec",
+            "http",
+            "vector",
+        ];
+        let methods = [
+            "kafka",
+            "aws_s3",
+            "gcp_pubsub",
+            "splunk_hec",
+            "routed",
+            "vector",
+        ];
         for ct in &drivers {
             for im in &methods {
                 let expected_ok = matches!(
@@ -1675,7 +1976,9 @@ mod tests {
     #[test]
     fn is_dispatch_compatible_rejects_unknown_config_type() {
         // A future / typo'd config_type should fail closed.
-        assert!(!ParserRepositoryService::is_dispatch_compatible("rabbitmq", "kafka"));
+        assert!(!ParserRepositoryService::is_dispatch_compatible(
+            "rabbitmq", "kafka"
+        ));
         assert!(!ParserRepositoryService::is_dispatch_compatible("", ""));
     }
 
@@ -1702,7 +2005,11 @@ mod tests {
         // Safe values preserved in order, unsafe one dropped silently.
         assert_eq!(
             result,
-            vec!["apache".to_string(), "apache_access".to_string(), "apache_error".to_string()],
+            vec![
+                "apache".to_string(),
+                "apache_access".to_string(),
+                "apache_error".to_string()
+            ],
         );
     }
 
@@ -1739,11 +2046,8 @@ mod tests {
     fn resolve_match_values_drops_unsafe_parser_name_too_and_uses_unknown() {
         // If even the parser_name fallback fails the allow-list, we land
         // on the "unknown" sentinel rather than persisting unsafe input.
-        let result = ParserRepositoryService::resolve_match_values(
-            None,
-            &[],
-            Some("bad parser name"),
-        );
+        let result =
+            ParserRepositoryService::resolve_match_values(None, &[], Some("bad parser name"));
         assert_eq!(result, vec!["unknown".to_string()]);
     }
 
@@ -1814,8 +2118,9 @@ mod tests {
         // None and whitespace-only both count as "no mapping".
         for vrl in [None, Some("   \n  ")] {
             let parser = enrichment_repo_parser(vrl, Some("user_registry"));
-            let err = ParserRepositoryService::validate_enrichment_import(&parser, &parser.file_path)
-                .unwrap_err();
+            let err =
+                ParserRepositoryService::validate_enrichment_import(&parser, &parser.file_path)
+                    .unwrap_err();
             assert!(
                 matches!(err, ParserRepositoryError::InvalidRequest(ref m) if m.contains("normalize_vrl")),
                 "expected normalize_vrl rejection, got {err:?}"

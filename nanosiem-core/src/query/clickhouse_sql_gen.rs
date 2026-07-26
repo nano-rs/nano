@@ -1257,7 +1257,8 @@ impl ClickHouseSqlGenerator {
             .as_ref()
             .map(|p| p.id() == crate::schema::SchemaId::Ocsf)
             .unwrap_or(false);
-        let source = crate::risk::clickhouse_sql::RiskFindingsSource::new(ocsf, logs_table);
+        let source = crate::risk::clickhouse_sql::RiskFindingsSource::new(ocsf, logs_table)
+            .with_source_deny(&self.source_scope_deny);
         let query = crate::risk::clickhouse_sql::risk_dataset_base_query(
             &source,
             cfg.now,
@@ -1700,6 +1701,58 @@ impl ClickHouseSqlGenerator {
         self.profile
             .class_split_value_sql(field)
             .unwrap_or_else(|| self.field_access_expr(field, json_type))
+    }
+
+    /// Display expression for a field-values aggregation (NAN-2149).
+    ///
+    /// Field-values group on the value returned to the caller, rather than on the
+    /// first physical column a semantic field happens to resolve to:
+    ///
+    /// - OCSF class-split UDM concepts (`user`, `process_name`, `src_host`, …)
+    ///   use the same indexed unified column / value-pick fallback as filters and
+    ///   `stats by`, so events from every OCSF class contribute.
+    /// - A class-scoped enum-int (`event_type` / `activity_id`) displays its
+    ///   manifest-declared sibling label column (`activity`), because the same ID
+    ///   has different meanings in different classes.
+    /// - A fixed enum-int (`severity_id`, `status_id`, …) is decoded with the
+    ///   manifest label table, falling back to the raw ID for forward-compatible
+    ///   values the current manifest does not know.
+    ///
+    /// UDM exposes neither class splits nor enum-int mappings, so this falls
+    /// through to [`field_access_expr`](Self::field_access_expr) byte-for-byte.
+    pub(crate) fn field_values_display_expr(&self, field: &str) -> String {
+        let value_expr = self.filter_field_expr(field, "String");
+
+        match self.profile.enum_int_mapping(field) {
+            Some(crate::schema::EnumIntMapping::LabelColumn(sibling)) => {
+                escape_identifier(sibling)
+            }
+            Some(crate::schema::EnumIntMapping::Values(labels)) => {
+                // HashMap iteration is deliberately not observable in generated
+                // SQL: sort by ID, then label, for stable snapshots/cache keys.
+                let mut entries: Vec<(&str, i64)> = labels
+                    .iter()
+                    .map(|(label, id)| (label.as_str(), *id))
+                    .collect();
+                entries.sort_unstable_by(|(label_a, id_a), (label_b, id_b)| {
+                    id_a.cmp(id_b).then_with(|| label_a.cmp(label_b))
+                });
+                let ids = entries
+                    .iter()
+                    .map(|(_, id)| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let display_labels = entries
+                    .iter()
+                    .map(|(label, _)| format!("'{}'", escape_string(label)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "transform({value_expr}, [{ids}], [{display_labels}], toString({value_expr}))"
+                )
+            }
+            None => value_expr,
+        }
     }
 
     /// Whether `field` is produced by an earlier pipeline command (eval, stats

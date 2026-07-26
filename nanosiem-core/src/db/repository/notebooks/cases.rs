@@ -139,6 +139,34 @@ impl NotebookRepository {
         Ok(result)
     }
 
+    /// Unlink a notebook from the case relationship the caller *observed and
+    /// authorized*, atomically (NAN-2050). The update only fires while the
+    /// notebook's `case_id` still equals `expected_case_id` — matched with
+    /// `IS NOT DISTINCT FROM` so `None` means "still unlinked". A concurrent
+    /// link or relink (including standalone → private case, or case A → case B)
+    /// changes `case_id`, matches 0 rows, and returns `NotFound`, so the caller
+    /// fails closed and an unlink never touches a relationship it never checked.
+    pub async fn unlink_from_case_if(
+        &self,
+        notebook_id: Uuid,
+        expected_case_id: Option<Uuid>,
+    ) -> Result<Notebook, NotebookRepositoryError> {
+        sqlx::query_as::<_, Notebook>(
+            r#"
+            UPDATE notebooks SET
+                case_id = NULL,
+                updated_at = NOW()
+            WHERE id = $1 AND case_id IS NOT DISTINCT FROM $2
+            RETURNING *
+            "#,
+        )
+        .bind(notebook_id)
+        .bind(expected_case_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(NotebookRepositoryError::NotFound(notebook_id))
+    }
+
     /// Merge a source notebook into a target notebook
     /// Copies all entries from source to target with merge markers, then archives the source
     pub async fn merge_notebooks(

@@ -37,6 +37,8 @@ pub enum SourceScopeError {
     /// A delete targeted a `source_type` (or grant on it) that does not exist.
     #[error("restricted source type not found: {0}")]
     NotFound(String),
+    #[error("grant authority changed during validation; retry the request")]
+    GrantAuthorityChanged,
 }
 
 /// A row of `restricted_source_types`: a `source_type` value that is
@@ -127,7 +129,41 @@ impl SourceScopeRepository {
         .bind(created_by)
         .fetch_one(&mut *tx)
         .await?;
-        sqlx::query(BUMP_SCOPE_VERSION_SQL).execute(&mut *tx).await?;
+        sqlx::query(BUMP_SCOPE_VERSION_SQL)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    pub async fn add_restricted_authorized(
+        &self,
+        source_type: &str,
+        description: Option<&str>,
+        created_by: Option<Uuid>,
+        stamp: crate::auth::GrantAuthorityStamp,
+    ) -> Result<RestrictedSourceType, SourceScopeError> {
+        let mut tx = self.pool.begin().await?;
+        if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
+            return Err(SourceScopeError::GrantAuthorityChanged);
+        }
+        let row = sqlx::query_as::<_, RestrictedSourceType>(
+            r#"
+            INSERT INTO restricted_source_types (source_type, description, created_by)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (source_type) DO UPDATE SET
+                description = EXCLUDED.description
+            RETURNING source_type, description, created_by, created_at
+            "#,
+        )
+        .bind(source_type)
+        .bind(description)
+        .bind(created_by)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(BUMP_SCOPE_VERSION_SQL)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(row)
     }
@@ -144,7 +180,32 @@ impl SourceScopeRepository {
             // tx rolls back on drop — nothing changed, no version bump.
             return Err(SourceScopeError::NotFound(source_type.to_string()));
         }
-        sqlx::query(BUMP_SCOPE_VERSION_SQL).execute(&mut *tx).await?;
+        sqlx::query(BUMP_SCOPE_VERSION_SQL)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn remove_restricted_authorized(
+        &self,
+        source_type: &str,
+        stamp: crate::auth::GrantAuthorityStamp,
+    ) -> Result<(), SourceScopeError> {
+        let mut tx = self.pool.begin().await?;
+        if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
+            return Err(SourceScopeError::GrantAuthorityChanged);
+        }
+        let res = sqlx::query("DELETE FROM restricted_source_types WHERE source_type = $1")
+            .bind(source_type)
+            .execute(&mut *tx)
+            .await?;
+        if res.rows_affected() == 0 {
+            return Err(SourceScopeError::NotFound(source_type.to_string()));
+        }
+        sqlx::query(BUMP_SCOPE_VERSION_SQL)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -231,7 +292,47 @@ impl SourceScopeRepository {
         .bind(created_by)
         .fetch_one(&mut *tx)
         .await?;
-        sqlx::query(BUMP_SCOPE_VERSION_SQL).execute(&mut *tx).await?;
+        sqlx::query(BUMP_SCOPE_VERSION_SQL)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    pub async fn add_grant_authorized(
+        &self,
+        source_type: &str,
+        group_id: Uuid,
+        created_by: Option<Uuid>,
+        stamp: crate::auth::GrantAuthorityStamp,
+    ) -> Result<SourceTypeGrant, SourceScopeError> {
+        let mut tx = self.pool.begin().await?;
+        if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
+            return Err(SourceScopeError::GrantAuthorityChanged);
+        }
+        let row = sqlx::query_as::<_, SourceTypeGrant>(
+            r#"
+            WITH upsert AS (
+                INSERT INTO source_type_grants (source_type, group_id, created_by)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (source_type, group_id) DO UPDATE SET
+                    created_by = source_type_grants.created_by
+                RETURNING source_type, group_id, created_by, created_at
+            )
+            SELECT u.source_type, u.group_id, grp.name AS group_name,
+                   u.created_by, u.created_at
+            FROM upsert u
+            LEFT JOIN groups grp ON grp.id = u.group_id
+            "#,
+        )
+        .bind(source_type)
+        .bind(group_id)
+        .bind(created_by)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(BUMP_SCOPE_VERSION_SQL)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(row)
     }
@@ -255,7 +356,35 @@ impl SourceScopeRepository {
             // tx rolls back on drop — nothing changed, no version bump.
             return Err(SourceScopeError::NotFound(source_type.to_string()));
         }
-        sqlx::query(BUMP_SCOPE_VERSION_SQL).execute(&mut *tx).await?;
+        sqlx::query(BUMP_SCOPE_VERSION_SQL)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn remove_grant_authorized(
+        &self,
+        source_type: &str,
+        group_id: Uuid,
+        stamp: crate::auth::GrantAuthorityStamp,
+    ) -> Result<(), SourceScopeError> {
+        let mut tx = self.pool.begin().await?;
+        if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
+            return Err(SourceScopeError::GrantAuthorityChanged);
+        }
+        let res =
+            sqlx::query("DELETE FROM source_type_grants WHERE source_type = $1 AND group_id = $2")
+                .bind(source_type)
+                .bind(group_id)
+                .execute(&mut *tx)
+                .await?;
+        if res.rows_affected() == 0 {
+            return Err(SourceScopeError::NotFound(source_type.to_string()));
+        }
+        sqlx::query(BUMP_SCOPE_VERSION_SQL)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }

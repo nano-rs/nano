@@ -16,6 +16,7 @@
 //! denominator + one numerator per artifact). Postgres is read for the
 //! installed-providers set.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -27,6 +28,7 @@ use tracing::{info, instrument, warn};
 use crate::marketplace::cache::MarketplaceCoverageCache;
 use crate::marketplace::error::MarketplaceError;
 use crate::schema::{SchemaId, SchemaProfile};
+use crate::search::service::source_scope_sql_predicate;
 
 // ============================================================================
 // Recommended-provider map
@@ -425,8 +427,12 @@ fn build_coverage_sql(profile: &dyn SchemaProfile, is_clustered: bool) -> String
 /// Resolve the coverage SQL for the active profile. UDM uses the verbatim
 /// long-lived const (byte-identical, zero behavioral drift); every other schema
 /// synthesizes a profile-aware query.
-fn coverage_sql(profile: &dyn SchemaProfile, is_clustered: bool) -> String {
-    match profile.id() {
+fn coverage_sql(
+    profile: &dyn SchemaProfile,
+    is_clustered: bool,
+    denied_sources: &BTreeSet<String>,
+) -> String {
+    let base = match profile.id() {
         // NAN-1728 (H5/R11): route the verbatim UDM aggregate's `FROM logs` to
         // the `_distributed` wrapper on a cluster so the hero counts all shards;
         // single-node returns the const byte-for-byte.
@@ -435,6 +441,37 @@ fn coverage_sql(profile: &dyn SchemaProfile, is_clustered: bool) -> String {
         }
         SchemaId::Udm => UDM_COVERAGE_SQL.to_string(),
         _ => build_coverage_sql(profile, is_clustered),
+    };
+
+    // NAN-2061: this hand-built aggregate bypasses the normal search-service
+    // planner, so inject the same canonical source-scope predicate explicitly.
+    // `source_type` is the operational String column under both UDM and OCSF
+    // (the OCSF taxonomy mapping of the UDM concept to `class_uid` is not the
+    // authorization dimension). An empty effective deny-set preserves the
+    // long-lived UDM query byte-for-byte.
+    let Some(predicate) = source_scope_sql_predicate("source_type", denied_sources) else {
+        return base;
+    };
+    let time_gate = "PREWHERE timestamp >= now() - INTERVAL 24 HOUR";
+    debug_assert!(
+        base.contains(time_gate),
+        "coverage aggregate must retain its 24-hour PREWHERE"
+    );
+    base.replacen(time_gate, &format!("{time_gate} AND {predicate}"), 1)
+}
+
+async fn fetch_counts(
+    ch: &ChClient,
+    profile: &dyn SchemaProfile,
+    denied_sources: &BTreeSet<String>,
+) -> CoverageCounts {
+    let sql = coverage_sql(profile, coverage_is_clustered(), denied_sources);
+    match ch.query(&sql).fetch_one::<CoverageCounts>().await {
+        Ok(row) => row,
+        Err(e) => {
+            warn!(error = %e, "marketplace_coverage: ClickHouse aggregate failed; returning zeros");
+            CoverageCounts::default()
+        }
     }
 }
 
@@ -447,17 +484,6 @@ fn coverage_is_clustered() -> bool {
     std::env::var("CLICKHOUSE_CLUSTER")
         .ok()
         .is_some_and(|c| !c.trim().is_empty())
-}
-
-async fn fetch_counts(ch: &ChClient, profile: &dyn SchemaProfile) -> CoverageCounts {
-    let sql = coverage_sql(profile, coverage_is_clustered());
-    match ch.query(&sql).fetch_one::<CoverageCounts>().await {
-        Ok(row) => row,
-        Err(e) => {
-            warn!(error = %e, "marketplace_coverage: ClickHouse aggregate failed; returning zeros");
-            CoverageCounts::default()
-        }
-    }
 }
 
 // ============================================================================
@@ -473,14 +499,18 @@ pub struct MarketplaceCoverageService {
     /// hero is correct under OCSF (`nanosiem.ocsf_logs` + promoted dotted
     /// enrichment columns) as well as UDM (NAN-1241).
     profile: Arc<dyn SchemaProfile>,
+    /// Canonical effective source deny-set supplied by the authenticated API
+    /// context. It drives both the ClickHouse predicate and cache partition, so
+    /// the two cannot drift apart.
+    denied_sources: BTreeSet<String>,
 }
 
 impl MarketplaceCoverageService {
     /// Construct a service that consults `cache` before recomputing. In
     /// production the cache is Dragonfly-backed (see
     /// [`MarketplaceCoverageCache::with_redis`]), so a slow recompute on
-    /// one replica warms every user's hero on every replica for the next
-    /// 6 hours.
+    /// one replica warms the hero for callers with the same effective source
+    /// visibility on every replica for the next 6 hours.
     ///
     /// `profile` is the active schema profile (`state.config.schema_profile()`
     /// at the API call site); it selects the logs table and resolves each
@@ -490,12 +520,14 @@ impl MarketplaceCoverageService {
         ch_client: ChClient,
         cache: MarketplaceCoverageCache,
         profile: Arc<dyn SchemaProfile>,
+        denied_sources: BTreeSet<String>,
     ) -> Self {
         Self {
             pool,
             ch_client,
             cache,
             profile,
+            denied_sources,
         }
     }
 
@@ -506,7 +538,7 @@ impl MarketplaceCoverageService {
     /// hits the warm cache.
     #[instrument(skip(self))]
     pub async fn compute(&self) -> Result<MarketplaceCoverage, MarketplaceError> {
-        if let Some(cached) = self.cache.get().await {
+        if let Some(cached) = self.cache.get(&self.denied_sources).await {
             info!(
                 artifact_count = cached.artifacts.len(),
                 computed_at = %cached.computed_at,
@@ -518,15 +550,19 @@ impl MarketplaceCoverageService {
         let coverage = self.recompute().await?;
         // Best-effort: a Redis hiccup here just means the next caller also
         // recomputes. Don't fail the response over it.
-        self.cache.set(&coverage).await;
+        self.cache.set(&self.denied_sources, &coverage).await;
         Ok(coverage)
     }
 
-    /// Recompute coverage unconditionally, bypassing the cache. The
-    /// refresh endpoint calls `cache.invalidate()` first and then `compute()`
-    /// — keeping invalidate + compute as the public flow makes it obvious
-    /// that the cache is also re-warmed (via `compute`'s `set`) on the
-    /// next read.
+    /// Invalidate only this service's effective-source-scope partition, then
+    /// recompute and re-warm it. Encapsulation keeps the refresh endpoint from
+    /// accidentally evicting or populating a different caller's partition.
+    pub async fn refresh(&self) -> Result<MarketplaceCoverage, MarketplaceError> {
+        self.cache.invalidate(&self.denied_sources).await;
+        self.compute().await
+    }
+
+    /// Recompute coverage unconditionally, bypassing the cache.
     pub async fn recompute(&self) -> Result<MarketplaceCoverage, MarketplaceError> {
         // 1. Look up installed slug → name from Postgres so the hero chips can
         // render display labels rather than raw slugs. We pull both because
@@ -538,7 +574,8 @@ impl MarketplaceCoverageService {
         .await?;
 
         // 2. Fan one query at ClickHouse — built against the active schema.
-        let counts = fetch_counts(&self.ch_client, self.profile.as_ref()).await;
+        let counts =
+            fetch_counts(&self.ch_client, self.profile.as_ref(), &self.denied_sources).await;
 
         // 3. Project each artifact row using the counts + installed set + the
         // recommended map.
@@ -651,14 +688,14 @@ mod tests {
         // The profile-aware resolver must reproduce the long-lived UDM query
         // verbatim — zero behavioral drift for the dominant deployment.
         let p = crate::schema::UdmProfile::new();
-        assert_eq!(coverage_sql(&p, false), UDM_COVERAGE_SQL);
+        assert_eq!(coverage_sql(&p, false, &BTreeSet::new()), UDM_COVERAGE_SQL);
     }
 
     #[test]
     fn clustered_coverage_sql_routes_to_distributed_wrappers() {
         // NAN-1728 (H5/R11): on a cluster the coverage hero must read the
         // `_distributed` wrapper so it counts all shards, not the LB-connected one.
-        let udm = coverage_sql(&crate::schema::UdmProfile::new(), true);
+        let udm = coverage_sql(&crate::schema::UdmProfile::new(), true, &BTreeSet::new());
         assert!(
             udm.contains("\nFROM logs_distributed\n"),
             "clustered UDM must read the distributed wrapper:\n{udm}"
@@ -668,7 +705,7 @@ mod tests {
             "clustered UDM must not read the bare local table:\n{udm}"
         );
 
-        let ocsf = coverage_sql(&crate::schema::OcsfProfile::new(), true);
+        let ocsf = coverage_sql(&crate::schema::OcsfProfile::new(), true, &BTreeSet::new());
         assert!(
             ocsf.contains("FROM nanosiem.ocsf_logs_distributed"),
             "clustered OCSF must read the distributed wrapper:\n{ocsf}"
@@ -678,7 +715,7 @@ mod tests {
     #[test]
     fn ocsf_coverage_sql_targets_ocsf_table_and_omits_unmapped_columns() {
         let p = crate::schema::OcsfProfile::new();
-        let sql = coverage_sql(&p, false);
+        let sql = coverage_sql(&p, false, &BTreeSet::new());
 
         // FROM the OCSF table, not the nonexistent `logs`.
         assert!(sql.contains("FROM nanosiem.ocsf_logs"), "sql:\n{sql}");
@@ -711,5 +748,50 @@ mod tests {
         // (12 aliases) is preserved so CoverageCounts still decodes.
         assert!(sql.contains("countIf(0) AS user_enriched"), "sql:\n{sql}");
         assert_eq!(sql.matches(" AS ").count(), 12, "12 aliases:\n{sql}");
+    }
+
+    #[test]
+    fn restricted_coverage_sql_uses_canonical_source_scope_predicate() {
+        let denied = ["windows_sysmon", "audit"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let sql = coverage_sql(&crate::schema::UdmProfile::new(), false, &denied);
+
+        assert!(
+            sql.contains(
+                "PREWHERE timestamp >= now() - INTERVAL 24 HOUR \
+                 AND lower(source_type) NOT IN ('audit', 'windows_sysmon')"
+            ),
+            "coverage aggregate must gate every counted row with the canonical predicate:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn ocsf_scope_gate_uses_operational_source_type() {
+        let denied = ["audit"].into_iter().map(str::to_string).collect();
+        let sql = coverage_sql(&crate::schema::OcsfProfile::new(), false, &denied);
+
+        assert!(
+            sql.contains("AND lower(source_type) != 'audit'"),
+            "OCSF coverage must scope on the operational source_type String:\n{sql}"
+        );
+        assert!(
+            !sql.contains("lower(class_uid)"),
+            "class_uid is taxonomy, not the source authorization dimension:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn source_scope_values_are_escaped_by_canonical_builder() {
+        let denied = ["audit", "weird'name"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let sql = coverage_sql(&crate::schema::UdmProfile::new(), false, &denied);
+        assert!(
+            sql.contains("NOT IN ('audit', 'weird''name')"),
+            "scope values must be SQL-escaped:\n{sql}"
+        );
     }
 }

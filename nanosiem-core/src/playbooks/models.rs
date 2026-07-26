@@ -235,7 +235,17 @@ pub struct PlaybookPermission {
     #[serde(with = "typeid::playbook")]
     #[schema(value_type = String)]
     pub playbook_id: Uuid,
+    /// Display label. AUTHORITATIVE only for the reserved synthetic principals
+    /// (`api_key`, `demo_analyst`), which carry `role_id = None`.
     pub role: String,
+    /// NAN-2097: the STABLE ACL key for a real role. `None` only for the
+    /// synthetic principals above. Matching on the id rather than the name is
+    /// what makes an entry survive a role rename, prevents a later role reusing
+    /// the name from capturing the grant, and lets `ON DELETE RESTRICT` require
+    /// an operator to unwind grants explicitly before deleting a role.
+    #[serde(with = "typeid::role::opt")]
+    #[schema(value_type = Option<String>)]
+    pub role_id: Option<Uuid>,
     pub can_view: bool,
     pub can_run: bool,
     pub can_edit: bool,
@@ -546,8 +556,11 @@ pub struct FinishRunRequest {
 /// Body for `POST /api/playbooks/{id}/submit-for-review`.
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 pub struct SubmitForReviewRequest {
-    /// User to assign the review to. Optional — if omitted, any user with
-    /// `playbooks:publish` can approve.
+    /// Active user to assign the review to. They must currently hold
+    /// `playbooks:publish` and this playbook's publish ACL grant. Optional — if
+    /// omitted, any publisher with both grants can respond. If a named reviewer
+    /// later loses either grant, another eligible publisher may recover the
+    /// pending review.
     #[serde(default, with = "typeid::user::opt")]
     #[schema(value_type = Option<String>)]
     pub approver_id: Option<Uuid>,

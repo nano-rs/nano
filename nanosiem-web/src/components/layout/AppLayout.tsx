@@ -290,7 +290,7 @@ const settingsNavigation: NavItem[] = [
   { name: 'Risk Scoring', href: '/settings/risk', icon: TrendingUp, permissions: 'risk:configure', capability: 'risk' },
   { name: 'Storage', href: '/settings/storage', icon: Database, permissions: 'settings:retention' },
   { name: 'Search', href: '/settings/search', icon: Gauge, permissions: 'settings:system' },
-  { name: 'AI', href: '/settings/ai', icon: Bot, permissions: 'settings:ai', capability: 'melod' },
+  { name: 'AI', href: '/settings/ai', icon: Bot, permissions: ['settings:ai', 'settings:ai_providers', 'settings:agent_models'], capability: 'melod' },
   { name: 'Webhooks', href: '/settings/webhooks', icon: Webhook, permissions: 'settings:webhooks' },
   { name: 'GDPR', href: '/settings/gdpr', icon: ShieldCheck, permissions: 'gdpr:anonymize' },
   { name: 'Access Control', href: '/settings/access-control', icon: LucideShield, permissions: ['users:view', 'groups:view', 'roles:view', 'apikeys:view', 'audit:view'] },

@@ -56,6 +56,13 @@ pub enum RuleRepositoryError {
     #[error("Detection service error: {0}")]
     DetectionService(String),
 
+    /// The caller holds the repository capability but not the target-resource
+    /// capability the import would consume (NAN-2118). Carries the canonical
+    /// permission string so the HTTP layer renders the same
+    /// `Missing permission: <capability>` body as the direct detection route.
+    #[error("Missing permission: {0}")]
+    Forbidden(String),
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -91,6 +98,7 @@ impl RuleRepositoryError {
             RuleRepositoryError::RateLimited(_) => 429,
             RuleRepositoryError::SyncInProgress(_) => 409,
             RuleRepositoryError::RepositoryDisabled => 403,
+            RuleRepositoryError::Forbidden(_) => 403,
             _ => 500,
         }
     }

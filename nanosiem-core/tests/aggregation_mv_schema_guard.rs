@@ -51,6 +51,10 @@ const MIGRATION_152: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../clickhouse/152_ocsf_prevalence_route_through_agg.sql"
 ));
+const MIGRATION_169: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../clickhouse/169_profile_aware_logs_per_source_5m.sql"
+));
 
 /// The split-per-branch aggregation MV family this guard pins.
 const UDM_AGG_MVS: &[&str] = &[
@@ -175,7 +179,10 @@ fn aggregation_mvs_have_no_union_all_bodies() {
             "{name} (ocsf/init.sql) has a UNION ALL body — only its first SELECT would ever fire"
         );
     }
-    for (label, mig_sql) in [("migration 128", MIGRATION_128), ("migration 129", MIGRATION_129)] {
+    for (label, mig_sql) in [
+        ("migration 128", MIGRATION_128),
+        ("migration 129", MIGRATION_129),
+    ] {
         for (name, stmt) in &create_mv_statements(mig_sql) {
             assert!(
                 !stmt.to_uppercase().contains("UNION ALL"),
@@ -220,11 +227,34 @@ fn migration_128_matches_init_definitions() {
             "{name} differs between migration 128 and clickhouse/init.sql"
         );
     }
-    for name in OCSF_AGG_MVS {
+    for name in OCSF_AGG_MVS
+        .iter()
+        .filter(|name| **name != "nanosiem.ocsf_logs_per_source_5m_mv")
+    {
         assert_eq!(
             mig.get(*name),
             ocsf.get(*name),
             "{name} differs between migration 128 and clickhouse/ocsf/init.sql"
+        );
+    }
+}
+
+/// NAN-2154 supersedes both per-source telemetry MVs with definitions that
+/// write the profile-aware target and preserve the raw scope key.
+#[test]
+fn migration_169_matches_profile_aware_telemetry_init_definitions() {
+    let udm = create_mv_statements(UDM_INIT);
+    let ocsf = create_mv_statements(OCSF_INIT);
+    let mig = create_mv_statements(MIGRATION_169);
+
+    for (name, init) in [
+        ("nanosiem.logs_per_source_5m_mv", &udm),
+        ("nanosiem.ocsf_logs_per_source_5m_mv", &ocsf),
+    ] {
+        assert_eq!(
+            mig.get(name),
+            init.get(name),
+            "{name} differs between migration 169 and its init definition"
         );
     }
 }

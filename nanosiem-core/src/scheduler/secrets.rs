@@ -15,9 +15,12 @@
 use std::collections::HashMap;
 
 /// Placeholder substituted for secret auth-header values in API responses.
-/// Mirrors the value used by the Vector-config snapshot redactor
-/// (`parsers::vector_config::redaction`) so the masking UX is consistent.
-pub const REDACTED_PLACEHOLDER: &str = "***REDACTED***";
+///
+/// Re-exported from [`crate::config_secrets`], the canonical definition shared
+/// with the config-JSON redactor (NAN-2067/2068/2069) and the Vector-config
+/// snapshot redactor, so the masking UX — and the sentinel clients echo back on
+/// a read-modify-write — cannot drift between surfaces.
+pub use crate::config_secrets::REDACTED_PLACEHOLDER;
 
 /// Mask every auth-header value with [`REDACTED_PLACEHOLDER`], in place, before
 /// the owning job is serialized into an API response. Keys are preserved so

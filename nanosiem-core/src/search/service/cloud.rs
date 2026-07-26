@@ -673,40 +673,21 @@ impl SearchService {
             }
         };
 
-        // 6. User activity query (from pre-aggregated MV). The MV table `ua` keeps a
-        // real `user` column; only the `cloud_base` side of the join is profile-
-        // mapped (OCSF promotes `user` -> `user.name`). The inner subquery aliases
-        // the mapped column back to `user` so the join key + struct deser stay
-        // stable. Skipped entirely when the schema has no user column.
-        let user_activity_sql = user_col.as_ref().map(|user_col| format!(
-            r#"WITH {}
-            SELECT
-                cb.user AS user,
-                sum(ua.event_count) AS event_count,
-                uniqMerge(ua.distinct_services) AS distinct_services,
-                uniqMerge(ua.distinct_regions) AS distinct_regions,
-                uniqMerge(ua.distinct_ips) AS distinct_ips,
-                sum(ua.fail_count) AS fail_count,
-                sum(ua.permission_change_count) AS permission_change_count,
-                sum(ua.delete_count) AS delete_count,
-                sum(ua.mfa_count) AS mfa_count,
-                sum(ua.no_mfa_count) AS no_mfa_count
-            FROM {cloud_user_activity_table} AS ua
-            INNER JOIN (
-                SELECT DISTINCT {user_col} AS user
-                FROM cloud_base
-                WHERE {user_col} != ''
-            ) AS cb ON ua.user = cb.user
-            WHERE ua.time_bucket >= toStartOfHour(toDateTime('{}'))
-              AND ua.time_bucket <= '{}'
-            GROUP BY cb.user
-            ORDER BY event_count DESC
-            LIMIT 200"#,
-            base_cte,
-            crate::sql_hygiene::format_ch_bound(&time_range.start),
-            crate::sql_hygiene::format_ch_bound(&time_range.end),
-            cloud_user_activity_table = self.table_names.read("cloud_user_activity_agg"),
-        ));
+        // 6. User activity query. The shared production builder preserves the
+        // aggregate SQL byte-for-byte for an unrestricted caller. Any nonempty
+        // effective scope (including implicit audit) bypasses the provenance-free
+        // aggregate and computes the counters from the already-scoped cloud_base
+        // CTE within this view's bounded time window (NAN-2076).
+        let cloud_user_activity_table = self.table_names.read("cloud_user_activity_agg");
+        let user_activity_sql = build_cloud_user_activity_sql(
+            profile,
+            &format!("WITH {}", base_cte),
+            "cloud_base",
+            &cloud_user_activity_table,
+            time_range,
+            scope,
+            "            ",
+        );
 
         let user_activity_future = async {
             let Some(ref sql) = user_activity_sql else {
@@ -1125,48 +1106,23 @@ impl SearchService {
             None
         };
 
-        // `user` is profile-mapped (OCSF -> `user.name`); the MV `ua` keeps a real
-        // `user` column so only the cloud_base side is mapped. Skip the panel when
-        // the schema has no user column.
-        //
-        // NAN-1801 RESIDUAL: `cloud_user_activity_agg` carries no source_type, so
-        // the per-user COUNTERS may include denied-source contributions. The user
-        // SET is scope-safe — it joins against the enforced cloud_base CTE, so
-        // users visible only in denied sources never appear. Same residual as
-        // `build_cloud_view`'s identical panel and `entity_time_range_agg`.
-        let user_col = Self::cloud_principal_col(profile);
+        // The shared production builder uses this filter-aware source table for
+        // the restricted raw fallback, keeping the refreshed panel aligned with
+        // active cloud filters. Unrestricted callers retain the legacy aggregate
+        // query byte-for-byte (NAN-2076).
         let cloud_user_activity_table = self.table_names.read("cloud_user_activity_agg");
-        let user_activity_sql = match (include_panels, &user_col) {
-            (true, Some(user_col)) => Some(format!(
-                r#"{}
-                SELECT
-                    cb.user AS user,
-                    sum(ua.event_count) AS event_count,
-                    uniqMerge(ua.distinct_services) AS distinct_services,
-                    uniqMerge(ua.distinct_regions) AS distinct_regions,
-                    uniqMerge(ua.distinct_ips) AS distinct_ips,
-                    sum(ua.fail_count) AS fail_count,
-                    sum(ua.permission_change_count) AS permission_change_count,
-                    sum(ua.delete_count) AS delete_count,
-                    sum(ua.mfa_count) AS mfa_count,
-                    sum(ua.no_mfa_count) AS no_mfa_count
-                FROM {cloud_user_activity_table} AS ua
-                INNER JOIN (
-                    SELECT DISTINCT {user_col} AS user
-                    FROM {}
-                    WHERE {user_col} != ''
-                ) AS cb ON ua.user = cb.user
-                WHERE ua.time_bucket >= toStartOfHour(toDateTime('{}'))
-                  AND ua.time_bucket <= '{}'
-                GROUP BY cb.user
-                ORDER BY event_count DESC
-                LIMIT 200"#,
-                filtered_cte,
+        let user_activity_sql = if include_panels {
+            build_cloud_user_activity_sql(
+                profile,
+                &filtered_cte,
                 source_table,
-                crate::sql_hygiene::format_ch_bound(&time_range.start),
-                crate::sql_hygiene::format_ch_bound(&time_range.end),
-            )),
-            _ => None,
+                &cloud_user_activity_table,
+                time_range,
+                scope,
+                "                ",
+            )
+        } else {
+            None
         };
 
         // Execute core queries in parallel — each query that includes the
@@ -1904,6 +1860,115 @@ impl SearchService {
     }
 }
 
+/// Build the user-activity panel query shared by the initial cloud view and its
+/// paginated/filter refresh endpoint (NAN-2076).
+///
+/// `cloud_user_activity_agg` has no source provenance. The empty-scope branch
+/// deliberately retains the legacy aggregate query byte-for-byte; callers with
+/// any effective deny use the bounded, already-scoped raw CTE instead. The raw
+/// expressions mirror the active UDM/OCSF materialized-view definitions so the
+/// route changes authorization, not counter meaning.
+fn build_cloud_user_activity_sql(
+    profile: &dyn crate::schema::SchemaProfile,
+    with_clause: &str,
+    source_table: &str,
+    aggregate_table: &str,
+    time_range: &TimeRange,
+    scope: &ScopeSet,
+    indent: &str,
+) -> Option<String> {
+    let user_col = SearchService::cloud_principal_col(profile)?;
+    let field_indent = format!("{indent}    ");
+    let continuation_indent = format!("{indent}  ");
+
+    if !scope.is_restricted() {
+        return Some(format!(
+            r#"{with_clause}
+{indent}SELECT
+{field_indent}cb.user AS user,
+{field_indent}sum(ua.event_count) AS event_count,
+{field_indent}uniqMerge(ua.distinct_services) AS distinct_services,
+{field_indent}uniqMerge(ua.distinct_regions) AS distinct_regions,
+{field_indent}uniqMerge(ua.distinct_ips) AS distinct_ips,
+{field_indent}sum(ua.fail_count) AS fail_count,
+{field_indent}sum(ua.permission_change_count) AS permission_change_count,
+{field_indent}sum(ua.delete_count) AS delete_count,
+{field_indent}sum(ua.mfa_count) AS mfa_count,
+{field_indent}sum(ua.no_mfa_count) AS no_mfa_count
+{indent}FROM {aggregate_table} AS ua
+{indent}INNER JOIN (
+{field_indent}SELECT DISTINCT {user_col} AS user
+{field_indent}FROM {source_table}
+{field_indent}WHERE {user_col} != ''
+{indent}) AS cb ON ua.user = cb.user
+{indent}WHERE ua.time_bucket >= toStartOfHour(toDateTime('{start}'))
+{continuation_indent}AND ua.time_bucket <= '{end}'
+{indent}GROUP BY cb.user
+{indent}ORDER BY event_count DESC
+{indent}LIMIT 200"#,
+            start = crate::sql_hygiene::format_ch_bound(&time_range.start),
+            end = crate::sql_hygiene::format_ch_bound(&time_range.end),
+        ));
+    }
+
+    let provider_col = profile.udm_column_sql("cloud_provider")?;
+    let service_expr = profile
+        .udm_column_sql("cloud_service")
+        .map(|col| format!("uniq({col})"))
+        .unwrap_or_else(|| "toUInt64(0)".to_string());
+    let region_expr = profile
+        .udm_column_sql("cloud_region")
+        .map(|col| format!("uniq({col})"))
+        .unwrap_or_else(|| "toUInt64(0)".to_string());
+    let ip_expr = profile
+        .udm_column_sql("src_ip")
+        .map(|col| format!("uniq({col})"))
+        .unwrap_or_else(|| "toUInt64(0)".to_string());
+    let http_status_col = profile.udm_column_sql("http_status_code");
+    let fail_predicate = match profile.id() {
+        crate::schema::SchemaId::Ocsf => match http_status_col {
+            Some(col) => format!("({col} >= 400 OR status_id = 2)"),
+            None => "status_id = 2".to_string(),
+        },
+        _ => http_status_col
+            .map(|col| format!("{col} >= 400"))
+            .unwrap_or_else(|| "0".to_string()),
+    };
+    let permission_change_predicate =
+        SearchService::change_type_equals(profile, "permission_change");
+    let delete_predicate = match profile.id() {
+        crate::schema::SchemaId::Ocsf => format!(
+            "(class_uid = 6003 AND {})",
+            SearchService::change_type_equals(profile, "delete")
+        ),
+        _ => SearchService::change_type_equals(profile, "delete"),
+    };
+    let (mfa_predicate, no_mfa_predicate) = match profile.udm_column_sql("mfa_used") {
+        Some(col) => (format!("{col} = 1"), format!("{col} = 0")),
+        None => ("0".to_string(), "0".to_string()),
+    };
+
+    Some(format!(
+        r#"{with_clause}
+{indent}SELECT
+{field_indent}{user_col} AS user,
+{field_indent}count() AS event_count,
+{field_indent}{service_expr} AS distinct_services,
+{field_indent}{region_expr} AS distinct_regions,
+{field_indent}{ip_expr} AS distinct_ips,
+{field_indent}countIf({fail_predicate}) AS fail_count,
+{field_indent}countIf({permission_change_predicate}) AS permission_change_count,
+{field_indent}countIf({delete_predicate}) AS delete_count,
+{field_indent}countIf({mfa_predicate}) AS mfa_count,
+{field_indent}countIf({no_mfa_predicate}) AS no_mfa_count
+{indent}FROM {source_table}
+{indent}WHERE {provider_col} != '' AND {user_col} != ''
+{indent}GROUP BY {user_col}
+{indent}ORDER BY event_count DESC
+{indent}LIMIT 200"#
+    ))
+}
+
 /// Build the parse-failure fallback scan for the cloud-view base CTE
 /// (NAN-1797). This is the one hand-built `FROM logs` scan on the cloud path —
 /// every other cloud sub-query selects from the `cloud_base` CTE, whose
@@ -1963,3 +2028,7 @@ mod source_scope_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "cloud_user_activity_scope_tests.rs"]
+mod cloud_user_activity_scope_tests;

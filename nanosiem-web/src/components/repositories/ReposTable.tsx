@@ -16,8 +16,10 @@ import {
 import { SiGithub } from '@icons-pack/react-simple-icons';
 import { cn } from '@/lib/utils';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { PermissionAction } from './PermissionAction';
 import { Chk, FilterPills, SeverityDot, StatusChip } from './chips';
 import type { CategoryCount, RepoRuleView, RepoView } from './helpers';
+import type { ActionAccess } from './repository-action-policy';
 
 // ------------------------------------------------------------------
 // Header strip — title + active-repo pill above the three panes
@@ -117,6 +119,7 @@ interface ToolbarProps {
   onQueryChange: (q: string) => void;
   onBulkImport: () => void;
   onBulkClear: () => void;
+  bulkImportAccess: ActionAccess;
 }
 
 export function ReposToolbar({
@@ -126,6 +129,7 @@ export function ReposToolbar({
   onQueryChange,
   onBulkImport,
   onBulkClear,
+  bulkImportAccess,
 }: ToolbarProps) {
   return (
     <div className="flex items-center gap-2 px-3.5 h-[42px] border-b border-border bg-card/30 shrink-0">
@@ -135,14 +139,17 @@ export function ReposToolbar({
             <span className="font-mono tabular-nums">{selectedCount}</span> selected
           </span>
           <span className="text-[11px] text-muted-foreground">of {totalShown}</span>
-          <button
-            type="button"
-            onClick={onBulkImport}
-            className="h-[26px] px-2.5 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium flex items-center gap-1"
-          >
-            <Download className="w-[11px] h-[11px]" strokeWidth={2} />
-            Import {selectedCount}
-          </button>
+          <PermissionAction access={bulkImportAccess}>
+            <button
+              type="button"
+              onClick={onBulkImport}
+              disabled={!bulkImportAccess.allowed}
+              className="h-[26px] px-2.5 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium flex items-center gap-1 disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              <Download className="w-[11px] h-[11px]" strokeWidth={2} />
+              Import {selectedCount}
+            </button>
+          </PermissionAction>
           <button
             type="button"
             onClick={onBulkClear}
@@ -207,6 +214,7 @@ interface TableProps {
   onToggleSelectAll: (sel: boolean) => void;
   onSelectRule: (id: string) => void;
   onAction: (rule: RepoRuleView) => void;
+  getActionAccess: (rule: RepoRuleView) => ActionAccess;
   /** NAN-974 — current category tab, used for tab-specific empty-state copy. */
   activeCat?: 'all' | 'new' | 'updated' | 'imported' | 'drift' | 'deleted';
 }
@@ -237,6 +245,7 @@ export function ReposTable({
   onToggleSelectAll,
   onSelectRule,
   onAction,
+  getActionAccess,
   activeCat,
 }: TableProps) {
   const eligible = rules.filter((r) => r.status !== 'DELETED');
@@ -279,6 +288,7 @@ export function ReposTable({
               onToggleSelect={() => onToggleSelect(r.id)}
               onSelect={() => onSelectRule(r.id)}
               onAction={() => onAction(r)}
+              actionAccess={getActionAccess(r)}
             />
           ))}
           {rules.length === 0 && (
@@ -305,9 +315,18 @@ interface RowProps {
   onToggleSelect: () => void;
   onSelect: () => void;
   onAction: () => void;
+  actionAccess: ActionAccess;
 }
 
-function RepoRuleRow({ rule, selected, active, onToggleSelect, onSelect, onAction }: RowProps) {
+function RepoRuleRow({
+  rule,
+  selected,
+  active,
+  onToggleSelect,
+  onSelect,
+  onAction,
+  actionAccess,
+}: RowProps) {
   const deleted = rule.status === 'DELETED';
   const remapped = rule.source !== rule.destSource;
   return (
@@ -383,89 +402,112 @@ function RepoRuleRow({ rule, selected, active, onToggleSelect, onSelect, onActio
         <div className="text-[10px] text-muted-foreground truncate">{rule.updated}</div>
       </td>
       <td className="py-2 pl-1 pr-3" onClick={(e) => e.stopPropagation()}>
-        <RowAction rule={rule} onAction={onAction} />
+        <RowAction rule={rule} onAction={onAction} access={actionAccess} />
       </td>
     </tr>
   );
 }
 
-function RowAction({ rule, onAction }: { rule: RepoRuleView; onAction: () => void }) {
+function RowAction({
+  rule,
+  onAction,
+  access,
+}: {
+  rule: RepoRuleView;
+  onAction: () => void;
+  access: ActionAccess;
+}) {
   if (rule.status === 'IMPORTED') {
     return (
-      <Tooltip>
-        <TooltipTrigger asChild>
+      <PermissionAction access={access}>
+        <Tooltip>
+          <TooltipTrigger asChild>
           <button
             type="button"
             onClick={onAction}
-            className="h-[22px] px-2 rounded-md border border-border bg-card hover:bg-muted text-[10.5px] font-mono text-foreground/70"
+            disabled={!access.allowed}
+            className="h-[22px] px-2 rounded-md border border-border bg-card hover:bg-muted text-[10.5px] font-mono text-foreground/70 disabled:opacity-60 disabled:cursor-not-allowed"
           >
             Open
           </button>
-        </TooltipTrigger>
-        <TooltipContent>Already imported — open in editor</TooltipContent>
-      </Tooltip>
+          </TooltipTrigger>
+          <TooltipContent>Already imported — open in editor</TooltipContent>
+        </Tooltip>
+      </PermissionAction>
     );
   }
   if (rule.status === 'DELETED') {
     return (
-      <Tooltip>
-        <TooltipTrigger asChild>
+      <PermissionAction access={access}>
+        <Tooltip>
+          <TooltipTrigger asChild>
           <button
             type="button"
             onClick={onAction}
-            className="h-[22px] px-2 rounded-md border border-destructive/30 text-[10.5px] font-mono text-destructive hover:bg-destructive/5"
+            disabled={!access.allowed}
+            className="h-[22px] px-2 rounded-md border border-destructive/30 text-[10.5px] font-mono text-destructive hover:bg-destructive/5 disabled:opacity-60 disabled:cursor-not-allowed"
           >
-            Remove
+            Review
           </button>
-        </TooltipTrigger>
-        <TooltipContent>Remove from your library</TooltipContent>
-      </Tooltip>
+          </TooltipTrigger>
+          <TooltipContent>Open the linked rule to review the upstream removal</TooltipContent>
+        </Tooltip>
+      </PermissionAction>
     );
   }
   if (rule.status === 'DRIFT') {
     return (
-      <Tooltip>
-        <TooltipTrigger asChild>
+      <PermissionAction access={access}>
+        <Tooltip>
+          <TooltipTrigger asChild>
           <button
             type="button"
             onClick={onAction}
-            className="h-[22px] px-2 rounded-md border border-destructive/30 bg-destructive/5 text-[10.5px] font-mono text-destructive hover:bg-destructive/10"
+            disabled={!access.allowed}
+            className="h-[22px] px-2 rounded-md border border-destructive/30 bg-destructive/5 text-[10.5px] font-mono text-destructive hover:bg-destructive/10 disabled:opacity-60 disabled:cursor-not-allowed"
           >
             Resolve
           </button>
-        </TooltipTrigger>
-        <TooltipContent>Resolve drift — merge or discard local changes</TooltipContent>
-      </Tooltip>
+          </TooltipTrigger>
+          <TooltipContent>Resolve drift — merge or discard local changes</TooltipContent>
+        </Tooltip>
+      </PermissionAction>
     );
   }
   if (rule.status === 'UPDATED') {
     return (
-      <Tooltip>
-        <TooltipTrigger asChild>
+      <PermissionAction access={access}>
+        <Tooltip>
+          <TooltipTrigger asChild>
           <button
             type="button"
             onClick={onAction}
-            className="h-[22px] px-2 rounded-md border border-warning/30 bg-warning/10 text-[10.5px] font-mono text-warning hover:bg-warning/15"
+            disabled={!access.allowed}
+            className="h-[22px] px-2 rounded-md border border-warning/30 bg-warning/10 text-[10.5px] font-mono text-warning hover:bg-warning/15 disabled:opacity-60 disabled:cursor-not-allowed"
           >
             Update
           </button>
-        </TooltipTrigger>
-        <TooltipContent>Update to latest version</TooltipContent>
-      </Tooltip>
+          </TooltipTrigger>
+          <TooltipContent>Update to latest version</TooltipContent>
+        </Tooltip>
+      </PermissionAction>
     );
   }
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
+    <PermissionAction access={access}>
+      <Tooltip>
+        <TooltipTrigger asChild>
         <button
           type="button"
           onClick={onAction}
-          className="h-[22px] px-2 rounded-md bg-primary text-primary-foreground text-[10.5px] font-mono font-semibold hover:bg-primary/90"
+          disabled={!access.allowed}
+          className="h-[22px] px-2 rounded-md bg-primary text-primary-foreground text-[10.5px] font-mono font-semibold hover:bg-primary/90 disabled:opacity-60 disabled:cursor-not-allowed"
         >
           Import
         </button>
-      </TooltipTrigger>
-      <TooltipContent>Import into your rule library</TooltipContent>
-    </Tooltip>
+        </TooltipTrigger>
+        <TooltipContent>Import into your rule library</TooltipContent>
+      </Tooltip>
+    </PermissionAction>
   );
 }

@@ -105,12 +105,37 @@ impl SysmonGenerator {
         parent: &Process,
         process_hash: Option<&str>,
     ) -> Event {
-        let mut rng = rand::rng();
-
         let hash = process_hash
             .map(str::to_string)
             .unwrap_or_else(|| deterministic_process_hash(&child.path, &child.name));
+        self.process_create_from_hash(ts, entity, child, parent, Some(&hash))
+    }
 
+    /// Event ID 1 for a scripted process whose executable should look exactly
+    /// like normal log-blaster traffic. The most common matching profile hash is
+    /// reused. If the normal profile has no observation for this executable, the
+    /// hash is omitted instead of inventing a novel value that would make a
+    /// legitimate wrapper appear compromised through low prevalence.
+    pub fn process_create_from_profile(
+        &self,
+        ts: DateTime<Utc>,
+        entity: &Entity,
+        child: &Process,
+        parent: &Process,
+    ) -> Event {
+        let hash = profiles::profiles().process_hash_for(&child.path, &child.name);
+        self.process_create_from_hash(ts, entity, child, parent, hash)
+    }
+
+    fn process_create_from_hash(
+        &self,
+        ts: DateTime<Utc>,
+        entity: &Entity,
+        child: &Process,
+        parent: &Process,
+        process_hash: Option<&str>,
+    ) -> Event {
+        let mut rng = rand::rng();
         let event_data = serde_json::json!({
             "RuleName": "ProcessCreate",
             "UtcTime": ts.format("%Y-%m-%d %H:%M:%S.%3f").to_string(),
@@ -129,7 +154,7 @@ impl SysmonGenerator {
             "LogonId": format!("0x{:X}", rng.random_range(0x10000u32..0xFFFFF)),
             "TerminalSessionId": "1",
             "IntegrityLevel": "Medium",
-            "Hashes": format!("SHA256={}", hash),
+            "Hashes": process_hash.map(|hash| format!("SHA256={hash}")).unwrap_or_default(),
             "ParentProcessGuid": format!("{{{}}}", parent.guid),
             "ParentProcessId": parent.pid.to_string(),
             "ParentImage": parent.path,
@@ -138,6 +163,99 @@ impl SysmonGenerator {
         });
 
         self.build_event(ts, entity, 1, "Process Create", event_data, &child.name)
+    }
+
+    /// Event ID 11: an explicit file written by a known process.
+    pub fn file_create_from(
+        &self,
+        ts: DateTime<Utc>,
+        entity: &Entity,
+        actor: &Process,
+        target_filename: &str,
+        file_hash: Option<&str>,
+    ) -> Event {
+        let event_data = serde_json::json!({
+            "RuleName": "-",
+            "UtcTime": ts.format("%Y-%m-%d %H:%M:%S.%3f").to_string(),
+            "ProcessGuid": format!("{{{}}}", actor.guid),
+            "ProcessId": actor.pid.to_string(),
+            "Image": actor.path,
+            "TargetFilename": target_filename,
+            "CreationUtcTime": ts.format("%Y-%m-%d %H:%M:%S.%3f").to_string(),
+            "Hashes": file_hash.map(|hash| format!("SHA256={hash}")).unwrap_or_default(),
+            "User": entity.user,
+        });
+
+        self.build_event(ts, entity, 11, "File created", event_data, target_filename)
+    }
+
+    /// Event ID 22: an explicit DNS query from a campaign process.
+    pub fn dns_query_from(
+        &self,
+        ts: DateTime<Utc>,
+        entity: &Entity,
+        actor: &Process,
+        query_name: &str,
+        result_ip: &str,
+    ) -> Event {
+        let event_data = serde_json::json!({
+            "RuleName": "-",
+            "UtcTime": ts.format("%Y-%m-%d %H:%M:%S.%3f").to_string(),
+            "ProcessGuid": format!("{{{}}}", actor.guid),
+            "ProcessId": actor.pid.to_string(),
+            "QueryName": query_name,
+            "QueryStatus": "0",
+            "QueryResults": format!("type:  1 {result_ip}"),
+            "Image": actor.path,
+            "User": entity.user,
+        });
+
+        self.build_event(ts, entity, 22, "Dns query", event_data, query_name)
+    }
+
+    /// Event ID 3: an explicit outbound connection from a campaign process.
+    pub fn network_connect_from(
+        &self,
+        ts: DateTime<Utc>,
+        entity: &Entity,
+        actor: &Process,
+        destination_hostname: &str,
+        destination_ip: &str,
+        destination_port: u16,
+    ) -> Event {
+        let mut rng = rand::rng();
+        let event_data = serde_json::json!({
+            "RuleName": "NetworkConnect",
+            "UtcTime": ts.format("%Y-%m-%d %H:%M:%S.%3f").to_string(),
+            "ProcessGuid": format!("{{{}}}", actor.guid),
+            "ProcessId": actor.pid.to_string(),
+            "Image": actor.path,
+            "User": entity.user,
+            "Protocol": "tcp",
+            "Initiated": "true",
+            "SourceIsIpv6": "false",
+            "SourceIp": entity.ip,
+            "SourceHostname": entity.fqdn(),
+            "SourcePort": rng.random_range(49152u16..65535).to_string(),
+            "SourcePortName": "-",
+            "DestinationIsIpv6": "false",
+            "DestinationIp": destination_ip,
+            "DestinationHostname": destination_hostname,
+            "DestinationPort": destination_port.to_string(),
+            "DestinationPortName": if destination_port == 443 { "https" } else { "-" },
+        });
+
+        self.build_event(
+            ts,
+            entity,
+            3,
+            "Network connection detected",
+            event_data,
+            &format!(
+                "{}→{}:{}",
+                actor.name, destination_hostname, destination_port
+            ),
+        )
     }
 
     /// Event ID 3: Network Connection

@@ -26,6 +26,10 @@ pub enum LogSourceRepositoryError {
     NotFound(String),
     #[error("Log source name already exists: {0}")]
     DuplicateName(String),
+    /// Optimistic-concurrency precondition failed: the row changed after the
+    /// caller last read it.
+    #[error("Log source was modified by another update: {0}")]
+    StaleVersion(uuid::Uuid),
 }
 
 pub struct LogSourceRepository {

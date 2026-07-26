@@ -66,6 +66,7 @@ export interface TestConnectionResult {
   can_read: boolean;
   can_write: boolean;
   default_branch: string | null;
+  error_code?: string;
   message: string;
 }
 

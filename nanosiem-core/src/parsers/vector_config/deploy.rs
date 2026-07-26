@@ -26,7 +26,9 @@ use crate::parsers::types::Parser;
 /// test (passing the committed `enrichment_lane_content()`) and the deploy-time
 /// guard in `write_enrichment_config` (passing the freshly-generated lane), so
 /// the same invariant gates both `cargo test` and every live reload.
-pub(super) fn enrichment_lane_backpressure_violations(candidate_enrichment_toml: &str) -> Vec<String> {
+pub(super) fn enrichment_lane_backpressure_violations(
+    candidate_enrichment_toml: &str,
+) -> Vec<String> {
     use std::collections::{HashMap, HashSet};
 
     // NAN-1572: `opentelemetry` is the Vector source `type` of the OOTB OTLP
@@ -52,7 +54,11 @@ pub(super) fn enrichment_lane_backpressure_violations(candidate_enrichment_toml:
     fn input_list(def: &toml::Value) -> Vec<String> {
         def.get("inputs")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -70,13 +76,34 @@ pub(super) fn enrichment_lane_backpressure_violations(candidate_enrichment_toml:
     }
 
     let docs: [(&str, &str); 8] = [
-        ("00-base.toml", include_str!("../../../../config/vector/00-base.toml")),
-        ("01-vector-source.toml", include_str!("../../../../config/vector/01-vector-source.toml")),
-        ("02-hec-source.toml", include_str!("../../../../config/vector/02-hec-source.toml")),
-        ("92-metrics.toml", include_str!("../../../../config/vector/92-metrics.toml")),
-        ("_router.toml", include_str!("../../../../config/vector/sources/parsers/_router.toml")),
-        ("_combiner.toml", include_str!("../../../../config/vector/sources/parsers/_combiner.toml")),
-        ("pipeline_config_content()", VectorConfigManager::pipeline_config_content()),
+        (
+            "00-base.toml",
+            include_str!("../../../../config/vector/00-base.toml"),
+        ),
+        (
+            "01-vector-source.toml",
+            include_str!("../../../../config/vector/01-vector-source.toml"),
+        ),
+        (
+            "02-hec-source.toml",
+            include_str!("../../../../config/vector/02-hec-source.toml"),
+        ),
+        (
+            "92-metrics.toml",
+            include_str!("../../../../config/vector/92-metrics.toml"),
+        ),
+        (
+            "_router.toml",
+            include_str!("../../../../config/vector/sources/parsers/_router.toml"),
+        ),
+        (
+            "_combiner.toml",
+            include_str!("../../../../config/vector/sources/parsers/_combiner.toml"),
+        ),
+        (
+            "pipeline_config_content()",
+            VectorConfigManager::pipeline_config_content(),
+        ),
         ("candidate _enrichment.toml", candidate_enrichment_toml),
     ];
 
@@ -117,7 +144,11 @@ pub(super) fn enrichment_lane_backpressure_violations(candidate_enrichment_toml:
                 sinks.insert(
                     name.clone(),
                     SinkInfo {
-                        ty: def.get("type").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        ty: def
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
                         inputs: input_list(def),
                         blocks,
                         acks,
@@ -321,8 +352,10 @@ impl VectorConfigManager {
             let filepath = self.parsers_dir.join(&filename);
 
             if parser.enabled {
-                // Write credential files if needed (GCP service account JSON, etc.)
-                self.write_credential_files(parser).await?;
+                // NAN-2126: remove any secret files left by the retired
+                // parser-owned transport path. Modern credentials are emitted
+                // exclusively by source_configurations.
+                self.remove_legacy_parser_credential_files(parser).await?;
 
                 // Write config for enabled parser
                 let config = self.generate_parser_config(parser);
@@ -343,8 +376,7 @@ impl VectorConfigManager {
                         filepath.display()
                     );
                 }
-                // Clean up credential files for disabled parsers
-                self.remove_credential_files(parser).await?;
+                self.remove_legacy_parser_credential_files(parser).await?;
             }
         }
 
@@ -373,7 +405,8 @@ impl VectorConfigManager {
         // Write the dynamic router config for routed parsers. Enrichment
         // parsers are passed too so the enrichment_router emits a per-source
         // route for each (NAN-1151).
-        self.write_router_config(&log_parsers, &enrichment_parsers).await?;
+        self.write_router_config(&log_parsers, &enrichment_parsers)
+            .await?;
 
         // NAN-1246: write the shared OCSF ingestion sink (only under
         // NANO_SCHEMA_PROFILE=ocsf) wired to every parser's generated `_ocsf_prepare`
@@ -532,7 +565,16 @@ impl VectorConfigManager {
         parsers: &[Parser],
     ) -> Result<(), VectorConfigError> {
         let combiner_path = self.parsers_dir.join("_combiner.toml");
+        let config = Self::combiner_config_content_for(parsers, Self::ocsf_mode());
+        fs::write(&combiner_path, &config).await?;
+        Ok(())
+    }
 
+    /// Build the shared persisted-log combiner plus a narrow pre-sampling health
+    /// branch. The latter sees every parser output, including recovered failures
+    /// and native OCSF successes, before optional sampling can skew the health
+    /// denominator.
+    pub(super) fn combiner_config_content_for(parsers: &[Parser], ocsf: bool) -> String {
         let enabled_parsers: Vec<_> = parsers.iter().filter(|p| p.enabled).collect();
 
         let mut config = String::from(
@@ -548,11 +590,16 @@ impl VectorConfigManager {
                  [transforms.db_parsers_combined]\n\
                  type = \"filter\"\n\
                  inputs = [\"prepare_output\"]\n\
+                 condition = \"false\"\n\
+                 \n\
+                 [transforms.db_parser_health]\n\
+                 type = \"filter\"\n\
+                 inputs = [\"prepare_output\"]\n\
                  condition = \"false\"\n",
             );
         } else {
-            // Combine all parser outputs
-            let inputs: Vec<String> = enabled_parsers
+            // The persisted stream honors each parser's optional sample step.
+            let persisted_inputs: Vec<String> = enabled_parsers
                 .iter()
                 .map(|p| {
                     let safe = Self::safe_name(&p.name);
@@ -568,17 +615,58 @@ impl VectorConfigManager {
                 })
                 .collect();
 
+            // Health consumes the unsampled UDM output. Under OCSF it also sees
+            // native successes, which bypass the UDM output after the split.
+            let mut health_inputs: Vec<String> = enabled_parsers
+                .iter()
+                .map(|p| format!("\"{}_output\"", Self::safe_name(&p.name)))
+                .collect();
+            if ocsf {
+                health_inputs.extend(
+                    enabled_parsers
+                        .iter()
+                        .filter(|p| p.kind != "enrichment")
+                        .map(|p| format!("\"{}_ocsf_prepare\"", Self::safe_name(&p.name))),
+                );
+            }
+
             config.push_str(&format!(
                 "[transforms.db_parsers_combined]\n\
                  type = \"remap\"\n\
                  inputs = [{}]\n\
-                 source = '''\n. = .\n'''\n",
-                inputs.join(", ")
+                 source = '''\n. = .\n'''\n\
+                 \n\
+                 # NAN-2164: reduce every pre-sampling parser attempt to a tiny\n\
+                 # health row. The ClickHouse ingress table is ENGINE=Null; only\n\
+                 # its five-minute aggregate survives.\n\
+                 [transforms.db_parser_health]\n\
+                 type = \"remap\"\n\
+                 inputs = [{}]\n\
+                 drop_on_abort = true\n\
+                 drop_on_error = true\n\
+                 source = '''\n\
+                 metadata_val, metadata_err = parse_json(.metadata)\n\
+                 if metadata_err != null || !is_object(metadata_val) {{ metadata_val = {{}} }}\n\
+                 parser_id = to_string(._nano_parser_id) ?? \"\"\n\
+                 if parser_id == \"\" {{ parser_id = to_string(metadata_val.parser_id) ?? \"\" }}\n\
+                 if parser_id == \"\" {{ abort }}\n\
+                 source_type = downcase(to_string(.source_type) ?? \"unknown\")\n\
+                 if source_type == \"\" {{ source_type = \"unknown\" }}\n\
+                 failed = to_bool(._nano_parser_failure) ?? false\n\
+                 parse_failure = if failed {{ 1 }} else {{ 0 }}\n\
+                 . = {{\n\
+                     \"parser_id\": parser_id,\n\
+                     \"source_type\": source_type,\n\
+                     \"observed_at\": now(),\n\
+                     \"parse_failure\": parse_failure\n\
+                 }}\n\
+                 '''\n",
+                persisted_inputs.join(", "),
+                health_inputs.join(", ")
             ));
         }
 
-        fs::write(&combiner_path, &config).await?;
-        Ok(())
+        config
     }
 
     /// Returns the static pipeline config content (generic parser, normalization, clickhouse mapping, sink).
@@ -764,6 +852,9 @@ type = "remap"
 inputs = ["prepare_output", "db_parsers_combined"]
 source = '''
 .id = uuid_v7()
+# Internal marker exists only long enough for the per-parser sample transform
+# to retain failures. The durable diagnostic lives in metadata.parse_error.
+del(._nano_parser_failure)
 if !exists(.timestamp) {
     .timestamp = format_timestamp!(now(), format: "%Y-%m-%d %H:%M:%S")
 } else if is_string(.timestamp) {
@@ -1005,6 +1096,51 @@ max_events = ${VECTOR_BATCH_MAX_EVENTS:-50000}
 timeout_secs = ${VECTOR_BATCH_TIMEOUT_SECS:-10}
 
 [sinks.clickhouse_logs.request]
+concurrency = "adaptive"
+timeout_secs = 120
+retry_initial_backoff_secs = 1
+retry_max_duration_secs = 300
+
+# =============================================================================
+# Parser Health Sink (NAN-2164)
+#
+# `db_parser_health` sees parser output before optional sampling and reduces
+# each attempt to parser_id/source_type/observed_at/failure. The destination is
+# ENGINE=Null; its materialized view retains only five-minute aggregates.
+# =============================================================================
+[sinks.clickhouse_parser_health]
+type = "clickhouse"
+inputs = ["db_parser_health"]
+
+endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
+database = "${CLICKHOUSE_DATABASE:-nanosiem}"
+table = "${CLICKHOUSE_PARSER_HEALTH_TABLE:-parser_health_ingest}"
+
+auth.strategy = "basic"
+auth.user = "${CLICKHOUSE_USER:-nanosiem}"
+auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
+
+compression = "gzip"
+date_time_best_effort = true
+skip_unknown_fields = true
+
+[sinks.clickhouse_parser_health.query_settings.async_insert_settings]
+deduplicate = true
+
+[sinks.clickhouse_parser_health.buffer]
+type = "memory"
+max_events = 100000
+when_full = "drop_newest"
+
+[sinks.clickhouse_parser_health.acknowledgements]
+enabled = false
+
+[sinks.clickhouse_parser_health.batch]
+max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}
+max_events = ${VECTOR_BATCH_MAX_EVENTS:-50000}
+timeout_secs = ${VECTOR_BATCH_TIMEOUT_SECS:-10}
+
+[sinks.clickhouse_parser_health.request]
 concurrency = "adaptive"
 timeout_secs = 120
 retry_initial_backoff_secs = 1
@@ -1293,7 +1429,11 @@ if otlp_time != "" {
             }
             let transform = format!("enrichment_normalize_{route}");
             let vrl = p.normalize_vrl.as_deref().unwrap_or("");
-            let table = p.target_table.as_deref().unwrap_or("user_registry").to_string();
+            let table = p
+                .target_table
+                .as_deref()
+                .unwrap_or("user_registry")
+                .to_string();
 
             out.push_str(&format!(
                 "[transforms.{transform}]\n\
@@ -1305,7 +1445,10 @@ if otlp_time != "" {
                  source = '''\n{vrl}\n'''\n\n"
             ));
 
-            by_table.entry(table).or_default().push(format!("\"{transform}\""));
+            by_table
+                .entry(table)
+                .or_default()
+                .push(format!("\"{transform}\""));
             dropped_inputs.push(format!("\"{transform}.dropped\""));
         }
 

@@ -30,6 +30,7 @@ pub mod audit;
 pub mod auth;
 pub mod baseline;
 pub(crate) mod config_safety;
+pub mod config_secrets;
 pub mod crypto;
 pub mod db;
 pub mod demo;
@@ -279,11 +280,10 @@ pub use playbooks::{
 pub use parsers::{
     AwsS3Credentials, CloudCredential, CloudProvider, CreateCloudCredential, CredentialRepository,
     CredentialRepositoryError, DeploymentAction, DeploymentResult, DeploymentStatus,
-    GcpPubSubCredentials, GcpPubSubSourceConfig, KafkaCredentials,
-    KafkaSourceConfig as ParserKafkaSourceConfig, NewParser, Parser, ParserCategory,
-    ParserDeployment, ParserService, ParserServiceError, ParserTestResult, PublicationOutcome,
-    S3SourceConfig, SnapshotBundle, UpdateCloudCredential, UpdateParser, ValidationResult,
-    VectorConfigPublicationError, VectorConfigPublisher, VrlValidationResult,
+    GcpPubSubCredentials, KafkaCredentials, NewParser, Parser, ParserCategory, ParserDeployment,
+    ParserService, ParserServiceError, ParserTestResult, PublicationOutcome, SnapshotBundle,
+    UpdateCloudCredential, UpdateParser, ValidationResult, VectorConfigPublicationError,
+    VectorConfigPublisher, VrlValidationResult,
 };
 pub use prevalence::{
     ArtifactType, BulkPrevalenceRequest, ExportFormat, PrevalenceConfig, PrevalenceData,

@@ -64,10 +64,16 @@ impl ParserService {
             )));
         }
 
-        // Azure Blob requires credential_id (AWS S3 can use IAM roles)
-        if new_parser.source_type == "azure_blob" && new_parser.credential_id.is_none() {
+        if matches!(
+            new_parser.source_type.as_str(),
+            "kafka" | "aws_s3" | "gcp_pubsub"
+        ) && new_parser.dispatch_source_config_id.is_none()
+        {
             return Err(ParserServiceError::InvalidSourceType(
-                "azure_blob source type requires credential_id".to_string(),
+                format!(
+                    "{} parsers require dispatch_source_config_id; transport configuration belongs to source_configurations",
+                    new_parser.source_type
+                ),
             ));
         }
 
@@ -124,13 +130,15 @@ impl ParserService {
                 return Err(ParserServiceError::InvalidSourceType(source_type.clone()));
             }
 
-            // Azure Blob requires credential_id
-            if source_type == "azure_blob" && update.credential_id.is_none() {
-                // Check if the existing parser has a credential_id
+            if matches!(source_type.as_str(), "kafka" | "aws_s3" | "gcp_pubsub")
+                && update.dispatch_source_config_id.is_none()
+            {
                 let existing = self.get(id).await?;
-                if existing.credential_id.is_none() {
+                if existing.dispatch_source_config_id.is_none() {
                     return Err(ParserServiceError::InvalidSourceType(
-                        "azure_blob source type requires credential_id".to_string(),
+                        format!(
+                            "{source_type} parsers require dispatch_source_config_id; transport configuration belongs to source_configurations"
+                        ),
                     ));
                 }
             }
@@ -239,14 +247,27 @@ mod tests {
     /// non-alphanumerics to `_`, so spaces/dashes/case all normalize.
     #[test]
     fn reserves_nano_prefixed_route_claims() {
-        for name in ["nano_enrich", "Nano Enrich", "nano enrich", "nano-enrich", "NANO_IDENTITY"] {
+        for name in [
+            "nano_enrich",
+            "Nano Enrich",
+            "nano enrich",
+            "nano-enrich",
+            "NANO_IDENTITY",
+        ] {
             assert!(
                 reserved_route_claim(name).is_some(),
                 "expected '{name}' to be reserved (safe_name starts with nano_)"
             );
         }
         // Not reserved: no `nano_` prefix on the normalized route value.
-        for name in ["Apache HTTP Server", "windows_event", "nanoenrich", "nano", "okta", "nginx"] {
+        for name in [
+            "Apache HTTP Server",
+            "windows_event",
+            "nanoenrich",
+            "nano",
+            "okta",
+            "nginx",
+        ] {
             assert!(
                 reserved_route_claim(name).is_none(),
                 "expected '{name}' to be allowed (safe_name does not start nano_)"

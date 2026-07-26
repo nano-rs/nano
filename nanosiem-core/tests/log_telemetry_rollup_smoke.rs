@@ -1,6 +1,6 @@
 //! End-to-end smoke test for the per-source_type log telemetry rollup (NAN-733).
 //!
-//! Boots against a local docker-compose stack, ensures migration 116 has been
+//! Boots against a local docker-compose stack, ensures migration 169 has been
 //! applied (prerequisite — the test does not run migrations itself; rely on
 //! the API binary's startup migrator or `cargo run --bin clickhouse_migrator`),
 //! inserts a handful of synthetic rows into `nanosiem.logs`, waits for the
@@ -43,18 +43,18 @@ async fn rollup_matches_raw_logs_for_inserted_rows() {
 
     let ch = pool.clickhouse();
 
-    // Sanity: rollup table must exist (migration 116 applied).
+    // Sanity: profile-aware rollup table must exist (migration 169 applied).
     let exists: u64 = ch
         .query(
             "SELECT count() FROM system.tables \
-             WHERE database = 'nanosiem' AND name = 'logs_per_source_5m'",
+             WHERE database = 'nanosiem' AND name = 'logs_per_source_5m_v2'",
         )
         .fetch_one()
         .await
         .expect("system.tables query should succeed");
     if exists == 0 {
         panic!(
-            "logs_per_source_5m table does not exist — apply migration 116 \
+            "logs_per_source_5m_v2 table does not exist — apply migration 169 \
              before running this test (e.g., start the API once or run the \
              clickhouse_migrator binary)."
         );
@@ -106,7 +106,10 @@ async fn rollup_matches_raw_logs_for_inserted_rows() {
     };
 
     assert_eq!(row.events, 5, "events count mismatch: {row:?}");
-    assert!(row.bytes > 0, "bytes should be non-zero (we wrote messages)");
+    assert!(
+        row.bytes > 0,
+        "bytes should be non-zero (we wrote messages)"
+    );
     assert!(
         row.last_event_at.is_some(),
         "last_event_at should be populated"
@@ -118,7 +121,120 @@ async fn rollup_matches_raw_logs_for_inserted_rows() {
         "last_event_at drift > 60s: now={now}, last={last}, drift={drift}s"
     );
 
-    println!("Rollup parity check passed: {} events, {} bytes", row.events, row.bytes);
+    // If the OCSF overlay exists, simulate Vector's transitional dual-write:
+    // the same logical five events land in UDM and OCSF. Each lane must contain
+    // five, never ten, and selecting either active profile must count once.
+    let has_ocsf: u64 = ch
+        .query(
+            "SELECT count() FROM system.tables \
+             WHERE database = 'nanosiem' AND name = 'ocsf_logs'",
+        )
+        .fetch_one()
+        .await
+        .expect("OCSF table existence query should succeed");
+    if has_ocsf != 0 {
+        let ocsf_insert = format!(
+            "INSERT INTO nanosiem.ocsf_logs \
+             (id, timestamp, source_type, event_bytes, `metadata.product.name`) VALUES \
+             (generateUUIDv4(), now64(3), '{st}', 9, 'vector'), \
+             (generateUUIDv4(), now64(3), '{st}', 9, 'vector'), \
+             (generateUUIDv4(), now64(3), '{st}', 11, 'vector'), \
+             (generateUUIDv4(), now64(3), '{st}', 10, 'vector'), \
+             (generateUUIDv4(), now64(3), '{st}', 10, 'vector')",
+            st = unique
+        );
+        ch.query(&ocsf_insert)
+            .execute()
+            .await
+            .expect("insert into ocsf_logs should succeed");
+
+        for profile in ["udm", "ocsf"] {
+            let count: u64 = ch
+                .query(&format!(
+                    "SELECT coalesce(sum(events), 0) \
+                     FROM nanosiem.logs_per_source_5m_v2 \
+                     WHERE schema_profile = '{profile}' AND source_type = '{unique}'"
+                ))
+                .fetch_one()
+                .await
+                .expect("profile rollup count should succeed");
+            assert_eq!(
+                count, 5,
+                "{profile} lane must count a dual-written event exactly once"
+            );
+        }
+
+        // Direct OCSF writers commonly omit source_type and identify themselves
+        // by product name. Display that product, but retain raw `unknown` for
+        // authorization. Denying `unknown` must hide it; denying the product
+        // must not hide a raw source the caller may search.
+        let product = format!("direct_{}", Uuid::new_v4().simple());
+        ch.query(&format!(
+            "INSERT INTO nanosiem.ocsf_logs \
+             (id, timestamp, source_type, event_bytes, `metadata.product.name`) \
+             VALUES (generateUUIDv4(), now64(3), 'unknown', 17, '{product}')"
+        ))
+        .execute()
+        .await
+        .expect("direct OCSF insert should succeed");
+
+        let provenance: (String, String, u8, u64) = ch
+            .query(&format!(
+                "SELECT source_type, scope_source_type, \
+                        min(scope_source_type_complete), sum(events) \
+                 FROM nanosiem.logs_per_source_5m_v2 \
+                 WHERE schema_profile = 'ocsf' AND source_type = '{product}' \
+                 GROUP BY source_type, scope_source_type"
+            ))
+            .fetch_one()
+            .await
+            .expect("direct-writer rollup row should exist");
+        assert_eq!(provenance, (product.clone(), "unknown".into(), 1, 1));
+
+        let hidden: u64 = ch
+            .query(&format!(
+                "SELECT coalesce(sum(events), 0) \
+                 FROM nanosiem.logs_per_source_5m_v2 \
+                 WHERE schema_profile = 'ocsf' \
+                   AND source_type = '{product}' \
+                   AND scope_source_type_complete = 1 \
+                   AND lower(scope_source_type) != 'unknown'"
+            ))
+            .fetch_one()
+            .await
+            .expect("restricted rollup query should succeed");
+        assert_eq!(hidden, 0, "deny unknown must hide the direct-writer row");
+
+        let visible: u64 = ch
+            .query(&format!(
+                "SELECT coalesce(sum(events), 0) \
+                 FROM nanosiem.logs_per_source_5m_v2 \
+                 WHERE schema_profile = 'ocsf' \
+                   AND source_type = '{product}' \
+                   AND scope_source_type_complete = 1 \
+                   AND lower(scope_source_type) != '{product}'"
+            ))
+            .fetch_one()
+            .await
+            .expect("display-key deny query should succeed");
+        assert_eq!(
+            visible, 1,
+            "denying a product display key must not hide raw unknown"
+        );
+
+        let _ = ch
+            .query(&format!(
+                "ALTER TABLE nanosiem.ocsf_logs DELETE \
+                 WHERE source_type = '{unique}' OR `metadata.product.name` = '{product}'"
+            ))
+            .execute()
+            .await;
+    }
+
+    println!(
+        "Rollup parity check passed: {} events, {} bytes",
+        row.events, row.bytes
+    );
 
     // Cleanup: delete the synthetic rows from `logs`. The rollup row will age
     // out via TTL within 7 days; we don't bother with explicit ALTER DELETE

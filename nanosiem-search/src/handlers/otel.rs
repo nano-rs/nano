@@ -19,13 +19,18 @@
 //! `observability_service_security_signals`. Cache keys here accordingly stay
 //! on the unrestricted `ScopeSet` — the cached bodies are identical for every
 //! authorized viewer.
+//!
+//! Authorization (NAN-2030): source scope is NOT an authorization boundary here
+//! (it defaults open and, per above, does not even apply to these tables), so
+//! every handler in this module gates on `search:execute` via
+//! `super::require_search_execute(&auth)` as its first statement. Authentication
+//! alone (a valid token) must not read observability data.
 
 use axum::{
     Json,
     extract::{Path, Query, State},
 };
 use nanosiem_core::TimeRangeInput;
-use nanosiem_core::auth::permissions;
 use nanosiem_core::query::{
     InfraHostsFilters, MetricAgg, MetricQuery, MetricTagFilter, RumFilters, ServicesOverviewFilters,
     ServicesSort, TimeRange, TraceListFilters, valid_tag_key,
@@ -84,13 +89,18 @@ pub struct TraceResponse {
         (status = 200, description = "Ordered spans for the trace (empty if unknown)", body = TraceResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Missing search:execute permission", body = ErrorResponse),
     )
 )]
 pub async fn get_trace(
     State(state): State<SearchState>,
+    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     Path(trace_id): Path<String>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
 ) -> Result<(axum::http::HeaderMap, Json<TraceResponse>), SearchError> {
+    // NAN-2030: authN is not authZ — gate on search:execute before any work.
+    super::require_search_execute(&auth)?;
+
     let start = Instant::now();
 
     // NAN-1593: the trace waterfall re-fetches on every load / shared-link
@@ -246,13 +256,18 @@ pub struct MetricTimeseriesResponse {
         (status = 200, description = "Labelled metric time series", body = MetricTimeseriesResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Missing search:execute permission", body = ErrorResponse),
     )
 )]
 pub async fn get_metric_timeseries(
     State(state): State<SearchState>,
+    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<MetricTimeseriesRequest>,
 ) -> Result<(axum::http::HeaderMap, Json<MetricTimeseriesResponse>), SearchError> {
+    // NAN-2030: authN is not authZ — gate on search:execute before any work.
+    super::require_search_execute(&auth)?;
+
     let start = Instant::now();
 
     request.time_range.validate()?;
@@ -423,13 +438,18 @@ pub struct MetricTagsResponse {
         (status = 200, description = "Tag keys (no key) or tag values (key given)", body = MetricTagsResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Missing search:execute permission", body = ErrorResponse),
     )
 )]
 pub async fn list_metric_tags(
     State(state): State<SearchState>,
+    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     Query(params): Query<MetricTagsParams>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
 ) -> Result<(axum::http::HeaderMap, Json<MetricTagsResponse>), SearchError> {
+    // NAN-2030: authN is not authZ — gate on search:execute before any work.
+    super::require_search_execute(&auth)?;
+
     let start = Instant::now();
 
     if params.metric_name.trim().is_empty() {
@@ -577,13 +597,18 @@ pub struct ListTracesResponse {
         (status = 200, description = "Recent traces, most-recent-first", body = ListTracesResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Missing search:execute permission", body = ErrorResponse),
     )
 )]
 pub async fn list_traces(
     State(state): State<SearchState>,
+    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     Query(params): Query<ListTracesParams>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
 ) -> Result<(axum::http::HeaderMap, Json<ListTracesResponse>), SearchError> {
+    // NAN-2030: authN is not authZ — gate on search:execute before any work.
+    super::require_search_execute(&auth)?;
+
     let start = Instant::now();
 
     // Resolve the time window: explicit start/end win; otherwise look back
@@ -706,13 +731,18 @@ pub struct MetricNamesResponse {
         (status = 200, description = "Distinct metric names", body = MetricNamesResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Missing search:execute permission", body = ErrorResponse),
     )
 )]
 pub async fn list_metric_names(
     State(state): State<SearchState>,
+    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     Query(params): Query<MetricNamesParams>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
 ) -> Result<(axum::http::HeaderMap, Json<MetricNamesResponse>), SearchError> {
+    // NAN-2030: authN is not authZ — gate on search:execute before any work.
+    super::require_search_execute(&auth)?;
+
     let start = Instant::now();
 
     let service = params.service.as_deref().filter(|s| !s.is_empty());
@@ -874,13 +904,18 @@ pub struct ServicesOverviewResponse {
         (status = 200, description = "Per-service RED overview", body = ServicesOverviewResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Missing search:execute permission", body = ErrorResponse),
     )
 )]
 pub async fn list_services(
     State(state): State<SearchState>,
+    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     Query(params): Query<ServicesParams>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
 ) -> Result<(axum::http::HeaderMap, Json<ServicesOverviewResponse>), SearchError> {
+    // NAN-2030: authN is not authZ — gate on search:execute before any work.
+    super::require_search_execute(&auth)?;
+
     let start = Instant::now();
 
     let time_range = resolve_window(params.start, params.end, params.window_hours)?;
@@ -1035,15 +1070,11 @@ pub async fn get_service_detail(
     Query(params): Query<ServiceDetailParams>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
 ) -> Result<(axum::http::HeaderMap, Json<ServiceDetailResponse>), SearchError> {
-    // NAN-1801: this drill-in was BEARER-ONLY. Gate it like the other search
-    // reads (mirrors the retro handler). The detail body itself reads only
-    // `otel_spans` (no source_type — unscoped by design, see module doc); the
-    // security-signals panel lives on the api crate's scoped endpoint.
-    if !auth.claims.has_permission(permissions::SEARCH_EXECUTE) {
-        return Err(SearchError::Forbidden(
-            "Service detail requires the search:execute permission".to_string(),
-        ));
-    }
+    // NAN-1801 / NAN-2030: this drill-in was BEARER-ONLY, then inline-gated; route
+    // it through the one shared gate like every sibling handler. The detail body
+    // reads only `otel_spans` (no source_type — unscoped by design, see module
+    // doc); the security-signals panel lives on the api crate's scoped endpoint.
+    super::require_search_execute(&auth)?;
 
     let start = Instant::now();
 
@@ -1173,13 +1204,18 @@ pub struct InfraHostsResponse {
         (status = 200, description = "Per-host latest-metric overview", body = InfraHostsResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Missing search:execute permission", body = ErrorResponse),
     )
 )]
 pub async fn list_infra_hosts(
     State(state): State<SearchState>,
+    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     Query(params): Query<InfraHostsParams>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
 ) -> Result<(axum::http::HeaderMap, Json<InfraHostsResponse>), SearchError> {
+    // NAN-2030: authN is not authZ — gate on search:execute before any work.
+    super::require_search_execute(&auth)?;
+
     let start = Instant::now();
 
     let time_range = resolve_window(params.start, params.end, params.window_hours)?;
@@ -1308,13 +1344,18 @@ pub struct RumSummaryResponse {
         (status = 200, description = "RUM summary (vitals/page-views/errors/top-pages)", body = RumSummaryResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Missing search:execute permission", body = ErrorResponse),
     )
 )]
 pub async fn get_rum_summary(
     State(state): State<SearchState>,
+    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     Query(params): Query<RumParams>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
 ) -> Result<(axum::http::HeaderMap, Json<RumSummaryResponse>), SearchError> {
+    // NAN-2030: authN is not authZ — gate on search:execute before any work.
+    super::require_search_execute(&auth)?;
+
     let start = Instant::now();
 
     let time_range = resolve_window(params.start, params.end, params.window_hours)?;

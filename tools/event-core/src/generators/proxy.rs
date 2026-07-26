@@ -317,6 +317,25 @@ const CATEGORIES: &[&str] = &[
 
 const CACHE_STATUSES: &[&str] = &["hit", "hit", "hit", "miss", "miss", "bypass", "expired"];
 
+/// Deterministic Conduit event inputs for a scripted campaign.
+///
+/// Normal background traffic should continue through [`ProxyGenerator::generate`].
+/// Injector scenarios use this shape when domains, paths, referrers, response
+/// sizes, and threat signals are evidence in the campaign rather than noise.
+pub struct ScriptedProxyEvent<'a> {
+    pub host: &'a str,
+    pub path: &'a str,
+    pub method: &'a str,
+    pub status: u16,
+    pub upstream_ip: &'a str,
+    pub referrer: Option<&'a str>,
+    pub category: &'a str,
+    pub content_type: &'a str,
+    pub response_bytes: u64,
+    pub threat_score: f64,
+    pub threat_signals: &'a [&'a str],
+}
+
 pub struct ProxyGenerator;
 
 impl ProxyGenerator {
@@ -331,6 +350,78 @@ impl ProxyGenerator {
             self.from_real_pattern(timestamp, entity, rng)
         } else {
             self.from_legit_browsing(timestamp, entity, rng)
+        }
+    }
+
+    /// Emit a fully specified Conduit proxy event for a scripted campaign.
+    pub fn scripted(
+        &self,
+        ts: DateTime<Utc>,
+        entity: &Entity,
+        spec: ScriptedProxyEvent<'_>,
+    ) -> Event {
+        let threat_tier = if spec.threat_score < 0.2 {
+            "tier0"
+        } else if spec.threat_score < 0.5 {
+            "tier1"
+        } else if spec.threat_score < 0.8 {
+            "tier2"
+        } else {
+            "tier3"
+        };
+        let threat_signals = spec
+            .threat_signals
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "score": spec.threat_score,
+                    "tier": threat_tier,
+                })
+            })
+            .collect::<Vec<_>>();
+        let full_url = format!("https://{}{}", spec.host, spec.path);
+        let action = if spec.status >= 400 { "deny" } else { "allow" };
+        let request_bytes = if spec.method == "GET" { 0 } else { 768 };
+
+        let log_entry = serde_json::json!({
+            "id": Uuid::now_v7().to_string(),
+            "timestamp": ts.format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string(),
+            "client_ip": entity.ip,
+            "username": entity.user,
+            "auth_method": "transparent",
+            "method": spec.method,
+            "scheme": "https",
+            "host": spec.host,
+            "port": 443,
+            "path": spec.path,
+            "full_url": full_url,
+            "referrer": spec.referrer,
+            "category": spec.category,
+            "action": action,
+            "rule_id": serde_json::Value::Null,
+            "status_code": spec.status,
+            "request_bytes": request_bytes,
+            "response_bytes": spec.response_bytes,
+            "duration_ms": 184,
+            "tls_intercepted": true,
+            "upstream_addr": format!("{}:443", spec.upstream_ip),
+            "cache_status": "miss",
+            "content_type": spec.content_type,
+            "threat_score": spec.threat_score,
+            "threat_tier": threat_tier,
+            "threat_blocked": false,
+            "threat_signals": threat_signals,
+        });
+
+        Event {
+            message: serde_json::to_string(&log_entry).unwrap(),
+            timestamp: ts.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+            source_type: "conduit_proxy".to_string(),
+            display_label: format!(
+                "[proxy] {} {} https://{}{} → {}",
+                entity.ip, spec.method, spec.host, spec.path, spec.status
+            ),
         }
     }
 

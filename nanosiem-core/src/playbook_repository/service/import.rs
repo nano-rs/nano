@@ -5,6 +5,7 @@
 use tracing::info;
 use uuid::Uuid;
 
+use crate::auth::{TargetEffect, TargetGrants};
 use crate::playbooks::models::{
     CreatePlaybookRequest, PlaybookCategory, PlaybookScope, PlaybookStatus,
 };
@@ -16,13 +17,27 @@ use super::PlaybookRepositoryService;
 
 impl PlaybookRepositoryService {
     /// Import a repository playbook into the main library.
+    ///
+    /// NAN-2119: this materializes a **first-class tenant playbook** — a
+    /// `playbooks` row, its initial `playbook_versions` row, and an import
+    /// provenance record — exactly what `POST /api/playbooks` creates behind
+    /// `playbooks:manage`. `playbook_repositories:import` authorizes reading the
+    /// catalog and must never substitute for the target capability, so `grants`
+    /// is re-checked HERE, at the branch that actually writes, rather than only
+    /// in the handler preflight (the handler's plan can be stale by the time a
+    /// bulk loop reaches this row).
     pub async fn import_playbook(
         &self,
         repo_id: Uuid,
         path: &str,
         req: PlaybookImportRequest,
         user_id: Option<Uuid>,
+        grants: &TargetGrants,
     ) -> Result<PlaybookImportResponse, PlaybookRepositoryError> {
+        grants.ensure(TargetEffect::PlaybookCreate).map_err(|e| {
+            PlaybookRepositoryError::Forbidden(format!("Missing permission: {}", e.permission()))
+        })?;
+
         let repo = self.get_repository(repo_id).await?;
         let repo_playbook = self.get_repository_playbook(repo_id, path).await?;
 

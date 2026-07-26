@@ -15,7 +15,7 @@ use crate::state::AppState;
 use nanosiem_core::auth::permissions;
 
 use super::types::ExportQuery;
-use super::{MAX_EXPORT_ARTIFACTS, parse_artifact_type, parse_time_window};
+use super::{MAX_EXPORT_ARTIFACTS, effective_artifact_scope, parse_artifact_type, parse_time_window};
 
 /// GET /api/prevalence/export
 ///
@@ -63,10 +63,16 @@ pub async fn export_prevalence(
     let default_max_prevalence = prevalence_service.get_config().await.rarity_threshold;
     let max_prevalence = params.max_prevalence.unwrap_or(default_max_prevalence);
     let format = params.format.as_deref().unwrap_or("csv");
+    let scope = effective_artifact_scope(&auth);
 
     // Get rare artifacts (limited to MAX_EXPORT_ARTIFACTS)
     let artifacts = prevalence_service
-        .get_rare_artifacts(artifact_type, time_window, MAX_EXPORT_ARTIFACTS as i64)
+        .get_rare_artifacts(
+            artifact_type,
+            time_window,
+            MAX_EXPORT_ARTIFACTS as i64,
+            &scope,
+        )
         .await
         .map_err(|e| {
             error!("Failed to get artifacts for export: {}", e);

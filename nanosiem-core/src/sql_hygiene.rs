@@ -24,6 +24,18 @@
 //!
 //! LIKE/ILIKE *pattern* escaping (the `%`/`_` wildcard semantics) is a
 //! separate concern handled by [`escape_like_pattern`] and is unchanged.
+//!
+//! # Identifiers are not values (NAN-1992 / NAN-2158)
+//!
+//! Everything above is about VALUES — text that lands inside a `'…'` literal.
+//! A column or table NAME lands *outside* any literal, so value escaping does
+//! nothing for it: `escape_sql_string("source_type) = 'audit' --")` is a no-op,
+//! and the result still closes the surrounding expression and comments out
+//! whatever follows — including a security predicate appended to the same line.
+//! This module offered only value escaping, which is exactly why the identifier
+//! class kept recurring. Use [`is_safe_sql_identifier`] to reject, or
+//! [`escape_sql_identifier`] to quote, ANY identifier that is not a
+//! compile-time constant.
 
 use chrono::{DateTime, Utc};
 
@@ -34,6 +46,56 @@ use chrono::{DateTime, Utc};
 /// become `''''` instead of `\\''`.
 pub fn escape_sql_string(s: impl AsRef<str>) -> String {
     s.as_ref().replace('\\', "\\\\").replace('\'', "''")
+}
+
+/// Maximum length accepted for a SQL identifier by [`is_safe_sql_identifier`].
+///
+/// ClickHouse itself is far more permissive; this is a sanity bound so a
+/// pathological stored value cannot balloon generated SQL.
+const MAX_IDENTIFIER_LEN: usize = 128;
+
+/// Is `s` usable as a BARE (unquoted) ClickHouse column/table identifier in
+/// generated SQL? (NAN-1992 / NAN-2158)
+///
+/// Deliberately strict: ASCII alphanumerics, `_`, and the `.` that OCSF nested
+/// columns need (`metadata.product.name`). No quotes, no backticks, no
+/// parentheses, no whitespace, no `-`, and therefore no `--`/`/*` comment
+/// introducer — so an interpolated value can neither terminate the surrounding
+/// expression nor comment out what follows it.
+///
+/// This is an ALLOWLIST, not an escaper: prefer rejecting a bad identifier at
+/// the write boundary and again at the sink. [`escape_sql_identifier`] exists
+/// for the cases where a legitimately exotic name must be preserved.
+///
+/// Callers must apply this to anything that is not a compile-time constant —
+/// including values read back out of PostgreSQL, which are attacker-influenced
+/// whenever a user can write the row (the NAN-2158 second-order case).
+pub fn is_safe_sql_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_IDENTIFIER_LEN
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+}
+
+/// Quote `s` as a ClickHouse identifier, escaping the quoting character.
+///
+/// ClickHouse quotes identifiers with backticks; a literal backtick inside is
+/// escaped with a backslash, and a literal backslash is doubled. Backslash is
+/// processed FIRST for the same reason as [`escape_sql_string`] — otherwise an
+/// escaped backtick would be re-escaped into a broken sequence.
+///
+/// Prefer [`is_safe_sql_identifier`] + a bare identifier where the surrounding
+/// SQL already expects one. Reach for this only where an identifier must be
+/// preserved verbatim, and note that backtick-quoting CHANGES SEMANTICS for
+/// dotted names: bare `a.b.c` is a compound/nested reference, whereas
+/// `` `a.b.c` `` is a single column literally named `a.b.c`. Those are different
+/// columns in ClickHouse, so do not swap one form for the other in existing SQL
+/// without checking which the schema actually has.
+pub fn escape_sql_identifier(s: impl AsRef<str>) -> String {
+    format!(
+        "`{}`",
+        s.as_ref().replace('\\', "\\\\").replace('`', "\\`")
+    )
 }
 
 /// Escape a raw string for use in a ClickHouse `LIKE`/`ILIKE` pattern.
@@ -256,6 +318,70 @@ mod tests {
         assert_eq!(escape_sql_string(r"C:\Users\admin"), r"C:\\Users\\admin");
         // Mixed backslash + single quote in one value.
         assert_eq!(escape_sql_string(r"O'Brien\path"), r"O''Brien\\path");
+    }
+
+    // ---- NAN-2158: identifier hygiene ------------------------------------
+
+    #[test]
+    fn safe_identifier_accepts_real_column_names() {
+        for ok in [
+            "source_type",
+            "host",
+            "metadata.product.name",
+            "src_endpoint.ip",
+            "ext",
+            "a1_B2",
+        ] {
+            assert!(is_safe_sql_identifier(ok), "should accept {ok}");
+        }
+    }
+
+    #[test]
+    fn safe_identifier_rejects_every_expression_breakout() {
+        for bad in [
+            // The NAN-2158 payload: closes `lower(` and comments out the rest
+            // of the line, including any appended security predicate.
+            "source_type) = 'audit' --",
+            "source_type)/*",
+            "source_type; DROP TABLE logs",
+            "source_type OR 1=1",
+            "`source_type`",
+            "'source_type'",
+            "source type",
+            "source\ttype",
+            "source\ntype",
+            "source-type",
+            "",
+        ] {
+            assert!(!is_safe_sql_identifier(bad), "should reject {bad:?}");
+        }
+        // Length bound.
+        assert!(!is_safe_sql_identifier(&"a".repeat(MAX_IDENTIFIER_LEN + 1)));
+        assert!(is_safe_sql_identifier(&"a".repeat(MAX_IDENTIFIER_LEN)));
+    }
+
+    #[test]
+    fn identifier_escaping_neutralizes_the_backtick_breakout() {
+        assert_eq!(escape_sql_identifier("source_type"), "`source_type`");
+        // A backtick in the input must not close the quoting early — that is
+        // the identifier-side equivalent of an unescaped `'` in a literal.
+        assert_eq!(
+            escape_sql_identifier("a`) = 'audit' --"),
+            "`a\\`) = 'audit' --`"
+        );
+        // Backslash is doubled, and processed BEFORE the backtick pass.
+        assert_eq!(escape_sql_identifier(r"a\b"), r"`a\\b`");
+        assert_eq!(escape_sql_identifier("a\\`b"), "`a\\\\\\`b`");
+    }
+
+    #[test]
+    fn value_escaping_does_nothing_for_the_identifier_payload() {
+        // The regression that motivated splitting the two: the value escaper
+        // leaves the identifier payload completely intact, which is why it was
+        // never a defense here.
+        let payload = "source_type) = 'x' --";
+        assert!(escape_sql_string(payload).contains("--"));
+        assert!(escape_sql_string(payload).contains(')'));
     }
 
     #[test]

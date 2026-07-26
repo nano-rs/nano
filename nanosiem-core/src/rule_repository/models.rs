@@ -520,7 +520,10 @@ pub struct CoverageResult {
 }
 
 /// Aggregated coverage analysis
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+///
+/// `Default` is the "nothing to report" shape returned when the caller may not
+/// consult live telemetry at all (NAN-2081) — all counts zero, all lists empty.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CoverageAnalysis {
     pub total_rules: i32,
     pub full_coverage: i32,

@@ -30,6 +30,14 @@ pub enum SourceConfigRepositoryError {
     /// the generic "name already exists" copy.
     #[error("Conflict: {0}")]
     Conflict(String),
+    /// Optimistic-concurrency precondition failed: the row changed after the
+    /// caller last read it.
+    #[error("Source configuration was modified by another update: {0}")]
+    StaleVersion(Uuid),
+    /// The credential reference changed after the service authorized and
+    /// validated its source-config snapshot but before the update reached SQL.
+    #[error("Source configuration credential changed concurrently: {0}")]
+    CredentialChanged(Uuid),
     #[error("Routing rule not found: {0}")]
     RuleNotFound(String),
     #[error("Invalid configuration: {0}")]
@@ -344,6 +352,19 @@ impl SourceConfigRepository {
         id: Uuid,
         request: UpdateSourceConfiguration,
     ) -> Result<SourceConfiguration, SourceConfigRepositoryError> {
+        let expected_credential_id = self.get(id).await?.credential_id;
+        self.update_with_credential_guard(id, request, expected_credential_id)
+            .await
+    }
+
+    /// Update only while the credential reference still matches the snapshot
+    /// that the caller authorized.
+    pub async fn update_with_credential_guard(
+        &self,
+        id: Uuid,
+        request: UpdateSourceConfiguration,
+        expected_credential_id: Option<Uuid>,
+    ) -> Result<SourceConfiguration, SourceConfigRepositoryError> {
         // Build dynamic update query
         let mut updates = Vec::new();
         let mut param_idx = 1;
@@ -378,14 +399,31 @@ impl SourceConfigRepository {
         }
 
         if updates.is_empty() {
-            return self.get(id).await;
+            let current = self.get(id).await?;
+            if request
+                .expected_updated_at
+                .is_some_and(|expected| expected != current.updated_at)
+            {
+                return Err(SourceConfigRepositoryError::StaleVersion(id));
+            }
+            return Ok(current);
         }
 
+        // Bind the credential snapshot into the write predicate. Without this
+        // compare-and-set guard, an under-scoped update could authorize a
+        // credentialless row, race an authorized credential attachment, then
+        // rewrite the newly credential-bearing destination.
+        let expected_updated_at_param = param_idx + 1;
+        let expected_credential_param = param_idx + 2;
         let query = format!(
-            "UPDATE source_configurations SET {} WHERE id = $1 \
+            "UPDATE source_configurations SET {} \
+             WHERE id = $1 \
+               AND (${expected_updated_at_param}::timestamptz IS NULL \
+                    OR updated_at = ${expected_updated_at_param}) \
+               AND credential_id IS NOT DISTINCT FROM ${expected_credential_param} \
              RETURNING id, name, description, config_type, connection_config, credential_id, \
              enabled, deployed, deployed_at, created_at, updated_at, default_source_type",
-            updates.join(", ")
+            updates.join(", "),
         );
 
         // Build query dynamically
@@ -412,13 +450,31 @@ impl SourceConfigRepository {
         if let Some(ref default_source_type) = request.default_source_type {
             query_builder = query_builder.bind(default_source_type);
         }
+        query_builder = query_builder.bind(request.expected_updated_at);
+        query_builder = query_builder.bind(expected_credential_id);
 
-        let config = query_builder
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or_else(|| SourceConfigRepositoryError::NotFound(id.to_string()))?;
-
-        Ok(config.into())
+        match query_builder.fetch_optional(&self.pool).await? {
+            Some(config) => Ok(config.into()),
+            None => {
+                // The atomic UPDATE can miss because the row disappeared, the
+                // optimistic version is stale, or the credential reference
+                // changed after authorization. This probe is diagnostic only;
+                // no write occurs outside the compare-and-set.
+                let current_credential_id: Option<Option<Uuid>> = sqlx::query_scalar(
+                    "SELECT credential_id FROM source_configurations WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+                let Some(current_credential_id) = current_credential_id else {
+                    return Err(SourceConfigRepositoryError::NotFound(id.to_string()));
+                };
+                if current_credential_id != expected_credential_id {
+                    return Err(SourceConfigRepositoryError::CredentialChanged(id));
+                }
+                Err(SourceConfigRepositoryError::StaleVersion(id))
+            }
+        }
     }
 
     /// Delete a source configuration

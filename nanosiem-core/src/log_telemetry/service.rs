@@ -65,19 +65,38 @@ impl LogTelemetryService {
             .await?)
     }
 
-    /// Cluster-wide per-bucket totals (no source_type filter). Used by the
-    /// dashboard activity timeline.
+    /// Per-bucket totals summed across every source the caller may see. Used by
+    /// the dashboard activity timeline.
+    ///
+    /// NAN-2060: `deny_set` is the caller's effective source deny-set; empty
+    /// means unrestricted and keeps the cluster-wide total exact.
     pub async fn buckets_all(
         &self,
         window_hours: i64,
         bucket: BucketSize,
+        deny_set: &std::collections::BTreeSet<String>,
     ) -> Result<Vec<HourlyPoint>, LogTelemetryError> {
-        Ok(self.repo.buckets_all(window_hours, bucket).await?)
+        Ok(self.repo.buckets_all(window_hours, bucket, deny_set).await?)
     }
 
-    /// Cluster-wide total event count for the window. Used by dashboard
-    /// headline numbers.
-    pub async fn total_events(&self, window_hours: i64) -> Result<i64, LogTelemetryError> {
-        Ok(self.repo.total_events(window_hours).await?)
+    /// Total event count for the window across every source the caller may see.
+    /// Used by dashboard headline numbers.
+    pub async fn total_events(
+        &self,
+        window_hours: i64,
+        deny_set: &std::collections::BTreeSet<String>,
+    ) -> Result<i64, LogTelemetryError> {
+        Ok(self.repo.total_events(window_hours, deny_set).await?)
+    }
+
+    /// Scoped event total over an explicit `[start, end)` range (NAN-2060) —
+    /// the previous-period comparison window the dashboard tiles need.
+    pub async fn total_events_range(
+        &self,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+        deny_set: &std::collections::BTreeSet<String>,
+    ) -> Result<i64, LogTelemetryError> {
+        Ok(self.repo.total_events_range(start, end, deny_set).await?)
     }
 }

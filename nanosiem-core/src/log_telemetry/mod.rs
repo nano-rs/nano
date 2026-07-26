@@ -2,13 +2,13 @@
 
 //! Log telemetry rollup access (NAN-733).
 //!
-//! Reads from `nanosiem.logs_per_source_5m`, an AggregatingMergeTree rollup
-//! populated by a materialized view from `nanosiem.logs`. Replaces the dozen+
-//! ad-hoc `FROM logs ... GROUP BY source_type` scans that previously hit the
-//! raw logs table from source-configs, log-sources health, feeds, system
-//! overview, meloD briefing, and the feed-staleness scheduler.
+//! Reads from `nanosiem.logs_per_source_5m_v2`, a profile-aware
+//! AggregatingMergeTree populated by separate UDM and OCSF materialized views.
+//! Readers select the active profile and authorize against the preserved raw
+//! scope key. Replaces the dozen+ ad-hoc raw-table scans used by source health,
+//! feeds, system overview, meloD briefing, and feed staleness.
 //!
-//! Schema: see `clickhouse/116_logs_per_source_5m.sql`.
+//! Schema: see `clickhouse/169_profile_aware_logs_per_source_5m.sql`.
 
 pub mod repository;
 pub mod service;

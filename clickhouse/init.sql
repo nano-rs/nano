@@ -394,6 +394,65 @@ ORDER BY (source_type, bucket_start)
 TTL bucket_start + INTERVAL 7 DAY
 SETTINGS index_granularity = 8192;
 
+-- Profile-aware per-source telemetry rollup (NAN-2154).
+--
+-- OCSF deployments temporarily dual-write each Vector event to both `logs`
+-- and `ocsf_logs`. The profile discriminator keeps those lanes separate so a
+-- reader can select exactly the active one. `source_type` is the display key;
+-- `scope_source_type` preserves the raw identifier canonical search authorizes
+-- against. Restricted reads additionally require `scope_source_type_complete`
+-- so any legacy/manual row that omitted provenance fails closed.
+CREATE TABLE IF NOT EXISTS nanosiem.logs_per_source_5m_v2
+(
+    `schema_profile`             LowCardinality(String),
+    `source_type`                LowCardinality(String),
+    `scope_source_type`          LowCardinality(String),
+    `scope_source_type_complete` UInt8 DEFAULT 0,
+    `bucket_start`               DateTime,
+    `events`                     SimpleAggregateFunction(sum, UInt64),
+    `bytes`                      SimpleAggregateFunction(sum, UInt64),
+    `last_event_at`              SimpleAggregateFunction(max, DateTime64(6, 'UTC')),
+    `first_event_at`             SimpleAggregateFunction(min, DateTime64(6, 'UTC'))
+)
+ENGINE = AggregatingMergeTree
+PARTITION BY toYYYYMMDD(bucket_start)
+ORDER BY
+(
+    schema_profile,
+    source_type,
+    scope_source_type_complete,
+    scope_source_type,
+    bucket_start
+)
+TTL bucket_start + INTERVAL 7 DAY
+SETTINGS index_granularity = 8192;
+
+-- Per-parser production parse-health rollup (NAN-2164). Parser output forks
+-- through a Null-engine ingress table before optional sampling, so the health
+-- denominator covers every production attempt without storing another raw log.
+CREATE TABLE IF NOT EXISTS nanosiem.parser_health_ingest
+(
+    `parser_id`     String,
+    `source_type`   LowCardinality(String),
+    `observed_at`   DateTime,
+    `parse_failure` UInt8
+)
+ENGINE = Null;
+
+CREATE TABLE IF NOT EXISTS nanosiem.parser_health_5m
+(
+    `parser_id`    String,
+    `source_type`  LowCardinality(String),
+    `bucket_start` DateTime,
+    `events`       SimpleAggregateFunction(sum, UInt64),
+    `parse_errors` SimpleAggregateFunction(sum, UInt64)
+)
+ENGINE = AggregatingMergeTree
+PARTITION BY toYYYYMMDD(bucket_start)
+ORDER BY (parser_id, source_type, bucket_start)
+TTL bucket_start + INTERVAL 7 DAY
+SETTINGS index_granularity = 8192;
+
 -- Custom enrichment staging + refresh (NAN-1407 — see
 -- ip_enrichment_dict_staging for the full rationale; migration 133).
 CREATE TABLE IF NOT EXISTS nanosiem.custom_enrichment_dict_staging
@@ -1534,16 +1593,36 @@ SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 2684
 -- the background. Target table is declared above near the prevalence summary
 -- tables.
 CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.logs_per_source_5m_mv
-TO nanosiem.logs_per_source_5m AS
+TO nanosiem.logs_per_source_5m_v2 AS
 SELECT
+    'udm'                                    AS schema_profile,
     lower(source_type)                       AS source_type,
+    lower(source_type)                       AS scope_source_type,
+    toUInt8(1)                               AS scope_source_type_complete,
     toStartOfFiveMinute(timestamp)           AS bucket_start,
     count()                                  AS events,
     sum(length(message) + length(metadata))  AS bytes,
     max(timestamp)                           AS last_event_at,
     min(timestamp)                           AS first_event_at
 FROM nanosiem.logs
-GROUP BY source_type, bucket_start;
+GROUP BY
+    schema_profile,
+    source_type,
+    scope_source_type,
+    scope_source_type_complete,
+    bucket_start;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.parser_health_5m_mv
+TO nanosiem.parser_health_5m AS
+SELECT
+    parser_id,
+    lower(source_type) AS source_type,
+    toStartOfFiveMinute(observed_at) AS bucket_start,
+    count() AS events,
+    countIf(parse_failure != 0) AS parse_errors
+FROM nanosiem.parser_health_ingest
+WHERE parser_id != ''
+GROUP BY parser_id, source_type, bucket_start;
 
 -- Table: entity_time_range_agg
 -- Pre-aggregates first/last seen timestamps for asset entities (IPs and hostnames)
@@ -2021,4 +2100,3 @@ SETTINGS
     max_threads = 32,
     priority = 5,
     queue_max_wait_ms = 120000;
-

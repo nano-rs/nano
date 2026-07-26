@@ -11,11 +11,12 @@ use axum::{
     Extension, Json,
 };
 use nanosiem_core::audit::{
-    AuditEvent, AuditSource, ClientContext, PARSER_ALL_REMOVED, PARSER_BATCH_IMPORTED,
-    PARSER_IMPORTED, PARSER_REPO_CREATED, PARSER_REPO_DELETED, PARSER_REPO_SYNCED,
-    PARSER_REPO_UPDATED, PARSER_UPSTREAM_APPLIED,
+    AuditEvent, AuditSource, ClientContext, LOG_SOURCE_CREATED, LOG_SOURCE_UPDATED,
+    PARSER_ALL_REMOVED, PARSER_BATCH_IMPORTED, PARSER_IMPORTED, PARSER_REPO_CREATED,
+    PARSER_REPO_DELETED, PARSER_REPO_SYNCED, PARSER_REPO_UPDATED, PARSER_UPSTREAM_APPLIED,
+    ROUTING_RULE_CREATED,
 };
-use nanosiem_core::auth::permissions;
+use nanosiem_core::auth::{permissions, TargetEffect};
 use nanosiem_core::parser_repository::{
     ApplyUpstreamUpdateResult, BulkApplyUpstreamResult, NewParserRepository, ParserImportPreview,
     ParserImportRequest, ParserImportType, ParserRepository, ParserRepositoryService,
@@ -27,9 +28,16 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
+use futures::StreamExt;
+
 use super::AuditExt;
+use crate::handlers::repository_target_authz::{ensure_target_effects, held_target_grants};
 use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
+
+/// How many import plans to preflight concurrently. Bounded so a 100-item batch
+/// cannot open 100 simultaneous pool connections.
+const PLAN_CONCURRENCY: usize = 16;
 
 // =============================================================================
 // Request/Response Types
@@ -622,7 +630,7 @@ pub async fn preview_parser_import(
     responses(
         (status = 200, description = "Parser imported successfully", body = ImportParserResponse),
         (status = 400, description = "Bad request"),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Forbidden — missing parser_repositories:import, or the log_sources:create / source_configs:edit capability the import consumes"),
         (status = 404, description = "Not found"),
     ),
     security(("api_key" = []))
@@ -650,8 +658,18 @@ pub async fn import_parser(
         dispatch_source_config_id: req.dispatch_source_config_id,
     };
 
-    let log_source_id = service
-        .import_parser(*id, &path, &import_request, Some(auth.user_id()))
+    // NAN-2117: `parser_repositories:import` authorizes reading the catalog — it
+    // is NOT a substitute for `log_sources:create` (this inserts a validated,
+    // active log source) or `source_configs:edit` (this can insert an identity
+    // routing rule into an ingestion source configuration, whether the caller
+    // pinned it or the auto-resolution picked one). Preflight both before any
+    // write; the service re-checks at the mutation itself.
+    let plan = service.plan_import(*id, &path, &import_request).await?;
+    ensure_target_effects(&auth, &plan.required_effects())?;
+    let grants = held_target_grants(&auth);
+
+    let result = service
+        .import_parser(*id, &path, &import_request, Some(auth.user_id()), &grants)
         .await?;
 
     // Emit audit event
@@ -664,8 +682,52 @@ pub async fn import_parser(
             .build(),
     );
 
+    // NAN-2117: also emit the TARGET-resource records. `parser_imported` alone
+    // left an audit blind spot — a live log source (and possibly a routing rule
+    // on a source configuration) appeared with nothing naming them.
+    state.emit_audit(
+        AuditEvent::builder(AuditSource::ParserRepo, LOG_SOURCE_CREATED)
+            .actor(Some(auth.user_id()), None)
+            .api_key(auth.api_key_id, auth.api_key_name.clone())
+            .resource(
+                "log_source",
+                Some(result.log_source_id),
+                Some(result.log_source_name.clone()),
+            )
+            .client_context(&client)
+            .details(serde_json::json!({
+                "source": "parser_repository_import",
+                "repository_id": id.to_string(),
+                "repository_path": path.clone(),
+            }))
+            .build(),
+    );
+    // Only when a rule was ACTUALLY inserted — the service dedupes against an
+    // existing identity rule and treats an insert failure as non-fatal, so the
+    // plan's `mutates_source_config` is authorization intent, not an outcome.
+    if let Some(routing_rule_id) = result.routing_rule_id {
+        state.emit_audit(
+            AuditEvent::builder(AuditSource::ParserRepo, ROUTING_RULE_CREATED)
+                .actor(Some(auth.user_id()), None)
+                .api_key(auth.api_key_id, auth.api_key_name.clone())
+                .resource(
+                    "routing_rule",
+                    Some(routing_rule_id),
+                    Some(result.log_source_name.clone()),
+                )
+                .client_context(&client)
+                .details(serde_json::json!({
+                    "source": "parser_repository_import",
+                    "repository_id": id.to_string(),
+                    "repository_path": path.clone(),
+                    "log_source_id": result.log_source_id.to_string(),
+                }))
+                .build(),
+        );
+    }
+
     Ok(Json(ImportParserResponse {
-        log_source_id,
+        log_source_id: result.log_source_id,
         import_type: req.import_type,
     }))
 }
@@ -681,7 +743,8 @@ pub async fn import_parser(
     request_body = BatchImportParsersRequest,
     responses(
         (status = 200, description = "Batch import completed", body = BatchImportParsersResponse),
-        (status = 403, description = "Forbidden"),
+        (status = 400, description = "Bad request"),
+        (status = 403, description = "Forbidden — missing parser_repositories:import, or the log_sources:create / source_configs:edit capability some item in the batch consumes"),
         (status = 404, description = "Not found"),
     ),
     security(("api_key" = []))
@@ -720,34 +783,79 @@ pub async fn batch_import_parsers(
 
     let service = get_parser_repo_service(&state);
 
+    // Build every item's import request up front so the authorization preflight
+    // sees exactly what the execution loop will submit.
+    let requests: Vec<(String, ParserImportRequest)> = items
+        .into_iter()
+        .map(|item| {
+            let import_type = match item.import_type.as_str() {
+                "forked" => ParserImportType::Forked,
+                _ => ParserImportType::Linked,
+            };
+            (
+                item.path,
+                ParserImportRequest {
+                    import_type,
+                    source_type: item.source_type,
+                    ingestion_method: item.ingestion_method,
+                    dispatch_source_config_id: item.dispatch_source_config_id,
+                },
+            )
+        })
+        .collect();
+
+    // NAN-2117: preflight the WHOLE batch before importing anything. Batch import
+    // is where the dispatch config is auto-resolved, so a caller with only
+    // `parser_repositories:import` could otherwise mutate up to 100 log sources
+    // and their source-config routing tables. Items whose plan errors are left to
+    // the execution loop — `plan_import` reads a strict subset of
+    // `import_parser`'s lookups, so the same error recurs there before any write.
+    //
+    // Planned with bounded concurrency so the preflight does not add ~100
+    // sequential round trips before the first import starts.
+    let plan_futures: Vec<_> = requests
+        .iter()
+        .map(|(path, import_req)| service.plan_import(*id, path, import_req))
+        .collect();
+    let plans: Vec<_> = futures::stream::iter(plan_futures)
+        .buffered(PLAN_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut required_effects: Vec<TargetEffect> = Vec::new();
+    for plan in plans.into_iter().flatten() {
+        // (errored plans are deferred to the execution loop, which fails the same way)
+        for effect in plan.required_effects() {
+            if !required_effects.contains(&effect) {
+                required_effects.push(effect);
+            }
+        }
+    }
+    ensure_target_effects(&auth, &required_effects)?;
+    let grants = held_target_grants(&auth);
+
     let mut imported = 0usize;
     let mut skipped = 0usize;
     let mut failed = Vec::new();
 
-    for item in &items {
-        let import_type = match item.import_type.as_str() {
-            "forked" => ParserImportType::Forked,
-            _ => ParserImportType::Linked,
-        };
-
-        let import_req = nanosiem_core::parser_repository::ParserImportRequest {
-            import_type,
-            source_type: item.source_type.clone(),
-            ingestion_method: item.ingestion_method.clone(),
-            dispatch_source_config_id: item.dispatch_source_config_id,
-        };
-
+    for (path, import_req) in &requests {
         match service
-            .import_parser(*id, &item.path, &import_req, Some(auth.user_id()))
+            .import_parser(*id, path, import_req, Some(auth.user_id()), &grants)
             .await
         {
             Ok(_) => imported += 1,
             Err(nanosiem_core::parser_repository::ParserRepositoryError::AlreadyImported {
                 ..
             }) => skipped += 1,
+            // A target-capability denial is never a per-item soft failure: the
+            // preflight should have rejected the whole request, so reaching here
+            // means the outcome changed under a race. Fail the batch.
+            Err(e @ nanosiem_core::parser_repository::ParserRepositoryError::Forbidden(_)) => {
+                return Err(e.into());
+            }
             Err(e) => {
                 failed.push(ParserBatchFailure {
-                    path: item.path.clone(),
+                    path: path.clone(),
                     error: e.to_string(),
                 });
             }
@@ -786,7 +894,7 @@ pub async fn batch_import_parsers(
     ),
     responses(
         (status = 200, description = "All imported parsers removed", body = BatchRemoveParsersResponse),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Forbidden — missing parser_repositories:manage or log_sources:delete"),
         (status = 404, description = "Not found"),
     ),
     security(("api_key" = []))
@@ -798,9 +906,17 @@ pub async fn remove_all_imported_parsers(
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<BatchRemoveParsersResponse>, ApiError> {
     ensure_permission(&auth, permissions::PARSER_REPOSITORIES_MANAGE)?;
+    // NAN-2111: this deletes first-class log sources. `parser_repositories:manage`
+    // covers the repository row ("Create, edit, and delete parser repositories"),
+    // never the linked log sources — `DELETE /api/log-sources/{id}` requires
+    // `log_sources:delete`. Re-checked inside the service before the imports are
+    // even loaded.
+    ensure_target_effects(&auth, &[TargetEffect::LogSourceDelete])?;
 
     let service = get_parser_repo_service(&state);
-    let (removed, failed) = service.remove_all_imported(*id).await?;
+    let (removed, failed) = service
+        .remove_all_imported(*id, &held_target_grants(&auth))
+        .await?;
 
     // Emit audit event
     state.emit_audit(
@@ -857,7 +973,7 @@ pub async fn get_parser_upstream_updates(
     ),
     responses(
         (status = 200, description = "Upstream diff retrieved successfully", body = UpstreamParserDiff),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Forbidden — missing parser_repositories:view or log_sources:view"),
         (status = 404, description = "Not found"),
     ),
     security(("api_key" = []))
@@ -868,6 +984,11 @@ pub async fn get_log_source_upstream_diff(
     Path(log_source_id): Path<TypeIdParam>,
 ) -> Result<Json<UpstreamParserDiff>, ApiError> {
     ensure_permission(&auth, permissions::PARSER_REPOSITORIES_VIEW)?;
+    // NAN-2103: the diff serializes the LIVE log source's deployed `parser_vrl` /
+    // `normalize_vrl` as `current_vrl`. Repository visibility authorizes the
+    // upstream/catalog half only — reading the live object is what
+    // `GET /api/log-sources/{id}` gates behind `log_sources:view`.
+    ensure_target_effects(&auth, &[TargetEffect::LogSourceView])?;
 
     let service = get_parser_repo_service(&state);
     let diff = service.get_upstream_diff(*log_source_id).await?;
@@ -913,7 +1034,7 @@ pub async fn dismiss_parser_upstream_changes(
     ),
     responses(
         (status = 200, description = "Upstream update applied successfully", body = ApplyUpstreamUpdateResult),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Forbidden — missing parsers:edit or log_sources:edit"),
         (status = 404, description = "Not found"),
     ),
     security(("api_key" = []))
@@ -925,9 +1046,15 @@ pub async fn apply_upstream_update(
     Path(log_source_id): Path<TypeIdParam>,
 ) -> Result<Json<ApplyUpstreamUpdateResult>, ApiError> {
     ensure_permission(&auth, permissions::PARSERS_EDIT)?;
+    // NAN-2120: applying an upstream update rewrites the live log source's VRL,
+    // description and (now) `match_values` — the routing metadata the global
+    // fixup used to churn. Same composite policy as the fixup endpoint.
+    ensure_target_effects(&auth, &[TargetEffect::ParserEdit, TargetEffect::LogSourceEdit])?;
 
     let service = get_parser_repo_service(&state);
-    let result = service.apply_upstream_update(*log_source_id).await?;
+    let result = service
+        .apply_upstream_update(*log_source_id, &held_target_grants(&auth))
+        .await?;
 
     state.emit_audit(
         AuditEvent::builder(AuditSource::ParserRepo, PARSER_UPSTREAM_APPLIED)
@@ -951,7 +1078,7 @@ pub async fn apply_upstream_update(
     ),
     responses(
         (status = 200, description = "Upstream updates applied", body = BulkApplyUpstreamResult),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Forbidden — missing parsers:edit or log_sources:edit"),
         (status = 404, description = "Not found"),
     ),
     security(("api_key" = []))
@@ -963,9 +1090,12 @@ pub async fn apply_all_upstream_updates(
     Path(repo_id): Path<TypeIdParam>,
 ) -> Result<Json<BulkApplyUpstreamResult>, ApiError> {
     ensure_permission(&auth, permissions::PARSERS_EDIT)?;
+    ensure_target_effects(&auth, &[TargetEffect::ParserEdit, TargetEffect::LogSourceEdit])?;
 
     let service = get_parser_repo_service(&state);
-    let result = service.apply_all_upstream_updates(*repo_id).await?;
+    let result = service
+        .apply_all_upstream_updates(*repo_id, &held_target_grants(&auth))
+        .await?;
 
     state.emit_audit(
         AuditEvent::builder(AuditSource::ParserRepo, PARSER_UPSTREAM_APPLIED)
@@ -995,27 +1125,69 @@ fn get_parser_repo_service(state: &AppState) -> ParserRepositoryService {
 // Fixup match_values
 // =============================================================================
 
-/// Re-sync match_values from upstream YAML for all imported log sources
+/// Re-sync match_values from upstream YAML for one repository's imported log sources
 #[utoipa::path(
     post,
-    path = "/api/parser-repositories/fixup-match-values",
-    tag = "parser-repositories",
+    path = "/api/parser-repositories/{id}/fixup-match-values",
+    tag = "parser_repositories",
+    params(
+        ("id" = String, Path, description = "Repository ID")
+    ),
     responses(
         (status = 200, description = "Match values fixup completed", body = FixupMatchValuesResponse),
+        (status = 403, description = "Forbidden — missing parser_repositories:manage, parsers:edit or log_sources:edit"),
+        (status = 404, description = "Not found"),
     ),
     security(("api_key" = []))
 )]
 pub async fn fixup_match_values(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
+    Extension(client): Extension<ClientContext>,
+    Path(id): Path<TypeIdParam>,
 ) -> Result<Json<FixupMatchValuesResponse>, ApiError> {
     ensure_permission(&auth, permissions::PARSER_REPOSITORIES_MANAGE)?;
+    // NAN-2120: this rewrites `log_sources.match_values` — LIVE ingestion-routing
+    // metadata deciding which upstream source-type aliases activate a parser.
+    // Repository management is not a licence to edit those targets; require the
+    // canonical parser and log-source edit capabilities too. Re-checked inside
+    // the service. The route is also repository-scoped now: the old global
+    // `/api/parser-repositories/fixup-match-values` rewrote every import in the
+    // tenant from one request.
+    ensure_target_effects(&auth, &[TargetEffect::ParserEdit, TargetEffect::LogSourceEdit])?;
 
     let service = get_parser_repo_service(&state);
+    // 404 for an unknown repository before any target work, so the endpoint is
+    // not an existence oracle for repositories.
+    let _ = service.get_repository(*id).await?;
 
-    let updated = service.fixup_imported_match_values().await?;
+    let updated = service
+        .fixup_imported_match_values(*id, &held_target_grants(&auth))
+        .await?;
 
-    Ok(Json(FixupMatchValuesResponse { updated }))
+    // One record per log source that actually changed, under the canonical
+    // `log_source` resource type — an audit search for log-source updates must
+    // be able to name every target this repair touched. A no-op fixup emits
+    // nothing.
+    for log_source_id in &updated {
+        state.emit_audit(
+            AuditEvent::builder(AuditSource::ParserRepo, LOG_SOURCE_UPDATED)
+                .actor(Some(auth.user_id()), None)
+                .api_key(auth.api_key_id, auth.api_key_name.clone())
+                .resource("log_source", Some(*log_source_id), None::<String>)
+                .client_context(&client)
+                .details(serde_json::json!({
+                    "source": "parser_repository_fixup_match_values",
+                    "repository_id": id.to_string(),
+                    "field": "match_values",
+                }))
+                .build(),
+        );
+    }
+
+    Ok(Json(FixupMatchValuesResponse {
+        updated: updated.len() as u32,
+    }))
 }
 
 #[derive(Debug, Serialize, ToSchema)]

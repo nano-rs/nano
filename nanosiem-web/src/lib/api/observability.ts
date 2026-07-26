@@ -166,6 +166,9 @@ export interface SloListResponse {
   slos: Slo[];
 }
 
+/** Stored SLO definition returned by create/update (no live span query). */
+export type SloDefinition = Omit<Slo, 'current' | 'budget_remaining_pct' | 'burn_rate' | 'status'>;
+
 /** Create/update payload (the computed fields are server-derived, never sent). */
 export interface SloInput {
   name: string;
@@ -354,6 +357,12 @@ export interface SyntheticChecksResponse {
   checks: SyntheticCheck[];
 }
 
+/** Stored check definition returned by create/update (no live result query). */
+export type SyntheticCheckDefinition = Omit<
+  SyntheticCheck,
+  'has_runs' | 'uptime_pct' | 'p50_latency_ms' | 'history'
+>;
+
 /** Create payload for a synthetic check. */
 export interface SyntheticCheckInput {
   name: string;
@@ -448,14 +457,14 @@ export class ObservabilityApi {
     return this.request('/api/observability/slos');
   }
 
-  async createSlo(input: SloInput): Promise<Slo> {
+  async createSlo(input: SloInput): Promise<SloDefinition> {
     return this.request('/api/observability/slos', {
       method: 'POST',
       body: JSON.stringify(input),
     });
   }
 
-  async updateSlo(id: string, input: SloInput): Promise<Slo> {
+  async updateSlo(id: string, input: SloInput): Promise<SloDefinition> {
     return this.request(`/api/observability/slos/${encodeURIComponent(id)}`, {
       method: 'PUT',
       body: JSON.stringify(input),
@@ -540,14 +549,17 @@ export class ObservabilityApi {
     return this.request('/api/observability/synthetics');
   }
 
-  async createSynthetic(input: SyntheticCheckInput): Promise<SyntheticCheck> {
+  async createSynthetic(input: SyntheticCheckInput): Promise<SyntheticCheckDefinition> {
     return this.request('/api/observability/synthetics', {
       method: 'POST',
       body: JSON.stringify(input),
     });
   }
 
-  async updateSynthetic(id: string, input: SyntheticCheckUpdate): Promise<SyntheticCheck> {
+  async updateSynthetic(
+    id: string,
+    input: SyntheticCheckUpdate
+  ): Promise<SyntheticCheckDefinition> {
     return this.request(`/api/observability/synthetics/${encodeURIComponent(id)}`, {
       method: 'PUT',
       body: JSON.stringify(input),

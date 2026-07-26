@@ -398,6 +398,14 @@ impl MarketplaceRepository {
             "none"
         };
 
+        // NAN-2151: a marketplace entry is a distributable listing, not a
+        // second credential store. Keep non-secret auth metadata (auth type,
+        // client id, token URL, etc.) but never copy the publisher's secret
+        // values into marketplace_catalog. An install must supply its own
+        // credentials; the originating custom_enrichments row is untouched.
+        let mut catalog_config = config.clone();
+        crate::config_secrets::strip_config_secrets(&mut catalog_config);
+
         let result = sqlx::query_as::<_, MarketplaceCatalogEntry>(
             r#"
             INSERT INTO marketplace_catalog (
@@ -432,7 +440,7 @@ impl MarketplaceRepository {
         .bind(requires_credential)
         .bind(code)
         .bind(allowed_domains)
-        .bind(config)
+        .bind(&catalog_config)
         .fetch_one(&self.pool)
         .await
         .map_err(MarketplaceError::Database)?;
@@ -520,6 +528,24 @@ impl MarketplaceRepository {
         credentials_encrypted: Option<&[u8]>,
         credentials_nonce: Option<&str>,
     ) -> Result<MarketplaceCatalogEntry, MarketplaceError> {
+        // NAN-2069: catalog reads mask `config.auth_config`, so a client that
+        // round-trips a redacted entry would persist `***REDACTED***` over the
+        // stored credential. Resolve against the current row first. `COALESCE`
+        // below already preserves an omitted `config` outright; this handles
+        // the supplied-but-masked case.
+        let merged;
+        let config = match config {
+            Some(incoming) => {
+                let current = self.get_catalog_entry(slug).await?;
+                merged = crate::config_secrets::merge_config_secrets(
+                    incoming.clone(),
+                    Some(&current.config.0),
+                );
+                Some(&merged)
+            }
+            None => None,
+        };
+
         let result = sqlx::query_as::<_, MarketplaceCatalogEntry>(
             r#"
             UPDATE marketplace_catalog SET

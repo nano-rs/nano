@@ -8,7 +8,7 @@
 //! ## Features
 //!
 //! - **Repository Management**: Add, sync, and browse public GitHub repositories
-//! - **Parser Import**: Import parsers as draft log sources (parser_only=true)
+//! - **Parser Import**: Import parsers as log-source parser definitions
 //! - **Linked vs Forked**: Track imported parsers with optional auto-updates
 //! - **Upstream Diff**: Detect and review upstream parser changes
 
@@ -20,14 +20,16 @@ mod yaml_parser;
 
 pub use error::ParserRepositoryError;
 pub use models::{
-    ApplyUpstreamUpdateResult, BulkApplyUpstreamResult, BundleImportResult,
-    NewParserRepository, ParserImport, ParserImportPreview, ParserImportRequest, ParserImportType,
-    ParserRepository, ParserUpstreamUpdate, RepositoryParser, RepositoryParserFilter, SyncResult,
-    SyncStatus, UpdateParserRepository, UpstreamParserDiff,
+    ApplyUpstreamUpdateResult, BulkApplyUpstreamResult, BundleImportResult, NewParserRepository,
+    ParserImport, ParserImportPreview, ParserImportRequest, ParserImportType, ParserRepository,
+    ParserUpstreamUpdate, RepositoryParser, RepositoryParserFilter, SyncResult, SyncStatus,
+    UpdateParserRepository, UpstreamParserDiff,
 };
 pub use repository::{
     ParserImportsRepository, ParserImportsRepositoryError, ParserRepositoryRepository,
     ParserRepositoryRepositoryError, RepositoryParsersRepository, RepositoryParsersRepositoryError,
 };
-pub use service::{ParserRepositoryService, ParserRepositoryServiceConfig};
+pub use service::{
+    ParserImportPlan, ParserImportResult, ParserRepositoryService, ParserRepositoryServiceConfig,
+};
 pub use yaml_parser::{parse_parser_yaml, ParserYaml, ParserYamlError};

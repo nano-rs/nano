@@ -493,9 +493,16 @@ export function Search() {
   // NAN-1793: schedule a saved query as a recurring report.
   const [schedulePreset, setSchedulePreset] = useState<ScheduleReportPreset | null>(null);
 
+  // Permission checks - Requirements: 5.3
+  const { user, hasPermission, isAuthenticated } = useAuth();
+
   // Active search jobs indicator — drives the badge on the More (...) chip.
+  // NAN-2046: the async-job endpoints require search:execute (NAN-2032). A session
+  // holding only search:view must not poll them, or every 15s poll 403-loops. Gate
+  // the query on the capability so the badge simply stays empty for such sessions.
   const { data: activeJobs } = useQuery({
     queryKey: ['search-jobs'],
+    enabled: hasPermission('search:execute'),
     queryFn: () => api.listSearchJobs(),
     refetchInterval: (query) => {
       const data = query.state.data as SearchJobSummary[] | undefined;
@@ -970,8 +977,6 @@ export function Search() {
   // Notebook capture for auto-documenting investigations
   const { captureSearch, isActive: notebookActive, addEntityToNotebook, addEntitiesToNotebook } = useNotebookCapture();
 
-  // Permission checks - Requirements: 5.3
-  const { user, hasPermission, isAuthenticated } = useAuth();
   const canSave = hasPermission('search:save');
   const canShare = hasPermission('search:share');
   const canSql = hasPermission('search:sql');

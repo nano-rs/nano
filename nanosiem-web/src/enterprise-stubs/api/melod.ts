@@ -16,6 +16,7 @@ import type {
   RefineDashboardRequest,
   FetchUrlForDetectionResponse,
   GenerateDetectionHintsRequest,
+  AiAvailability,
   ProviderCredentials,
   UpdateProviderCredentialsRequest,
   AgentModelConfig,
@@ -108,6 +109,9 @@ export class MelodApi {
   generateDetectionHints(
     _request: GenerateDetectionHintsRequest,
   ): Promise<MelodJobStartResponse> {
+    return ENTERPRISE_ONLY();
+  }
+  getAiAvailability(): Promise<AiAvailability> {
     return ENTERPRISE_ONLY();
   }
   listAiProviders(): Promise<ProviderCredentials[]> {

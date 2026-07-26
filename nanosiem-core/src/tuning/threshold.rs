@@ -15,6 +15,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::{BaselineMonitor, BaselineStatus, RuleMetrics, ThresholdBreach};
+use crate::auth::{Provenanced, SourceProvenance};
 
 /// Number of consecutive periods required to trigger auto-tuning
 const CONSECUTIVE_PERIODS_THRESHOLD: i32 = 3;
@@ -89,7 +90,7 @@ impl ThresholdDetector {
             // Get the most recent metrics for this rule
             if let Some(metrics) = self.get_latest_metrics(rule_id).await? {
                 // Evaluate the rule and check for breaches
-                if let Some(breach) = self.evaluate_rule(rule_id, metrics).await? {
+                if let Some(breach) = self.evaluate_rule_with_provenance(rule_id, metrics).await? {
                     breaches.push(breach);
                 }
             }
@@ -121,10 +122,25 @@ impl ThresholdDetector {
         rule_id: Uuid,
         metrics: RuleMetrics,
     ) -> Result<Option<ThresholdBreach>, ThresholdDetectorError> {
+        // Callers supplying an in-memory metric cannot prove where it came
+        // from. Preserve this compatibility API, but stamp any breach
+        // incomplete instead of inventing provenance.
+        self.evaluate_rule_with_provenance(
+            rule_id,
+            Provenanced::new(metrics, SourceProvenance::default()),
+        )
+        .await
+    }
+
+    async fn evaluate_rule_with_provenance(
+        &self,
+        rule_id: Uuid,
+        metrics: Provenanced<RuleMetrics>,
+    ) -> Result<Option<ThresholdBreach>, ThresholdDetectorError> {
         // Get baseline for this rule
         let baseline = self
             .baseline_monitor
-            .get_baseline(rule_id)
+            .get_baseline_with_provenance(rule_id)
             .await
             .map_err(|e| ThresholdDetectorError::BaselineError(e.to_string()))?;
 
@@ -132,6 +148,9 @@ impl ThresholdDetector {
             Some(b) => b,
             None => return Err(ThresholdDetectorError::NoBaseline(rule_id)),
         };
+        let provenance = metrics.provenance.clone().merge(&baseline.provenance);
+        let metrics = metrics.value;
+        let baseline = baseline.value;
 
         // Calculate current alert rate (alerts per hour)
         let current_value = metrics.alert_count_1h as f64;
@@ -180,6 +199,7 @@ impl ThresholdDetector {
                 baseline.mean_alerts_per_hour,
                 effective_threshold,
                 deviation_magnitude,
+                &provenance,
             )
             .await?;
 
@@ -254,7 +274,7 @@ impl ThresholdDetector {
     async fn get_latest_metrics(
         &self,
         rule_id: Uuid,
-    ) -> Result<Option<RuleMetrics>, ThresholdDetectorError> {
+    ) -> Result<Option<Provenanced<RuleMetrics>>, ThresholdDetectorError> {
         let metrics: Option<MetricsRow> = sqlx::query_as(
             r#"
             SELECT 
@@ -267,7 +287,9 @@ impl ThresholdDetector {
                 unique_hosts,
                 unique_ips,
                 avg_severity,
-                execution_time_ms
+                execution_time_ms,
+                source_types,
+                source_types_complete
             FROM detection_rule_metrics
             WHERE rule_id = $1
             ORDER BY timestamp DESC
@@ -278,17 +300,24 @@ impl ThresholdDetector {
         .fetch_optional(&self.pg_pool)
         .await?;
 
-        Ok(metrics.map(|row| RuleMetrics {
-            rule_id: row.rule_id,
-            timestamp: row.timestamp,
-            alert_count_1h: row.alert_count_1h,
-            alert_count_24h: row.alert_count_24h,
-            alert_count_7d: row.alert_count_7d,
-            unique_users: row.unique_users,
-            unique_hosts: row.unique_hosts,
-            unique_ips: row.unique_ips,
-            avg_severity: row.avg_severity,
-            execution_time_ms: row.execution_time_ms,
+        Ok(metrics.map(|row| {
+            let provenance =
+                SourceProvenance::from_parts(row.source_types, row.source_types_complete);
+            Provenanced::new(
+                RuleMetrics {
+                    rule_id: row.rule_id,
+                    timestamp: row.timestamp,
+                    alert_count_1h: row.alert_count_1h,
+                    alert_count_24h: row.alert_count_24h,
+                    alert_count_7d: row.alert_count_7d,
+                    unique_users: row.unique_users,
+                    unique_hosts: row.unique_hosts,
+                    unique_ips: row.unique_ips,
+                    avg_severity: row.avg_severity,
+                    execution_time_ms: row.execution_time_ms,
+                },
+                provenance,
+            )
         }))
     }
 
@@ -302,6 +331,7 @@ impl ThresholdDetector {
         baseline_mean: f64,
         baseline_threshold: f64,
         deviation_magnitude: f64,
+        provenance: &SourceProvenance,
     ) -> Result<i32, ThresholdDetectorError> {
         let mut tx = self.pg_pool.begin().await?;
 
@@ -354,8 +384,10 @@ impl ThresholdDetector {
                 baseline_threshold,
                 deviation_magnitude,
                 consecutive_periods,
-                tuning_triggered
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                tuning_triggered,
+                source_types,
+                source_types_complete
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             "#,
         )
         .bind(rule_id)
@@ -367,6 +399,8 @@ impl ThresholdDetector {
         .bind(deviation_magnitude)
         .bind(consecutive_periods)
         .bind(consecutive_periods >= CONSECUTIVE_PERIODS_THRESHOLD)
+        .bind(provenance.source_types())
+        .bind(provenance.is_complete())
         .execute(&mut *tx)
         .await?;
 
@@ -424,6 +458,8 @@ struct MetricsRow {
     unique_ips: i64,
     avg_severity: f64,
     execution_time_ms: i64,
+    source_types: Vec<String>,
+    source_types_complete: bool,
 }
 
 #[cfg(test)]

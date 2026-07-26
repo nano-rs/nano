@@ -43,11 +43,16 @@ use crate::scheduler::{calculate_next_run, calculate_next_runs, validate_cron};
 use crate::search::query_processing::enforce_non_audit_query;
 use crate::shutdown::ShutdownToken;
 use crate::webhooks::{WebhookRepository, WebhookService};
-use crate::{DashboardRepository, RawSqlRequest, SearchRequest, SearchService, TimeRangeInput};
+use crate::{Dashboard, RawSqlRequest, SearchRequest, SearchService, TimeRangeInput};
 
 use super::render::{self, PanelOutput};
 use super::repository::{ReportRepository, ReportRepositoryError};
 use super::types::*;
+use super::authz::MAX_DASHBOARD_PANELS;
+use super::{
+    dashboard_panel_executes_search_sql, ReportAuthorizationError, ReportAuthorizer,
+    ReportExecutionAuthorization,
+};
 
 /// Max result rows fetched for a SEARCH report. Bounds ClickHouse work and
 /// artifact size; the byte cap bounds the rest. A search returning exactly this
@@ -66,9 +71,6 @@ const REPORT_PANEL_ROW_CAP: usize = 2_000;
 /// Hard per-artifact byte cap (5 MiB). Content beyond this is truncated by the
 /// renderer and flagged `artifact_truncated` — never silently cut.
 const REPORT_ARTIFACT_BYTE_CAP: usize = 5 * 1024 * 1024;
-
-/// Max panels executed for a dashboard report (matches the dashboard panel cap).
-const MAX_DASHBOARD_PANELS: usize = 50;
 
 /// Default per-run execution timeout. Overridable via REPORT_RUN_TIMEOUT_SECS.
 const DEFAULT_RUN_TIMEOUT_SECS: u64 = 300;
@@ -117,6 +119,21 @@ pub enum ReportError {
     ClaimLost,
     #[error("Too many report runs in flight; try again shortly")]
     Busy,
+    #[error("Report authorization denied: {0}")]
+    AuthorizationDenied(String),
+    #[error("Report authorization could not be resolved: {0}")]
+    AuthorizationResolution(String),
+}
+
+impl From<ReportAuthorizationError> for ReportError {
+    fn from(error: ReportAuthorizationError) -> Self {
+        match error {
+            ReportAuthorizationError::Denied(message) => Self::AuthorizationDenied(message),
+            ReportAuthorizationError::Resolution(message) => {
+                Self::AuthorizationResolution(message)
+            }
+        }
+    }
 }
 
 /// Concurrent report executions allowed PER PROCESS.
@@ -163,6 +180,8 @@ struct ExecutionOutput {
     /// that dropped `source_type`, or a companion that could not resolve) makes
     /// the download gate deny every source-restricted requester.
     source_types_complete: bool,
+    /// NAN-2066: whether the authorized source snapshot executed raw SQL.
+    requires_search_sql: bool,
 }
 
 /// F-31: authorization predicate for downloading (or seeing the artifact
@@ -185,20 +204,7 @@ pub fn report_artifact_download_allowed(
     run_source_types: &[String],
     complete: bool,
 ) -> bool {
-    if denied.is_empty() {
-        return true;
-    }
-    if !complete {
-        return false;
-    }
-    // Normalize the stored manifest the same way deny sets are normalized
-    // (trim + lowercase) before the disjointness test.
-    let manifest: BTreeSet<String> = run_source_types
-        .iter()
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect();
-    denied.is_disjoint(&manifest)
+    crate::auth::ArtifactScope::from_denied(denied).allows(run_source_types, complete)
 }
 
 /// Report service: definition CRUD + execution + the distributed scheduler loop.
@@ -355,17 +361,57 @@ impl ReportService {
         })
     }
 
-    pub async fn get_artifact(
+    /// Resolve only authorization facts before loading run artifact metadata.
+    pub async fn get_run_authorization_scope(
+        &self,
+        run_id: Uuid,
+    ) -> Result<ReportRunAuthorizationScope, ReportError> {
+        self.repository
+            .get_run_authorization_scope(run_id)
+            .await
+            .map_err(|e| match e {
+                ReportRepositoryError::RunNotFound(id) => ReportError::NotFound(id),
+                other => other.into(),
+            })
+    }
+
+    /// Resolve only authorization facts before loading artifact bytes.
+    pub async fn get_artifact_scope(
         &self,
         artifact_id: Uuid,
-    ) -> Result<(ReportArtifactContent, ArtifactScope), ReportError> {
+    ) -> Result<ArtifactScope, ReportError> {
         self.repository
-            .get_artifact_content(artifact_id)
+            .get_artifact_scope(artifact_id)
             .await
             .map_err(|e| match e {
                 ReportRepositoryError::ArtifactNotFound(id) => ReportError::NotFound(id),
                 other => other.into(),
             })
+    }
+
+    pub async fn get_artifact_content(
+        &self,
+        artifact_id: Uuid,
+    ) -> Result<ReportArtifactContent, ReportError> {
+        self.repository
+            .get_artifact_bytes(artifact_id)
+            .await
+            .map_err(|e| match e {
+                ReportRepositoryError::ArtifactNotFound(id) => ReportError::NotFound(id),
+                other => other.into(),
+            })
+    }
+
+    /// Authoritative owner authorization used for manual preflight and repeated
+    /// inside every execution to close the trigger-to-run race.
+    pub async fn authorize_execution(
+        &self,
+        definition: &ReportDefinition,
+    ) -> Result<ReportExecutionAuthorization, ReportError> {
+        ReportAuthorizer::new(self.pool.clone())
+            .authorize_execution(definition)
+            .await
+            .map_err(Into::into)
     }
 
     /// Manually trigger a run now (fire-and-forget on this node). Returns the new
@@ -374,7 +420,15 @@ impl ReportService {
     /// Bounded: takes a permit from the process-global execution pool BEFORE
     /// spawning and SHEDS with [`ReportError::Busy`] when saturated, so repeated
     /// "Run now" clicks cannot pile up unbounded 50k-row executions.
-    pub async fn trigger_now(&self, id: Uuid) -> Result<Uuid, ReportError> {
+    ///
+    /// The requester's SQL capability is frozen with the trigger and checked
+    /// again against the exact dashboard snapshot used by the spawned run. This
+    /// closes a dashboard nPL-to-SQL change between handler preflight and work.
+    pub async fn trigger_now(
+        &self,
+        id: Uuid,
+        requester_can_search_sql: bool,
+    ) -> Result<Uuid, ReportError> {
         let def = self.get_definition(id).await?;
 
         let permit = exec_semaphore()
@@ -386,7 +440,9 @@ impl ReportService {
         let svc = self.clone();
         tokio::spawn(async move {
             let _permit = permit; // held for the run's lifetime
-            let _ = svc.execute_isolated(def, run_id, "manual", None).await;
+            let _ = svc
+                .execute_isolated(def, run_id, "manual", Some(requester_can_search_sql), None)
+                .await;
         });
         Ok(run_id)
     }
@@ -400,6 +456,9 @@ impl ReportService {
         def: ReportDefinition,
         run_id: Uuid,
         triggered_by: &'static str,
+        // `Some` only for a request-triggered run; schedules authorize their
+        // owner directly and have no separate requester identity.
+        requester_can_search_sql: Option<bool>,
         fence: Option<(String, i64)>,
     ) -> ExecOutcome {
         let definition_id = def.id;
@@ -407,7 +466,14 @@ impl ReportService {
         let task_fence = fence.clone();
         let handle = tokio::spawn(async move {
             let fence_ref = task_fence.as_ref().map(|(n, g)| (n.as_str(), *g));
-            svc.run_and_record(&def, run_id, triggered_by, fence_ref).await
+            svc.run_and_record(
+                &def,
+                run_id,
+                triggered_by,
+                requester_can_search_sql,
+                fence_ref,
+            )
+            .await
         });
         match handle.await {
             Ok(Ok(())) => ExecOutcome::Success,
@@ -459,6 +525,9 @@ impl ReportService {
         def: &ReportDefinition,
         run_id: Uuid,
         triggered_by: &str,
+        // See `trigger_now`: this is checked against `authorization`, the exact
+        // source snapshot subsequently consumed by `produce`.
+        requester_can_search_sql: Option<bool>,
         fence: Option<(&str, i64)>,
     ) -> Result<(), ReportError> {
         let started = Instant::now();
@@ -467,19 +536,32 @@ impl ReportService {
             .await?;
 
         let timeout = Duration::from_secs(run_timeout_secs());
-        // F-32: the scheduler checks the OWNER independently of any caller — a
-        // disabled owner's report must not execute (and produce downloadable
-        // artifacts) under their identity. FAIL-CLOSED: a status-lookup error
-        // fails the run rather than proceeding. Then resolve the owner's
-        // per-source scope ONCE per run (NAN-1809), also fail-closed.
-        let outcome = match self.ensure_owner_active(def).await {
+        // NAN-2065: every scheduler/manual execution re-resolves the owner's
+        // active status, required capabilities, and dashboard ACL without a
+        // cache. Authorization is checked after the run row is created so a
+        // scheduled denial is observable as FAILED, but before source scope,
+        // search, artifacts, notifications, or webhooks.
+        let outcome = match self.authorize_execution(def).await {
             Err(e) => Err(e),
-            Ok(()) => match self.owner_scope(def).await {
+            Ok(authorization)
+                if authorization.requires_search_sql()
+                    && requester_can_search_sql == Some(false) =>
+            {
+                Err(ReportError::AuthorizationDenied(format!(
+                    "manual report requester does not have required permission {}; run skipped",
+                    crate::auth::permissions::SEARCH_SQL
+                )))
+            }
+            Ok(authorization) => match self.owner_scope(def).await {
                 Err(e) => Err(e),
-                Ok(scope) => match tokio::time::timeout(timeout, self.produce(def, &scope)).await {
-                    Ok(res) => res,
-                    Err(_) => Err(ReportError::Timeout),
-                },
+                Ok(scope) => {
+                    match tokio::time::timeout(timeout, self.produce(def, &scope, &authorization))
+                        .await
+                    {
+                        Ok(res) => res,
+                        Err(_) => Err(ReportError::Timeout),
+                    }
+                }
             },
         };
 
@@ -499,6 +581,8 @@ impl ReportService {
                         &out.artifacts,
                         &out.source_types,
                         out.source_types_complete,
+                        out.requires_search_sql,
+                        true,
                     )
                     .await?;
                 if !stored {
@@ -558,31 +642,6 @@ impl ReportService {
             .filter(|s| !s.is_empty())
             .collect();
         Ok(ScopeSet::from_denied(deny))
-    }
-
-    /// F-32: fail the run unless the report OWNER is currently `active`.
-    ///
-    /// FAIL-CLOSED: a status-lookup error is a run-failing
-    /// [`ReportError::Execution`], never a silent proceed. The recorded message
-    /// is what analysts see on the failed run.
-    async fn ensure_owner_active(&self, def: &ReportDefinition) -> Result<(), ReportError> {
-        let status: Option<String> =
-            sqlx::query_scalar::<_, String>("SELECT status FROM users WHERE id = $1")
-                .bind(def.owner_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| {
-                    ReportError::Execution(format!(
-                        "could not resolve the report owner's status ({e}); \
-                         failing closed — the report was not run"
-                    ))
-                })?;
-        match status.as_deref() {
-            Some("active") => Ok(()),
-            _ => Err(ReportError::Execution(
-                "report owner disabled; run skipped".to_string(),
-            )),
-        }
     }
 
     /// F-31: snapshot the global restricted-`source_type` registry (best-effort,
@@ -677,15 +736,19 @@ impl ReportService {
         };
         match self.search_service.search(req, scope).await {
             Ok(resp) => {
-                let companion_types = distinct_source_types_over(&resp.results);
-                if companion_types.is_empty() {
-                    // Companion produced nothing trustworthy → fail closed.
-                    (direct, false)
-                } else {
-                    let mut union = direct;
-                    union.extend(companion_types);
-                    (union, true)
+                // NAN-2155: one classification, whose precedence rules live (and
+                // are tested) in `companion_provenance`. `trustworthy` false =>
+                // the window was not fully attributed, so the manifest is
+                // incomplete and the download gate denies every restricted
+                // requester — even if some groups DID name real sources
+                // (codex round 7).
+                let (companion_types, trustworthy) = companion_provenance(&resp.results);
+                if !trustworthy {
+                    return (direct, false);
                 }
+                let mut union = direct;
+                union.extend(companion_types);
+                (union, true)
             }
             Err(_) => (direct, false),
         }
@@ -695,10 +758,26 @@ impl ReportService {
         &self,
         def: &ReportDefinition,
         scope: &ScopeSet,
+        authorization: &ReportExecutionAuthorization,
     ) -> Result<ExecutionOutput, ReportError> {
         match def.source_type {
             ReportSourceType::Search => self.produce_search(def, scope).await,
-            ReportSourceType::Dashboard => self.produce_dashboard(def, scope).await,
+            ReportSourceType::Dashboard => {
+                let dashboard_authorization =
+                    authorization.dashboard_authorization().ok_or_else(|| {
+                        ReportError::AuthorizationResolution(
+                            "authorized dashboard snapshot is unavailable; failing closed"
+                                .to_string(),
+                        )
+                    })?;
+                self.produce_dashboard(
+                    def,
+                    scope,
+                    dashboard_authorization.dashboard(),
+                    dashboard_authorization.requires_search_sql(),
+                )
+                .await
+            }
         }
     }
 
@@ -800,6 +879,7 @@ impl ReportService {
             artifact_truncated: csv_trunc || html_trunc,
             source_types: source_types.into_iter().collect(),
             source_types_complete: complete,
+            requires_search_sql: false,
         })
     }
 
@@ -807,17 +887,9 @@ impl ReportService {
         &self,
         def: &ReportDefinition,
         scope: &ScopeSet,
+        dashboard: &Dashboard,
+        requires_search_sql: bool,
     ) -> Result<ExecutionOutput, ReportError> {
-        let dashboard_id = def
-            .source_dashboard_id
-            .ok_or_else(|| ReportError::InvalidDefinition("dashboard report has no dashboard".into()))?;
-
-        let dash_repo = DashboardRepository::new(self.pool.clone());
-        let dashboard = dash_repo
-            .find_by_id(dashboard_id)
-            .await
-            .map_err(|e| ReportError::Execution(format!("load dashboard: {e}")))?;
-
         let now = Utc::now();
         let start = now - chrono::Duration::seconds(def.time_range_seconds.max(1));
 
@@ -875,6 +947,7 @@ impl ReportService {
             artifact_truncated: html_trunc,
             source_types: union.into_iter().collect(),
             source_types_complete: all_complete,
+            requires_search_sql,
         })
     }
 
@@ -933,12 +1006,7 @@ impl ReportService {
             };
         }
 
-        let mode = panel
-            .get("queryMode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("piped");
-
-        let result = if mode == "sql" {
+        let result = if dashboard_panel_executes_search_sql(panel) {
             // Bind SQL panels to the report window. NAN-2001: reports NEVER expose
             // audit — the SQL arm ALWAYS runs as the audit-hidden identity
             // (`RawSqlAuditAccess::Hidden`), independent of the owner's audit:view,
@@ -1134,6 +1202,7 @@ impl ReportService {
                 claimed.definition,
                 run_id,
                 "schedule",
+                None,
                 Some((node_id.to_string(), generation)),
             )
             .await;
@@ -1233,7 +1302,18 @@ fn distinct_source_types_over(rows: &[Value]) -> BTreeSet<String> {
     }
     let mut set = BTreeSet::new();
     for event in rows {
-        if let Some(st) = event.get("source_type").and_then(|v| v.as_str()) {
+        // NAN-2155 (codex round 5): the per-event `source_type` is
+        // ingest-controlled. Letting a forged reserved marker into a report's
+        // manifest would make `report_artifact_download_allowed` deny EVERY
+        // source-restricted requester — including the report's own owner — so a
+        // single crafted event could take a scheduled report offline. Only the
+        // engine's `_nano_source_types` stamp below may carry the sentinel,
+        // where it legitimately means "provenance unresolved".
+        if let Some(st) = event
+            .get("source_type")
+            .and_then(|v| v.as_str())
+            .filter(|st| !crate::auth::is_reserved_source_type(st))
+        {
             insert_normalized(st, &mut set);
         }
         if let Some(arr) = event.get("_nano_source_types").and_then(|v| v.as_array()) {
@@ -1245,6 +1325,53 @@ fn distinct_source_types_over(rows: &[Value]) -> BTreeSet<String> {
         }
     }
     set
+}
+
+/// NAN-2155: what a report companion result set proved about the window's
+/// provenance — the report-side twin of
+/// `detection::service::execution::classify_companion_rows`, kept pure so the
+/// decision matrix is unit-testable.
+///
+/// Returns `(types, trustworthy)`:
+///
+/// * `trustworthy == false` — the companion returned nothing, or at least ONE
+///   group had a blank / missing / non-string `source_type`, i.e. a slice of the
+///   window whose source is unknown. **Partial attribution loses to nothing**
+///   (codex round 7): a non-empty set of *other* groups must not certify the
+///   result, or a restricted requester could download an artifact containing
+///   unresolved-provenance data.
+/// * `trustworthy == true` with an EMPTY set — every group was attributed and
+///   every value was a reserved marker. The window is attributed to a name we
+///   refuse to honour, which cannot be in the restricted registry, so nobody is
+///   denied it (codex round 5). Failing closed here would let one crafted event
+///   take a scheduled report offline for every restricted requester, including
+///   its owner.
+pub(crate) fn companion_provenance(rows: &[Value]) -> (BTreeSet<String>, bool) {
+    let mut types: BTreeSet<String> = BTreeSet::new();
+    let mut any_unattributed = false;
+    for event in rows {
+        match event
+            .get("source_type")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+        {
+            Some(source_type) => {
+                // Reserved markers are dropped, never honoured — the companion
+                // reads the ingest-controlled `source_type` column.
+                if !crate::auth::is_reserved_source_type(&source_type) {
+                    types.insert(source_type);
+                }
+            }
+            None => any_unattributed = true,
+        }
+    }
+    // Partial attribution loses to nothing: a non-empty set of OTHER groups must
+    // not certify a result that also contains an unattributed slice.
+    if any_unattributed || rows.is_empty() {
+        return (types, false);
+    }
+    (types, true)
 }
 
 /// F-31: derive the companion query that lists the DISTINCT `source_type`

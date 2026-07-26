@@ -11,17 +11,17 @@
 //! time-bound WHERE) — the heavy lifting lives in the search service glue
 //! (`observability_service_security_signals`).
 //!
-//! Read endpoint requires `search:view` (the console is a search-adjacent
-//! surface, matching the SLO/synthetics read gate).
+//! The endpoint executes live ClickHouse queries, so it requires
+//! `search:execute`, matching the canonical search data plane.
 
 use axum::{
-    Extension, Json,
     extract::{Path, Query, State},
+    Extension, Json,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ErrorResponse};
-use crate::middleware::{AuthContext, ensure_permission};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::state::AppState;
 use nanosiem_core::auth::permissions;
 use nanosiem_core::query::TimeRange;
@@ -82,7 +82,7 @@ pub struct ServiceSecuritySignalsResponse {
 /// over the window, then returns the security DETECTION signals (ClickHouse
 /// `signals`) whose matched `risk_entity` is one of those entities — the
 /// convergence cross-link in the Observability service-detail view. Bounded +
-/// injection-safe. Requires `search:view`.
+/// injection-safe. Requires `search:execute`.
 #[utoipa::path(
     get,
     path = "/api/observability/services/{service}/security-signals",
@@ -94,7 +94,7 @@ pub struct ServiceSecuritySignalsResponse {
     responses(
         (status = 200, description = "Security signals against the service's hosts/IPs", body = ServiceSecuritySignalsResponse),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 403, description = "Forbidden - Missing search:execute permission", body = ErrorResponse),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -104,10 +104,12 @@ pub async fn get_service_security_signals(
     Path(service): Path<String>,
     Query(params): Query<ServiceSecuritySignalsParams>,
 ) -> Result<Json<ServiceSecuritySignalsResponse>, ApiError> {
-    ensure_permission(&auth, permissions::SEARCH_VIEW)?;
+    ensure_service_security_signals_access(&auth)?;
 
     if service.trim().is_empty() {
-        return Err(ApiError::BadRequest("service must not be empty".to_string()));
+        return Err(ApiError::BadRequest(
+            "service must not be empty".to_string(),
+        ));
     }
 
     // Resolve the window: explicit start/end win; else look back window_hours
@@ -142,9 +144,83 @@ pub async fn get_service_security_signals(
     }))
 }
 
+/// Authorize the service-to-security live-query boundary.
+///
+/// `search:view` controls navigation and saved search surfaces; it does not
+/// authorize executing queries over `otel_spans` and detection signals. Keep
+/// this check before input validation and every ClickHouse read so rejected
+/// callers cannot use validation or timing differences as a query oracle.
+fn ensure_service_security_signals_access(auth: &AuthContext) -> Result<(), ApiError> {
+    ensure_permission(auth, permissions::SEARCH_EXECUTE)
+}
+
 #[derive(utoipa::OpenApi)]
 #[openapi(
     paths(get_service_security_signals),
     components(schemas(ServiceSecuritySignalsResponse, SecuritySignal))
 )]
 pub struct ObservabilityServiceSignalsApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nanosiem_core::auth::api_key::ApiKeyInfo;
+    use nanosiem_core::auth::token::{DEFAULT_TOKEN_AUDIENCE, DEFAULT_TOKEN_ISSUER};
+    use nanosiem_core::auth::TokenClaims;
+    use uuid::Uuid;
+
+    fn jwt_auth(values: &[&str]) -> AuthContext {
+        AuthContext::from_jwt(TokenClaims {
+            iss: DEFAULT_TOKEN_ISSUER.to_string(),
+            aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
+            sub: Uuid::now_v7(),
+            roles: Vec::new(),
+            permissions: values.iter().map(ToString::to_string).collect(),
+            exp: chrono::Utc::now().timestamp() + 60,
+            iat: chrono::Utc::now().timestamp(),
+            jti: Uuid::now_v7(),
+            purpose: "access".to_string(),
+        })
+    }
+
+    fn api_key_auth(values: &[&str]) -> AuthContext {
+        AuthContext::from_api_key(&ApiKeyInfo {
+            id: Uuid::now_v7(),
+            name: "nan-2056-probe".to_string(),
+            permissions: values.iter().map(ToString::to_string).collect(),
+            user_id: Some(Uuid::now_v7()),
+        })
+    }
+
+    fn both_principals(values: &[&str]) -> [AuthContext; 2] {
+        [jwt_auth(values), api_key_auth(values)]
+    }
+
+    #[test]
+    fn service_security_signals_requires_search_execute_for_every_principal() {
+        for permissions in [
+            Vec::<&str>::new(),
+            vec![permissions::SEARCH_VIEW],
+            vec![permissions::SETTINGS_VIEW],
+        ] {
+            for auth in both_principals(&permissions) {
+                assert!(
+                    ensure_service_security_signals_access(&auth).is_err(),
+                    "under-scoped principal unexpectedly reached live query path: {permissions:?}"
+                );
+            }
+        }
+
+        for permissions in [
+            vec![permissions::SEARCH_EXECUTE],
+            vec![permissions::SEARCH_VIEW, permissions::SEARCH_EXECUTE],
+        ] {
+            for auth in both_principals(&permissions) {
+                assert!(
+                    ensure_service_security_signals_access(&auth).is_ok(),
+                    "search:execute principal was denied live query access: {permissions:?}"
+                );
+            }
+        }
+    }
+}

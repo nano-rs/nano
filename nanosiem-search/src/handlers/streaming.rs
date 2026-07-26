@@ -39,6 +39,7 @@ use crate::{SearchState, error::SearchError, metrics::record_search_query};
         (status = 200, description = "SSE stream of search results"),
         (status = 400, description = "Invalid query", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Missing search:execute permission", body = ErrorResponse),
     )
 )]
 pub async fn search_stream(
@@ -48,7 +49,10 @@ pub async fn search_stream(
     Json(request): Json<SearchRequest>,
 ) -> Result<(axum::http::HeaderMap, Sse<impl Stream<Item = Result<Event, Infallible>>>), SearchError>
 {
-    let user_id = auth.claims.sub;
+    // NAN-2030: authN (a valid token) is not authZ — gate the SSE search path on
+    // search:execute before any work, exactly like POST /api/search. This path
+    // was authenticated but UNAUTHORIZED (a parity gap vs. the batch `search`).
+    super::require_search_execute(&auth)?;
 
     // NAN-1799: compose the effective deny-set (per-user source scope ∪ audit
     // gate) ONCE, before the cache lookup below — the scope is folded into
@@ -58,19 +62,12 @@ pub async fn search_stream(
     let scope = super::search::effective_scope(&auth);
 
     if let Some(request_id) = request.request_id.clone() {
-        match state.reserve_query_owner(&request_id, user_id).await {
-            Ok(true) => {}
-            Ok(false) => return Err(SearchError::BadRequest(
-                "request_id is already in use".to_string(),
-            )),
-            Err(error) => {
-                tracing::warn!(%error, %request_id, "Shared query ownership unavailable; using local ownership");
-            }
-        }
-        state
-            .search
-            .query_tracker()
-            .reserve_request(request_id, user_id);
+        // NAN-2100: reserve under the CREDENTIAL (api-key id, or user id for
+        // an interactive session) — `cancel_search` compares the same
+        // principal. Shares the batch path's helper so the two entry points
+        // cannot drift on the identity they record.
+        super::search::reserve_query_owner(&state, request_id, auth.credential_principal_id())
+            .await?;
     }
 
     // Create event channel

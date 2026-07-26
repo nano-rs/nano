@@ -216,7 +216,7 @@ export function extractIp(e: Record<string, unknown>): string | undefined {
 // The local heuristic is now belt-and-suspenders for envelope misses.
 export function isAggregateRow(e: Record<string, unknown>): boolean {
   if (e._match_kind === 'aggregate') return true;
-  if (e._match_kind === 'raw') return false;
+  if (e._match_kind === 'raw' || e._match_kind === 'sequence') return false;
   if (typeof e._first_seen === 'string' || typeof e._last_seen === 'string') return true;
   if (typeof e.first_seen === 'string' && typeof e.last_seen === 'string') return true;
   if (typeof e.actions_attempted === 'string') return true;

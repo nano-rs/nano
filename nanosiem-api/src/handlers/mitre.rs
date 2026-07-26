@@ -261,7 +261,7 @@ pub struct CoverageQueryParams {
     params(CoverageQueryParams),
     responses(
         (status = 200, description = "MITRE ATT&CK coverage data", body = MitreCoverageResponse),
-        (status = 403, description = "Forbidden - Missing permission: mitre:view"),
+        (status = 403, description = "Forbidden - Missing permission: mitre:view and detections:view"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []), ("api_key" = []))
@@ -272,6 +272,13 @@ pub async fn get_mitre_coverage(
     Query(params): Query<CoverageQueryParams>,
 ) -> Result<Json<MitreCoverageResponse>, (StatusCode, String)> {
     check_permission(&auth, permissions::MITRE_VIEW)
+        .map_err(|(status, json)| (status, json.0.message))?;
+    // Composite operation: the per-technique coverage payload enumerates the
+    // detection inventory (rule id, name, severity, mode, source_type) parsed
+    // from private rule queries. Require `detections:view` in addition to
+    // `mitre:view` so a MITRE-only caller that GET /api/rules/{id} correctly
+    // denies cannot enumerate protected detections here (NAN-2106 / CWE-862).
+    check_permission(&auth, permissions::DETECTIONS_VIEW)
         .map_err(|(status, json)| (status, json.0.message))?;
 
     let repo = MitreRepository::new(state.pool.clone());

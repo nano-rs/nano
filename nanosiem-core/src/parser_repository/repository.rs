@@ -533,16 +533,25 @@ impl ParserImportsRepository {
     }
 
     /// List all imports with their upstream YAML content for match_values fixup
+    /// Imported log sources and their upstream YAML, for ONE repository.
+    ///
+    /// NAN-2120: this used to return every import across every repository, which
+    /// let a single repair request rewrite live routing metadata tenant-wide.
+    /// The repository filter is applied inside the SQL so the caller cannot
+    /// widen the blast radius after the fact.
     pub async fn list_with_raw_content(
         &self,
+        repository_id: Uuid,
     ) -> Result<Vec<(Uuid, String)>, ParserImportsRepositoryError> {
         let rows: Vec<(Uuid, String)> = sqlx::query_as(
             r#"
             SELECT pi.log_source_id, rp.raw_content
             FROM parser_imports pi
             JOIN repository_parsers rp ON pi.repository_parser_id = rp.id
+            WHERE rp.repository_id = $1
             "#,
         )
+        .bind(repository_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)

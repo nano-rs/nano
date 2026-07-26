@@ -15,7 +15,7 @@
 //! - `dataset=logs/spans/metrics` output is byte-identical with and without an
 //!   attached risk config (the new plumbing is output-neutral for non-risk).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use chrono::{TimeZone, Utc};
 
@@ -130,6 +130,41 @@ fn risk_base_source_inlines_decay_and_cleared_boundaries() {
     assert!(sql.contains(&cutoff_7d), "{sql}");
     // No unresolved placeholders.
     assert!(!sql.contains('?'), "unrendered bind placeholder: {sql}");
+}
+
+#[test]
+fn risk_dataset_uses_generator_source_scope_for_finding_origins() {
+    let deny: BTreeSet<String> = ["insider_threat".to_string()].into_iter().collect();
+    let gen = ClickHouseSqlGenerator::new()
+        .with_risk_config(risk_config())
+        .with_source_scope_deny(deny.clone())
+        .with_dataset(Dataset::Risk);
+    let sql = generate(&gen, "score_24h > 0");
+
+    assert!(
+        sql.contains(
+            "notEmpty(JSONExtract(metadata, 'origin_source_types', 'Array(String)'))"
+        ),
+        "restricted dataset=risk must fail closed on legacy-empty origins: {sql}"
+    );
+    assert!(
+        sql.contains("['__nano:unresolved_source__', 'insider_threat']"),
+        "restricted dataset=risk must inline the normalized effective deny payload: {sql}"
+    );
+
+    let subsearch = ClickHouseSqlGenerator::new()
+        .with_risk_config(risk_config())
+        .with_source_scope_deny(deny);
+    let subsearch_sql = generate(
+        &subsearch,
+        "user IN [dataset=risk score_24h > 0 | return entity]",
+    );
+    assert!(
+        subsearch_sql.contains(
+            "notEmpty(JSONExtract(metadata, 'origin_source_types', 'Array(String)'))"
+        ),
+        "a risk subsearch must inherit the outer request's scope: {subsearch_sql}"
+    );
 }
 
 #[test]

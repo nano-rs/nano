@@ -25,6 +25,20 @@ use crate::{
 /// drawer opens cheaply — explicit longer ranges are an opt-in click.
 const DEFAULT_TEST_RANGE_HOURS: i64 = 1;
 
+/// NAN-2047: compose the caller's EFFECTIVE per-source deny scope for the rule
+/// tester — the per-source RBAC deny set (NAN-1799) unioned with the `audit`
+/// source unless the caller holds `audit:view`. Identical composition to the
+/// canonical search / alert / dashboard surfaces (`effective_viewer_scope` in
+/// handlers/alerts.rs), so the tester cannot become an unrestricted alternate
+/// search surface. An unrestricted caller with `audit:view` yields an empty
+/// deny set → byte-identical SQL to before.
+///
+/// NAN-2055: the composition now lives on `AuthContext`; this stays as a local
+/// alias for the call sites below.
+fn effective_viewer_scope(auth: &AuthContext) -> nanosiem_core::auth::ScopeSet {
+    auth.effective_viewer_scope()
+}
+
 /// Resolve the test time window from the request. Falls back to the legacy
 /// `days` field for back-compat with older clients, then to a 1-hour default.
 fn resolve_test_range(request: &TestRuleRequest) -> TimeRangeInput {
@@ -60,7 +74,7 @@ fn resolve_test_range(request: &TestRuleRequest) -> TimeRangeInput {
     responses(
         (status = 200, description = "Historical analysis results", body = HistoricalAnalysisResult),
         (status = 400, description = "Invalid request (e.g. range exceeds 14 days)", body = ErrorResponse),
-        (status = 403, description = "Missing permission: detections:view", body = ErrorResponse),
+        (status = 403, description = "Missing permission: detections:view + search:execute", body = ErrorResponse),
         (status = 404, description = "Rule not found", body = ErrorResponse),
         (status = 429, description = "Another rule test is already in flight for this user", body = ErrorResponse),
         (status = 503, description = "Distributed rule-test admission is unavailable", body = ErrorResponse),
@@ -74,6 +88,12 @@ pub async fn test_detection(
     Json(request): Json<TestRuleRequest>,
 ) -> Result<Json<HistoricalAnalysisResult>, ApiError> {
     ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
+    // NAN-2047: this executes stepped ClickHouse searches over logs and returns
+    // raw `sample_events` — the same data surface as POST /api/search, which
+    // requires search:execute (NAN-2028). Require it here too; detections:view
+    // alone let a principal denied canonical search read sampled log rows. (When
+    // the drawer supplies a query override below, that's an even stronger reason.)
+    ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
 
     let _guard = state
         .rule_test_admission
@@ -93,11 +113,14 @@ pub async fn test_detection(
     // Look up the saved rule so we can step at its actual schedule + lookback.
     let rule = state.detection_service.get_rule(*id).await?;
 
+    // NAN-2047: run the tester's searches under the caller's effective scope so
+    // a source-restricted principal can't read denied sources through it.
+    let scope = effective_viewer_scope(&auth);
     let result = if clean_query.is_empty() {
         // Standard case: testing the saved rule as-is.
         state
             .detection_service
-            .analyze_rule_stepped(&rule, time_range)
+            .analyze_rule_stepped(&rule, time_range, &scope)
             .await?
     } else {
         // The drawer lets users edit the query before testing without saving.
@@ -110,6 +133,7 @@ pub async fn test_detection(
                 rule.schedule_cron.as_deref(),
                 rule.lookback_minutes.map(|m| m as i64),
                 rule.dataset.clone(),
+                &scope,
             )
             .await?
     };
@@ -131,7 +155,7 @@ pub async fn test_detection(
     responses(
         (status = 200, description = "Historical analysis results", body = HistoricalAnalysisResult),
         (status = 400, description = "Invalid request (e.g. range exceeds 14 days)", body = ErrorResponse),
-        (status = 403, description = "Missing permission: detections:create", body = ErrorResponse),
+        (status = 403, description = "Missing permission: detections:create + search:execute", body = ErrorResponse),
         (status = 429, description = "Another rule test is already in flight for this user", body = ErrorResponse),
         (status = 503, description = "Distributed rule-test admission is unavailable", body = ErrorResponse),
     ),
@@ -143,6 +167,10 @@ pub async fn test_query(
     Json(request): Json<TestRuleRequest>,
 ) -> Result<Json<HistoricalAnalysisResult>, ApiError> {
     ensure_permission(&auth, permissions::DETECTIONS_CREATE)?;
+    // NAN-2047: executes an arbitrary caller-supplied query as stepped ClickHouse
+    // searches and returns raw `sample_events` — require search:execute, matching
+    // POST /api/search. detections:create alone was an alternate raw-log surface.
+    ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
 
     let _guard = state
         .rule_test_admission
@@ -172,6 +200,8 @@ pub async fn test_query(
         }
     }
 
+    // NAN-2047: run under the caller's effective scope (see effective_viewer_scope).
+    let scope = effective_viewer_scope(&auth);
     let result = state
         .detection_service
         .analyze_query_stepped(
@@ -180,6 +210,7 @@ pub async fn test_query(
             request.schedule_cron.as_deref(),
             request.lookback_minutes,
             request.dataset.clone(),
+            &scope,
         )
         .await?;
     Ok(Json(result))

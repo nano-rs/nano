@@ -37,15 +37,18 @@ use crate::{
         auth::{auth_middleware, AuthState},
         ip_allowlist::{ip_allowlist_middleware, IpAllowlistState},
         rate_limit::{
-            dry_resolve_rate_limit_middleware, kafka_probe_rate_limit_middleware,
-            login_rate_limit_middleware, mfa_setup_rate_limit_middleware,
-            password_reset_rate_limit_middleware, upload_rate_limit_middleware, RateLimitState,
+            detection_code_probe_rate_limit_middleware, dry_resolve_rate_limit_middleware,
+            kafka_probe_rate_limit_middleware, login_rate_limit_middleware,
+            mfa_setup_rate_limit_middleware, password_reset_rate_limit_middleware,
+            upload_rate_limit_middleware, RateLimitState,
         },
         request_id_middleware, request_logging_layer,
     },
     openapi,
     state::AppState,
 };
+#[cfg(feature = "enterprise")]
+use crate::middleware::rate_limit::marketplace_preview_rate_limit_middleware;
 use nanosiem_core::ip_allowlist::IpAllowlistScope;
 
 /// Create the API router with all routes
@@ -215,6 +218,33 @@ pub fn create_router(state: AppState) -> Router {
         .layer(axum_middleware::from_fn_with_state(
             (*rate_limit_state).clone(),
             kafka_probe_rate_limit_middleware,
+        ));
+
+    // NAN-2064: this probe decrypts a stored GitHub PAT and spends external API
+    // budget. Keep it out of the general route tree so every invocation is
+    // rate-limited per interactive user/API key and target.
+    let detection_code_probe_routes = Router::new()
+        .route(
+            "/api/detection-code-targets/{id}/test",
+            post(handlers::detection_code_targets::test_connection),
+        )
+        .layer(axum_middleware::from_fn_with_state(
+            (*rate_limit_state).clone(),
+            detection_code_probe_rate_limit_middleware,
+        ));
+
+    // NAN-2062: preview can decrypt saved provider credentials, execute Deno
+    // code, and make outbound requests. Every call is rate-limited per
+    // interactive user/API key and provider slug.
+    #[cfg(feature = "enterprise")]
+    let marketplace_preview_routes = Router::new()
+        .route(
+            "/api/marketplace/catalog/{slug}/preview",
+            post(handlers::marketplace::preview_enrichment),
+        )
+        .layer(axum_middleware::from_fn_with_state(
+            (*rate_limit_state).clone(),
+            marketplace_preview_rate_limit_middleware,
         ));
 
     // Cacheable route groups with Cache-Control headers
@@ -743,6 +773,11 @@ pub fn create_router(state: AppState) -> Router {
                 "/api/incidents/{id}/cases/{case_id}",
                 delete(handlers::incidents::remove_case_from_incident::<AppState>),
             );
+    }
+
+    #[cfg(feature = "enterprise")]
+    {
+        app = app.merge(marketplace_preview_routes);
     }
 
     app = app
@@ -1473,16 +1508,6 @@ pub fn create_router(state: AppState) -> Router {
             get(handlers::marketplace::export_enrichment),
         );
 
-    // Preview a Deno enrichment — enterprise only (Phase 3.3 lifted the
-    // sandbox runtime).
-    #[cfg(feature = "enterprise")]
-    {
-        app = app.route(
-            "/api/marketplace/catalog/{slug}/preview",
-            post(handlers::marketplace::preview_enrichment),
-        );
-    }
-
     app = app
         .route(
             "/api/marketplace/coverage",
@@ -1533,6 +1558,10 @@ pub fn create_router(state: AppState) -> Router {
     #[cfg(feature = "enterprise")]
     {
         app = app
+            .route(
+                "/api/settings/ai-availability",
+                get(handlers::get_ai_availability),
+            )
             .route(
                 "/api/settings/ai-providers",
                 get(handlers::list_ai_providers),
@@ -1881,10 +1910,6 @@ pub fn create_router(state: AppState) -> Router {
             "/api/detection-code-targets/{id}/token",
             post(handlers::detection_code_targets::set_token),
         )
-        .route(
-            "/api/detection-code-targets/{id}/test",
-            post(handlers::detection_code_targets::test_connection),
-        )
         // Rule Repositories (external Sigma rule syncing)
         .route(
             "/api/rule-repositories",
@@ -1977,8 +2002,12 @@ pub fn create_router(state: AppState) -> Router {
             "/api/parser-repositories",
             post(handlers::parser_repositories::create_parser_repository),
         )
+        // NAN-2120: repository-scoped. The predecessor
+        // `/api/parser-repositories/fixup-match-values` rewrote live
+        // `match_values` for EVERY import in the tenant from a single request
+        // holding only `parser_repositories:manage`.
         .route(
-            "/api/parser-repositories/fixup-match-values",
+            "/api/parser-repositories/{id}/fixup-match-values",
             post(handlers::parser_repositories::fixup_match_values),
         )
         .route(
@@ -2250,6 +2279,8 @@ pub fn create_router(state: AppState) -> Router {
         .merge(dry_resolve_routes)
         // NAN-939: rate-limited Kafka broker-probe sub-router
         .merge(kafka_probe_routes)
+        // NAN-2064: rate-limited stored-credential GitHub probe
+        .merge(detection_code_probe_routes)
         .route("/api/upload/history", get(handlers::get_upload_history))
         // Lookup table endpoints
         .route("/api/lookup-tables", post(handlers::create_lookup_table))

@@ -15,8 +15,19 @@ use uuid::Uuid;
 pub struct QueryInfo {
     /// ClickHouse query_id for KILL QUERY
     pub query_id: String,
-    /// Authenticated user that started this request_id (for cancel authz)
-    pub owner_user_id: Option<Uuid>,
+    /// NAN-2100: the CREDENTIAL that started this request_id, for cancel authz.
+    ///
+    /// MUST be the api-key id for api-key auth and the user id for an
+    /// interactive session — never the key's human OWNER. Storing the owner
+    /// collapses "Fred's browser session", "Fred's key A" and "Fred's
+    /// zero-permission key B" into one identity, letting the weakest of them
+    /// `KILL QUERY` the others' live investigations.
+    ///
+    /// The two `AuthContext` types disagree on what `claims.sub` means for an
+    /// api key (`nanosiem-search` stores the key id, `nanosiem-api-lib` the
+    /// owner), so callers must resolve it through their context's explicit
+    /// credential accessor rather than reading `claims.sub` directly.
+    pub owner_principal_id: Option<Uuid>,
     /// When the query started
     pub started_at: Instant,
 }
@@ -47,25 +58,49 @@ impl QueryTracker {
         let existing_owner = self
             .active
             .get(&request_id)
-            .and_then(|r| r.value().owner_user_id);
+            .and_then(|r| r.value().owner_principal_id);
         self.active.insert(
             request_id,
             QueryInfo {
                 query_id,
-                owner_user_id: existing_owner,
+                owner_principal_id: existing_owner,
                 started_at: Instant::now(),
             },
         );
     }
 
-    /// Reserve a request_id with its authenticated owner before execution starts.
-    /// This lets cancellation enforce ownership even before query_id is assigned.
-    pub fn reserve_request(&self, request_id: String, owner_user_id: Uuid) {
-        self.active.entry(request_id).or_insert_with(|| QueryInfo {
-            query_id: String::new(),
-            owner_user_id: Some(owner_user_id),
-            started_at: Instant::now(),
-        });
+    /// Reserve a request_id with the CREDENTIAL that started it, before
+    /// execution begins. This lets cancellation enforce ownership even before a
+    /// query_id is assigned. See [`QueryInfo::owner_principal_id`] for what
+    /// `owner_principal_id` must be.
+    ///
+    /// Returns `true` when the caller owns the id afterwards — it was free, or
+    /// it was already held by the SAME principal (companion queries reuse the
+    /// main request id). Returns `false` on a conflict with a DIFFERENT
+    /// principal; the caller must then refuse the request.
+    ///
+    /// NAN-2100: this used to be an unconditional `or_insert_with`, which kept
+    /// the FIRST reserver's identity and still reported success. A second
+    /// credential's query then ran under an id owned by the first, so the first
+    /// could `KILL QUERY` it. The shared Redis registry already rejected that
+    /// collision (`SET NX`); single-instance deployments — and any request that
+    /// fell back to local ownership after a Redis error — had no such check.
+    #[must_use]
+    pub fn reserve_request(&self, request_id: String, owner_principal_id: Uuid) -> bool {
+        use dashmap::mapref::entry::Entry;
+        match self.active.entry(request_id) {
+            Entry::Occupied(existing) => {
+                existing.get().owner_principal_id == Some(owner_principal_id)
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(QueryInfo {
+                    query_id: String::new(),
+                    owner_principal_id: Some(owner_principal_id),
+                    started_at: Instant::now(),
+                });
+                true
+            }
+        }
     }
 
     /// Unregister a query (call when query completes)
@@ -125,7 +160,7 @@ mod tests {
 
         let info = tracker.get("req-123").unwrap();
         assert_eq!(info.query_id, "ch-456");
-        assert_eq!(info.owner_user_id, None);
+        assert_eq!(info.owner_principal_id, None);
 
         let removed = tracker.unregister("req-123").unwrap();
         assert_eq!(removed.query_id, "ch-456");
@@ -164,11 +199,38 @@ mod tests {
         let tracker = QueryTracker::new();
         let user_id = Uuid::now_v7();
 
-        tracker.reserve_request("req-1".to_string(), user_id);
+        assert!(tracker.reserve_request("req-1".to_string(), user_id));
         tracker.register("req-1".to_string(), "ch-1".to_string());
 
         let info = tracker.get("req-1").unwrap();
         assert_eq!(info.query_id, "ch-1");
-        assert_eq!(info.owner_user_id, Some(user_id));
+        assert_eq!(info.owner_principal_id, Some(user_id));
+    }
+
+    /// NAN-2100: reserving an id already held by a DIFFERENT credential must be
+    /// refused. The old `or_insert_with` kept the first reserver and reported
+    /// success, so the second credential's query ran under an id the first one
+    /// could `KILL QUERY`. Companion queries from the SAME credential must
+    /// still succeed — they deliberately reuse the main request id.
+    #[test]
+    fn reserve_request_rejects_a_different_principal() {
+        let tracker = QueryTracker::new();
+        let key_a = Uuid::now_v7();
+        let key_b = Uuid::now_v7();
+
+        assert!(tracker.reserve_request("req-1".to_string(), key_a));
+        // Same credential re-reserving (companion query) — allowed.
+        assert!(tracker.reserve_request("req-1".to_string(), key_a));
+        // Different credential — refused, and ownership does NOT change.
+        assert!(!tracker.reserve_request("req-1".to_string(), key_b));
+        assert_eq!(
+            tracker.get("req-1").unwrap().owner_principal_id,
+            Some(key_a)
+        );
+
+        // An id registered by the engine with no reserved owner is not
+        // claimable either — fail closed rather than let a late caller adopt it.
+        tracker.register("req-2".to_string(), "ch-2".to_string());
+        assert!(!tracker.reserve_request("req-2".to_string(), key_b));
     }
 }

@@ -12,6 +12,11 @@ pub mod artifacts;
 // against columns its database doesn't have.
 #[cfg(feature = "enterprise")]
 pub mod cases;
+// NAN-2075/2077: the case-visibility predicate itself is NOT gated. Open-core
+// surfaces (playbooks, notebooks) legitimately need to answer "can this user see
+// this case?" without depending on the enterprise-gated `CaseRepository` type,
+// and having ONE definition is the whole point — see the module docs.
+pub mod case_visibility;
 pub mod dashboards;
 pub mod detection_rules;
 pub mod feedback;

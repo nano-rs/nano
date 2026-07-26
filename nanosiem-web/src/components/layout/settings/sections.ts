@@ -197,7 +197,7 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     icon: Bot,
     desc: 'Model selection, guardrails, allowed capabilities, cost caps.',
     href: '/settings/ai',
-    permissions: 'settings:ai',
+    permissions: ['settings:ai', 'settings:ai_providers', 'settings:agent_models'],
     capability: 'melod',
     // Demo users hold `settings:ai` only for the meloD-availability probe; the
     // section is otherwise demo-restricted by demo_guard, so hide it (NAN-1198).
@@ -209,21 +209,21 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
         label: 'Providers',
         href: '/settings/ai?tab=providers',
         icon: Cloud,
-        permissions: 'settings:ai',
+        permissions: 'settings:ai_providers',
       },
       {
         id: 'ai-models',
         label: 'Models',
         href: '/settings/ai?tab=models',
         icon: Boxes,
-        permissions: 'settings:ai',
+        permissions: 'settings:agent_models',
       },
       {
         id: 'ai-agents',
         label: 'Agent Models',
         href: '/settings/ai?tab=agents',
         icon: Cpu,
-        permissions: 'settings:ai',
+        permissions: 'settings:agent_models',
       },
       {
         id: 'ai-guidance',

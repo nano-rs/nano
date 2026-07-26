@@ -131,8 +131,8 @@ pub struct DetectionMatch {
     /// The actual events that triggered this detection. Each event also
     /// carries a canonical envelope injected by the API (NAN-830):
     /// `_match_event_time` (RFC 3339 string, optional), `_match_event_label`
-    /// (one-line summary, optional), and `_match_kind` (`"raw"` or
-    /// `"aggregate"`, always present). UI clients should prefer these
+    /// (one-line summary, always present), and `_match_kind` (`"raw"`,
+    /// `"aggregate"`, or `"sequence"`, always present). UI clients should prefer these
     /// fields over inferring from the user's free-form rule output.
     pub events: Vec<serde_json::Value>,
     /// Whether the match has been reviewed by an analyst (NAN-494).

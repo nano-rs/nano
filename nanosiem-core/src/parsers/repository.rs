@@ -36,8 +36,8 @@ impl ParserRepository {
             r#"
             SELECT
                 id, name, description, source_type,
-                source_config, parser_vrl, output_fields,
-                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
+                parser_vrl, output_fields,
+                dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
@@ -56,8 +56,8 @@ impl ParserRepository {
             r#"
             SELECT
                 id, name, description, source_type,
-                source_config, parser_vrl, output_fields,
-                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
+                parser_vrl, output_fields,
+                dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
@@ -77,8 +77,8 @@ impl ParserRepository {
             r#"
             SELECT
                 id, name, description, source_type,
-                source_config, parser_vrl, output_fields,
-                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
+                parser_vrl, output_fields,
+                dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
@@ -99,8 +99,8 @@ impl ParserRepository {
             r#"
             SELECT
                 id, name, description, source_type,
-                source_config, parser_vrl, output_fields,
-                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
+                parser_vrl, output_fields,
+                dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
@@ -129,24 +129,26 @@ impl ParserRepository {
 
         let row = sqlx::query(
             r#"
-            INSERT INTO log_sources (name, description, source_type, source_config, parser_vrl, output_fields, credential_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO log_sources (
+                name, description, source_type, parser_vrl, output_fields,
+                dispatch_source_config_id
+            )
+            VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING
                 id, name, description, source_type,
-                source_config, parser_vrl, output_fields,
-                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
+                parser_vrl, output_fields,
+                dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
-            "#
+            "#,
         )
         .bind(&parser.name)
         .bind(&parser.description)
         .bind(&parser.source_type)
-        .bind(&parser.source_config)
         .bind(&parser.parser_vrl)
         .bind(&parser.output_fields)
-        .bind(parser.credential_id)
+        .bind(parser.dispatch_source_config_id)
         .fetch_one(&self.pool)
         .await?;
 
@@ -181,18 +183,17 @@ impl ParserRepository {
                 name = COALESCE($2, name),
                 description = COALESCE($3, description),
                 source_type = COALESCE($4, source_type),
-                source_config = COALESCE($5, source_config),
-                parser_vrl = COALESCE($6, parser_vrl),
-                output_fields = COALESCE($7, output_fields),
-                credential_id = COALESCE($8, credential_id),
-                enabled = COALESCE($9, enabled),
+                parser_vrl = COALESCE($5, parser_vrl),
+                output_fields = COALESCE($6, output_fields),
+                dispatch_source_config_id = COALESCE($7, dispatch_source_config_id),
+                enabled = COALESCE($8, enabled),
                 validated = false,
                 validation_error = NULL
             WHERE id = $1
             RETURNING
                 id, name, description, source_type,
-                source_config, parser_vrl, output_fields,
-                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
+                parser_vrl, output_fields,
+                dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
@@ -202,10 +203,9 @@ impl ParserRepository {
         .bind(&update.name)
         .bind(&update.description)
         .bind(&update.source_type)
-        .bind(&update.source_config)
         .bind(&update.parser_vrl)
         .bind(&update.output_fields)
-        .bind(update.credential_id)
+        .bind(update.dispatch_source_config_id)
         .bind(update.enabled)
         .fetch_one(&self.pool)
         .await?;
@@ -240,8 +240,8 @@ impl ParserRepository {
             WHERE id = $1
             RETURNING
                 id, name, description, source_type,
-                source_config, parser_vrl, output_fields,
-                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
+                parser_vrl, output_fields,
+                dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
@@ -263,8 +263,8 @@ impl ParserRepository {
             WHERE id = $1
             RETURNING
                 id, name, description, source_type,
-                source_config, parser_vrl, output_fields,
-                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
+                parser_vrl, output_fields,
+                dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
@@ -285,8 +285,8 @@ impl ParserRepository {
             WHERE id = $1
             RETURNING
                 id, name, description, source_type,
-                source_config, parser_vrl, output_fields,
-                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
+                parser_vrl, output_fields,
+                dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
@@ -382,8 +382,8 @@ impl ParserRepository {
             WHERE id = $1
             RETURNING
                 id, name, description, source_type,
-                source_config, parser_vrl, output_fields,
-                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
+                parser_vrl, output_fields,
+                dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
@@ -413,8 +413,8 @@ impl ParserRepository {
             WHERE id = $1
             RETURNING
                 id, name, description, source_type,
-                source_config, parser_vrl, output_fields,
-                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
+                parser_vrl, output_fields,
+                dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
@@ -432,15 +432,16 @@ impl ParserRepository {
 
 /// NAN-928 / NAN-930: stamp `dispatch_route_name` on every parser that
 /// carries a `dispatch_source_config_id`. The Vector config generator
-/// reads `dispatch_route_name` to decide between "emit a parser-owned
-/// source" (None) and "emit a filter on the source-config's route" (Some).
+/// reads `dispatch_route_name` to emit a filter on the source-config's route.
+/// Fetch parsers without a dispatch binding are rejected; parser-owned
+/// transports no longer exist.
 ///
 /// Free function (not a method) so both `ParserService::deploy_to_vector`
 /// (parser-only path that the API startup hook fires) and
 /// `LogSourceService::deploy*` (log-source publish path) can share the
 /// resolution — without this dedup, the two paths drifted: parser-deploy
-/// produced a parser-owned Kafka source while log-source-deploy produced
-/// the correct dispatched filter. NAN-930 follow-up.
+/// produced a parser-owned Kafka source while log-source-deploy produced the
+/// correct dispatched filter. NAN-930 follow-up.
 ///
 /// `safe_name` is computed in Rust (matches `source_configs::service::
 /// safe_name`) so it stays Unicode-correct against `[^A-Za-z0-9]` regex
@@ -454,20 +455,20 @@ pub async fn resolve_parser_dispatch_routes(
         .iter()
         .filter_map(|p| p.dispatch_source_config_id)
         .collect();
-    if ids.is_empty() {
-        return Ok(());
-    }
     let mut unique = ids;
     unique.sort();
     unique.dedup();
 
-    let rows: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT id, name FROM source_configurations WHERE id = ANY($1)",
-    )
-    .bind(&unique)
-    .fetch_all(pool)
-    .await?;
-    let name_by_id: HashMap<Uuid, String> = rows.into_iter().collect();
+    let name_by_id: HashMap<Uuid, String> = if unique.is_empty() {
+        HashMap::new()
+    } else {
+        sqlx::query_as("SELECT id, name FROM source_configurations WHERE id = ANY($1)")
+            .bind(&unique)
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .collect()
+    };
 
     apply_resolved_dispatch_routes(parsers, &name_by_id)
         .map_err(|e| sqlx::Error::Configuration(e.into()))
@@ -476,7 +477,7 @@ pub async fn resolve_parser_dispatch_routes(
 /// Pure helper for `resolve_parser_dispatch_routes`'s in-memory phase.
 ///
 /// Stamps `dispatch_route_name` on parsers whose `dispatch_source_config_id`
-/// resolves; returns `Err` when any parser is orphaned (NAN-949).
+/// resolves; returns `Err` when a fetch parser is unbound or orphaned.
 ///
 /// Pre-NAN-949 the orphan case logged a warn and fell through to the
 /// legacy parser-owned-source branch — for Kafka that emits a source
@@ -490,7 +491,7 @@ pub(crate) fn apply_resolved_dispatch_routes(
     parsers: &mut [Parser],
     name_by_id: &std::collections::HashMap<Uuid, String>,
 ) -> Result<(), String> {
-    let mut orphans: Vec<(String, Uuid)> = Vec::new();
+    let mut invalid: Vec<String> = Vec::new();
     for parser in parsers.iter_mut() {
         if let Some(id) = parser.dispatch_source_config_id {
             if let Some(sc_name) = name_by_id.get(&id) {
@@ -506,22 +507,36 @@ pub(crate) fn apply_resolved_dispatch_routes(
                     dispatch_source_config_id = %id,
                     "dispatch source config not found; refusing to deploy parser to avoid silent fall-through to default source",
                 );
-                orphans.push((parser.name.clone(), id));
+                invalid.push(format!(
+                    "{} ({id}: source-configuration no longer exists)",
+                    parser.name
+                ));
             }
+        } else if parser.kind != "enrichment"
+            && matches!(
+                parser.source_type.as_str(),
+                "kafka" | "aws_s3" | "aws_sqs" | "s3" | "gcp_pubsub" | "pubsub"
+            )
+        {
+            tracing::error!(
+                parser = %parser.name,
+                source_type = %parser.source_type,
+                "fetch parser has no dispatch source configuration; refusing to deploy",
+            );
+            invalid.push(format!(
+                "{} (missing dispatch_source_config_id for {})",
+                parser.name, parser.source_type
+            ));
         }
     }
-    if orphans.is_empty() {
+    if invalid.is_empty() {
         return Ok(());
     }
-    let names: Vec<String> = orphans
-        .into_iter()
-        .map(|(name, id)| format!("{name} ({id})"))
-        .collect();
     Err(format!(
-        "{} parser(s) reference a dispatch_source_config_id that no longer exists: {}; \
-         restore the source-configuration or clear dispatch_source_config_id on the parser(s)",
-        names.len(),
-        names.join(", "),
+        "{} parser(s) have no usable source-configuration dispatch: {}; \
+         create or restore the source-configuration and bind dispatch_source_config_id",
+        invalid.len(),
+        invalid.join(", "),
     ))
 }
 
@@ -532,11 +547,9 @@ fn row_to_parser(row: &sqlx::postgres::PgRow) -> Parser {
         name: row.get("name"),
         description: row.get("description"),
         source_type: row.get("source_type"),
-        source_config: row.get("source_config"),
         parser_vrl: row.get("parser_vrl"),
         output_fields: row.get("output_fields"),
         feed_id: None, // log_sources doesn't have feed_id
-        credential_id: row.get("credential_id"),
         // NAN-928: try_get so existing parsers built from log_source rows
         // that pre-date migration 189 still load cleanly with None.
         dispatch_source_config_id: row.try_get("dispatch_source_config_id").unwrap_or(None),
@@ -560,9 +573,7 @@ fn row_to_parser(row: &sqlx::postgres::PgRow) -> Parser {
         vendor: row.get("vendor"),
         product: row.get("product"),
         // NAN-1149: try_get so rows predating migration 198 still load as logs.
-        kind: row
-            .try_get("kind")
-            .unwrap_or_else(|_| "log".to_string()),
+        kind: row.try_get("kind").unwrap_or_else(|_| "log".to_string()),
         enrich_kind: row.try_get("enrich_kind").unwrap_or(None),
         enrich_source: row.try_get("enrich_source").unwrap_or(None),
         target_table: row.try_get("target_table").unwrap_or(None),
@@ -584,11 +595,9 @@ mod tests {
             name: name.to_string(),
             description: None,
             source_type: "kafka".to_string(),
-            source_config: serde_json::json!({}),
             parser_vrl: String::new(),
             output_fields: None,
             feed_id: None,
-            credential_id: None,
             dispatch_source_config_id: dispatch_id,
             dispatch_route_name: None,
             namespace: "default".to_string(),
@@ -647,8 +656,14 @@ mod tests {
 
         let err = apply_resolved_dispatch_routes(&mut parsers, &map)
             .expect_err("orphan must surface as Err");
-        assert!(err.contains("ds_auth"), "error must name the orphan parser: {err}");
-        assert!(err.contains(&orphan_id.to_string()), "error must include the id: {err}");
+        assert!(
+            err.contains("ds_auth"),
+            "error must name the orphan parser: {err}"
+        );
+        assert!(
+            err.contains(&orphan_id.to_string()),
+            "error must include the id: {err}"
+        );
         assert!(
             err.contains("no longer exists"),
             "error must describe the failure mode: {err}"
@@ -663,16 +678,33 @@ mod tests {
     }
 
     #[test]
-    fn apply_resolved_dispatch_routes_ignores_parsers_without_dispatch_id() {
-        // Parsers that don't dispatch from a source-config (e.g. routed/vector
-        // sources, or pull parsers that own their own source) are passed
-        // through unchanged.
+    fn apply_resolved_dispatch_routes_ignores_routed_parsers_without_dispatch_id() {
+        // Routed parsers consume the shared source_router and do not require a
+        // source-configuration dispatch binding.
         let mut parsers = vec![parser_with_dispatch("plain_routed", None)];
+        parsers[0].source_type = "routed".to_string();
         let map: HashMap<Uuid, String> = HashMap::new();
 
         apply_resolved_dispatch_routes(&mut parsers, &map)
             .expect("no-dispatch parsers must pass through");
         assert!(parsers[0].dispatch_route_name.is_none());
+    }
+
+    #[test]
+    fn apply_resolved_dispatch_routes_rejects_fetch_parser_without_dispatch_id() {
+        let mut parsers = vec![parser_with_dispatch("legacy_kafka", None)];
+        let map: HashMap<Uuid, String> = HashMap::new();
+
+        let err = apply_resolved_dispatch_routes(&mut parsers, &map)
+            .expect_err("fetch parser must use a source-configuration");
+        assert!(
+            err.contains("legacy_kafka"),
+            "error must name the parser: {err}"
+        );
+        assert!(
+            err.contains("missing dispatch_source_config_id"),
+            "error must name the required modern binding: {err}"
+        );
     }
 
     #[test]
@@ -685,7 +717,10 @@ mod tests {
             parser_with_dispatch("orphan_b", Some(Uuid::new_v4())),
         ];
         let mut map = HashMap::new();
-        map.insert(parsers[0].dispatch_source_config_id.unwrap(), "Good".to_string());
+        map.insert(
+            parsers[0].dispatch_source_config_id.unwrap(),
+            "Good".to_string(),
+        );
 
         let err = apply_resolved_dispatch_routes(&mut parsers, &map)
             .expect_err("two orphans must surface as Err");

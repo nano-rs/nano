@@ -15,14 +15,13 @@ impl LogSourceRepository {
             r#"
             UPDATE log_sources SET enabled = true
             WHERE id = $1
-            RETURNING id, name, description, namespace, timezone, source_type, source_config, credential_id,
+            RETURNING id, name, description, namespace, timezone, source_type,
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values,
                 validated, validation_error, deployed, deployed_at, enabled,
                 lifecycle_status,
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
-                parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
                 dispatch_source_config_id,
                 created_at, updated_at
@@ -42,14 +41,13 @@ impl LogSourceRepository {
             r#"
             UPDATE log_sources SET enabled = false
             WHERE id = $1
-            RETURNING id, name, description, namespace, timezone, source_type, source_config, credential_id,
+            RETURNING id, name, description, namespace, timezone, source_type,
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values,
                 validated, validation_error, deployed, deployed_at, enabled,
                 lifecycle_status,
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
-                parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
                 dispatch_source_config_id,
                 created_at, updated_at

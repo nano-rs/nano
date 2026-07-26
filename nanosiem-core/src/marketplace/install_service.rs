@@ -396,7 +396,24 @@ impl MarketplaceInstallService {
         user_id: Uuid,
     ) -> Result<(), MarketplaceError> {
         let code = entry.code.as_deref().unwrap_or("");
-        let config = request.config.as_ref().unwrap_or(&entry.config.0);
+        // NAN-2069: an install can override the catalog config, and the client
+        // may well have built that override from a redacted catalog read.
+        // Resolve masked keys back to the catalog's stored values so the
+        // installed enrichment gets real consumer-supplied credentials rather
+        // than the placeholder. With no override we use the catalog config
+        // as-is; NAN-2151 deliberately strips publisher credentials at publish
+        // time, so a fresh install never inherits the publisher's identity.
+        let merged_config;
+        let config = match request.config.as_ref() {
+            Some(override_config) => {
+                merged_config = crate::config_secrets::merge_config_secrets(
+                    override_config.clone(),
+                    Some(&entry.config.0),
+                );
+                &merged_config
+            }
+            None => &entry.config.0,
+        };
 
         // Determine the functional enrichment type from category + config.
         // `category` alone is unreliable: the retired (NAN-1998) 'security' UI

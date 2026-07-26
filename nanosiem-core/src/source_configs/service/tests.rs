@@ -2619,3 +2619,30 @@
         // filename to stay under typical filesystem name limits (255).
         assert_eq!(stem.len(), 36);
     }
+
+    #[test]
+    fn credential_use_guard_is_required_only_for_referenced_credentials() {
+        assert!(
+            SourceConfigService::ensure_credential_use(None, CredentialUseGrant::none()).is_ok()
+        );
+
+        let denied = SourceConfigService::ensure_credential_use(
+            Some(Uuid::new_v4()),
+            CredentialUseGrant::none(),
+        );
+        assert!(matches!(
+            denied,
+            Err(SourceConfigServiceError::CredentialUseRequired)
+        ));
+
+        assert!(SourceConfigService::ensure_credential_use(
+            Some(Uuid::new_v4()),
+            CredentialUseGrant::granted(),
+        )
+        .is_ok());
+        assert!(SourceConfigService::ensure_credential_use(
+            Some(Uuid::new_v4()),
+            CredentialUseGrant::system(),
+        )
+        .is_ok());
+    }

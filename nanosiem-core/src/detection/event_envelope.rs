@@ -12,8 +12,8 @@
 //! canonical envelope alongside:
 //!
 //! - `_match_event_time` — RFC 3339 timestamp string, best-effort
-//! - `_match_event_label` — one-line human label, best-effort
-//! - `_match_kind` — `"raw"` or `"aggregate"`
+//! - `_match_event_label` — one-line human label (always present)
+//! - `_match_kind` — `"raw"`, `"aggregate"`, or `"sequence"`
 //!
 //! The heuristics mirror what the frontend has accumulated across NAN-822 /
 //! NAN-826 / NAN-829. Moving them server-side means future regressions get
@@ -42,6 +42,7 @@ pub fn normalize_match_event(event: &mut Value) {
         MATCH_KIND.into(),
         Value::String(match kind {
             Kind::Aggregate => "aggregate".into(),
+            Kind::Sequence => "sequence".into(),
             Kind::Raw => "raw".into(),
         }),
     );
@@ -51,6 +52,7 @@ pub fn normalize_match_event(event: &mut Value) {
 enum Kind {
     Raw,
     Aggregate,
+    Sequence,
 }
 
 /// Aggregate-row detection mirrors NAN-829's widened heuristic:
@@ -58,6 +60,12 @@ enum Kind {
 /// `first_seen` + `last_seen` together, or the standalone `actions_attempted`
 /// marker (which has no raw-event analog).
 fn pick_kind(obj: &Map<String, Value>) -> Kind {
+    if sequence_step_count(obj) >= 2
+        || (sequence_step_count(obj) > 0
+            && numeric_field(obj, "sequence_duration_seconds").is_some())
+    {
+        return Kind::Sequence;
+    }
     if str_field(obj, "_first_seen").is_some() || str_field(obj, "_last_seen").is_some() {
         return Kind::Aggregate;
     }
@@ -65,6 +73,12 @@ fn pick_kind(obj: &Map<String, Value>) -> Kind {
         return Kind::Aggregate;
     }
     if str_field(obj, "actions_attempted").is_some() {
+        return Kind::Aggregate;
+    }
+    if obj
+        .iter()
+        .any(|(key, value)| value.as_f64().is_some() && is_aggregate_measure_name(key))
+    {
         return Kind::Aggregate;
     }
     Kind::Raw
@@ -114,26 +128,117 @@ fn pick_time(obj: &Map<String, Value>) -> Option<String> {
 /// fall through to user-aliased summary strings, then count-based derivation,
 /// then a generic `"stats aggregate"` so the cell is never empty.
 fn pick_label(obj: &Map<String, Value>, kind: Kind) -> Option<String> {
-    for key in ["eventName", "event_type", "action", "event_id"] {
+    if kind == Kind::Sequence {
+        return Some(sequence_label(obj));
+    }
+
+    for key in [
+        "eventName",
+        "event_type",
+        "action",
+        "event_id",
+        "activity",
+        "api.operation",
+    ] {
         if let Some(v) = str_field(obj, key) {
             return Some(v.to_string());
         }
     }
-    if kind != Kind::Aggregate {
-        return None;
+
+    if kind == Kind::Aggregate {
+        for key in [
+            "actions_attempted",
+            "action_summary",
+            "top_action",
+            "operations",
+            "tools",
+            "domains",
+        ] {
+            if let Some(v) = obj.get(key).and_then(compact_value) {
+                return Some(v);
+            }
+        }
+        if let Some(label) = aggregate_measure_label(obj) {
+            return Some(label);
+        }
+        return Some("stats aggregate".into());
     }
-    for key in ["actions_attempted", "action_summary", "top_action"] {
-        if let Some(v) = str_field(obj, key) {
-            return Some(v.to_string());
+
+    Some(semantic_raw_label(obj).unwrap_or_else(|| "Matched event".into()))
+}
+
+fn sequence_step_count(obj: &Map<String, Value>) -> usize {
+    let mut steps = std::collections::BTreeSet::new();
+    for (key, value) in obj {
+        let Some(rest) = key.strip_prefix("step") else {
+            continue;
+        };
+        let digits = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>();
+        if digits.is_empty() || !rest[digits.len()..].starts_with('_') || !meaningful(value) {
+            continue;
+        }
+        if let Ok(step) = digits.parse::<usize>() {
+            steps.insert(step);
         }
     }
-    // Largest `*_count` numeric field, labeled with its column name.
+    steps.len()
+}
+
+fn sequence_label(obj: &Map<String, Value>) -> String {
+    let steps = sequence_step_count(obj);
+    let base = if steps > 0 {
+        format!("{steps}-step sequence")
+    } else {
+        "Sequence match".into()
+    };
+    match numeric_field(obj, "sequence_duration_seconds") {
+        Some(seconds) if seconds.is_finite() && seconds >= 0.0 => {
+            format!("{base} · {}", format_duration(seconds))
+        }
+        _ => base,
+    }
+}
+
+fn format_duration(seconds: f64) -> String {
+    if seconds < 120.0 {
+        return format!("{}s", seconds.round() as u64);
+    }
+    let total = seconds.round() as u64;
+    let minutes = total / 60;
+    let remainder = total % 60;
+    if remainder == 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{minutes}m {remainder}s")
+    }
+}
+
+fn is_aggregate_measure_name(key: &str) -> bool {
+    key == "count"
+        || key.ends_with("_count")
+        || key.starts_with("unique_")
+        || matches!(
+            key,
+            "hits"
+                | "failures"
+                | "executions"
+                | "logons"
+                | "queries"
+                | "beacons"
+                | "recon_commands"
+        )
+}
+
+fn aggregate_measure_label(obj: &Map<String, Value>) -> Option<String> {
     let mut best: Option<(f64, &str)> = None;
     for (k, v) in obj {
         if k.starts_with('_') {
             continue;
         }
-        if !(k == "count" || k.ends_with("_count")) {
+        if !is_aggregate_measure_name(k) {
             continue;
         }
         let Some(n) = v.as_f64() else { continue };
@@ -146,19 +251,154 @@ fn pick_label(obj: &Map<String, Value>, kind: Kind) -> Option<String> {
         }
     }
     if let Some((n, key)) = best {
-        return Some(format!(
-            "{} {}",
-            format_count(n),
-            key.replace('_', " ")
-        ));
+        return Some(format!("{} {}", format_count(n), key.replace('_', " ")));
     }
-    Some("stats aggregate".into())
+    None
+}
+
+fn semantic_raw_label(obj: &Map<String, Value>) -> Option<String> {
+    if let Some(process) = first_str(obj, &["process_name", "process.name", "actor.process.name"]) {
+        return Some(process.to_string());
+    }
+
+    let file_action = first_str(obj, &["file_action"]);
+    let file = first_str(obj, &["file_name", "file.name", "file_path", "file.path"]);
+    if file_action.is_some() || file.is_some() {
+        return Some(match (file_action, file) {
+            (Some(action), Some(path)) => format!("{action} · {}", basename(path)),
+            (Some(action), None) => format!("{action} file"),
+            (None, Some(path)) => format!("File · {}", basename(path)),
+            (None, None) => unreachable!(),
+        });
+    }
+
+    let auth_type = first_str(obj, &["auth_type", "authentication_method"]);
+    // OCSF's generic `status` is only authentication-specific when an auth
+    // method is also present. Treating a standalone status as auth would turn
+    // ordinary "Success" process/network rows into "Success authentication".
+    let auth_result = first_str(obj, &["auth_result"])
+        .or_else(|| auth_type.and_then(|_| first_str(obj, &["status"])));
+    if auth_result.is_some() || auth_type.is_some() {
+        return Some(match (auth_result, auth_type) {
+            (Some(result), Some(method)) => format!("{result} {method} authentication"),
+            (Some(result), None) => format!("{result} authentication"),
+            (None, Some(method)) => format!("{method} authentication"),
+            (None, None) => unreachable!(),
+        });
+    }
+
+    let method = first_str(obj, &["http_method", "http_request.http_method"]);
+    let destination = first_str(
+        obj,
+        &[
+            "dest_host",
+            "http_request.url.hostname",
+            "url",
+            "http_request.url.url_string",
+            "dest_ip",
+        ],
+    );
+    if method.is_some() || destination.is_some() {
+        return Some(match (method, destination) {
+            (Some(method), Some(dest)) => format!("{method} · {}", truncate(dest, 72)),
+            (Some(method), None) => format!("{method} request"),
+            (None, Some(dest)) => format!("Connection · {}", truncate(dest, 72)),
+            (None, None) => unreachable!(),
+        });
+    }
+
+    if let Some(registry) = first_str(
+        obj,
+        &["registry_key_name", "registry_path", "registry_value_name"],
+    ) {
+        return Some(format!("Registry · {}", truncate(registry, 72)));
+    }
+    if let Some(subject) = first_str(obj, &["subject", "email.subject"]) {
+        return Some(format!("Email · {}", truncate(subject, 72)));
+    }
+    if let Some(message) = first_str(obj, &["message", "signature", "alert_name"]) {
+        return Some(truncate(message, 96));
+    }
+    first_str(obj, &["source_type"])
+        .map(|source| format!("{} event", source.replace(['_', '-'], " ")))
+}
+
+fn first_str<'a>(obj: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| str_field(obj, key))
+}
+
+fn numeric_field(obj: &Map<String, Value>, key: &str) -> Option<f64> {
+    obj.get(key).and_then(Value::as_f64)
+}
+
+fn meaningful(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(s) => !s.trim().is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+        _ => true,
+    }
+}
+
+fn compact_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) if !s.trim().is_empty() => Some(truncate(s, 96)),
+        Value::Array(values) => {
+            let parts = values
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .take(3)
+                .collect::<Vec<_>>();
+            if parts.is_empty() {
+                None
+            } else {
+                let suffix = if values.len() > parts.len() {
+                    ", …"
+                } else {
+                    ""
+                };
+                Some(format!("{}{}", parts.join(", "), suffix))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn basename(path: &str) -> &str {
+    path.rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(path)
+}
+
+fn truncate(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let prefix = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
 }
 
 fn str_field<'a>(obj: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
-    obj.get(key).and_then(|v| v.as_str()).and_then(|s| {
+    let value = obj.get(key).or_else(|| {
+        let mut parts = key.split('.');
+        let first = parts.next()?;
+        let mut value = obj.get(first)?;
+        for part in parts {
+            value = value.as_object()?.get(part)?;
+        }
+        Some(value)
+    });
+    value.and_then(|v| v.as_str()).and_then(|s| {
         let t = s.trim();
-        if t.is_empty() { None } else { Some(s) }
+        if t.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
     })
 }
 
@@ -304,11 +544,115 @@ mod tests {
     }
 
     #[test]
-    fn empty_event_gets_kind_only() {
+    fn sequence_row_gets_step_and_duration_summary() {
+        let v = normalize(json!({
+            "timestamp": "2026-07-24T15:00:00Z",
+            "user": "alice",
+            "step1_url": "https://search.example/",
+            "step2_file_path": "C:\\Users\\alice\\Downloads\\search_term.zip",
+            "step3_process_name": "wscript.exe",
+            "step4_dest_host": "low-prevalence.example",
+            "step5_process_name": "powershell.exe",
+            "sequence_duration_seconds": 64,
+            "risk_score": 95,
+        }));
+        assert_eq!(field(&v, MATCH_KIND), "sequence");
+        assert_eq!(field(&v, MATCH_EVENT_LABEL), "5-step sequence · 64s");
+    }
+
+    #[test]
+    fn malformed_negative_sequence_duration_is_omitted() {
+        let v = normalize(json!({
+            "step1_user": "alice",
+            "step2_process_name": "powershell.exe",
+            "sequence_duration_seconds": -42,
+        }));
+        assert_eq!(field(&v, MATCH_KIND), "sequence");
+        assert_eq!(field(&v, MATCH_EVENT_LABEL), "2-step sequence");
+    }
+
+    #[test]
+    fn aggregate_alias_without_time_markers_is_recognized() {
+        let v = normalize(json!({
+            "src_host": "WS-ENG-003",
+            "hits": 12,
+            "commands": ["whoami.exe", "net.exe"],
+        }));
+        assert_eq!(field(&v, MATCH_KIND), "aggregate");
+        assert_eq!(field(&v, MATCH_EVENT_LABEL), "12 hits");
+    }
+
+    #[test]
+    fn aggregate_array_summary_is_compact() {
+        let v = normalize(json!({
+            "first_seen": "2026-07-24T15:00:00Z",
+            "last_seen": "2026-07-24T15:01:00Z",
+            "operations": ["DeleteBucket", "DeleteObject", "StopLogging", "DeleteTrail"],
+        }));
+        assert_eq!(
+            field(&v, MATCH_EVENT_LABEL),
+            "DeleteBucket, DeleteObject, StopLogging, …"
+        );
+    }
+
+    #[test]
+    fn projected_process_row_uses_process_name() {
+        let v = normalize(json!({
+            "timestamp": "2026-07-24T15:00:00Z",
+            "user": "alice",
+            "process_name": "powershell.exe",
+            "command_line": "powershell.exe -enc ...",
+        }));
+        assert_eq!(field(&v, MATCH_KIND), "raw");
+        assert_eq!(field(&v, MATCH_EVENT_LABEL), "powershell.exe");
+    }
+
+    #[test]
+    fn projected_file_row_uses_action_and_basename() {
+        let v = normalize(json!({
+            "file_action": "created",
+            "file_path": "C:\\Users\\alice\\Downloads\\search_term.zip",
+        }));
+        assert_eq!(field(&v, MATCH_EVENT_LABEL), "created · search_term.zip");
+    }
+
+    #[test]
+    fn projected_auth_row_uses_result_and_type() {
+        let v = normalize(json!({
+            "auth_result": "failed",
+            "auth_type": "RDP",
+            "user": "alice",
+        }));
+        assert_eq!(field(&v, MATCH_EVENT_LABEL), "failed RDP authentication");
+    }
+
+    #[test]
+    fn nested_ocsf_network_row_gets_request_summary() {
+        let v = normalize(json!({
+            "http_request": {
+                "http_method": "GET",
+                "url": {
+                    "hostname": "low-prevalence.example"
+                }
+            }
+        }));
+        assert_eq!(field(&v, MATCH_EVENT_LABEL), "GET · low-prevalence.example");
+    }
+
+    #[test]
+    fn source_type_is_the_last_data_driven_fallback() {
+        let v = normalize(json!({
+            "source_type": "windows_sysmon"
+        }));
+        assert_eq!(field(&v, MATCH_EVENT_LABEL), "windows sysmon event");
+    }
+
+    #[test]
+    fn empty_event_gets_non_empty_fallback() {
         let v = normalize(json!({}));
         assert_eq!(field(&v, MATCH_KIND), "raw");
         assert!(v.get(MATCH_EVENT_TIME).is_none());
-        assert!(v.get(MATCH_EVENT_LABEL).is_none());
+        assert_eq!(field(&v, MATCH_EVENT_LABEL), "Matched event");
     }
 
     #[test]

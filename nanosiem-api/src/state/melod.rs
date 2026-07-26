@@ -293,7 +293,21 @@ impl AppState {
         Ok(true)
     }
 
-    /// Helper to create the data access layer
+    /// Helper to create the data access layer.
+    ///
+    /// NAN-2029 (cluster C): the returned layer carries the AMBIENT
+    /// `AiActor::System` authority. That is correct for the long-lived
+    /// `MelodService` instance built at startup, which has no requesting
+    /// principal — the fixed-purpose `/api/melod/*` wizard endpoints declare
+    /// their full capability composite at the route instead (see
+    /// `ensure_ai_available`), which they can do because each one drives a
+    /// single known agent.
+    ///
+    /// Per-REQUEST constructions must call `.with_actor(AiActor::principal(..))`
+    /// — see `handlers::notebooks::chat::prepare_notebook_chat`. The notebook
+    /// concierge picks its effects at runtime from a model classification, so no
+    /// route-level enumeration can cover them and the layer itself has to know
+    /// whose authority it is acting under.
     pub fn create_data_access_layer(&self) -> DataAccessLayer {
         DataAccessLayer::with_clickhouse_clustered(
             self.pool.clone(),

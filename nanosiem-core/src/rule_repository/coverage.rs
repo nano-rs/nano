@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use tracing::info;
 
+use crate::auth::ScopeSet;
 use crate::db::DualPool;
 
 use super::models::{
@@ -31,10 +32,57 @@ pub enum CoverageAnalyzerError {
     Database(#[from] sqlx::Error),
 }
 
-/// Analyzer for checking rule coverage against available log sources
+/// What a caller is allowed to learn from the live telemetry inventory
+/// (NAN-2081).
+///
+/// The coverage analyzer reads an all-time `SELECT DISTINCT source_type` off the
+/// ingested-events table. That inventory is exactly what `GET /api/source-types`
+/// gates behind `search:view`, and individual sources are further hidden by
+/// per-source RBAC — so a repository viewer must clear BOTH bars before any of
+/// it reaches them.
+#[derive(Debug, Clone, Copy)]
+pub enum LiveInventoryAccess<'a> {
+    /// The caller holds the live-data capability. Sources are still filtered by
+    /// their per-source RBAC deny set (which carries the implicit `audit`
+    /// denial unless the caller holds `audit:view`).
+    Scoped(&'a ScopeSet),
+    /// The caller has no live-data capability at all. The inventory is withheld
+    /// entirely and the coverage decision degrades to `unknown` rather than
+    /// leaking "these source types do / do not exist" through a status.
+    Denied,
+}
+
+impl LiveInventoryAccess<'_> {
+    /// True when the caller may consult live telemetry at all. Callers use this
+    /// to skip the ClickHouse scan entirely for a denied principal.
+    pub fn permits_live_data(&self) -> bool {
+        self.scope().is_some()
+    }
+
+    fn scope(&self) -> Option<&ScopeSet> {
+        match self {
+            LiveInventoryAccess::Scoped(scope) => Some(scope),
+            LiveInventoryAccess::Denied => None,
+        }
+    }
+}
+
+/// Coverage status used when the caller may not consult live telemetry at all.
+/// Deliberately distinct from `none`, which is a real "we looked and found
+/// nothing" answer.
+pub const COVERAGE_STATUS_UNKNOWN: &str = "unknown";
+
+/// Analyzer for checking rule coverage against available log sources.
+///
+/// NAN-2081: the cached inventory is deliberately **raw and unscoped** — it is
+/// shared process-wide across every caller, so baking one requester's per-source
+/// RBAC scope into it would leak that scope to the next requester (or hide
+/// sources from them). Every method that can surface a source type to a caller
+/// therefore takes an explicit [`ScopeSet`] and filters against it at read time.
 pub struct CoverageAnalyzer {
     dual_pool: DualPool,
-    /// Cache of available fields per source type
+    /// Raw, unscoped cache of available fields per source type. Never returned
+    /// directly — always filtered through the calling principal's scope.
     available_fields: HashMap<String, HashSet<String>>,
 }
 
@@ -91,99 +139,204 @@ impl CoverageAnalyzer {
         Ok(())
     }
 
-    /// Get list of source types that have logs
-    pub fn get_available_source_types(&self) -> Vec<String> {
-        self.available_fields.keys().cloned().collect()
+    /// True when the raw inventory has never been populated.
+    ///
+    /// Callers use this to decide whether to trigger a refresh. It must be
+    /// evaluated against the RAW cache, not a scoped view — otherwise a caller
+    /// denied every cached source would re-scan ClickHouse on every request.
+    pub fn is_inventory_empty(&self) -> bool {
+        self.available_fields.is_empty()
     }
 
-    /// Check coverage for a single rule
-    pub fn check_rule_coverage(&self, rule: &RepositoryRule) -> CoverageResult {
-        let required_fields: HashSet<String> = rule
-            .requires_fields
-            .as_ref()
-            .map(|f| f.iter().cloned().collect())
-            .unwrap_or_default();
-
-        let suggested_source_types: Vec<String> = rule
-            .requires_source_types
-            .as_ref()
-            .cloned()
-            .unwrap_or_default();
-
-        // Find which source types have the required fields
-        let mut available_fields = HashSet::new();
-        let mut available_source_types = Vec::new();
-
-        // Collect all available source types (excluding internal types)
-        let excluded_types = ["audit", "findings", "signal"];
-        for (source_type, fields) in &self.available_fields {
-            // Skip internal/system source types
-            let st_lower = source_type.to_lowercase();
-            if excluded_types.iter().any(|ex| st_lower == *ex) {
-                continue;
-            }
-
-            available_source_types.push(source_type.clone());
-
-            // Check if this source type might be relevant for field tracking
-            let is_suggested = suggested_source_types.is_empty()
-                || suggested_source_types.iter().any(|s| {
-                    st_lower.contains(&s.to_lowercase()) || s.to_lowercase().contains(&st_lower)
-                });
-
-            if is_suggested {
-                // Add fields from this source type
-                for field in fields {
-                    // Map common field names
-                    let normalized = normalize_field_name(field);
-                    if required_fields.contains(&normalized) || required_fields.contains(field) {
-                        available_fields.insert(field.clone());
-                    }
-                }
-            }
-        }
-
-        // Sort source types alphabetically
-        available_source_types.sort();
-
-        // Calculate missing fields
-        let missing_fields: Vec<String> = required_fields
-            .iter()
-            .filter(|f| {
-                !available_fields.contains(*f)
-                    && !available_fields.contains(&normalize_field_name(f))
-            })
-            .cloned()
-            .collect();
-
-        // Determine coverage status
-        let status = if required_fields.is_empty() || missing_fields.is_empty() {
-            "full".to_string()
-        } else if available_fields.is_empty() {
-            "none".to_string()
-        } else {
-            "partial".to_string()
+    /// Get list of source types that have logs, filtered to what `access` allows.
+    ///
+    /// NAN-2081: pass [`LiveInventoryAccess::Scoped`] with the requester's
+    /// effective deny set (per-source RBAC ∪ implicit `audit` unless they hold
+    /// `audit:view`) only once the live-data capability has been verified;
+    /// otherwise pass [`LiveInventoryAccess::Denied`].
+    pub fn get_available_source_types(&self, access: &LiveInventoryAccess<'_>) -> Vec<String> {
+        let Some(scope) = access.scope() else {
+            return Vec::new();
         };
-
-        CoverageResult {
-            status,
-            required_fields: required_fields.into_iter().collect(),
-            available_fields: available_fields.into_iter().collect(),
-            missing_fields,
-            suggested_source_types,
-            available_source_types,
-        }
+        self.available_fields
+            .keys()
+            .filter(|source_type| Self::is_visible(source_type, scope))
+            .cloned()
+            .collect()
     }
 
-    /// Analyze coverage for multiple rules
+    /// Per-source RBAC visibility for one cached source type.
+    ///
+    /// The deny set is normalized (`trim().to_lowercase()`) by
+    /// `SourceScopeResolver`, and every SQL-side gate compares
+    /// `lower(source_type)` (see `source_scope_sql_predicate`). The cached value
+    /// comes straight out of ClickHouse and may be mixed-case — notably under
+    /// the OCSF profile — so it must be normalized the same way before the
+    /// membership test, or `Insider_Threat` would slip past a deny entry of
+    /// `insider_threat`.
+    fn is_visible(source_type: &str, scope: &ScopeSet) -> bool {
+        !scope
+            .deny_set()
+            .contains(&source_type.trim().to_lowercase())
+    }
+
+    /// The entries of `inventory` a caller with `scope` is allowed to observe.
+    ///
+    /// Single source of truth for "which source types may this principal see",
+    /// used by both the per-rule coverage decision and the aggregate analysis
+    /// (NAN-2081). Internal/system source types are excluded for everyone; the
+    /// per-source RBAC deny set (which already carries the implicit `audit`
+    /// denial unless the caller holds `audit:view`) removes the rest.
+    pub(crate) fn visible_source_types<'a>(
+        inventory: &'a HashMap<String, HashSet<String>>,
+        scope: &ScopeSet,
+    ) -> Vec<(&'a String, &'a HashSet<String>)> {
+        const EXCLUDED_TYPES: [&str; 3] = ["audit", "findings", "signal"];
+        inventory
+            .iter()
+            .filter(|(source_type, _)| {
+                let lowered = source_type.to_lowercase();
+                !EXCLUDED_TYPES.contains(&lowered.as_str())
+            })
+            .filter(|(source_type, _)| Self::is_visible(source_type, scope))
+            .collect()
+    }
+
+    /// Check coverage for a single rule against the sources `access` permits.
+    pub fn check_rule_coverage(
+        &self,
+        rule: &RepositoryRule,
+        access: &LiveInventoryAccess<'_>,
+    ) -> CoverageResult {
+        check_rule_coverage_in(&self.available_fields, rule, access)
+    }
+
+    /// Analyze coverage for multiple rules against the sources `access` permits.
     pub fn analyze_coverage(
         &self,
         rules: &[RepositoryRule],
         filter: &CoverageFilter,
+        access: &LiveInventoryAccess<'_>,
     ) -> CoverageAnalysis {
-        analyze_coverage_with(rules, filter, &self.available_fields, |rule| {
-            self.check_rule_coverage(rule)
+        // NAN-2081: with no live-data capability there is no analysis to report.
+        // Returning per-rule `unknown` verdicts through the aggregator would
+        // produce an incoherent shape (N total rules, zero in every bucket)
+        // since `CoverageAnalysis` has no `unknown` bucket — so return the empty
+        // analysis instead of a misleading one.
+        let Some(scope) = access.scope() else {
+            return CoverageAnalysis::default();
+        };
+
+        // `most_missing_fields[].source_types_with_field` is derived from the raw
+        // inventory too, so hand the aggregator a scoped view rather than the
+        // shared cache.
+        let visible_fields: HashMap<String, HashSet<String>> =
+            Self::visible_source_types(&self.available_fields, scope)
+                .into_iter()
+                .map(|(source_type, fields)| (source_type.clone(), fields.clone()))
+                .collect();
+        analyze_coverage_with(rules, filter, &visible_fields, |rule| {
+            self.check_rule_coverage(rule, access)
         })
+    }
+}
+
+/// The coverage decision for one rule against an explicit inventory.
+///
+/// Free-standing (rather than a method) so the authorization behavior can be
+/// exercised over a synthetic inventory without a live `DualPool` — the shape
+/// the NAN-2081 regressions need.
+fn check_rule_coverage_in(
+    inventory: &HashMap<String, HashSet<String>>,
+    rule: &RepositoryRule,
+    access: &LiveInventoryAccess<'_>,
+) -> CoverageResult {
+    let required_fields: HashSet<String> = rule
+        .requires_fields
+        .as_ref()
+        .map(|f| f.iter().cloned().collect())
+        .unwrap_or_default();
+
+    let suggested_source_types: Vec<String> = rule
+        .requires_source_types
+        .as_ref()
+        .cloned()
+        .unwrap_or_default();
+
+    // NAN-2081: no live-data capability → the caller learns nothing about the
+    // tenant's telemetry, not even a derived full/partial/none verdict.
+    // `required_fields` / `suggested_source_types` come from the repository rule
+    // itself (catalog content they may already read), so they stay.
+    let Some(scope) = access.scope() else {
+        return CoverageResult {
+            status: COVERAGE_STATUS_UNKNOWN.to_string(),
+            required_fields: required_fields.into_iter().collect(),
+            available_fields: Vec::new(),
+            missing_fields: Vec::new(),
+            suggested_source_types,
+            available_source_types: Vec::new(),
+        };
+    };
+
+    // Find which source types have the required fields
+    let mut available_fields = HashSet::new();
+    let mut available_source_types = Vec::new();
+
+    // Collect the source types this caller may observe. A source denied by
+    // per-source RBAC must not appear in the inventory, the suggestions, or the
+    // coverage decision — the preview would otherwise be an existence oracle for
+    // telemetry that `GET /api/source-types` and search both hide.
+    for (source_type, fields) in CoverageAnalyzer::visible_source_types(inventory, scope) {
+        let st_lower = source_type.to_lowercase();
+
+        available_source_types.push(source_type.clone());
+
+        // Check if this source type might be relevant for field tracking
+        let is_suggested = suggested_source_types.is_empty()
+            || suggested_source_types.iter().any(|s| {
+                st_lower.contains(&s.to_lowercase()) || s.to_lowercase().contains(&st_lower)
+            });
+
+        if is_suggested {
+            // Add fields from this source type
+            for field in fields {
+                // Map common field names
+                let normalized = normalize_field_name(field);
+                if required_fields.contains(&normalized) || required_fields.contains(field) {
+                    available_fields.insert(field.clone());
+                }
+            }
+        }
+    }
+
+    // Sort source types alphabetically
+    available_source_types.sort();
+
+    // Calculate missing fields
+    let missing_fields: Vec<String> = required_fields
+        .iter()
+        .filter(|f| {
+            !available_fields.contains(*f) && !available_fields.contains(&normalize_field_name(f))
+        })
+        .cloned()
+        .collect();
+
+    // Determine coverage status
+    let status = if required_fields.is_empty() || missing_fields.is_empty() {
+        "full".to_string()
+    } else if available_fields.is_empty() {
+        "none".to_string()
+    } else {
+        "partial".to_string()
+    };
+
+    CoverageResult {
+        status,
+        required_fields: required_fields.into_iter().collect(),
+        available_fields: available_fields.into_iter().collect(),
+        missing_fields,
+        suggested_source_types,
+        available_source_types,
     }
 }
 
@@ -430,6 +583,150 @@ mod tests {
         assert_eq!(tactic_to_name("credential_access"), "Credential Access");
         assert_eq!(tactic_to_name("initial-access"), "Initial Access");
         assert_eq!(tactic_to_name("execution"), "Execution");
+    }
+
+    /// NAN-2081: the raw inventory is shared process-wide; every read must be
+    /// filtered against the *calling* principal's deny set. These exercise
+    /// `CoverageAnalyzer::visible_source_types`, the single gate both
+    /// `check_rule_coverage` and `analyze_coverage` route through.
+    mod scope_filtering {
+        use super::*;
+        use std::collections::BTreeSet;
+
+        fn inventory(source_types: &[&str]) -> HashMap<String, HashSet<String>> {
+            source_types
+                .iter()
+                .map(|st| ((*st).to_string(), HashSet::new()))
+                .collect()
+        }
+
+        fn scope(denied: &[&str]) -> ScopeSet {
+            ScopeSet::from_denied(
+                denied
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect::<BTreeSet<String>>(),
+            )
+        }
+
+        fn visible(inv: &HashMap<String, HashSet<String>>, scope: &ScopeSet) -> Vec<String> {
+            let mut names: Vec<String> = CoverageAnalyzer::visible_source_types(inv, scope)
+                .into_iter()
+                .map(|(source_type, _)| source_type.clone())
+                .collect();
+            names.sort();
+            names
+        }
+
+        #[test]
+        fn denied_source_is_invisible_and_allowed_source_is_visible() {
+            let s = scope(&["windows_sysmon", "audit"]);
+            assert!(!CoverageAnalyzer::is_visible("windows_sysmon", &s));
+            assert!(!CoverageAnalyzer::is_visible("audit", &s));
+            assert!(CoverageAnalyzer::is_visible("apache_http_server", &s));
+        }
+
+        /// The deny set is normalized by `SourceScopeResolver`, and the SQL gates
+        /// compare `lower(source_type)`. A mixed-case or padded value out of
+        /// ClickHouse (common under OCSF) must not slip past.
+        #[test]
+        fn denial_is_case_and_whitespace_insensitive() {
+            let s = scope(&["windows_sysmon"]);
+            assert!(!CoverageAnalyzer::is_visible("Windows_Sysmon", &s));
+            assert!(!CoverageAnalyzer::is_visible("WINDOWS_SYSMON", &s));
+            assert!(!CoverageAnalyzer::is_visible("  windows_sysmon  ", &s));
+        }
+
+        #[test]
+        fn mixed_case_denied_source_is_absent_from_the_visible_inventory() {
+            let inv = inventory(&["Windows_Sysmon", "apache_http_server"]);
+            assert_eq!(
+                visible(&inv, &scope(&["windows_sysmon"])),
+                vec!["apache_http_server".to_string()]
+            );
+        }
+
+        /// NAN-2081: repository visibility is not a live-data capability. A
+        /// caller without it must learn nothing about tenant telemetry — not the
+        /// inventory, and not a derived coverage verdict.
+        #[test]
+        fn a_caller_without_live_data_capability_gets_no_inventory_and_no_verdict() {
+            let rule = repository_rule(uuid::Uuid::now_v7(), "high", &[], &[]);
+            let inv = inventory(&["windows_sysmon", "apache_http_server"]);
+
+            let denied = check_rule_coverage_in(&inv, &rule, &LiveInventoryAccess::Denied);
+            assert!(denied.available_source_types.is_empty());
+            assert!(denied.available_fields.is_empty());
+            assert_eq!(denied.status, COVERAGE_STATUS_UNKNOWN);
+            assert!(!LiveInventoryAccess::Denied.permits_live_data());
+
+            // With the capability, the same inventory answers normally.
+            let unrestricted = ScopeSet::unrestricted();
+            let allowed = LiveInventoryAccess::Scoped(&unrestricted);
+            let granted = check_rule_coverage_in(&inv, &rule, &allowed);
+            assert_eq!(granted.available_source_types.len(), 2);
+            assert_ne!(granted.status, COVERAGE_STATUS_UNKNOWN);
+            assert!(allowed.permits_live_data());
+        }
+
+        /// Both gates compose: the capability lets the inventory through, the
+        /// per-source scope still removes the denied entries.
+        #[test]
+        fn the_capability_gate_and_the_source_scope_compose() {
+            let rule = repository_rule(uuid::Uuid::now_v7(), "high", &[], &[]);
+            let inv = inventory(&["windows_sysmon", "apache_http_server"]);
+            let restricted = scope(&["windows_sysmon"]);
+
+            let result =
+                check_rule_coverage_in(&inv, &rule, &LiveInventoryAccess::Scoped(&restricted));
+            assert_eq!(
+                result.available_source_types,
+                vec!["apache_http_server".to_string()]
+            );
+        }
+
+        #[test]
+        fn denied_source_is_absent_from_the_visible_inventory() {
+            let inv = inventory(&["windows_sysmon", "apache_http_server", "aws_cloudtrail"]);
+            assert_eq!(
+                visible(&inv, &scope(&["windows_sysmon"])),
+                vec![
+                    "apache_http_server".to_string(),
+                    "aws_cloudtrail".to_string()
+                ]
+            );
+        }
+
+        #[test]
+        fn two_principals_do_not_contaminate_each_other_through_the_shared_cache() {
+            let inv = inventory(&["windows_sysmon", "apache_http_server", "aws_cloudtrail"]);
+
+            // Same cache, different grants — each caller sees only their own set,
+            // and neither read mutates the inventory for the other.
+            let restricted = visible(&inv, &scope(&["windows_sysmon"]));
+            let unrestricted = visible(&inv, &ScopeSet::unrestricted());
+            let restricted_again = visible(&inv, &scope(&["windows_sysmon"]));
+
+            assert!(!restricted.contains(&"windows_sysmon".to_string()));
+            assert!(unrestricted.contains(&"windows_sysmon".to_string()));
+            assert_eq!(unrestricted.len(), 3);
+            assert_eq!(restricted, restricted_again);
+        }
+
+        #[test]
+        fn audit_is_denied_without_audit_view_and_internal_types_never_surface() {
+            // `effective_source_deny_set()` injects "audit" unless the caller
+            // holds `audit:view`; the internal types are excluded for everyone.
+            let inv = inventory(&["audit", "findings", "signal", "apache_http_server"]);
+            assert_eq!(
+                visible(&inv, &scope(&["audit"])),
+                vec!["apache_http_server".to_string()]
+            );
+            assert_eq!(
+                visible(&inv, &ScopeSet::unrestricted()),
+                vec!["apache_http_server".to_string()]
+            );
+        }
     }
 
     #[test]

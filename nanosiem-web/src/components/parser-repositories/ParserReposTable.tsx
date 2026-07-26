@@ -16,6 +16,8 @@ import {
 import { SiGithub } from '@icons-pack/react-simple-icons';
 import { cn } from '@/lib/utils';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { PermissionAction } from '@/components/repositories/PermissionAction';
+import type { ActionAccess } from '@/components/repositories/repository-action-policy';
 import { CategoryChip, Chk, FilterPills, StatusChip, TransportChip } from './chips';
 import type { CategoryCount, ParserRepoView, RepoParserView } from './helpers';
 
@@ -114,6 +116,7 @@ interface ToolbarProps {
   onQueryChange: (q: string) => void;
   onBulkImport: () => void;
   onBulkClear: () => void;
+  bulkImportAccess: ActionAccess;
 }
 
 export function ReposToolbar({
@@ -123,6 +126,7 @@ export function ReposToolbar({
   onQueryChange,
   onBulkImport,
   onBulkClear,
+  bulkImportAccess,
 }: ToolbarProps) {
   return (
     <div className="flex items-center gap-2 px-3.5 h-[42px] border-b border-border bg-card/30 shrink-0">
@@ -132,14 +136,17 @@ export function ReposToolbar({
             <span className="font-mono tabular-nums">{selectedCount}</span> selected
           </span>
           <span className="text-[11px] text-muted-foreground">of {totalShown}</span>
-          <button
-            type="button"
-            onClick={onBulkImport}
-            className="h-[26px] px-2.5 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium flex items-center gap-1"
-          >
-            <Download className="w-[11px] h-[11px]" strokeWidth={2} />
-            Import {selectedCount}
-          </button>
+          <PermissionAction access={bulkImportAccess}>
+            <button
+              type="button"
+              onClick={onBulkImport}
+              disabled={!bulkImportAccess.allowed}
+              className="h-[26px] px-2.5 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium flex items-center gap-1 disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              <Download className="w-[11px] h-[11px]" strokeWidth={2} />
+              Import {selectedCount}
+            </button>
+          </PermissionAction>
           <button
             type="button"
             onClick={onBulkClear}
@@ -204,6 +211,7 @@ interface TableProps {
   onToggleSelectAll: (sel: boolean) => void;
   onSelectParser: (id: string) => void;
   onAction: (parser: RepoParserView) => void;
+  getActionAccess: (parser: RepoParserView) => ActionAccess;
   /** NAN-974 — current category tab, used for tab-specific empty-state copy. */
   activeCat?: 'all' | 'updated' | 'available' | 'imported' | 'drift' | 'deleted';
 }
@@ -234,6 +242,7 @@ export function ReposTable({
   onToggleSelectAll,
   onSelectParser,
   onAction,
+  getActionAccess,
   activeCat,
 }: TableProps) {
   const eligible = parsers.filter((p) => p.status !== 'DELETED' && p.status !== 'IMPORTED');
@@ -273,6 +282,7 @@ export function ReposTable({
               onToggleSelect={() => onToggleSelect(p.id)}
               onSelect={() => onSelectParser(p.id)}
               onAction={() => onAction(p)}
+              actionAccess={getActionAccess(p)}
             />
           ))}
           {parsers.length === 0 && (
@@ -299,9 +309,18 @@ interface RowProps {
   onToggleSelect: () => void;
   onSelect: () => void;
   onAction: () => void;
+  actionAccess: ActionAccess;
 }
 
-function ParserRow({ parser, selected, active, onToggleSelect, onSelect, onAction }: RowProps) {
+function ParserRow({
+  parser,
+  selected,
+  active,
+  onToggleSelect,
+  onSelect,
+  onAction,
+  actionAccess,
+}: RowProps) {
   const deleted = parser.status === 'DELETED';
   const imported = parser.status === 'IMPORTED';
 
@@ -386,7 +405,7 @@ function ParserRow({ parser, selected, active, onToggleSelect, onSelect, onActio
         <div className="text-[10px] text-muted-foreground truncate">{parser.updated}</div>
       </td>
       <td className="py-2 pl-1 pr-3" onClick={(e) => e.stopPropagation()}>
-        <RowAction parser={parser} onAction={onAction} />
+        <RowAction parser={parser} onAction={onAction} access={actionAccess} />
       </td>
     </tr>
   );
@@ -417,83 +436,106 @@ function VersionCell({ parser }: { parser: RepoParserView }) {
   );
 }
 
-function RowAction({ parser, onAction }: { parser: RepoParserView; onAction: () => void }) {
+function RowAction({
+  parser,
+  onAction,
+  access,
+}: {
+  parser: RepoParserView;
+  onAction: () => void;
+  access: ActionAccess;
+}) {
   if (parser.status === 'IMPORTED') {
     return (
-      <Tooltip>
-        <TooltipTrigger asChild>
+      <PermissionAction access={access}>
+        <Tooltip>
+          <TooltipTrigger asChild>
           <button
             type="button"
             onClick={onAction}
-            className="h-[22px] px-2 rounded-md border border-border bg-card hover:bg-muted text-[10.5px] font-mono text-foreground/70"
+            disabled={!access.allowed}
+            className="h-[22px] px-2 rounded-md border border-border bg-card hover:bg-muted text-[10.5px] font-mono text-foreground/70 disabled:opacity-60 disabled:cursor-not-allowed"
           >
             Open
           </button>
-        </TooltipTrigger>
-        <TooltipContent>Already imported — open the log source</TooltipContent>
-      </Tooltip>
+          </TooltipTrigger>
+          <TooltipContent>Already imported — open the log source</TooltipContent>
+        </Tooltip>
+      </PermissionAction>
     );
   }
   if (parser.status === 'DELETED') {
     return (
-      <Tooltip>
-        <TooltipTrigger asChild>
+      <PermissionAction access={access}>
+        <Tooltip>
+          <TooltipTrigger asChild>
           <button
             type="button"
             onClick={onAction}
-            className="h-[22px] px-2 rounded-md border border-destructive/30 text-[10.5px] font-mono text-destructive hover:bg-destructive/5"
+            disabled={!access.allowed}
+            className="h-[22px] px-2 rounded-md border border-destructive/30 text-[10.5px] font-mono text-destructive hover:bg-destructive/5 disabled:opacity-60 disabled:cursor-not-allowed"
           >
-            Remove
+            Review
           </button>
-        </TooltipTrigger>
-        <TooltipContent>Remove from your library</TooltipContent>
-      </Tooltip>
+          </TooltipTrigger>
+          <TooltipContent>Review the parser removed upstream</TooltipContent>
+        </Tooltip>
+      </PermissionAction>
     );
   }
   if (parser.status === 'DRIFT') {
     return (
-      <Tooltip>
-        <TooltipTrigger asChild>
+      <PermissionAction access={access}>
+        <Tooltip>
+          <TooltipTrigger asChild>
           <button
             type="button"
             onClick={onAction}
-            className="h-[22px] px-2 rounded-md border border-destructive/30 bg-destructive/5 text-[10.5px] font-mono text-destructive hover:bg-destructive/10"
+            disabled={!access.allowed}
+            className="h-[22px] px-2 rounded-md border border-destructive/30 bg-destructive/5 text-[10.5px] font-mono text-destructive hover:bg-destructive/10 disabled:opacity-60 disabled:cursor-not-allowed"
           >
             Resolve
           </button>
-        </TooltipTrigger>
-        <TooltipContent>Resolve drift — merge upstream into your fork</TooltipContent>
-      </Tooltip>
+          </TooltipTrigger>
+          <TooltipContent>Resolve drift — merge upstream into your fork</TooltipContent>
+        </Tooltip>
+      </PermissionAction>
     );
   }
   if (parser.status === 'UPDATED') {
     return (
-      <Tooltip>
-        <TooltipTrigger asChild>
+      <PermissionAction access={access}>
+        <Tooltip>
+          <TooltipTrigger asChild>
           <button
             type="button"
             onClick={onAction}
-            className="h-[22px] px-2 rounded-md border border-warning/30 bg-warning/10 text-[10.5px] font-mono text-warning hover:bg-warning/15"
+            disabled={!access.allowed}
+            className="h-[22px] px-2 rounded-md border border-warning/30 bg-warning/10 text-[10.5px] font-mono text-warning hover:bg-warning/15 disabled:opacity-60 disabled:cursor-not-allowed"
           >
             Update
           </button>
-        </TooltipTrigger>
-        <TooltipContent>Update linked copy to latest version</TooltipContent>
-      </Tooltip>
+          </TooltipTrigger>
+          <TooltipContent>Update linked copy to latest version</TooltipContent>
+        </Tooltip>
+      </PermissionAction>
     );
   }
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
+    <PermissionAction access={access}>
+      <Tooltip>
+        <TooltipTrigger asChild>
         <button
           type="button"
           onClick={onAction}
-          className="h-[22px] px-2 rounded-md bg-primary text-primary-foreground text-[10.5px] font-mono font-semibold hover:bg-primary/90"
+          disabled={!access.allowed}
+          className="h-[22px] px-2 rounded-md bg-primary text-primary-foreground text-[10.5px] font-mono font-semibold hover:bg-primary/90 disabled:opacity-60 disabled:cursor-not-allowed"
         >
           Import
         </button>
-      </TooltipTrigger>
-      <TooltipContent>Import as a draft log source</TooltipContent>
-    </Tooltip>
+        </TooltipTrigger>
+        <TooltipContent>Import as a draft log source</TooltipContent>
+      </Tooltip>
+    </PermissionAction>
   );
 }

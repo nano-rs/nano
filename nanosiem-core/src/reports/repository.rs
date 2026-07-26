@@ -321,7 +321,9 @@ impl ReportRepository {
             VALUES ($1, $2, 'running', $3, NOW())
             ON CONFLICT (id) DO UPDATE
                 SET status = 'running', started_at = NOW(),
-                    finished_at = NULL, error = NULL
+                    finished_at = NULL, error = NULL,
+                    requires_search_sql = FALSE,
+                    search_sql_requirement_complete = FALSE
             "#,
         )
         .bind(run_id)
@@ -384,6 +386,10 @@ impl ReportRepository {
         // F-31: source_type manifest of the produced artifacts + completeness.
         source_types: &[String],
         source_types_complete: bool,
+        // NAN-2066: positive capability required by the authorized dashboard
+        // snapshot that produced the frozen artifacts.
+        requires_search_sql: bool,
+        search_sql_requirement_complete: bool,
     ) -> Result<bool, ReportRepositoryError> {
         let mut tx = self.pool.begin().await?;
 
@@ -429,6 +435,8 @@ impl ReportRepository {
                 artifact_truncated = $5,
                 source_types = $6,
                 source_types_complete = $7,
+                requires_search_sql = $8,
+                search_sql_requirement_complete = $9,
                 error = NULL
             WHERE id = $1
             "#,
@@ -440,6 +448,8 @@ impl ReportRepository {
         .bind(artifact_truncated)
         .bind(source_types)
         .bind(source_types_complete)
+        .bind(requires_search_sql)
+        .bind(search_sql_requirement_complete)
         .execute(&mut *tx)
         .await?;
 
@@ -547,6 +557,31 @@ impl ReportRepository {
         Ok(run)
     }
 
+    /// Resolve only authorization facts for a run before loading artifact
+    /// metadata. `has_artifacts` distinguishes protected successful output from
+    /// an authorization failure/status row.
+    pub async fn get_run_authorization_scope(
+        &self,
+        run_id: Uuid,
+    ) -> Result<ReportRunAuthorizationScope, ReportRepositoryError> {
+        sqlx::query_as::<_, ReportRunAuthorizationScope>(
+            r#"
+            SELECT r.definition_id,
+                   EXISTS (
+                       SELECT 1 FROM report_run_artifacts a WHERE a.run_id = r.id
+                   ) AS has_artifacts,
+                   r.requires_search_sql,
+                   r.search_sql_requirement_complete
+            FROM report_runs r
+            WHERE r.id = $1
+            "#,
+        )
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(ReportRepositoryError::RunNotFound(run_id))
+    }
+
     pub async fn list_artifacts_meta(
         &self,
         run_id: Uuid,
@@ -565,17 +600,15 @@ impl ReportRepository {
         Ok(rows)
     }
 
-    /// Fetch artifact bytes for download. Returns the artifact plus the
-    /// [`ArtifactScope`] of its owning run (definition id + source_type manifest)
-    /// so the handler can enforce BOTH ownership and F-31 source-scope access.
-    pub async fn get_artifact_content(
+    /// Fetch only authorization facts for an artifact, never its BYTEA.
+    pub async fn get_artifact_scope(
         &self,
         artifact_id: Uuid,
-    ) -> Result<(ReportArtifactContent, ArtifactScope), ReportRepositoryError> {
-        let row = sqlx::query_as::<_, ArtifactContentRow>(
+    ) -> Result<ArtifactScope, ReportRepositoryError> {
+        let row = sqlx::query_as::<_, ArtifactScopeRow>(
             r#"
-            SELECT a.filename, a.content_type, a.content,
-                   r.definition_id, r.source_types, r.source_types_complete
+            SELECT r.definition_id, r.source_types, r.source_types_complete,
+                   r.requires_search_sql, r.search_sql_requirement_complete
             FROM report_run_artifacts a
             JOIN report_runs r ON r.id = a.run_id
             WHERE a.id = $1
@@ -585,30 +618,56 @@ impl ReportRepository {
         .fetch_optional(&self.pool)
         .await?
         .ok_or(ReportRepositoryError::ArtifactNotFound(artifact_id))?;
+        Ok(ArtifactScope {
+            definition_id: row.definition_id,
+            source_types: row.source_types,
+            source_types_complete: row.source_types_complete,
+            requires_search_sql: row.requires_search_sql,
+            search_sql_requirement_complete: row.search_sql_requirement_complete,
+        })
+    }
 
-        Ok((
-            ReportArtifactContent {
-                filename: row.filename,
-                content_type: row.content_type,
-                content: row.content,
-            },
-            ArtifactScope {
-                definition_id: row.definition_id,
-                source_types: row.source_types,
-                source_types_complete: row.source_types_complete,
-            },
-        ))
+    /// Fetch artifact bytes only after callers have authorized against
+    /// [`Self::get_artifact_scope`].
+    pub async fn get_artifact_bytes(
+        &self,
+        artifact_id: Uuid,
+    ) -> Result<ReportArtifactContent, ReportRepositoryError> {
+        let row = sqlx::query_as::<_, ArtifactBytesRow>(
+            r#"
+            SELECT filename, content_type, content
+            FROM report_run_artifacts
+            WHERE id = $1
+            "#,
+        )
+        .bind(artifact_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(ReportRepositoryError::ArtifactNotFound(artifact_id))?;
+        Ok(ReportArtifactContent {
+            filename: row.filename,
+            content_type: row.content_type,
+            content: row.content,
+        })
     }
 }
 
 #[derive(Debug, sqlx::FromRow)]
-struct ArtifactContentRow {
-    filename: String,
-    content_type: String,
-    content: Vec<u8>,
+struct ArtifactScopeRow {
     definition_id: Uuid,
     #[sqlx(default)]
     source_types: Vec<String>,
     #[sqlx(default)]
     source_types_complete: bool,
+    #[sqlx(default)]
+    requires_search_sql: bool,
+    #[sqlx(default)]
+    search_sql_requirement_complete: bool,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ArtifactBytesRow {
+    filename: String,
+    content_type: String,
+    content: Vec<u8>,
 }

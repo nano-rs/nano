@@ -59,11 +59,6 @@ impl SourceType {
         }
     }
 
-    /// Whether this source type requires cloud credentials
-    pub fn requires_credentials(&self) -> bool {
-        matches!(self, Self::AwsS3 | Self::GcpPubSub | Self::Kafka)
-    }
-
     /// Get display label for UI
     pub fn label(&self) -> &'static str {
         match self {
@@ -190,12 +185,8 @@ pub struct LogSource {
     #[serde(default = "default_utc")]
     pub timezone: String,
 
-    // Ingestion Configuration
+    // Parser routing
     pub source_type: String,
-    pub source_config: serde_json::Value,
-    #[serde(default, with = "typeid::cloud_credential::opt")]
-    #[schema(value_type = Option<String>)]
-    pub credential_id: Option<Uuid>,
 
     // Dispatch source (NAN-928): the deployed source-configuration whose
     // routing transform feeds events into this parser. Set when the user
@@ -203,8 +194,8 @@ pub struct LogSource {
     // parser-import "DISPATCH FROM" UI. When `Some`, the parser generator
     // emits a `filter` on `<sc.safe_name>_route` instead of a brand-new
     // parser-owned source (which was the silent-failure pre-NAN-928).
-    // `None` means "use the legacy parser-owned source from source_config",
-    // preserving behavior for parsers imported before this field existed.
+    // Fetch parsers must carry this link; connection configuration and
+    // credentials live exclusively on source_configurations.
     #[serde(default, with = "typeid::source_config::opt")]
     #[schema(value_type = Option<String>)]
     pub dispatch_source_config_id: Option<Uuid>,
@@ -268,12 +259,6 @@ pub struct LogSource {
     /// VRL condition for events that are NEVER sampled (e.g., .action != "allow"). None = no exclusions.
     pub sampling_exclude_condition: Option<String>,
 
-    // Parser-only mode
-    /// When true, this log source is parser-only and uses source_configurations for connection config.
-    /// The source_config, credential_id, and match_* fields are deprecated for parser_only sources.
-    #[serde(default)]
-    pub parser_only: bool,
-
     // Enrichment-parser flavor (NAN-1149)
     /// "log" (default) = a normal log-source parser; "enrichment" = a
     /// push-enrichment normalizer that carries `normalize_vrl` +
@@ -323,12 +308,8 @@ pub struct NewLogSource {
     #[serde(default = "default_utc")]
     pub timezone: String,
     pub source_type: String,
-    pub source_config: serde_json::Value,
     pub parser_vrl: String,
     pub output_fields: Option<serde_json::Value>,
-    #[serde(default, with = "typeid::cloud_credential::opt")]
-    #[schema(value_type = Option<String>)]
-    pub credential_id: Option<Uuid>,
     /// NAN-928: dispatch source-configuration this parser should consume from.
     /// When set on a fetch-source parser (kafka/aws_s3/gcp_pubsub), the
     /// generator emits a filter on the source-config's routing transform
@@ -381,7 +362,6 @@ pub struct UpdateLogSource {
     /// IANA timezone for timestamps without offset info
     pub timezone: Option<String>,
     pub source_type: Option<String>,
-    pub source_config: Option<serde_json::Value>,
     pub parser_vrl: Option<String>,
     /// NAN-1151: enrichment-parser mapping VRL. Lets the upstream-update/apply
     /// path refresh a linked enrichment parser (which carries `normalize_vrl`,
@@ -389,9 +369,6 @@ pub struct UpdateLogSource {
     #[serde(default)]
     pub normalize_vrl: Option<String>,
     pub output_fields: Option<serde_json::Value>,
-    #[serde(default, with = "typeid::cloud_credential::opt")]
-    #[schema(value_type = Option<String>)]
-    pub credential_id: Option<Uuid>,
     /// NAN-928: rebind dispatch source. `None` here means "no change"; use
     /// the dedicated null-clear path on the API if you need to unbind.
     #[serde(default, with = "typeid::source_config::opt")]
@@ -428,6 +405,12 @@ pub struct UpdateLogSource {
     pub extension_vrl: Option<String>,
     /// Toggle whether extension_vrl is included in deploys. None = no change.
     pub extension_enabled: Option<bool>,
+    /// Optimistic-concurrency precondition: the caller's last-seen
+    /// [`LogSource::updated_at`]. When present, the update succeeds only if
+    /// the stored timestamp still matches. Optional so existing internal and
+    /// API callers retain unconditional-update behavior.
+    #[serde(default)]
+    pub expected_updated_at: Option<DateTime<Utc>>,
 }
 
 /// Log source with health metrics for list views
@@ -455,7 +438,8 @@ pub struct LogSourceHealth {
     pub log_source_id: Uuid,
     pub log_source_name: String,
 
-    // Event counts
+    // Event counts. Detailed live-health metrics are bounded to the last 24h;
+    // `total_events` is retained as a compatibility alias for that window.
     pub total_events: i64,
     pub events_last_24h: i64,
     pub events_last_hour: i64,
@@ -479,6 +463,12 @@ pub struct LogSourceHealth {
     // Errors
     pub error_rate_24h: f64,
     pub parse_errors_24h: i64,
+    /// Events evaluated by this parser in the last 24 hours, counted before
+    /// optional log sampling.
+    pub parse_attempts_24h: i64,
+    /// Runtime parse success ratio over the last 24 hours. `None` means no
+    /// production events were available; static VRL validation is not counted.
+    pub parse_success_rate_24h: Option<f64>,
 }
 
 /// Health status of a log source

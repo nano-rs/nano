@@ -22,3 +22,6 @@ uuid.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 utoipa.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

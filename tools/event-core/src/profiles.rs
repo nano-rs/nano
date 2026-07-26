@@ -6,6 +6,7 @@
 use rand::distr::{weighted::WeightedIndex, Distribution};
 use rand::Rng;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 static PROFILES: OnceLock<ProfileData> = OnceLock::new();
@@ -183,6 +184,15 @@ impl ProfileData {
         &self.process_chains[self.chain_weights.sample(rng)]
     }
 
+    /// Most frequently observed hash for this exact executable in the normal
+    /// telemetry profile. Scripted campaigns use this to keep signed wrappers
+    /// and LOLBins on the same prevalence identity as background log-blaster
+    /// traffic. If the profile has never observed the executable, callers
+    /// should omit the hash rather than inventing a new low-prevalence value.
+    pub fn process_hash_for(&self, path: &str, name: &str) -> Option<&str> {
+        most_prevalent_process_hash(self.process_chains.iter(), path, name)
+    }
+
     /// Sample a random file hash entry weighted by frequency
     pub fn sample_file_hash(&self, rng: &mut impl Rng) -> &FileHashEntry {
         &self.file_hashes[self.file_weights.sample(rng)]
@@ -196,5 +206,60 @@ impl ProfileData {
     /// Sample a random sysmon event type weighted by real distribution
     pub fn sample_sysmon_event(&self, rng: &mut impl Rng) -> &SysmonEventDist {
         &self.sysmon_dist[self.sysmon_weights.sample(rng)]
+    }
+}
+
+fn most_prevalent_process_hash<'a>(
+    chains: impl Iterator<Item = &'a ProcessChain>,
+    path: &str,
+    name: &str,
+) -> Option<&'a str> {
+    let mut counts = BTreeMap::<&str, u64>::new();
+    for chain in chains.filter(|chain| {
+        chain.process_path.eq_ignore_ascii_case(path)
+            && chain.process_name.eq_ignore_ascii_case(name)
+            && chain.process_hash.len() == 64
+            && chain
+                .process_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        *counts.entry(&chain.process_hash).or_default() += chain.cnt;
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(hash, _)| hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chain(hash: &str, count: u64) -> ProcessChain {
+        ProcessChain {
+            process_name: "tool.exe".into(),
+            process_path: r"C:\Windows\tool.exe".into(),
+            process_hash: hash.into(),
+            parent_process_name: String::new(),
+            parent_process_path: String::new(),
+            parent_command_line: String::new(),
+            command_line: String::new(),
+            cnt: count,
+        }
+    }
+
+    #[test]
+    fn process_hash_prevalence_is_aggregated_across_profile_rows() {
+        const HASH_A: &str =
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        const HASH_B: &str =
+            "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let chains = [chain(HASH_A, 4), chain(HASH_A, 4), chain(HASH_B, 7)];
+
+        assert_eq!(
+            most_prevalent_process_hash(chains.iter(), r"C:\Windows\tool.exe", "tool.exe"),
+            Some(HASH_A)
+        );
     }
 }

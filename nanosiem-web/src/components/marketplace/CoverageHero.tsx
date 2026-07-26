@@ -8,16 +8,16 @@
  * segmented bar, a tone-coded state dot, "have" pills, and dashed-button
  * "missing" chips that prefill the marketplace search when clicked.
  *
- * NAN-609 — Decoupled from page load. Backed by a *shared* 6h
- * Dragonfly-backed cache server-side so the slow ~10s coverage SQL only
- * runs once per 6h across all replicas/users; caller still gets a
- * permissive React Query staleTime so in-tab navigations don't even
- * re-issue the GET. While the hero is loading or refetching, render a
- * dense skeleton so the rest of the page (catalog grid) is unblocked.
- * The header's RefreshCw button calls the dedicated POST refresh
- * endpoint, which invalidates the shared cache for everyone. The footer
- * meta line stamps "as of HH:MM" so users can see when the data was
- * last computed.
+ * NAN-609 / NAN-2061 — Decoupled from page load. Backed by a 6h
+ * Dragonfly cache partitioned by effective source visibility, so the slow
+ * ~10s coverage SQL only runs once per 6h for equivalent scopes across all
+ * replicas; caller still gets a permissive React Query staleTime so in-tab
+ * navigations don't even re-issue the GET. While the hero is loading or
+ * refetching, render a dense skeleton so the rest of the page (catalog grid)
+ * is unblocked. The header's RefreshCw button calls the dedicated POST refresh
+ * endpoint, which invalidates only the caller's scope partition. The footer
+ * meta line stamps "as of HH:MM" so users can see when the data was last
+ * computed.
  *
  * Source of truth: design-ref/ui_kits/search/marketplace.html lines 290-349.
  */

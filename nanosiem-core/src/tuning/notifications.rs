@@ -261,20 +261,61 @@ impl NotificationService {
         Ok(notifications)
     }
 
-    /// Mark a notification as read
-    pub async fn mark_as_read(&self, notification_id: Uuid) -> Result<(), NotificationError> {
-        sqlx::query(
+    /// Mark a notification as read, scoped to the owning user.
+    ///
+    /// NAN-2087: ownership is part of the WRITE predicate, not a check the
+    /// caller performs first. The previous form (`WHERE id = $1 AND read_at IS
+    /// NULL`) committed the mutation for ANY id and only afterwards let the
+    /// handler discover the row belonged to somebody else — a
+    /// mutate-before-authorize TOCTOU that let a `detections:view` principal
+    /// suppress other users' tuning notifications while receiving a plausible
+    /// 404. There is no check-then-act window here: a row that is not owned by
+    /// `user_id` is never touched.
+    ///
+    /// `COALESCE(read_at, NOW())` keeps the call idempotent — re-marking an
+    /// already-read owned notification succeeds without moving its timestamp.
+    ///
+    /// The `notification_type LIKE 'tuning_%'` predicate matches every read
+    /// path on this service, so the tuning route can only mutate the same rows
+    /// it can list.
+    ///
+    /// Returns the updated notification when it is owned by `user_id`, `None`
+    /// otherwise. Callers MUST map `None` to the same response an unknown id
+    /// produces so this is not a cross-user existence oracle.
+    ///
+    /// `RETURNING` the row also removes the old follow-up "load the caller's
+    /// 100 most recent notifications and find it" scan, which reported a
+    /// misleading 404 for an owned notification that had fallen outside that
+    /// window.
+    pub async fn mark_as_read(
+        &self,
+        notification_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<Notification>, NotificationError> {
+        let row = sqlx::query(
             r#"
             UPDATE notifications
-            SET read_at = NOW()
-            WHERE id = $1 AND read_at IS NULL
+            SET read_at = COALESCE(read_at, NOW())
+            WHERE id = $1
+              AND user_id = $2
+              AND notification_type LIKE 'tuning_%'
+            RETURNING
+                id,
+                user_id,
+                notification_type,
+                title,
+                message,
+                link,
+                created_at,
+                read_at
             "#,
         )
         .bind(notification_id)
-        .execute(&self.db_pool)
+        .bind(user_id)
+        .fetch_optional(&self.db_pool)
         .await?;
 
-        Ok(())
+        Ok(row.map(Self::row_to_notification))
     }
 
     /// Mark all tuning notifications as read for a user

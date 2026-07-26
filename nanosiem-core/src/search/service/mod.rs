@@ -11,7 +11,6 @@
 //! - Executes log search on ClickHouse (PostgreSQL is metadata-only)
 //! - Supports prevalence filtering and enrichment
 
-use sqlx::{PgPool, Row};
 use std::time::Instant;
 use tracing::{debug, info, instrument, warn};
 
@@ -720,8 +719,6 @@ fn strip_internal_lookup_fields(results: &mut Vec<serde_json::Value>) {
 /// PostgreSQL is always used for lookup table enrichment.
 #[derive(Clone)]
 pub struct SearchService {
-    /// PostgreSQL pool (for lookups and legacy queries)
-    pg_pool: PgPool,
     /// ClickHouse client (for log queries)
     ch_client: Option<clickhouse::Client>,
     /// Service configuration
@@ -990,7 +987,6 @@ impl SearchService {
         let ch_executor_rawsql_noaudit =
             Some(ClickHouseExecutor::new(dual_pool.clickhouse_rawsql_noaudit().clone()));
         Self {
-            pg_pool: dual_pool.postgres().clone(),
             ch_client: Some(dual_pool.clickhouse().clone()),
             config: SearchConfig::default(),
             ch_sql_generator: Self::ch_generator_for_pool(dual_pool, profile.clone()),
@@ -1057,7 +1053,6 @@ impl SearchService {
         let ch_executor_rawsql_noaudit =
             Some(ClickHouseExecutor::new(dual_pool.clickhouse_rawsql_noaudit().clone()));
         Self {
-            pg_pool: dual_pool.postgres().clone(),
             ch_client: Some(dual_pool.clickhouse().clone()),
             config: SearchConfig::default(),
             ch_sql_generator: Self::ch_generator_for_pool(dual_pool, profile.clone()),

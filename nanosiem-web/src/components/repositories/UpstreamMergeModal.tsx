@@ -29,12 +29,17 @@ import {
   ArrowRight,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import {
+  repositoryQueryEnabled,
+  type ActionAccess,
+} from '@/components/repositories/repository-action-policy';
 
 interface UpstreamMergeModalProps {
   detectionRuleId: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onApplyMerge: (mergedQuery: string) => void;
+  diffAccess: ActionAccess;
 }
 
 interface Hunk {
@@ -121,8 +126,6 @@ function applyHunkDecisions(oldText: string, newText: string, hunks: Hunk[]): st
   const result: string[] = [];
 
   let hunkIndex = 0;
-  let oldLineNum = 1;
-  let newLineNum = 1;
 
   for (const change of changes) {
     const lines = change.value.split('\n');
@@ -133,8 +136,6 @@ function applyHunkDecisions(oldText: string, newText: string, hunks: Hunk[]): st
     if (!change.added && !change.removed) {
       // Unchanged - always include
       result.push(...lines);
-      oldLineNum += lines.length;
-      newLineNum += lines.length;
     } else {
       // Find the corresponding hunk
       const hunk = hunks[hunkIndex];
@@ -146,7 +147,6 @@ function applyHunkDecisions(oldText: string, newText: string, hunks: Hunk[]): st
           result.push(...lines);
         }
         // If accepted === true or null, we skip old lines (will use new ones)
-        oldLineNum += lines.length;
       } else if (change.added) {
         // This is the "new" part of a hunk
         if (hunk && (hunk.accepted === true || hunk.accepted === null)) {
@@ -154,8 +154,6 @@ function applyHunkDecisions(oldText: string, newText: string, hunks: Hunk[]): st
           result.push(...lines);
         }
         // If accepted === false, we skip new lines (already added old ones)
-        newLineNum += lines.length;
-
         // Move to next hunk after processing the "new" part
         // (assuming hunks are removed+added pairs)
         if (hunk && hunkIndex < hunks.length) {
@@ -311,12 +309,13 @@ export function UpstreamMergeModal({
   open,
   onOpenChange,
   onApplyMerge,
+  diffAccess,
 }: UpstreamMergeModalProps) {
   // Fetch the diff
   const { data: diff, isLoading } = useQuery({
     queryKey: ['upstream-diff', detectionRuleId],
     queryFn: () => api.ruleRepositories.getUpstreamDiff(detectionRuleId),
-    enabled: open,
+    enabled: repositoryQueryEnabled(diffAccess, open),
   });
 
   // Parse hunks from diff
@@ -384,7 +383,11 @@ export function UpstreamMergeModal({
           </DialogDescription>
         </DialogHeader>
 
-        {isLoading ? (
+        {!diffAccess.allowed ? (
+          <div className="text-center py-8 text-muted-foreground">
+            {diffAccess.reason}
+          </div>
+        ) : isLoading ? (
           <div className="flex items-center justify-center py-12">
             <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
           </div>

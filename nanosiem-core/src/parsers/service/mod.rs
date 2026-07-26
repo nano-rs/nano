@@ -3,12 +3,10 @@
 //! Parser service for business logic
 //!
 //! Submodules organized by concern:
-//! - `credentials`: Cloud credential injection for parsers
 //! - `crud`: Parser CRUD operations (create, read, update, delete, enable, disable)
 //! - `deployment`: Parser deployment lifecycle (deploy, undeploy, rollback)
 //! - `validation`: VRL and UDM field validation
 
-mod credentials;
 mod crud;
 mod deployment;
 mod validation;
@@ -20,9 +18,8 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use thiserror::Error;
 
-use super::credential_repository::{CredentialRepository, CredentialRepositoryError};
-use super::repository::ParserRepositoryError;
 use super::repository::ParserRepository;
+use super::repository::ParserRepositoryError;
 use super::validator::VrlValidator;
 use super::vector_config::{VectorConfigError, VectorConfigManager};
 
@@ -30,8 +27,6 @@ use super::vector_config::{VectorConfigError, VectorConfigManager};
 pub enum ParserServiceError {
     #[error("Repository error: {0}")]
     RepositoryError(#[from] ParserRepositoryError),
-    #[error("Credential error: {0}")]
-    CredentialError(#[from] CredentialRepositoryError),
     #[error("Invalid VRL: {0}")]
     InvalidVrl(String),
     #[error("Invalid source type: {0}")]
@@ -88,9 +83,5 @@ impl ParserService {
 
     fn repository(&self) -> ParserRepository {
         ParserRepository::new(self.pool.clone())
-    }
-
-    fn credential_repository(&self) -> CredentialRepository {
-        CredentialRepository::new(self.pool.clone())
     }
 }

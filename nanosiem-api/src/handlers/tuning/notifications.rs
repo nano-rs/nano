@@ -77,28 +77,24 @@ pub async fn mark_tuning_notification_read(
 ) -> Result<Json<Notification>, ApiError> {
     ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
-    // Mark the notification as read
-    state
+    let user_id = auth.user_id();
+
+    // NAN-2087: the ownership predicate lives INSIDE the UPDATE. Previously
+    // this handler mutated `read_at` for any id first and only then searched
+    // the caller's own notifications, so a `detections:view` principal could
+    // silently mark another user's tuning notification read and still get a
+    // 404. A foreign id now leaves the row untouched.
+    // The updated row comes straight back from the same statement, so there is
+    // no follow-up scan that could mis-report an owned notification as missing.
+    // A not-owned id and an unknown id are indistinguishable to the caller —
+    // identical 404, no existence oracle.
+    let notification = state
         .notification_service
-        .mark_as_read(*id)
+        .mark_as_read(*id, user_id)
         .await
         .map_err(|e| {
             ApiError::InternalError(format!("Failed to mark notification as read: {}", e))
-        })?;
-
-    // Fetch and return the updated notification
-    // Note: We need to get all user notifications and find the one we just updated
-    let user_id = auth.user_id();
-    let notifications = state
-        .notification_service
-        .get_user_notifications(user_id, 100)
-        .await
-        .map_err(|e| ApiError::InternalError(format!("Failed to fetch notification: {}", e)))?;
-
-    // Find the notification we just marked as read
-    let notification = notifications
-        .into_iter()
-        .find(|n| n.id == *id)
+        })?
         .ok_or_else(|| ApiError::NotFound("Notification not found".to_string()))?;
 
     Ok(Json(notification))

@@ -464,12 +464,39 @@ pub struct SourceConfiguration {
     pub last_event_at: Option<DateTime<Utc>>,
 }
 
+impl SourceConfiguration {
+    /// NAN-2067: mask secret values in `connection_config` before this row is
+    /// serialized into an API response.
+    ///
+    /// `connection_config` is an accepted storage location for Kafka SASL
+    /// passwords and AWS access keys, so returning it verbatim let any
+    /// `source_configs:view` holder recover reusable infrastructure
+    /// credentials. Applied at the `SourceConfigService` read boundary —
+    /// deploy-time generation reads plaintext through `SourceConfigRepository`
+    /// directly and is unaffected.
+    #[must_use]
+    pub fn redacted(mut self) -> Self {
+        crate::config_secrets::redact_config_secrets(&mut self.connection_config);
+        self
+    }
+}
+
 /// Source configuration with its routing rules
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SourceConfigurationWithRules {
     #[serde(flatten)]
     pub config: SourceConfiguration,
     pub routing_rules: Vec<RoutingRule>,
+}
+
+impl SourceConfigurationWithRules {
+    /// NAN-2067: see [`SourceConfiguration::redacted`]. The flattened inner
+    /// config inherits the leak, so the wrapper needs its own boundary call.
+    #[must_use]
+    pub fn redacted(mut self) -> Self {
+        self.config = self.config.redacted();
+        self
+    }
 }
 
 /// Request to create a new source configuration
@@ -505,6 +532,12 @@ pub struct UpdateSourceConfiguration {
     /// NAN-1919: fallback `source_type` for unmatched pull-source events.
     #[serde(default)]
     pub default_source_type: Option<String>,
+    /// Optimistic-concurrency precondition: the caller's last-seen
+    /// [`SourceConfiguration::updated_at`]. When present, the update succeeds
+    /// only if the stored timestamp still matches. Optional so existing
+    /// internal and API callers retain unconditional-update behavior.
+    #[serde(default)]
+    pub expected_updated_at: Option<DateTime<Utc>>,
 }
 
 // ============================================================================

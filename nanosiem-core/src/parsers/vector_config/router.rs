@@ -83,7 +83,12 @@ pub fn base_router_inputs(
 /// `otlp_logs_prep` input.
 pub fn otlp_source_present() -> bool {
     std::env::var("NANOSIEM_VECTOR_OTLP_PRESENT")
-        .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "false" | "0" | "no" | "off"))
+        .map(|v| {
+            !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "false" | "0" | "no" | "off"
+            )
+        })
         .unwrap_or(true)
 }
 
@@ -99,7 +104,12 @@ pub fn otlp_source_present() -> bool {
 /// `splunk_in` + `auth_check` and never defines `hec_normalize`.
 pub fn hec_normalize_present() -> bool {
     std::env::var("NANOSIEM_VECTOR_HEC_NORMALIZE_PRESENT")
-        .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "false" | "0" | "no" | "off"))
+        .map(|v| {
+            !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "false" | "0" | "no" | "off"
+            )
+        })
         .unwrap_or(true)
 }
 
@@ -210,9 +220,7 @@ pub(super) fn parser_claimed_route(parser: &Parser) -> Option<&str> {
         // Kafka/S3/GCP parsers only claim a route when bound to a source-config
         // via the DISPATCH FROM picker (NAN-928); otherwise they spin their own
         // owned source and don't intersect with source_router.
-        "kafka" | "aws_s3" | "aws_sqs" | "gcp_pubsub" => {
-            parser.dispatch_route_name.as_deref()
-        }
+        "kafka" | "aws_s3" | "aws_sqs" | "gcp_pubsub" => parser.dispatch_route_name.as_deref(),
         _ => None,
     }
 }
@@ -241,13 +249,10 @@ fn build_unclaimed_filter_condition(claimants: &[&Parser]) -> String {
         .map(|v| format!("\"{}\"", escape_vrl_string_for_router(v)))
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
-        "!includes([{}], to_string(.source_type) ?? \"\")",
-        list
-    )
+    format!("!includes([{}], to_string(.source_type) ?? \"\")", list)
 }
 
-/// Minimal VRL string escape — backslashes + quotes + embedded newlines.
+/// Minimal VRL string escape — backslashes, quotes, and control characters.
 /// Duplicated from `sources::escape_vrl_string` (private) to keep the router
 /// module standalone; sub-50-char helper, not worth lifting yet.
 fn escape_vrl_string_for_router(s: &str) -> String {
@@ -258,6 +263,9 @@ fn escape_vrl_string_for_router(s: &str) -> String {
             '"' => out.push_str("\\\""),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 || (c as u32) == 0x7f => {
+                out.push_str(&format!("\\u{:04x}", c as u32))
+            }
             _ => out.push(ch),
         }
     }
@@ -728,7 +736,10 @@ impl VectorConfigManager {
         // parsers (shared helper keeps router.rs + staging.rs in lockstep).
         let enabled_enrichment: Vec<&Parser> =
             enrichment_parsers.iter().filter(|p| p.enabled).collect();
-        config.push_str(&enrichment_router_block(&enabled_enrichment, &inputs_formatted));
+        config.push_str(&enrichment_router_block(
+            &enabled_enrichment,
+            &inputs_formatted,
+        ));
 
         // Add placeholder transforms
         config.push_str(
@@ -824,7 +835,10 @@ source = "# passthrough"
             Some("[\"source_type_extract\"]")
         );
         // No inputs in block → None.
-        assert_eq!(route_transform_upstream("[transforms.x_route]\ntype=\"remap\"\n", "x_route"), None);
+        assert_eq!(
+            route_transform_upstream("[transforms.x_route]\ntype=\"remap\"\n", "x_route"),
+            None
+        );
     }
 
     /// NAN-1442 (Saturn 2× ingestion): http + vector routes both read
@@ -973,20 +987,20 @@ source = ".source_type = \"foo\""
     #[test]
     fn base_router_inputs_excludes_source_type_extract_when_covered() {
         for hec_present in [true, false] {
-            assert!(
-                !base_router_inputs(true, false, hec_present, false).contains(&"source_type_extract")
-            );
-            assert!(!base_router_inputs(true, true, hec_present, false).contains(&"source_type_extract"));
+            assert!(!base_router_inputs(true, false, hec_present, false)
+                .contains(&"source_type_extract"));
+            assert!(!base_router_inputs(true, true, hec_present, false)
+                .contains(&"source_type_extract"));
         }
     }
 
     #[test]
     fn base_router_inputs_includes_source_type_extract_when_uncovered() {
         for hec_present in [true, false] {
-            assert!(
-                base_router_inputs(false, false, hec_present, false).contains(&"source_type_extract")
-            );
-            assert!(base_router_inputs(false, true, hec_present, false).contains(&"source_type_extract"));
+            assert!(base_router_inputs(false, false, hec_present, false)
+                .contains(&"source_type_extract"));
+            assert!(base_router_inputs(false, true, hec_present, false)
+                .contains(&"source_type_extract"));
         }
     }
 
@@ -1001,7 +1015,9 @@ source = ".source_type = \"foo\""
             return;
         }
         for hec_present in [true, false] {
-            assert!(base_router_inputs(false, false, hec_present, false).contains(&"otlp_logs_prep"));
+            assert!(
+                base_router_inputs(false, false, hec_present, false).contains(&"otlp_logs_prep")
+            );
             assert!(base_router_inputs(true, true, hec_present, false).contains(&"otlp_logs_prep"));
         }
     }
@@ -1038,11 +1054,9 @@ source = ".source_type = \"foo\""
             name: "Apache HTTP Server".to_string(),
             description: None,
             source_type: source_type.to_string(),
-            source_config: serde_json::json!({}),
             parser_vrl: String::new(),
             output_fields: None,
             feed_id: None,
-            credential_id: None,
             dispatch_source_config_id: dispatch.map(|_| Uuid::new_v4()),
             dispatch_route_name: dispatch.map(|s| s.to_string()),
             enabled: true,

@@ -96,6 +96,14 @@ jobs:
           # insert shifts the global count between a test's baseline and
           # excluded reads → flaky `N vs N-1`. Serial = deterministic.
           #
+          # NAN-2029: case_route_authz_guard is the ONLY entry here without
+          # `-- --ignored`. It needs no database (it source-scans the case
+          # authorization surface), and `--ignored` runs ONLY ignored tests, so
+          # listing it with the flag would silently execute nothing. This
+          # workflow is the sole checked-in job that runs `cargo test`, and it
+          # triggers on any `**/*.rs` change, so this is where a non-DB
+          # regression guard has to live to actually gate a PR.
+          #
           # IMPORTANT: the `bash -c '...'` body below MUST stay apostrophe-free.
           # An apostrophe closes the single-quoted -c string, so everything after
           # it runs on the bare host instead of in the container (cargo: command
@@ -109,10 +117,17 @@ jobs:
             -e DATABASE_URL="$DATABASE_URL" \
             "$RUST_IMAGE" \
             bash -euo pipefail -c '
+              cargo test -p nanosiem-enterprise --test case_route_authz_guard
               cargo test -p nanosiem-core --test api_key_rate_limit_integration -- --ignored
               cargo test -p nanosiem-core --test source_scope_integration -- --ignored
+              cargo test -p nanosiem-enterprise --test notebook_tab_revocation_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-enterprise --test settings_integration -- --ignored
+              cargo test -p nanosiem-enterprise --test playbook_acl_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-enterprise --test case_stats_visibility_integration -- --ignored --test-threads=1
+              cargo test -p nanosiem-enterprise --test incident_confidence_integration -- --ignored
+              cargo test -p nanosiem-enterprise --test f34_case_source_scoping_integration -- --ignored
+              cargo test -p nanosiem-enterprise --test case_visibility_scope_integration -- --ignored --test-threads=1
+              cargo test -p nanosiem-enterprise --test case_entity_provenance_integration -- --ignored
             '
 
       - name: Stop Postgres

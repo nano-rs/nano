@@ -12,7 +12,7 @@ use tracing::error;
 use super::types::{
     BulkPrevalenceRequest, BulkPrevalenceResponse, PrevalenceQuery, PrevalenceResponse,
 };
-use super::{MAX_BULK_ARTIFACTS, parse_time_window};
+use super::{MAX_BULK_ARTIFACTS, effective_artifact_scope, parse_time_window};
 use crate::middleware::{AuthContext, check_permission};
 use crate::state::AppState;
 use nanosiem_core::auth::permissions;
@@ -61,9 +61,10 @@ pub async fn get_hash_prevalence(
     .await;
 
     let time_window = parse_time_window(params.window.as_deref());
+    let scope = effective_artifact_scope(&auth);
 
     match prevalence_service
-        .get_hash_prevalence(&hash, time_window)
+        .get_hash_prevalence(&hash, time_window, &scope)
         .await
     {
         Ok(data) => Ok(Json(PrevalenceResponse { data })),
@@ -118,9 +119,10 @@ pub async fn get_domain_prevalence(
     .await;
 
     let time_window = parse_time_window(params.window.as_deref());
+    let scope = effective_artifact_scope(&auth);
 
     match prevalence_service
-        .get_domain_prevalence(&domain, time_window)
+        .get_domain_prevalence(&domain, time_window, &scope)
         .await
     {
         Ok(data) => Ok(Json(PrevalenceResponse { data })),
@@ -185,9 +187,10 @@ pub async fn get_bulk_prevalence(
     .await;
 
     let time_window = parse_time_window(request.window.as_deref());
+    let scope = effective_artifact_scope(&auth);
 
     match prevalence_service
-        .get_bulk_prevalence(&request.artifacts, time_window)
+        .get_bulk_prevalence(&request.artifacts, time_window, &scope)
         .await
     {
         Ok(data) => {

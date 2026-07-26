@@ -16,6 +16,7 @@ use super::collector;
 use super::repository::SiemHealthRepository;
 use super::suppressions_repository::SuppressionRepository;
 use super::types::HealthStatus;
+use crate::auth::ScopeSet;
 use crate::extensions::SiemHealthAiAnalyzer;
 
 /// Default interval: 12 hours
@@ -46,14 +47,7 @@ pub fn start(
         let repo = SiemHealthRepository::new(pool.clone());
 
         loop {
-            run_health_check(
-                &pool,
-                &ch_client,
-                is_clustered,
-                ai_analyzer.as_ref(),
-                &repo,
-            )
-            .await;
+            run_health_check(&pool, &ch_client, is_clustered, ai_analyzer.as_ref(), &repo).await;
             time::sleep(Duration::from_secs(interval_secs)).await;
         }
     })
@@ -73,23 +67,40 @@ pub async fn run_health_check(
     ai_analyzer: &dyn SiemHealthAiAnalyzer,
     repo: &SiemHealthRepository,
 ) -> Option<uuid::Uuid> {
-    run_health_check_with_trigger(pool, ch_client, is_clustered, ai_analyzer, repo, None).await
+    let system_scope = ScopeSet::unrestricted();
+    run_health_check_with_trigger(
+        pool,
+        ch_client,
+        is_clustered,
+        ai_analyzer,
+        repo,
+        &system_scope,
+        None,
+    )
+    .await
 }
 
-/// Run a health check, optionally recording who triggered it.
+/// Run a health check under an explicit collection scope, optionally recording
+/// who triggered it.
+///
+/// The scheduled path passes [`ScopeSet::unrestricted`]. HTTP callers pass
+/// their current effective viewer scope so denied log rows never enter metrics,
+/// the AI prompt, fallback analysis, or the durable report.
 pub async fn run_health_check_with_trigger(
     pool: &PgPool,
     ch_client: &ClickHouseClient,
     is_clustered: bool,
     ai_analyzer: &dyn SiemHealthAiAnalyzer,
     repo: &SiemHealthRepository,
+    scope: &ScopeSet,
     triggered_by: Option<uuid::Uuid>,
 ) -> Option<uuid::Uuid> {
     let start = std::time::Instant::now();
     info!("Starting SIEM health check...");
 
     // Step 1: Collect metrics
-    let metrics = collector::collect_metrics(pool, ch_client, is_clustered).await;
+    let metrics = collector::collect_metrics(pool, ch_client, is_clustered, scope).await;
+    let provenance = metrics.source_provenance();
     let metrics_json = serde_json::to_value(&metrics).unwrap_or_default();
 
     // Step 1b: Load active suppressions so the AI can omit classes the tenant
@@ -150,6 +161,7 @@ pub async fn run_health_check_with_trigger(
             &metrics_json,
             &recommendations_json,
             &details_json,
+            &provenance,
             triggered_by,
             Some(duration_ms),
         )

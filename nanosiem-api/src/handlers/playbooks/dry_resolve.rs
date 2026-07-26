@@ -137,7 +137,7 @@ pub struct DryResolveResponse {
             body = DryResolveResponse),
         (status = 400, description = "Missing both alert_id and sample_alert, or alert_id was malformed",
             body = crate::error::ErrorResponse),
-        (status = 403, description = "Forbidden — missing playbooks:manage"),
+        (status = 403, description = "Forbidden — missing playbooks:manage (or alerts:view when resolving by alert_id)"),
         (status = 404, description = "alert_id not found", body = crate::error::ErrorResponse),
         (status = 413, description = "`doc` exceeds the 256 KiB size limit",
             body = crate::error::ErrorResponse),
@@ -174,6 +174,13 @@ pub async fn dry_resolve(
     }
 
     let ctx_json = if let Some(alert_id_str) = req.alert_id.as_deref() {
+        // NAN-2045: this path loads a persisted alert's matched events (log data) —
+        // a cross-resource read that `playbooks:manage` does not authorize. Require
+        // `alerts:view` too, matching the alerts read surface. Source scope below is
+        // a secondary row filter, not the capability gate. (The inline
+        // `sample_alert` path reads no persisted alert, so it needs no alerts:view.)
+        ensure_permission(&auth, permissions::ALERTS_VIEW)?;
+
         // Authoritative path — load the real alert from Postgres and build
         // the snapshot the same way the rule-fire path does.
         let alert_uuid = parse_alert_id(alert_id_str)?;

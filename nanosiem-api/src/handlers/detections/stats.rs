@@ -8,6 +8,7 @@ use axum::{
 };
 use nanosiem_core::audit::{AuditEvent, AuditSource, ClientContext, RULE_TRIGGERED};
 use nanosiem_core::auth::permissions;
+use nanosiem_core::detection::match_scope::{DetectionMatchRepository, MatchScope};
 use nanosiem_core::typeid::TypeIdParam;
 use uuid::Uuid;
 
@@ -19,28 +20,17 @@ use crate::{
     state::AppState,
 };
 
-/// NAN-1808: compose the caller's EFFECTIVE per-source deny scope for
-/// detection-match reads — the per-source RBAC deny set (NAN-1799) unioned
-/// with the `audit` source unless the caller holds `audit:view`. Mirrors
-/// `handlers::alerts::effective_viewer_scope`. Returns `None` for an
-/// unrestricted caller so the emitted SQL stays byte-identical to the
-/// pre-scoping query; otherwise the normalized (trimmed + lowercased) deny
-/// values to bind against `detection_matches.source_types`.
-fn effective_viewer_deny(auth: &AuthContext) -> Option<Vec<String>> {
-    let mut deny = auth.denied_sources.deny_set().clone();
-    if !auth.has_permission(permissions::AUDIT_VIEW) {
-        deny.insert("audit".to_string());
-    }
-    let deny: Vec<String> = deny
-        .iter()
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if deny.is_empty() {
-        None
-    } else {
-        Some(deny)
-    }
+/// NAN-1808 / NAN-2071: the caller's EFFECTIVE per-source deny scope for the
+/// `detection_matches` surface — the per-source RBAC deny set (NAN-1799)
+/// unioned with the `audit` source unless the caller holds `audit:view`.
+///
+/// NAN-2071 replaced the hand-rolled composition that used to live here with
+/// the canonical `AuthContext::effective_source_deny_set()` so the implicit
+/// audit gate cannot drift, and moved the SQL predicate into
+/// `nanosiem_core::detection::match_scope` so the sibling count and MUTATION
+/// paths enforce the identical rule.
+pub(super) fn effective_match_scope(auth: &AuthContext) -> MatchScope {
+    MatchScope::from_denied(&auth.effective_source_deny_set())
 }
 
 /// Manually trigger a detection rule to run now
@@ -166,17 +156,13 @@ pub async fn get_today_counts(
         .and_time(NaiveTime::MIN)
         .and_utc();
 
-    let rows = sqlx::query_as::<_, (uuid::Uuid, i64)>(
-        r#"
-        SELECT rule_id, COUNT(*)::bigint AS firings
-        FROM detection_matches
-        WHERE detected_at >= $1
-        GROUP BY rule_id
-        "#,
-    )
-    .bind(today_start)
-    .fetch_all(&state.pool)
-    .await?;
+    // NAN-2071: this counts `detection_matches` rows, the same table
+    // `/api/rules/{id}/matches` scopes. Counting denied-source rows here would
+    // re-expose the activity the row-level read path hides — a rule's firing
+    // volume and timing is exactly what the per-source restriction protects.
+    let rows = DetectionMatchRepository::new(state.pool.clone())
+        .firing_counts_since(today_start, &effective_match_scope(&auth))
+        .await?;
 
     let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
 
@@ -222,7 +208,7 @@ pub async fn get_detection_matches(
     // A row is visible iff NONE of its stamped source_types is denied; rows
     // stamped '{}' (pre-feature / non-source-derived) never overlap and stay
     // visible. `None` (unrestricted) keeps the SQL byte-identical.
-    let deny_vec = effective_viewer_deny(&auth);
+    let scope = effective_match_scope(&auth);
 
     // Build the base query from detection_matches table.
     // LEFT JOIN match_reviews so the UI can show a "reviewed" chip without an
@@ -255,12 +241,9 @@ pub async fn get_detection_matches(
         sql.push_str(&format!(" AND dm.detected_at <= ${}", param_count));
     }
 
-    if deny_vec.is_some() {
+    if !scope.is_unrestricted() {
         param_count += 1;
-        sql.push_str(&format!(
-            " AND (${p}::text[] = '{{}}' OR NOT (dm.source_types && ${p}::text[]))",
-            p = param_count
-        ));
+        sql.push_str(&MatchScope::sql_predicate("dm.source_types", param_count));
     }
 
     // Order by most recent first
@@ -294,8 +277,8 @@ pub async fn get_detection_matches(
         query_builder = query_builder.bind(end);
     }
 
-    if let Some(deny) = &deny_vec {
-        query_builder = query_builder.bind(deny);
+    if !scope.is_unrestricted() {
+        query_builder = query_builder.bind(scope.deny_bind_values());
     }
 
     query_builder = query_builder.bind(query.limit).bind(query.offset);
@@ -319,12 +302,9 @@ pub async fn get_detection_matches(
 
     // NAN-1808: total must count the same scope-filtered rows the page shows —
     // an unfiltered count would leak the existence of denied-source matches.
-    if deny_vec.is_some() {
+    if !scope.is_unrestricted() {
         count_param += 1;
-        count_sql.push_str(&format!(
-            " AND (${p}::text[] = '{{}}' OR NOT (source_types && ${p}::text[]))",
-            p = count_param
-        ));
+        count_sql.push_str(&MatchScope::sql_predicate("source_types", count_param));
     }
 
     let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql).bind(*id);
@@ -337,8 +317,8 @@ pub async fn get_detection_matches(
         count_query = count_query.bind(end);
     }
 
-    if let Some(deny) = &deny_vec {
-        count_query = count_query.bind(deny);
+    if !scope.is_unrestricted() {
+        count_query = count_query.bind(scope.deny_bind_values());
     }
 
     let total = count_query.fetch_one(&state.pool).await?;
@@ -381,3 +361,7 @@ pub async fn get_detection_matches(
 
     Ok(Json(DetectionMatchesResponse { total, matches }))
 }
+
+#[cfg(test)]
+#[path = "scope_tests.rs"]
+mod scope_tests;

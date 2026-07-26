@@ -294,8 +294,11 @@ pub async fn health_check_detailed(
     Extension(auth): Extension<crate::middleware::AuthContext>,
     request_id: Option<Extension<RequestId>>,
 ) -> Result<Json<DualHealthResponse>, crate::error::ApiError> {
-    // L2: Restrict detailed health to admin role — exposes internal service URLs
-    crate::middleware::ensure_permission(&auth, nanosiem_core::auth::permissions::SETTINGS_VIEW)?;
+    // NAN-2070: this response leaks internal service URLs, database/service
+    // topology, latencies, and raw backend/HTTP error strings that the public
+    // `/health` endpoint intentionally suppresses. Gate it on the privileged
+    // `settings:system` capability, not the broad read-only `settings:view`.
+    crate::middleware::ensure_permission(&auth, nanosiem_core::auth::permissions::SETTINGS_SYSTEM)?;
 
     // Get service URLs from environment or use defaults
     let ingest_url = std::env::var("INGEST_SERVICE_URL")

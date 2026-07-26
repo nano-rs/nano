@@ -9,6 +9,7 @@ use super::TuningRepository;
 use crate::detection::materialized_view::{acquire_rule_runtime_lock, MaterializedViewGenerator};
 use crate::detection_code_target::acquire_autonomous_tuning_dac_lock;
 use crate::models::DetectionRule;
+use crate::tuning::scope::TuningScope;
 use crate::tuning::types::{TuningStatus, TuningValidationProof};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -43,6 +44,14 @@ pub struct AtomicProposalApplyRequest {
     pub mutation: ProposalRuleMutation,
     pub reviewer_notes: Option<String>,
     pub log_trigger_reason: String,
+    /// NAN-2085 / NAN-2088: the ACTOR's effective per-source deny scope,
+    /// re-evaluated under the row lock rather than trusted from the handler's
+    /// earlier `get_proposal`. The silent-rule detector can restamp
+    /// `source_types` on an still-open proposal at any moment, so a preflight
+    /// visibility check is check-then-act: a proposal visible when stamped for
+    /// source A could be restamped to a denied source B and still be actioned.
+    /// Background/system callers pass [`TuningScope::system`].
+    pub scope: TuningScope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +92,8 @@ struct LockedProposalRule {
     rule_id: Uuid,
     proposal_type: String,
     proposal_status: String,
+    proposal_source_types: Vec<String>,
+    proposal_source_types_complete: bool,
     proposal_confidence_score: f64,
     proposal_safety_validation: Value,
     original_query: String,
@@ -258,6 +269,8 @@ impl TuningRepository {
                 tp.rule_id,
                 COALESCE(tp.proposal_type, 'query_tuning') AS proposal_type,
                 tp.status AS proposal_status,
+                tp.source_types AS proposal_source_types,
+                tp.source_types_complete AS proposal_source_types_complete,
                 tp.confidence_score AS proposal_confidence_score,
                 tp.safety_validation AS proposal_safety_validation,
                 tp.original_query,
@@ -295,6 +308,18 @@ impl TuningRepository {
         .ok_or(AtomicProposalApplyError::ProposalNotFound(
             request.proposal_id,
         ))?;
+
+        // NAN-2085 / NAN-2088: authorize the artifact's CURRENT provenance
+        // while the row is locked. Reported as ProposalNotFound so a denied
+        // proposal is indistinguishable from a missing one.
+        if !request.scope.allows(
+            &locked.proposal_source_types,
+            locked.proposal_source_types_complete,
+        ) {
+            return Err(AtomicProposalApplyError::ProposalNotFound(
+                request.proposal_id,
+            ));
+        }
 
         if query_rule_id.is_some_and(|rule_id| rule_id != locked.rule_id) {
             return Err(stale_error(request.proposal_id, locked.rule_id));
@@ -619,31 +644,50 @@ impl TuningRepository {
 
     /// Compare-and-set a proposal status, optionally recording reviewer notes.
     /// Returns `false` when another actor already moved the proposal.
+    ///
+    /// NAN-2085 / NAN-2088: `scope` is the ACTOR's effective per-source deny
+    /// scope and rides INSIDE the compare-and-set, so a proposal restamped onto
+    /// a denied source between the handler's read and this write cannot be
+    /// transitioned. `false` covers "already moved", "denied" and "missing"
+    /// alike — callers must render them identically.
     pub async fn transition_proposal_status(
         &self,
         proposal_id: Uuid,
         expected: &[TuningStatus],
         target: TuningStatus,
         reviewer_notes: Option<&str>,
+        scope: &TuningScope,
     ) -> Result<bool, sqlx::Error> {
         let expected: Vec<String> = expected.iter().map(ToString::to_string).collect();
-        let mut tx = self.pool.begin().await?;
-        let transitioned_rule_id: Option<Uuid> = sqlx::query_scalar(
+        let mut sql = String::from(
             r#"
             UPDATE tuning_proposals
             SET status = $1,
                 reviewer_notes = COALESCE($2, reviewer_notes),
                 pr_target_id = CASE WHEN $1 = 'rejected' THEN NULL ELSE pr_target_id END
             WHERE id = $3 AND status = ANY($4::text[])
-            RETURNING rule_id
             "#,
-        )
-        .bind(target.to_string())
-        .bind(reviewer_notes)
-        .bind(proposal_id)
-        .bind(expected)
-        .fetch_optional(&mut *tx)
-        .await?;
+        );
+        let scoped = !scope.is_unrestricted();
+        if scoped {
+            sql.push_str(&TuningScope::sql_predicate(
+                "source_types",
+                "source_types_complete",
+                5,
+            ));
+        }
+        sql.push_str(" RETURNING rule_id");
+
+        let mut tx = self.pool.begin().await?;
+        let mut update = sqlx::query_scalar(&sql)
+            .bind(target.to_string())
+            .bind(reviewer_notes)
+            .bind(proposal_id)
+            .bind(expected);
+        if scoped {
+            update = update.bind(scope.deny_bind_values().to_vec());
+        }
+        let transitioned_rule_id: Option<Uuid> = update.fetch_optional(&mut *tx).await?;
 
         let Some(rule_id) = transitioned_rule_id else {
             tx.rollback().await?;
@@ -963,6 +1007,8 @@ mod tests {
             rule_id: Uuid::now_v7(),
             proposal_type: "query_tuning".to_string(),
             proposal_status: status.to_string(),
+            proposal_source_types: Vec::new(),
+            proposal_source_types_complete: false,
             proposal_confidence_score: 0.95,
             proposal_safety_validation: serde_json::json!({ "is_safe": true }),
             original_query: original.to_string(),

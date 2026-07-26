@@ -17,6 +17,7 @@ use tracing::{debug, instrument};
 
 use super::repository::{DictArtifactKind, PrevalenceRepository};
 use super::types::*;
+use crate::auth::ArtifactScope;
 use crate::db::TableNames;
 
 /// Maximum number of entries in the prevalence cache
@@ -210,11 +211,12 @@ impl PrevalenceService {
     }
 
     /// Query prevalence for a single hash
-    #[instrument(skip(self))]
+    #[instrument(skip(self, scope))]
     pub async fn get_hash_prevalence(
         &self,
         hash: &str,
         time_window: TimeWindow,
+        scope: &ArtifactScope,
     ) -> Result<PrevalenceData, PrevalenceError> {
         let config = self.config.read().await;
 
@@ -223,7 +225,7 @@ impl PrevalenceService {
         }
 
         // Check cache first
-        {
+        if scope.is_unrestricted() {
             let mut cache = self.cache.write().await;
             if let Some(data) = cache.get(hash, time_window) {
                 debug!("Cache hit for hash: {}", hash);
@@ -234,7 +236,7 @@ impl PrevalenceService {
         // Query ClickHouse
         let row = self
             .repository
-            .get_hash_prevalence(hash, time_window)
+            .get_hash_prevalence(hash, time_window, scope)
             .await
             .map_err(PrevalenceError::ClickHouse)?;
 
@@ -250,7 +252,7 @@ impl PrevalenceService {
         };
 
         // Update cache
-        {
+        if scope.is_unrestricted() {
             let mut cache = self.cache.write().await;
             cache.insert(hash, time_window, data.clone());
         }
@@ -259,11 +261,12 @@ impl PrevalenceService {
     }
 
     /// Query prevalence for a single domain
-    #[instrument(skip(self))]
+    #[instrument(skip(self, scope))]
     pub async fn get_domain_prevalence(
         &self,
         domain: &str,
         time_window: TimeWindow,
+        scope: &ArtifactScope,
     ) -> Result<PrevalenceData, PrevalenceError> {
         let config = self.config.read().await;
 
@@ -272,7 +275,7 @@ impl PrevalenceService {
         }
 
         // Check cache first
-        {
+        if scope.is_unrestricted() {
             let mut cache = self.cache.write().await;
             if let Some(data) = cache.get(domain, time_window) {
                 debug!("Cache hit for domain: {}", domain);
@@ -283,7 +286,7 @@ impl PrevalenceService {
         // Query ClickHouse
         let row = self
             .repository
-            .get_domain_prevalence(domain, time_window)
+            .get_domain_prevalence(domain, time_window, scope)
             .await
             .map_err(PrevalenceError::ClickHouse)?;
 
@@ -299,7 +302,7 @@ impl PrevalenceService {
         };
 
         // Update cache
-        {
+        if scope.is_unrestricted() {
             let mut cache = self.cache.write().await;
             cache.insert(domain, time_window, data.clone());
         }
@@ -308,11 +311,12 @@ impl PrevalenceService {
     }
 
     /// Query prevalence for a single IP address
-    #[instrument(skip(self))]
+    #[instrument(skip(self, scope))]
     pub async fn get_ip_prevalence(
         &self,
         ip: &str,
         time_window: TimeWindow,
+        scope: &ArtifactScope,
     ) -> Result<PrevalenceData, PrevalenceError> {
         let config = self.config.read().await;
 
@@ -321,7 +325,7 @@ impl PrevalenceService {
         }
 
         // Check cache first
-        {
+        if scope.is_unrestricted() {
             let mut cache = self.cache.write().await;
             if let Some(data) = cache.get(ip, time_window) {
                 debug!("Cache hit for IP: {}", ip);
@@ -332,7 +336,7 @@ impl PrevalenceService {
         // Query ClickHouse
         let row = self
             .repository
-            .get_ip_prevalence(ip, time_window)
+            .get_ip_prevalence(ip, time_window, scope)
             .await
             .map_err(PrevalenceError::ClickHouse)?;
 
@@ -348,7 +352,7 @@ impl PrevalenceService {
         };
 
         // Update cache
-        {
+        if scope.is_unrestricted() {
             let mut cache = self.cache.write().await;
             cache.insert(ip, time_window, data.clone());
         }
@@ -360,11 +364,12 @@ impl PrevalenceService {
     ///
     /// Returns results for all requested artifacts (zero counts for missing).
     /// Limited to MAX_BULK_ARTIFACTS per request.
-    #[instrument(skip(self, artifacts))]
+    #[instrument(skip(self, artifacts, scope))]
     pub async fn get_bulk_prevalence(
         &self,
         artifacts: &[String],
         time_window: TimeWindow,
+        scope: &ArtifactScope,
     ) -> Result<Vec<PrevalenceData>, PrevalenceError> {
         if artifacts.len() > MAX_BULK_ARTIFACTS {
             return Err(PrevalenceError::TooManyArtifacts {
@@ -387,7 +392,7 @@ impl PrevalenceService {
         let mut results: HashMap<String, PrevalenceData> = HashMap::new();
 
         // Check cache and categorize artifacts
-        {
+        if scope.is_unrestricted() {
             let mut cache = self.cache.write().await;
             for artifact in artifacts {
                 if let Some(data) = cache.get(artifact, time_window) {
@@ -403,13 +408,24 @@ impl PrevalenceService {
                     }
                 }
             }
+        } else {
+            for artifact in artifacts {
+                let artifact_type = ArtifactType::detect(artifact);
+                if artifact_type.is_hash() {
+                    hashes.push(artifact.clone());
+                } else if artifact_type.is_domain() {
+                    domains.push(artifact.clone());
+                } else if artifact_type.is_ip() {
+                    ips.push(artifact.clone());
+                }
+            }
         }
 
         // Query hashes if enabled
         if config.enable_hash_tracking && !hashes.is_empty() {
             let hash_rows = self
                 .repository
-                .get_bulk_hash_prevalence(&hashes, time_window)
+                .get_bulk_hash_prevalence(&hashes, time_window, scope)
                 .await
                 .map_err(PrevalenceError::ClickHouse)?;
 
@@ -443,7 +459,7 @@ impl PrevalenceService {
         if config.enable_domain_tracking && !domains.is_empty() {
             let domain_rows = self
                 .repository
-                .get_bulk_domain_prevalence(&domains, time_window)
+                .get_bulk_domain_prevalence(&domains, time_window, scope)
                 .await
                 .map_err(PrevalenceError::ClickHouse)?;
 
@@ -480,7 +496,7 @@ impl PrevalenceService {
         if config.enable_ip_tracking && !ips.is_empty() {
             let ip_rows = self
                 .repository
-                .get_bulk_ip_prevalence(&ips, time_window)
+                .get_bulk_ip_prevalence(&ips, time_window, scope)
                 .await
                 .map_err(PrevalenceError::ClickHouse)?;
 
@@ -504,7 +520,7 @@ impl PrevalenceService {
         }
 
         // Update cache with new results
-        {
+        if scope.is_unrestricted() {
             let mut cache = self.cache.write().await;
             for (artifact, data) in &results {
                 cache.insert(artifact, time_window, data.clone());
@@ -530,13 +546,14 @@ impl PrevalenceService {
     /// raw for IP — callers should lowercase hash/domain values when
     /// looking up in the resulting map. Tracking-disabled artifact kinds
     /// are silently skipped (no entries returned for that kind).
-    #[instrument(skip(self, artifacts))]
+    #[instrument(skip(self, artifacts, scope))]
     pub async fn get_bulk_prevalence_via_dict(
         &self,
         artifacts: &[String],
         time_window: TimeWindow,
+        scope: &ArtifactScope,
     ) -> Result<Vec<PrevalenceData>, PrevalenceError> {
-        self.get_bulk_prevalence_bounded(artifacts, time_window, BulkPrevalenceSource::Dict)
+        self.get_bulk_prevalence_bounded(artifacts, time_window, BulkPrevalenceSource::Dict, scope)
             .await
     }
 
@@ -549,14 +566,20 @@ impl PrevalenceService {
     /// (`host_count >= 1000`) and out-of-window entities return no row.
     ///
     /// Same result shape and cache behavior as [`Self::get_bulk_prevalence_via_dict`].
-    #[instrument(skip(self, artifacts))]
+    #[instrument(skip(self, artifacts, scope))]
     pub async fn get_bulk_summary_prevalence(
         &self,
         artifacts: &[String],
         time_window: TimeWindow,
+        scope: &ArtifactScope,
     ) -> Result<Vec<PrevalenceData>, PrevalenceError> {
-        self.get_bulk_prevalence_bounded(artifacts, time_window, BulkPrevalenceSource::Summary)
-            .await
+        self.get_bulk_prevalence_bounded(
+            artifacts,
+            time_window,
+            BulkPrevalenceSource::Summary,
+            scope,
+        )
+        .await
     }
 
     /// Shared body for the two bounded bulk lookups above — identical cache
@@ -567,6 +590,7 @@ impl PrevalenceService {
         artifacts: &[String],
         time_window: TimeWindow,
         source: BulkPrevalenceSource,
+        scope: &ArtifactScope,
     ) -> Result<Vec<PrevalenceData>, PrevalenceError> {
         if artifacts.is_empty() {
             return Ok(Vec::new());
@@ -582,13 +606,22 @@ impl PrevalenceService {
 
         // Cache check + categorize misses by kind. We use the cache key as-is
         // (caller's input case) so subsequent lookups by the same value hit.
-        {
+        if scope.is_unrestricted() {
             let mut cache = self.cache.write().await;
             for artifact in artifacts {
                 if let Some(data) = cache.get(artifact, time_window) {
                     results.push(data);
                     continue;
                 }
+                match ArtifactType::detect(artifact) {
+                    t if t.is_hash() => hashes.push(artifact.clone()),
+                    t if t.is_domain() => domains.push(artifact.clone()),
+                    t if t.is_ip() => ips.push(artifact.clone()),
+                    _ => {}
+                }
+            }
+        } else {
+            for artifact in artifacts {
                 match ArtifactType::detect(artifact) {
                     t if t.is_hash() => hashes.push(artifact.clone()),
                     t if t.is_domain() => domains.push(artifact.clone()),
@@ -619,12 +652,12 @@ impl PrevalenceService {
             match source {
                 BulkPrevalenceSource::Dict => {
                     self.repository
-                        .get_bulk_prevalence_via_dict(&kind_artifacts, kind, time_window)
+                        .get_bulk_prevalence_via_dict(&kind_artifacts, kind, time_window, scope)
                         .await
                 }
                 BulkPrevalenceSource::Summary => {
                     self.repository
-                        .get_bulk_summary_prevalence(&kind_artifacts, kind, time_window)
+                        .get_bulk_summary_prevalence(&kind_artifacts, kind, time_window, scope)
                         .await
                 }
             }
@@ -658,7 +691,7 @@ impl PrevalenceService {
         }
 
         // Populate cache with newly fetched entries.
-        {
+        if scope.is_unrestricted() {
             let mut cache = self.cache.write().await;
             for data in &results {
                 cache.insert(&data.artifact, time_window, data.clone());
@@ -669,12 +702,13 @@ impl PrevalenceService {
     }
 
     /// Get list of rare artifacts (below threshold)
-    #[instrument(skip(self))]
+    #[instrument(skip(self, scope))]
     pub async fn get_rare_artifacts(
         &self,
         artifact_type: Option<ArtifactType>,
         time_window: TimeWindow,
         limit: i64,
+        scope: &ArtifactScope,
     ) -> Result<Vec<PrevalenceData>, PrevalenceError> {
         let config = self.config.read().await;
         let rarity_threshold = config.rarity_threshold;
@@ -685,7 +719,7 @@ impl PrevalenceService {
         if include_hashes && config.enable_hash_tracking {
             let hash_rows = self
                 .repository
-                .get_rare_hashes(rarity_threshold, time_window, limit)
+                .get_rare_hashes(rarity_threshold, time_window, limit, scope)
                 .await
                 .map_err(PrevalenceError::ClickHouse)?;
 
@@ -702,7 +736,7 @@ impl PrevalenceService {
         if include_domains && config.enable_domain_tracking {
             let domain_rows = self
                 .repository
-                .get_rare_domains(rarity_threshold, time_window, limit)
+                .get_rare_domains(rarity_threshold, time_window, limit, scope)
                 .await
                 .map_err(PrevalenceError::ClickHouse)?;
 
@@ -723,7 +757,7 @@ impl PrevalenceService {
         if include_ips && config.enable_ip_tracking {
             let ip_rows = self
                 .repository
-                .get_rare_ips(rarity_threshold, time_window, limit)
+                .get_rare_ips(rarity_threshold, time_window, limit, scope)
                 .await
                 .map_err(PrevalenceError::ClickHouse)?;
 
@@ -743,12 +777,13 @@ impl PrevalenceService {
     }
 
     /// Get newly seen artifacts (first_seen within time range)
-    #[instrument(skip(self))]
+    #[instrument(skip(self, scope))]
     pub async fn get_new_artifacts(
         &self,
         artifact_type: Option<ArtifactType>,
         since: DateTime<Utc>,
         limit: i64,
+        scope: &ArtifactScope,
     ) -> Result<Vec<PrevalenceData>, PrevalenceError> {
         let config = self.config.read().await;
         let rarity_threshold = config.rarity_threshold;
@@ -759,7 +794,7 @@ impl PrevalenceService {
         if include_hashes && config.enable_hash_tracking {
             let hash_rows = self
                 .repository
-                .get_new_hashes(since, limit)
+                .get_new_hashes(since, limit, scope)
                 .await
                 .map_err(PrevalenceError::ClickHouse)?;
 
@@ -776,7 +811,7 @@ impl PrevalenceService {
         if include_domains && config.enable_domain_tracking {
             let domain_rows = self
                 .repository
-                .get_new_domains(since, limit)
+                .get_new_domains(since, limit, scope)
                 .await
                 .map_err(PrevalenceError::ClickHouse)?;
 
@@ -796,7 +831,7 @@ impl PrevalenceService {
         if include_ips && config.enable_ip_tracking {
             let ip_rows = self
                 .repository
-                .get_new_ips(since, limit)
+                .get_new_ips(since, limit, scope)
                 .await
                 .map_err(PrevalenceError::ClickHouse)?;
 
@@ -816,7 +851,7 @@ impl PrevalenceService {
     }
 
     /// Get artifact explorer data with daily breakdowns
-    #[instrument(skip(self))]
+    #[instrument(skip(self, scope))]
     pub async fn get_artifact_explorer(
         &self,
         artifact_type: Option<ArtifactType>,
@@ -825,6 +860,7 @@ impl PrevalenceService {
         search: Option<&str>,
         limit: i64,
         offset: i64,
+        scope: &ArtifactScope,
     ) -> Result<ArtifactExplorerResponse, PrevalenceError> {
         let config = self.config.read().await;
         let rarity_threshold = config.rarity_threshold;
@@ -850,7 +886,7 @@ impl PrevalenceService {
                     match risk_filter {
                         Some("rare") => self
                             .repository
-                            .get_rare_hashes(rarity_threshold, time_window, fetch_limit)
+                            .get_rare_hashes(rarity_threshold, time_window, fetch_limit, scope)
                             .await
                             .map(|rows| {
                                 rows.into_iter()
@@ -865,7 +901,7 @@ impl PrevalenceService {
                         Some("new") => {
                             let since = Utc::now() - Duration::hours(24);
                             self.repository
-                                .get_new_hashes(since, fetch_limit)
+                                .get_new_hashes(since, fetch_limit, scope)
                                 .await
                                 .map(|rows| {
                                     rows.into_iter()
@@ -887,7 +923,7 @@ impl PrevalenceService {
                             // undercount them (audit P10). `u64::MAX` keeps the
                             // get_rare code path (host_count < threshold + recency)
                             // while admitting every host_count.
-                            .get_rare_hashes(u64::MAX, time_window, fetch_limit)
+                            .get_rare_hashes(u64::MAX, time_window, fetch_limit, scope)
                             .await
                             .map(|rows| {
                                 rows.into_iter()
@@ -909,7 +945,7 @@ impl PrevalenceService {
                     match risk_filter {
                         Some("rare") => self
                             .repository
-                            .get_rare_domains(rarity_threshold, time_window, fetch_limit)
+                            .get_rare_domains(rarity_threshold, time_window, fetch_limit, scope)
                             .await
                             .map(|rows| {
                                 rows.into_iter()
@@ -924,7 +960,7 @@ impl PrevalenceService {
                         Some("new") => {
                             let since = Utc::now() - Duration::hours(24);
                             self.repository
-                                .get_new_domains(since, fetch_limit)
+                                .get_new_domains(since, fetch_limit, scope)
                                 .await
                                 .map(|rows| {
                                     rows.into_iter()
@@ -940,7 +976,7 @@ impl PrevalenceService {
                         _ => self
                             .repository
                             // See hash lane above — admit every host_count (P10).
-                            .get_rare_domains(u64::MAX, time_window, fetch_limit)
+                            .get_rare_domains(u64::MAX, time_window, fetch_limit, scope)
                             .await
                             .map(|rows| {
                                 rows.into_iter()
@@ -962,7 +998,7 @@ impl PrevalenceService {
                     match risk_filter {
                         Some("rare") => self
                             .repository
-                            .get_rare_ips(rarity_threshold, time_window, fetch_limit)
+                            .get_rare_ips(rarity_threshold, time_window, fetch_limit, scope)
                             .await
                             .map(|rows| {
                                 rows.into_iter()
@@ -977,7 +1013,7 @@ impl PrevalenceService {
                         Some("new") => {
                             let since = Utc::now() - Duration::hours(24);
                             self.repository
-                                .get_new_ips(since, fetch_limit)
+                                .get_new_ips(since, fetch_limit, scope)
                                 .await
                                 .map(|rows| {
                                     rows.into_iter()
@@ -993,7 +1029,7 @@ impl PrevalenceService {
                         _ => self
                             .repository
                             // See hash lane above — admit every host_count (P10).
-                            .get_rare_ips(u64::MAX, time_window, fetch_limit)
+                            .get_rare_ips(u64::MAX, time_window, fetch_limit, scope)
                             .await
                             .map(|rows| {
                                 rows.into_iter()
@@ -1089,11 +1125,11 @@ impl PrevalenceService {
 
         let (hash_daily, domain_daily, ip_daily) = tokio::join!(
             self.repository
-                .get_hash_daily_counts(&hash_artifacts, daily_window),
+                .get_hash_daily_counts(&hash_artifacts, daily_window, scope),
             self.repository
-                .get_domain_daily_counts(&domain_artifacts, daily_window),
+                .get_domain_daily_counts(&domain_artifacts, daily_window, scope),
             self.repository
-                .get_ip_daily_counts(&ip_artifacts, daily_window),
+                .get_ip_daily_counts(&ip_artifacts, daily_window, scope),
         );
 
         // Build a sparse {artifact → {day → count}} map from the daily rows,
@@ -1273,13 +1309,14 @@ impl PrevalenceService {
     }
 
     /// Get scatter plot data for a set of artifacts
-    #[instrument(skip(self, hashes, domains, ips))]
+    #[instrument(skip(self, hashes, domains, ips, scope))]
     pub async fn get_scatter_data(
         &self,
         hashes: &[String],
         domains: &[String],
         ips: &[String],
         time_window: TimeWindow,
+        scope: &ArtifactScope,
     ) -> Result<PrevalenceScatterData, PrevalenceError> {
         // Snapshot the config values we need and release the guard *before*
         // the concurrent fetches — get_bulk_prevalence re-acquires config.read()
@@ -1311,21 +1348,21 @@ impl PrevalenceService {
         let (hash_res, domain_res, ip_res) = tokio::join!(
             async {
                 if !hashes.is_empty() && enable_hash {
-                    self.get_bulk_prevalence(hashes, time_window).await
+                    self.get_bulk_prevalence(hashes, time_window, scope).await
                 } else {
                     Ok(Vec::new())
                 }
             },
             async {
                 if !domains.is_empty() && enable_domain {
-                    self.get_bulk_prevalence(domains, time_window).await
+                    self.get_bulk_prevalence(domains, time_window, scope).await
                 } else {
                     Ok(Vec::new())
                 }
             },
             async {
                 if !ips.is_empty() && enable_ip {
-                    self.get_bulk_prevalence(ips, time_window).await
+                    self.get_bulk_prevalence(ips, time_window, scope).await
                 } else {
                     Ok(Vec::new())
                 }

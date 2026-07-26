@@ -26,6 +26,12 @@ import {
 import { PivtIcon } from '@/enterprise/icons/PivtIcon';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import {
+  canViewNotifications,
+  notificationCountQueryOptions,
+  notificationListQueryOptions,
+} from '@/components/notification-query-policy';
+import { useAuth } from '@/contexts/AuthContext';
 import { cn } from '@/lib/utils';
 import { api, Notification, NotificationType } from '@/lib/api';
 
@@ -83,19 +89,17 @@ const TONE_TILE: Record<Tone, string> = {
 export function NotificationBell() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const { hasPermission } = useAuth();
   const [open, setOpen] = useState(false);
+  const canView = canViewNotifications(hasPermission);
 
-  const { data: countData } = useQuery({
-    queryKey: ['notifications-count'],
-    queryFn: () => api.getUnreadNotificationCount(),
-    refetchInterval: 30000,
-  });
+  const { data: countData } = useQuery(
+    notificationCountQueryOptions(canView, () => api.getUnreadNotificationCount()),
+  );
 
-  const { data: notificationsData, isLoading } = useQuery({
-    queryKey: ['notifications'],
-    queryFn: () => api.getNotifications(20),
-    enabled: open,
-  });
+  const { data: notificationsData, isLoading } = useQuery(
+    notificationListQueryOptions(canView && open, () => api.getNotifications(20)),
+  );
 
   const markReadMutation = useMutation({
     mutationFn: (id: string) => api.markNotificationRead(id),
@@ -128,6 +132,10 @@ export function NotificationBell() {
 
   const unreadCount = countData?.count ?? 0;
   const notifications = notificationsData?.notifications ?? [];
+
+  if (!canView) {
+    return null;
+  }
 
   return (
     <Popover open={open} onOpenChange={setOpen}>

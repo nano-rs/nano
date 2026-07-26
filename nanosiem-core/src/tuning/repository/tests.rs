@@ -46,6 +46,8 @@ fn create_test_proposal(rule_id: Uuid) -> TuningProposal {
         pr_url: None,
         pr_number: None,
         pr_state: None,
+        source_types: Vec::new(),
+        source_types_complete: false,
     }
 }
 

@@ -23,8 +23,9 @@ use axum::{
     Extension, Json,
 };
 use chrono::{DateTime, Utc};
-use nanosiem_core::log_telemetry::repository::is_safe_source_type;
+use nanosiem_core::auth::{permissions, CredentialUseGrant};
 use nanosiem_core::inputlookup::SsrfValidator;
+use nanosiem_core::log_telemetry::repository::is_safe_source_type;
 use nanosiem_core::audit::{
     AuditEvent, AuditSource, ClientContext, ROUTING_RULE_CREATED, ROUTING_RULE_DELETED,
     ROUTING_RULE_REORDERED, ROUTING_RULE_UPDATED, SOURCE_CONFIG_CREATED, SOURCE_CONFIG_DELETED,
@@ -52,6 +53,34 @@ const SOURCE_CONFIGS_CREATE: &str = "source_configs:create";
 const SOURCE_CONFIGS_EDIT: &str = "source_configs:edit";
 const SOURCE_CONFIGS_DELETE: &str = "source_configs:delete";
 const SOURCE_CONFIGS_DEPLOY: &str = "source_configs:deploy";
+
+/// Compose the static source-config permission with credential-use authority.
+///
+/// Explicit credential references are rejected at the handler before service
+/// work. For operations whose credential reference lives in the database, the
+/// returned fail-closed grant is re-evaluated by the service immediately before
+/// credential use. JWT and API-key principals intentionally share this path.
+fn authorize_source_config_operation(
+    auth: &AuthContext,
+    source_permission: &str,
+    explicitly_references_credential: bool,
+) -> Result<CredentialUseGrant, ApiError> {
+    ensure_permission(auth, source_permission)?;
+
+    if explicitly_references_credential {
+        ensure_permission(auth, permissions::CREDENTIALS_USE)?;
+    }
+
+    Ok(if auth.has_permission(permissions::CREDENTIALS_USE) {
+        CredentialUseGrant::granted()
+    } else {
+        CredentialUseGrant::none()
+    })
+}
+
+#[cfg(test)]
+#[path = "source_config_credential_authz_tests.rs"]
+mod credential_authz_tests;
 
 /// Query params for listing source configurations
 #[derive(Debug, Deserialize, IntoParams)]
@@ -418,7 +447,7 @@ pub async fn get_source_config_with_rules(
     request_body = NewSourceConfiguration,
     responses(
         (status = 200, description = "Source configuration created", body = SourceConfiguration),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Requires source_configs:create and, when credential_id is set, credentials:use"),
         (status = 400, description = "Bad request"),
     ),
     security(("api_key" = []))
@@ -429,9 +458,16 @@ pub async fn create_source_config(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<NewSourceConfiguration>,
 ) -> Result<Json<SourceConfiguration>, ApiError> {
-    ensure_permission(&auth, SOURCE_CONFIGS_CREATE)?;
+    let credential_use = authorize_source_config_operation(
+        &auth,
+        SOURCE_CONFIGS_CREATE,
+        request.credential_id.is_some(),
+    )?;
 
-    let config = state.source_config_service.create(request).await?;
+    let config = state
+        .source_config_service
+        .create(request, credential_use)
+        .await?;
 
     state.emit_audit(
         AuditEvent::builder(AuditSource::SourceConfig, SOURCE_CONFIG_CREATED)
@@ -457,8 +493,9 @@ pub async fn create_source_config(
     request_body = UpdateSourceConfiguration,
     responses(
         (status = 200, description = "Source configuration updated", body = SourceConfiguration),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Requires source_configs:edit and credentials:use when the request or saved configuration references a credential"),
         (status = 404, description = "Not found"),
+        (status = 409, description = "expected_updated_at is stale; reload before retrying"),
     ),
     security(("api_key" = []))
 )]
@@ -469,9 +506,16 @@ pub async fn update_source_config(
     Path(id): Path<TypeIdParam>,
     Json(request): Json<UpdateSourceConfiguration>,
 ) -> Result<Json<SourceConfiguration>, ApiError> {
-    ensure_permission(&auth, SOURCE_CONFIGS_EDIT)?;
+    let credential_use = authorize_source_config_operation(
+        &auth,
+        SOURCE_CONFIGS_EDIT,
+        request.credential_id.is_some(),
+    )?;
 
-    let config = state.source_config_service.update(*id, request).await?;
+    let config = state
+        .source_config_service
+        .update(*id, request, credential_use)
+        .await?;
 
     state.emit_audit(
         AuditEvent::builder(AuditSource::SourceConfig, SOURCE_CONFIG_UPDATED)
@@ -581,7 +625,7 @@ pub async fn toggle_source_config(
     ),
     responses(
         (status = 200, description = "Deployment result", body = DeploymentResult),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Requires source_configs:deploy and, when the saved configuration references a credential, credentials:use"),
         (status = 404, description = "Not found"),
     ),
     security(("api_key" = []))
@@ -592,9 +636,13 @@ pub async fn deploy_source_config(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<DeploymentResult>, ApiError> {
-    ensure_permission(&auth, SOURCE_CONFIGS_DEPLOY)?;
+    let credential_use =
+        authorize_source_config_operation(&auth, SOURCE_CONFIGS_DEPLOY, false)?;
 
-    let result = state.source_config_service.deploy(*id).await?;
+    let result = state
+        .source_config_service
+        .deploy(*id, credential_use)
+        .await?;
 
     state.emit_audit(
         AuditEvent::builder(AuditSource::SourceConfig, SOURCE_CONFIG_DEPLOYED)
@@ -654,7 +702,7 @@ pub async fn undeploy_source_config(
     tag = "source_configs",
     responses(
         (status = 200, description = "Deployment results for all enabled source configurations", body = Vec<DeploymentResult>),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Requires source_configs:deploy and credentials:use when any enabled configuration references a credential"),
     ),
     security(("api_key" = []))
 )]
@@ -663,9 +711,13 @@ pub async fn deploy_all_source_configs(
     Extension(auth): Extension<AuthContext>,
     Extension(client): Extension<ClientContext>,
 ) -> Result<Json<Vec<DeploymentResult>>, ApiError> {
-    ensure_permission(&auth, SOURCE_CONFIGS_DEPLOY)?;
+    let credential_use =
+        authorize_source_config_operation(&auth, SOURCE_CONFIGS_DEPLOY, false)?;
 
-    let results = state.source_config_service.deploy_all().await?;
+    let results = state
+        .source_config_service
+        .deploy_all(credential_use)
+        .await?;
 
     let success_count = results.iter().filter(|r| r.success).count();
     let fail_count = results.iter().filter(|r| !r.success).count();

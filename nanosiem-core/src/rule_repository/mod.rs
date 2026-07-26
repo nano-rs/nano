@@ -41,7 +41,9 @@ mod repository;
 mod service;
 mod sigma_parser;
 
-pub use coverage::{CoverageAnalyzer, CoverageAnalyzerError};
+pub use coverage::{
+    CoverageAnalyzer, CoverageAnalyzerError, LiveInventoryAccess, COVERAGE_STATUS_UNKNOWN,
+};
 pub use error::RuleRepositoryError;
 pub use github_client::{FileContent, GitHubClient, GitHubClientError, TreeEntry};
 pub use models::{
@@ -58,7 +60,9 @@ pub use repository::{
     RepositoryRulesRepository, RepositoryRulesRepositoryError, RuleImportsRepository,
     RuleImportsRepositoryError, RuleRepositoryRepository, RuleRepositoryRepositoryError,
 };
-pub use service::{RuleRepositoryService, RuleRepositoryServiceConfig};
+pub use service::{
+    RuleImportAction, RuleImportPlan, RuleRepositoryService, RuleRepositoryServiceConfig,
+};
 pub use sigma_parser::{
     extract_mitre_tactics, extract_mitre_techniques, extract_required_fields,
     map_logsource_to_source_types, map_severity, parse_sigma, SigmaDetection, SigmaLogsource,

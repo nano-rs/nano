@@ -3,6 +3,7 @@
 //! Log entry operations for the tuning repository.
 
 use super::TuningRepository;
+use crate::tuning::scope::TuningScope;
 use crate::tuning::types::{
     TestResults, TuningLogEntry, TuningProposal, TuningStatus, TuningValidationProof,
 };
@@ -222,11 +223,19 @@ impl TuningRepository {
     ///
     /// # Arguments
     /// * `id` - The UUID of the log entry to retrieve
+    /// * `scope` - the READER's effective per-source deny scope. NAN-2085: the
+    ///   entry NESTS the full proposal, so an unfiltered log read was an
+    ///   alternate path to exactly the bytes the proposal gate hides. A log
+    ///   whose proposal is denied returns `None`, identical to a missing id.
     ///
     /// # Returns
-    /// The tuning log entry if found, None otherwise
-    pub async fn get_log_entry(&self, id: Uuid) -> Result<Option<TuningLogEntry>> {
-        let row = sqlx::query(
+    /// The tuning log entry if found AND visible to `scope`, None otherwise
+    pub async fn get_log_entry(
+        &self,
+        id: Uuid,
+        scope: &TuningScope,
+    ) -> Result<Option<TuningLogEntry>> {
+        let mut sql = String::from(
             r#"
             SELECT
                 tl.id,
@@ -248,6 +257,8 @@ impl TuningRepository {
                 tp.changes_summary,
                 tp.affected_patterns,
                 tp.safety_validation,
+                tp.source_types,
+                tp.source_types_complete,
                 ttr.id as test_id,
                 ttr.tested_at,
                 ttr.original_alert_count,
@@ -262,11 +273,24 @@ impl TuningRepository {
             LEFT JOIN tuning_test_results ttr ON tl.test_results_id = ttr.id
             WHERE tl.id = $1
             "#,
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await
-        .context("Failed to fetch tuning log entry")?;
+        );
+        let scoped = !scope.is_unrestricted();
+        if scoped {
+            sql.push_str(&TuningScope::sql_predicate(
+                "tp.source_types",
+                "tp.source_types_complete",
+                2,
+            ));
+        }
+
+        let mut query = sqlx::query(&sql).bind(id);
+        if scoped {
+            query = query.bind(scope.deny_bind_values().to_vec());
+        }
+        let row = query
+            .fetch_optional(&self.pool)
+            .await
+            .context("Failed to fetch tuning log entry")?;
 
         if let Some(row) = row {
             let proposal = TuningProposal {
@@ -295,9 +319,26 @@ impl TuningRepository {
                 pr_url: None,
                 pr_number: None,
                 pr_state: None,
+                // NAN-2085: the log's nested proposal is a verbatim copy of the
+                // proposal text, so it carries the proposal's provenance too —
+                // the reader gate applies to both surfaces identically.
+                source_types: row.try_get("source_types")?,
+                source_types_complete: row.try_get("source_types_complete")?,
             };
 
-            let test_results = if let Ok(_test_id) = row.try_get::<Uuid, _>("test_id") {
+            // NAN-2085: `tuning_test_results` is INDEPENDENTLY derived — a
+            // replay over the rule's own window, whose
+            // `comparison_metrics.pattern_changes` stores raw matched field
+            // VALUES and whose alert counts span every source the rule touches,
+            // not just the ones sampled into the proposal. It carries no
+            // provenance of its own, so the proposal's manifest cannot
+            // authorize it. Withhold it entirely from a restricted reader
+            // rather than serve un-provenanced replay data; unrestricted
+            // readers see it unchanged. (Serving it needs a provenance stamp on
+            // `tuning_test_results` — tracked separately.)
+            let test_results = if scoped {
+                None
+            } else if let Ok(_test_id) = row.try_get::<Uuid, _>("test_id") {
                 Some(TestResults {
                     proposal_id: row.try_get("proposal_id")?,
                     tested_at: row.try_get("tested_at")?,
@@ -358,11 +399,16 @@ impl TuningRepository {
     ///
     /// # Arguments
     /// * `rule_id` - The UUID of the rule
+    /// * `scope` - the READER's effective per-source deny scope (NAN-2085).
     ///
     /// # Returns
-    /// Vector of tuning log entries for the rule
-    pub async fn get_logs_for_rule(&self, rule_id: Uuid) -> Result<Vec<TuningLogEntry>> {
-        let rows = sqlx::query(
+    /// Vector of tuning log entries for the rule visible to `scope`
+    pub async fn get_logs_for_rule(
+        &self,
+        rule_id: Uuid,
+        scope: &TuningScope,
+    ) -> Result<Vec<TuningLogEntry>> {
+        let mut sql = String::from(
             r#"
             SELECT
                 tl.id,
@@ -384,6 +430,8 @@ impl TuningRepository {
                 tp.changes_summary,
                 tp.affected_patterns,
                 tp.safety_validation,
+                tp.source_types,
+                tp.source_types_complete,
                 ttr.id as test_id,
                 ttr.tested_at,
                 ttr.original_alert_count,
@@ -397,13 +445,26 @@ impl TuningRepository {
             INNER JOIN tuning_proposals tp ON tl.proposal_id = tp.id
             LEFT JOIN tuning_test_results ttr ON tl.test_results_id = ttr.id
             WHERE tl.rule_id = $1
-            ORDER BY tl.triggered_at DESC
             "#,
-        )
-        .bind(rule_id)
-        .fetch_all(&self.pool)
-        .await
-        .context("Failed to fetch tuning logs for rule")?;
+        );
+        let scoped = !scope.is_unrestricted();
+        if scoped {
+            sql.push_str(&TuningScope::sql_predicate(
+                "tp.source_types",
+                "tp.source_types_complete",
+                2,
+            ));
+        }
+        sql.push_str(" ORDER BY tl.triggered_at DESC");
+
+        let mut query = sqlx::query(&sql).bind(rule_id);
+        if scoped {
+            query = query.bind(scope.deny_bind_values().to_vec());
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to fetch tuning logs for rule")?;
 
         let mut entries = Vec::new();
         for row in rows {
@@ -433,9 +494,26 @@ impl TuningRepository {
                 pr_url: None,
                 pr_number: None,
                 pr_state: None,
+                // NAN-2085: the log's nested proposal is a verbatim copy of the
+                // proposal text, so it carries the proposal's provenance too —
+                // the reader gate applies to both surfaces identically.
+                source_types: row.try_get("source_types")?,
+                source_types_complete: row.try_get("source_types_complete")?,
             };
 
-            let test_results = if let Ok(_test_id) = row.try_get::<Uuid, _>("test_id") {
+            // NAN-2085: `tuning_test_results` is INDEPENDENTLY derived — a
+            // replay over the rule's own window, whose
+            // `comparison_metrics.pattern_changes` stores raw matched field
+            // VALUES and whose alert counts span every source the rule touches,
+            // not just the ones sampled into the proposal. It carries no
+            // provenance of its own, so the proposal's manifest cannot
+            // authorize it. Withhold it entirely from a restricted reader
+            // rather than serve un-provenanced replay data; unrestricted
+            // readers see it unchanged. (Serving it needs a provenance stamp on
+            // `tuning_test_results` — tracked separately.)
+            let test_results = if scoped {
+                None
+            } else if let Ok(_test_id) = row.try_get::<Uuid, _>("test_id") {
                 Some(TestResults {
                     proposal_id: row.try_get("proposal_id")?,
                     tested_at: row.try_get("tested_at")?,
@@ -496,11 +574,19 @@ impl TuningRepository {
     ///
     /// # Arguments
     /// * `limit` - Maximum number of entries to return
+    /// * `scope` - the READER's effective per-source deny scope (NAN-2085).
+    ///   This is the widest read in the module — no `WHERE` at all before the
+    ///   scope predicate — and it backs `GET /api/tuning/logs` whenever no
+    ///   `rule_id` filter is supplied.
     ///
     /// # Returns
-    /// Vector of recent tuning log entries
-    pub async fn get_recent_logs(&self, limit: i32) -> Result<Vec<TuningLogEntry>> {
-        let rows = sqlx::query(
+    /// Vector of recent tuning log entries visible to `scope`
+    pub async fn get_recent_logs(
+        &self,
+        limit: i32,
+        scope: &TuningScope,
+    ) -> Result<Vec<TuningLogEntry>> {
+        let mut sql = String::from(
             r#"
             SELECT
                 tl.id,
@@ -522,6 +608,8 @@ impl TuningRepository {
                 tp.changes_summary,
                 tp.affected_patterns,
                 tp.safety_validation,
+                tp.source_types,
+                tp.source_types_complete,
                 ttr.id as test_id,
                 ttr.tested_at,
                 ttr.original_alert_count,
@@ -534,14 +622,27 @@ impl TuningRepository {
             FROM tuning_logs tl
             INNER JOIN tuning_proposals tp ON tl.proposal_id = tp.id
             LEFT JOIN tuning_test_results ttr ON tl.test_results_id = ttr.id
-            ORDER BY tl.triggered_at DESC
-            LIMIT $1
+            WHERE 1=1
             "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .context("Failed to fetch recent tuning logs")?;
+        );
+        let scoped = !scope.is_unrestricted();
+        if scoped {
+            sql.push_str(&TuningScope::sql_predicate(
+                "tp.source_types",
+                "tp.source_types_complete",
+                2,
+            ));
+        }
+        sql.push_str(" ORDER BY tl.triggered_at DESC LIMIT $1");
+
+        let mut query = sqlx::query(&sql).bind(limit);
+        if scoped {
+            query = query.bind(scope.deny_bind_values().to_vec());
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to fetch recent tuning logs")?;
 
         let mut entries = Vec::new();
         for row in rows {
@@ -571,9 +672,26 @@ impl TuningRepository {
                 pr_url: None,
                 pr_number: None,
                 pr_state: None,
+                // NAN-2085: the log's nested proposal is a verbatim copy of the
+                // proposal text, so it carries the proposal's provenance too —
+                // the reader gate applies to both surfaces identically.
+                source_types: row.try_get("source_types")?,
+                source_types_complete: row.try_get("source_types_complete")?,
             };
 
-            let test_results = if let Ok(_test_id) = row.try_get::<Uuid, _>("test_id") {
+            // NAN-2085: `tuning_test_results` is INDEPENDENTLY derived — a
+            // replay over the rule's own window, whose
+            // `comparison_metrics.pattern_changes` stores raw matched field
+            // VALUES and whose alert counts span every source the rule touches,
+            // not just the ones sampled into the proposal. It carries no
+            // provenance of its own, so the proposal's manifest cannot
+            // authorize it. Withhold it entirely from a restricted reader
+            // rather than serve un-provenanced replay data; unrestricted
+            // readers see it unchanged. (Serving it needs a provenance stamp on
+            // `tuning_test_results` — tracked separately.)
+            let test_results = if scoped {
+                None
+            } else if let Ok(_test_id) = row.try_get::<Uuid, _>("test_id") {
                 Some(TestResults {
                     proposal_id: row.try_get("proposal_id")?,
                     tested_at: row.try_get("tested_at")?,

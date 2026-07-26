@@ -375,9 +375,6 @@ impl From<nanosiem_core::ParserServiceError> for ApiError {
             nanosiem_core::ParserServiceError::RollbackFailed(msg) => {
                 ApiError::InternalError(format!("Rollback failed: {}", msg))
             }
-            nanosiem_core::ParserServiceError::CredentialError(cred_err) => {
-                ApiError::ValidationError(format!("Credential error: {}", cred_err))
-            }
         }
     }
 }
@@ -391,6 +388,15 @@ impl From<nanosiem_core::LogSourceServiceError> for ApiError {
                 }
                 nanosiem_core::log_sources::LogSourceRepositoryError::DuplicateName(name) => {
                     ApiError::ValidationError(format!("Log source name already exists: {}", name))
+                }
+                nanosiem_core::log_sources::LogSourceRepositoryError::StaleVersion(id) => {
+                    ApiError::Conflict(format!(
+                        "Log source {} was modified by another update. Please reload and try again.",
+                        nanosiem_core::typeid::encode(
+                            nanosiem_core::typeid::log_source::PREFIX,
+                            id
+                        )
+                    ))
                 }
                 nanosiem_core::log_sources::LogSourceRepositoryError::DatabaseError(e) => {
                     tracing::error!(error = %e, "Log source repository database error");
@@ -408,6 +414,12 @@ impl From<nanosiem_core::LogSourceServiceError> for ApiError {
             }
             nanosiem_core::LogSourceServiceError::InvalidSourceConfig(msg) => {
                 ApiError::ValidationError(format!("Invalid source config: {}", msg))
+            }
+            // NAN-2158: a rejected `match_field` is an injection payload, not a
+            // server fault — 400 with the offending value named, so an operator
+            // fixing a legacy row can see what to change.
+            nanosiem_core::LogSourceServiceError::InvalidMatchField(msg) => {
+                ApiError::ValidationError(format!("Invalid match_field: {}", msg))
             }
             nanosiem_core::LogSourceServiceError::NotValidated => ApiError::ValidationError(
                 "Log source must be validated before enabling".to_string(),
@@ -429,9 +441,6 @@ impl From<nanosiem_core::LogSourceServiceError> for ApiError {
             }
             nanosiem_core::LogSourceServiceError::RollbackFailed(msg) => {
                 ApiError::InternalError(format!("Rollback failed: {}", msg))
-            }
-            nanosiem_core::LogSourceServiceError::CredentialError(cred_err) => {
-                ApiError::ValidationError(format!("Credential error: {}", cred_err))
             }
             nanosiem_core::LogSourceServiceError::VersionError(ver_err) => match ver_err {
                 nanosiem_core::log_sources::LogSourceVersionError::VersionNotFound(id) => {
@@ -462,6 +471,21 @@ impl From<nanosiem_core::SourceConfigServiceError> for ApiError {
                 nanosiem_core::source_configs::SourceConfigRepositoryError::Conflict(msg) => {
                     ApiError::Conflict(msg.clone())
                 }
+                nanosiem_core::source_configs::SourceConfigRepositoryError::StaleVersion(id) => {
+                    ApiError::Conflict(format!(
+                        "Source configuration {} was modified by another update. Please reload and try again.",
+                        nanosiem_core::typeid::encode(
+                            nanosiem_core::typeid::source_config::PREFIX,
+                            id
+                        )
+                    ))
+                }
+                nanosiem_core::source_configs::SourceConfigRepositoryError::CredentialChanged(_) => {
+                    ApiError::Conflict(
+                        "Source configuration credentials changed concurrently; retry the update"
+                            .to_string(),
+                    )
+                }
                 nanosiem_core::source_configs::SourceConfigRepositoryError::RuleNotFound(id) => {
                     ApiError::NotFound(format!("Routing rule not found: {}", id))
                 }
@@ -485,6 +509,9 @@ impl From<nanosiem_core::SourceConfigServiceError> for ApiError {
             }
             nanosiem_core::SourceConfigServiceError::CredentialError(msg) => {
                 ApiError::ValidationError(format!("Credential error: {}", msg))
+            }
+            nanosiem_core::SourceConfigServiceError::CredentialUseRequired => {
+                ApiError::Forbidden("Missing permission: credentials:use".to_string())
             }
             nanosiem_core::SourceConfigServiceError::IoError(e) => {
                 ApiError::InternalError(format!("IO error: {}", e))
@@ -715,6 +742,12 @@ impl From<nanosiem_core::ParserRepositoryError> for ApiError {
             ParserRepositoryError::SyncInProgress(id) => {
                 ApiError::Conflict(format!("Sync already in progress for repository: {}", id))
             }
+            // NAN-2117/2111/2120: target-resource capability denied inside the
+            // service (the fail-closed re-check at the mutation branch). Renders
+            // the same body as the canonical log-source/source-config route.
+            ParserRepositoryError::Forbidden(permission) => {
+                ApiError::Forbidden(format!("Missing permission: {}", permission))
+            }
             ParserRepositoryError::RepositoryDisabled => {
                 ApiError::Forbidden("Parser repository is disabled".to_string())
             }
@@ -736,9 +769,9 @@ impl From<nanosiem_core::PlaybookRepositoryError> for ApiError {
             PlaybookRepositoryError::RepositoryNotFound(id) => {
                 ApiError::NotFound(format!("Playbook repository not found: {}", id))
             }
-            PlaybookRepositoryError::PlaybookNotFound { repo_id, path } => {
-                ApiError::NotFound(format!("Repository playbook not found: {}/{}", repo_id, path))
-            }
+            PlaybookRepositoryError::PlaybookNotFound { repo_id, path } => ApiError::NotFound(
+                format!("Repository playbook not found: {}/{}", repo_id, path),
+            ),
             PlaybookRepositoryError::ImportNotFound(id) => {
                 ApiError::NotFound(format!("Import not found for playbook: {}", id))
             }
@@ -770,6 +803,10 @@ impl From<nanosiem_core::PlaybookRepositoryError> for ApiError {
             PlaybookRepositoryError::GitHubApi(msg) => {
                 ApiError::ServiceUnavailable(format!("GitHub API error: {}", msg))
             }
+            // NAN-2119: already the canonical `Missing permission: <capability>`
+            // text, so a denied repository alias is byte-identical to a denied
+            // direct call.
+            PlaybookRepositoryError::Forbidden(msg) => ApiError::Forbidden(msg),
             _ => ApiError::InternalError(err.to_string()),
         }
     }
@@ -779,8 +816,13 @@ impl From<nanosiem_core::playbooks::PlaybookError> for ApiError {
     fn from(err: nanosiem_core::playbooks::PlaybookError) -> Self {
         use nanosiem_core::playbooks::PlaybookError;
         match err {
-            PlaybookError::NotFound(id) => ApiError::NotFound(format!("Playbook not found: {}", id)),
-            PlaybookError::VersionNotFound { playbook_id, version } => ApiError::NotFound(format!(
+            PlaybookError::NotFound(id) => {
+                ApiError::NotFound(format!("Playbook not found: {}", id))
+            }
+            PlaybookError::VersionNotFound {
+                playbook_id,
+                version,
+            } => ApiError::NotFound(format!(
                 "Version not found for playbook {}: version {}",
                 playbook_id, version
             )),
@@ -796,6 +838,7 @@ impl From<nanosiem_core::playbooks::PlaybookError> for ApiError {
                 ApiError::BadRequest(format!("Frontmatter parse error: {}", msg))
             }
             PlaybookError::Forbidden(msg) => ApiError::Forbidden(msg),
+            PlaybookError::Validation(msg) => ApiError::BadRequest(msg),
             _ => ApiError::InternalError(err.to_string()),
         }
     }
@@ -878,6 +921,12 @@ impl From<nanosiem_core::RuleRepositoryError> for ApiError {
             RuleRepositoryError::SyncInProgress(id) => {
                 ApiError::Conflict(format!("Sync already in progress for repository: {}", id))
             }
+            // NAN-2118: target-resource capability denied inside the service
+            // (the fail-closed re-check at the create/update branch). Renders the
+            // same body as the canonical detection route.
+            RuleRepositoryError::Forbidden(permission) => {
+                ApiError::Forbidden(format!("Missing permission: {}", permission))
+            }
             RuleRepositoryError::RepositoryDisabled => {
                 ApiError::Forbidden("Repository is disabled".to_string())
             }
@@ -886,5 +935,45 @@ impl From<nanosiem_core::RuleRepositoryError> for ApiError {
             }
             _ => ApiError::InternalError(err.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn stale_log_source_version_maps_to_conflict() {
+        let error: ApiError = nanosiem_core::LogSourceServiceError::RepositoryError(
+            nanosiem_core::log_sources::LogSourceRepositoryError::StaleVersion(Uuid::nil()),
+        )
+        .into();
+
+        assert_eq!(error.status_code(), StatusCode::CONFLICT);
+        assert_eq!(error.code(), "CONFLICT");
+    }
+
+    #[test]
+    fn stale_source_configuration_version_maps_to_conflict() {
+        let error: ApiError = nanosiem_core::SourceConfigServiceError::RepositoryError(
+            nanosiem_core::source_configs::SourceConfigRepositoryError::StaleVersion(Uuid::nil()),
+        )
+        .into();
+
+        assert_eq!(error.status_code(), StatusCode::CONFLICT);
+        assert_eq!(error.code(), "CONFLICT");
+    }
+
+    #[test]
+    fn credential_use_denial_maps_to_non_disclosing_forbidden() {
+        let error = ApiError::from(nanosiem_core::SourceConfigServiceError::CredentialUseRequired);
+
+        assert_eq!(error.status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(error.code(), "FORBIDDEN");
+        assert_eq!(
+            error.to_string(),
+            "Forbidden: Missing permission: credentials:use"
+        );
     }
 }

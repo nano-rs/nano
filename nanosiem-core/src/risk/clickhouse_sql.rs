@@ -144,7 +144,7 @@ const ENTITY_FINDINGS_WHERE: &str = r#"                FROM __LOGS_TBL__
                   -- Cleared-entity boundary: for a cleared entity keep only
                   -- post-clear findings (ts > its boundary); everything else
                   -- falls through indexOf=0 -> arrayElement(_,0)=0 -> ts>0. (R4)
-                  AND toUnixTimestamp64Micro(timestamp) > arrayElement(?, indexOf(?, __RISK_ENTITY__))
+                  AND toUnixTimestamp64Micro(timestamp) > arrayElement(?, indexOf(?, __RISK_ENTITY__))__RISK_SOURCE_SCOPE__
             ),
 "#;
 
@@ -154,7 +154,7 @@ const ENTITY_FINDINGS_WHERE: &str = r#"                FROM __LOGS_TBL__
 const CONTRIB_FINDINGS_WHERE: &str = r#"                FROM __LOGS_TBL__
                 WHERE source_type = 'findings'
                   AND __RISK_ENTITY__ IN ?
-                  AND toUnixTimestamp64Micro(timestamp) >= ?
+                  AND toUnixTimestamp64Micro(timestamp) >= ?__RISK_SOURCE_SCOPE__
             )
 "#;
 
@@ -289,7 +289,7 @@ const ENTITY_FINDINGS_WHERE_IN: &str = r#"                FROM __LOGS_TBL__
                   -- Cleared-entity boundary: for a cleared entity keep only
                   -- post-clear findings (ts > its boundary); everything else
                   -- falls through indexOf=0 -> arrayElement(_,0)=0 -> ts>0. (R4)
-                  AND toUnixTimestamp64Micro(timestamp) > arrayElement(?, indexOf(?, __RISK_ENTITY__))
+                  AND toUnixTimestamp64Micro(timestamp) > arrayElement(?, indexOf(?, __RISK_ENTITY__))__RISK_SOURCE_SCOPE__
             ),
 "#;
 
@@ -311,7 +311,7 @@ const LATERAL_FINDINGS_WHERE: &str = r#"                FROM __LOGS_TBL__
                   AND (
                       lower(__RISK_ENTITY__) IN ?
                       OR lower(arrayElement(splitByChar('.', __RISK_ENTITY__), 1)) IN ?
-                  )
+                  )__RISK_SOURCE_SCOPE__
             ),
 "#;
 
@@ -506,6 +506,10 @@ impl RiskChQuery {
 pub struct RiskFindingsSource {
     ocsf: bool,
     logs_table: String,
+    /// Normalized bind payload for a restricted viewer: the explicit deny set
+    /// plus the unresolved-provenance sentinel. Empty means unrestricted and
+    /// emits no predicate, preserving every pre-scope SQL byte.
+    source_deny: Vec<String>,
 }
 
 impl RiskFindingsSource {
@@ -515,6 +519,7 @@ impl RiskFindingsSource {
         Self {
             ocsf,
             logs_table: logs_table.into(),
+            source_deny: Vec::new(),
         }
     }
 
@@ -527,7 +532,30 @@ impl RiskFindingsSource {
             .unwrap_or(false);
         let logs_table =
             crate::db::TableNames::new(is_clustered).read_bare(crate::schema::active_logs_table());
-        Self { ocsf, logs_table }
+        Self {
+            ocsf,
+            logs_table,
+            source_deny: Vec::new(),
+        }
+    }
+
+    /// Apply a caller's effective source scope to finding-origin provenance.
+    ///
+    /// Restricted viewers fail closed: a row is visible only when its persisted
+    /// origin array is non-empty and disjoint from the deny set. This hides
+    /// legacy/malformed rows with missing provenance and hides an entire
+    /// mixed-origin finding when any contributor is denied. An unrestricted
+    /// scope stores an empty bind payload and therefore emits no SQL at all.
+    pub fn with_source_scope(mut self, scope: &crate::auth::ScopeSet) -> Self {
+        self.source_deny = crate::auth::deny_bind_values(scope.deny_set());
+        self
+    }
+
+    /// Apply an already-composed effective deny set. Used by the nPL SQL
+    /// generator, which carries the set directly rather than a `ScopeSet`.
+    pub fn with_source_deny(mut self, denied: &std::collections::BTreeSet<String>) -> Self {
+        self.source_deny = crate::auth::deny_bind_values(denied);
+        self
     }
 
     fn entity_col(&self) -> &'static str {
@@ -596,11 +624,60 @@ impl RiskFindingsSource {
         }
     }
 
+    /// Full-origin provenance persisted by the finding writer (NAN-1800).
+    fn origin_source_types_col(&self) -> &'static str {
+        if self.ocsf {
+            "JSONExtract(toString(unmapped), 'origin_source_types', 'Array(String)')"
+        } else {
+            "JSONExtract(metadata, 'origin_source_types', 'Array(String)')"
+        }
+    }
+
+    /// SQL appended to a findings WHERE clause for a restricted viewer.
+    ///
+    /// The two terms are deliberately inseparable: `notEmpty` is the legacy
+    /// fail-closed rule, while `hasAny` implements conservative overlap for
+    /// mixed-origin findings. Stored values are normalized defensively so
+    /// malformed historical casing/whitespace cannot bypass a normalized deny.
+    fn source_scope_predicate(&self) -> &'static str {
+        if self.source_deny.is_empty() {
+            ""
+        } else {
+            r#"
+                  AND notEmpty(__ORIGIN_SOURCE_TYPES__)
+                  AND NOT hasAny(
+                      arrayMap(origin -> lowerUTF8(trimBoth(origin)), __ORIGIN_SOURCE_TYPES__),
+                      ?
+                  )"#
+        }
+    }
+
+    fn push_scope_bind(&self, binds: &mut Vec<RiskSqlBind>) {
+        if !self.source_deny.is_empty() {
+            binds.push(RiskSqlBind::StrList(self.source_deny.clone()));
+        }
+    }
+
+    /// Render a profile-aware finding query template. Enterprise's two
+    /// hand-written finding readers use this same substitution so their origin
+    /// policy cannot drift from the accumulated-score builders.
+    pub fn render_template(&self, template: &str) -> String {
+        self.substitute(template.to_string())
+    }
+
+    /// Restricted-viewer bind payload, if the rendered template contains the
+    /// `__RISK_SOURCE_SCOPE__` marker. Callers bind it at that marker's position.
+    pub fn source_scope_bind_values(&self) -> Option<&[String]> {
+        (!self.source_deny.is_empty()).then_some(self.source_deny.as_slice())
+    }
+
     /// Replace the column/table sentinels in an assembled template.
     /// `__RISK_ENTITY_TYPE__` must substitute BEFORE `__RISK_ENTITY__`
     /// (the former contains the latter as a prefix).
     fn substitute(&self, template: String) -> String {
         template
+            .replace("__RISK_SOURCE_SCOPE__", self.source_scope_predicate())
+            .replace("__ORIGIN_SOURCE_TYPES__", self.origin_source_types_col())
             .replace("__RISK_ENTITY_TYPE__", self.stamped_type_col())
             .replace("__RISK_ENTITY__", self.entity_col())
             .replace("__RISK_SCORE__", self.score_col())
@@ -733,6 +810,7 @@ pub fn entity_scores_query(
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_7d_us));
     binds.push(RiskSqlBind::I64List(cleared.boundaries_micros.clone()));
     binds.push(RiskSqlBind::StrList(cleared.entities.clone()));
+    source.push_scope_bind(&mut binds);
     // ENTITY_AGGREGATED_SELECT: 24h bounds for raw sum, decayed sum, count.
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
@@ -812,6 +890,7 @@ pub fn risky_entities_query(
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_7d_us));
     binds.push(RiskSqlBind::I64List(cleared.boundaries_micros.clone()));
     binds.push(RiskSqlBind::StrList(cleared.entities.clone()));
+    source.push_scope_bind(&mut binds);
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
@@ -857,6 +936,7 @@ pub fn risk_for_entities_query(
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_7d_us));
     binds.push(RiskSqlBind::I64List(cleared.boundaries_micros.clone()));
     binds.push(RiskSqlBind::StrList(cleared.entities.clone()));
+    source.push_scope_bind(&mut binds);
     // ENTITY_AGGREGATED_SELECT: 24h bounds for raw sum, decayed sum, count.
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
@@ -892,6 +972,7 @@ pub fn entity_types_query(
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_7d_us));
     binds.push(RiskSqlBind::I64List(cleared.boundaries_micros.clone()));
     binds.push(RiskSqlBind::StrList(cleared.entities.clone()));
+    source.push_scope_bind(&mut binds);
 
     RiskChQuery {
         sql: source.substitute(sql),
@@ -930,6 +1011,7 @@ pub fn lateral_scores_query(
     // DNS label).
     binds.push(RiskSqlBind::StrList(normalized_ids.to_vec()));
     binds.push(RiskSqlBind::StrList(normalized_ids.to_vec()));
+    source.push_scope_bind(&mut binds);
 
     RiskChQuery {
         sql: source.substitute(sql),
@@ -967,6 +1049,7 @@ pub fn decayed_overview_query(
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_7d_us));
     binds.push(RiskSqlBind::I64List(cleared.boundaries_micros.clone()));
     binds.push(RiskSqlBind::StrList(cleared.entities.clone()));
+    source.push_scope_bind(&mut binds);
     // OVERVIEW_AGGREGATED_SELECT: 24h bounds for decayed sum and count.
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
@@ -999,6 +1082,7 @@ pub fn rule_contributions_query(
     // CONTRIB_FINDINGS_WHERE: entity IN-set precedes the 7d horizon.
     binds.push(RiskSqlBind::StrList(entities.to_vec()));
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_7d_us));
+    source.push_scope_bind(&mut binds);
     // CONTRIB_FINAL_SELECT: 24h bounds for fire count and decayed sum.
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
@@ -1043,6 +1127,7 @@ pub fn risk_dataset_base_query(
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_7d_us));
     binds.push(RiskSqlBind::I64List(cleared.boundaries_micros.clone()));
     binds.push(RiskSqlBind::StrList(cleared.entities.clone()));
+    source.push_scope_bind(&mut binds);
     // DATASET_AGGREGATED_SELECT: 24h bounds for decayed sum, raw sum, finding
     // count, distinct rules, distinct tactics.
     for _ in 0..5 {

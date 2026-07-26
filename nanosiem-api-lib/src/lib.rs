@@ -21,14 +21,16 @@ pub mod api_error;
 pub mod audit_ext;
 pub mod auth_context;
 pub mod cookies;
+pub mod grant_authz;
 pub mod headers;
 pub mod pagination;
+pub mod source_inventory;
 
 pub use api_error::{ApiError, ErrorDetail, ErrorResponse};
 pub use audit_ext::AuditExt;
 pub use auth_context::{
-    check_all_permissions, check_any_permission, check_permission, ensure_permission,
-    require_session_auth, require_session_or_self, AuthContext, AuthErrorResponse,
+    check_all_permissions, check_any_permission, check_permission, ensure_interactive_session,
+    ensure_permission, require_session_auth, require_session_or_self, AuthContext, AuthErrorResponse,
 };
 pub use cookies::{
     build_access_token_cookie, build_refresh_token_cookie, clear_access_token_cookie,
@@ -36,3 +38,6 @@ pub use cookies::{
 };
 pub use headers::{extract_client_ip, extract_user_agent};
 pub use pagination::Pagination;
+pub use source_inventory::{
+    ensure_source_inventory_access, permits_source_inventory, SOURCE_INVENTORY_CAPS,
+};

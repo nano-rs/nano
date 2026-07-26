@@ -7,7 +7,7 @@
 //! # Submodules
 //!
 //! - [`backup`] - Backup and restore for rollback support
-//! - [`credentials`] - Credential file management (GCP, Kafka, TLS)
+//! - [`credentials`] - Cleanup for retired parser-owned credential files
 //! - [`deploy`] - Parser deployment and Vector reload
 //! - [`parser_config`] - Per-parser TOML config generation
 //! - [`redaction`] - Snapshot redaction for persisted Vector configs
@@ -27,12 +27,11 @@ mod sources;
 mod staging;
 mod validation;
 
+pub use publication::{
+    PublicationOutcome, SnapshotBundle, VectorConfigPublicationError, VectorConfigPublisher,
+};
 pub use redaction::redact_config_snapshot;
 pub use router::{base_router_inputs, hec_normalize_present};
-pub use publication::{
-    PublicationOutcome, SnapshotBundle, VectorConfigPublicationError,
-    VectorConfigPublisher,
-};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -62,9 +61,8 @@ pub struct VectorConfigManager {
     config_dir: PathBuf,
     /// Directory where parser configs are written
     parsers_dir: PathBuf,
-    /// Sources directory (parent of parsers_dir). Used for credential/cert files
-    /// that need to live one level up from the parsers/ subdir so they survive
-    /// K8s ConfigMap key flattening (see `parser_creds_path`).
+    /// Sources directory (parent of parsers_dir). Retained for cleanup of
+    /// credential files written by the removed parser-owned transport path.
     sources_dir: PathBuf,
     /// Staging directory for validation before deployment
     staging_dir: PathBuf,
@@ -72,11 +70,6 @@ pub struct VectorConfigManager {
     backup_dir: PathBuf,
     /// Directory for credential files (GCP service account JSON, etc.)
     credentials_dir: PathBuf,
-    /// Absolute runtime path of the sources root (one level above parsers).
-    /// Credential/cert files reference this so the same path resolves under
-    /// Docker bind-mounts, S3-synced K8s, and ConfigMap-synced K8s (where keys
-    /// can't contain `/` and the sync flattens subdirs as `__`).
-    sources_runtime_path: String,
     /// Serializes all deploy operations to prevent concurrent deploys from
     /// corrupting config or overwriting each other's backups.
     ///
@@ -99,8 +92,6 @@ impl VectorConfigManager {
         let staging_dir = config_dir.join("staging");
         let backup_dir = config_dir.join("backup");
         let credentials_dir = config_dir.join("credentials");
-        let sources_runtime_path = std::env::var("VECTOR_SOURCES_RUNTIME_PATH")
-            .unwrap_or_else(|_| "/etc/vector/sources".to_string());
         Self {
             config_dir,
             parsers_dir,
@@ -108,7 +99,6 @@ impl VectorConfigManager {
             staging_dir,
             backup_dir,
             credentials_dir,
-            sources_runtime_path,
             deploy_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -145,12 +135,6 @@ impl VectorConfigManager {
     /// S3-synced K8s, and ConfigMap-synced K8s.
     pub(super) fn parser_creds_path(&self, filename: &str) -> PathBuf {
         self.sources_dir.join(format!("parsers__{}", filename))
-    }
-
-    /// Absolute runtime path Vector should reference for a parser-side
-    /// credential or cert file written via `parser_creds_path`.
-    pub(super) fn parser_creds_runtime(&self, filename: &str) -> String {
-        format!("{}/parsers__{}", self.sources_runtime_path, filename)
     }
 
     /// Build a VRL route condition for a parser.

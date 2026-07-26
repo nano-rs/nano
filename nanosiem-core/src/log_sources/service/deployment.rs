@@ -94,11 +94,8 @@ impl LogSourceService {
 
         let all_log_sources = self.list_enabled_for_deploy().await?;
 
-        // Inject credentials for cloud sources
-        let log_sources_with_creds = self.inject_credentials_for_all(&all_log_sources).await?;
-
         // Convert LogSource to Parser for VectorConfigManager compatibility
-        let mut parsers: Vec<Parser> = log_sources_with_creds
+        let mut parsers: Vec<Parser> = all_log_sources
             .into_iter()
             .map(log_source_to_parser)
             .collect();
@@ -350,9 +347,7 @@ impl LogSourceService {
 
         // Redeploy all remaining enabled log sources (using active versions)
         let enabled = self.list_enabled_for_deploy().await?;
-        let with_creds = self.inject_credentials_for_all(&enabled).await?;
-        let mut parsers: Vec<Parser> =
-            with_creds.into_iter().map(log_source_to_parser).collect();
+        let mut parsers: Vec<Parser> = enabled.into_iter().map(log_source_to_parser).collect();
         self.resolve_dispatch_route_names(&mut parsers).await?;
 
         if let Err(e) = self.vector_config.deploy_and_reload(&parsers).await {
@@ -435,9 +430,7 @@ impl LogSourceService {
     /// Deploy all enabled log sources (using active version VRL)
     pub async fn deploy_all(&self) -> Result<(), LogSourceServiceError> {
         let enabled = self.list_enabled_for_deploy().await?;
-        let with_creds = self.inject_credentials_for_all(&enabled).await?;
-        let mut parsers: Vec<Parser> =
-            with_creds.into_iter().map(log_source_to_parser).collect();
+        let mut parsers: Vec<Parser> = enabled.into_iter().map(log_source_to_parser).collect();
         self.resolve_dispatch_route_names(&mut parsers).await?;
 
         self.vector_config.deploy_and_reload(&parsers).await?;
@@ -450,15 +443,28 @@ impl LogSourceService {
         Ok(())
     }
 
-    /// Get deployment history for a log source
+    /// Get deployment history for a log source, with secrets scrubbed from
+    /// every snapshot.
+    ///
+    /// NAN-2068: `LogSourceService` writes no snapshot, but `ParserService`
+    /// writes into the same table, and rows persisted before the NAN-690
+    /// redactor landed still hold raw generated TOML. This endpoint serves
+    /// them to any `log_sources:view` holder, so scrub at the read boundary —
+    /// idempotent, and it covers historical rows without a backfill migration.
     pub async fn get_deployment_history(
         &self,
         id: Uuid,
         limit: Option<i64>,
     ) -> Result<Vec<LogSourceDeployment>, LogSourceServiceError> {
-        Ok(self
+        let mut deployments = self
             .repository()
             .get_deployment_history(id, limit.unwrap_or(50))
-            .await?)
+            .await?;
+        for deployment in &mut deployments {
+            if let Some(snapshot) = deployment.config_snapshot.as_deref() {
+                deployment.config_snapshot = Some(crate::parsers::redact_config_snapshot(snapshot));
+            }
+        }
+        Ok(deployments)
     }
 }

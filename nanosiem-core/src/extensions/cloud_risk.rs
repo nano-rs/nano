@@ -19,6 +19,7 @@
 
 use async_trait::async_trait;
 
+use crate::auth::ScopeSet;
 use crate::extensions::ExtensionError;
 use crate::risk::{EntityRiskSummary, RiskFilter, RiskTimeWindow};
 
@@ -31,6 +32,7 @@ pub trait CloudRiskProvider: Send + Sync {
         &self,
         window: RiskTimeWindow,
         filter: &RiskFilter,
+        scope: &ScopeSet,
     ) -> Result<Vec<EntityRiskSummary>, ExtensionError>;
 
     /// Highest-risk summary across an alias list (e.g. all identity-resolved
@@ -39,6 +41,7 @@ pub trait CloudRiskProvider: Send + Sync {
     async fn risk_for_entities(
         &self,
         entities: &[String],
+        scope: &ScopeSet,
     ) -> Result<Option<EntityRiskSummary>, ExtensionError>;
 }
 
@@ -52,6 +55,7 @@ impl CloudRiskProvider for NoopCloudRiskProvider {
         &self,
         _window: RiskTimeWindow,
         _filter: &RiskFilter,
+        _scope: &ScopeSet,
     ) -> Result<Vec<EntityRiskSummary>, ExtensionError> {
         Ok(Vec::new())
     }
@@ -59,6 +63,7 @@ impl CloudRiskProvider for NoopCloudRiskProvider {
     async fn risk_for_entities(
         &self,
         _entities: &[String],
+        _scope: &ScopeSet,
     ) -> Result<Option<EntityRiskSummary>, ExtensionError> {
         Ok(None)
     }

@@ -48,6 +48,16 @@ import {
   type RepoRuleView,
   type RepoView,
 } from '@/components/repositories/helpers';
+import {
+  detectionViewAccess,
+  repositoryQueryEnabled,
+  ruleDiffAccess,
+  ruleDismissAccess,
+  ruleImportAccess,
+  rulePreviewAccess,
+  sourceInventoryAccess,
+  type ActionAccess,
+} from '@/components/repositories/repository-action-policy';
 
 export function RuleRepositories() {
   useDocumentTitle('Rule Repositories');
@@ -60,6 +70,11 @@ export function RuleRepositories() {
   // rules, distinct from the pull-only rule repositories on this page.
   const canViewDac = hasPermission('detection_code_targets:view');
   const canManageDac = hasPermission('detection_code_targets:manage');
+  const previewAccess = rulePreviewAccess(hasPermission);
+  const diffAccess = ruleDiffAccess(hasPermission);
+  const dismissAccess = ruleDismissAccess(hasPermission);
+  const liveRuleViewAccess = detectionViewAccess(hasPermission);
+  const inventoryAccess = sourceInventoryAccess(hasPermission);
   const [dacOpen, setDacOpen] = useState(false);
 
   const pushTargetsButton = canViewDac ? (
@@ -158,15 +173,16 @@ export function RuleRepositories() {
     enabled: !!activeRepoId,
   });
 
-  const { data: sourceTypeRows = [] } = useQuery({
+  const { data: cachedSourceTypeRows = [] } = useQuery({
     queryKey: ['source-types'],
     queryFn: () => api.getSourceTypes(),
+    enabled: repositoryQueryEnabled(inventoryAccess),
     staleTime: 5 * 60 * 1000,
   });
-
   const availableSourceTypes = useMemo(
-    () => sourceTypeRows.map(([s]) => s).sort(),
-    [sourceTypeRows],
+    // A disabled query may still expose data cached before a role change.
+    () => (inventoryAccess.allowed ? cachedSourceTypeRows : []).map(([s]) => s).sort(),
+    [cachedSourceTypeRows, inventoryAccess.allowed],
   );
 
   // ----------------------------------------------------------------
@@ -212,6 +228,66 @@ export function RuleRepositories() {
   const selectedRule = ruleViews.find((r) => r.id === selectedRuleId) ?? null;
   const selectedRules = ruleViews.filter((r) => selected.has(r.id));
   const categories = categoryCounts(ruleViews);
+
+  const importIntent = (
+    rule: RepoRuleView,
+    mode?: 'staging' | 'live' | 'alerting',
+  ) => ({
+    outcome:
+      rule.status === 'IMPORTED'
+        ? ('skip' as const)
+        : rule.status === 'UPDATED'
+          ? ('update' as const)
+          : ('create' as const),
+    mode,
+    ruleFormat: activeRepo?.raw.rule_format ?? 'nanosiem',
+    rawContent: rule.raw.raw_content,
+  });
+
+  const importAccessForRule = (
+    rule: RepoRuleView,
+    mode?: 'staging' | 'live' | 'alerting',
+  ) => ruleImportAccess(hasPermission, [importIntent(rule, mode)]);
+
+  const getRuleActionAccess = (rule: RepoRuleView): ActionAccess => {
+    if (rule.status === 'UPDATED') return importAccessForRule(rule);
+    if (rule.status === 'AVAILABLE' || rule.status === 'NEW') {
+      return importAccessForRule(rule);
+    }
+    return liveRuleViewAccess;
+  };
+
+  const bulkImportAccess = ruleImportAccess(
+    hasPermission,
+    selectedRules
+      .filter((rule) => rule.status !== 'IMPORTED' && rule.status !== 'DELETED')
+      .map((rule) => importIntent(rule, 'staging')),
+  );
+
+  const accessForBulkItems = (
+    items: {
+      path: string;
+      mode?: string;
+    }[],
+  ): ActionAccess =>
+    ruleImportAccess(
+      hasPermission,
+      items.flatMap((item) => {
+        const rule = selectedRules.find((candidate) => candidate.raw.file_path === item.path);
+        if (!rule) return [];
+        const mode =
+          item.mode === 'live' || item.mode === 'alerting' ? item.mode : 'staging';
+        return [importIntent(rule, mode)];
+      }),
+    );
+
+  const showDeniedAction = (title: string, access: ActionAccess) => {
+    toast({
+      title,
+      description: access.reason ?? 'This action is not available.',
+      variant: 'destructive',
+    });
+  };
 
   // ----------------------------------------------------------------
   // Mutations
@@ -355,6 +431,12 @@ export function RuleRepositories() {
   };
 
   const handleRowAction = (rule: RepoRuleView) => {
+    const access = getRuleActionAccess(rule);
+    if (!access.allowed) {
+      showDeniedAction('Action unavailable', access);
+      return;
+    }
+
     // UPDATED rules go through the same import endpoint as a single-item batch
     // so the backend's overwrite-with-newer-upstream path runs (NAN-673). The
     // result toast tells the user whether the rule was actually updated or
@@ -387,6 +469,13 @@ export function RuleRepositories() {
 
   const handlePreviewImport = (req: ImportRequest) => {
     if (!activeRepoId || !selectedRule) return;
+    const mode =
+      req.mode === 'live' || req.mode === 'alerting' ? req.mode : 'staging';
+    const access = importAccessForRule(selectedRule, mode);
+    if (!access.allowed) {
+      showDeniedAction('Import unavailable', access);
+      return;
+    }
     importMutation.mutate({
       repoId: activeRepoId,
       path: selectedRule.raw.file_path,
@@ -403,6 +492,11 @@ export function RuleRepositories() {
     }[],
   ) => {
     if (!activeRepoId) return;
+    const access = accessForBulkItems(items);
+    if (!access.allowed) {
+      showDeniedAction('Bulk import unavailable', access);
+      return;
+    }
     batchImportMutation.mutate({ repoId: activeRepoId, items });
   };
 
@@ -595,6 +689,7 @@ export function RuleRepositories() {
             onQueryChange={setQuery}
             onBulkImport={() => setBulkOpen(true)}
             onBulkClear={() => setSelected(new Set())}
+            bulkImportAccess={bulkImportAccess}
           />
           <FilterRow categories={categories} activeId={activeCat} onActivate={setActiveCat} />
           {(upstreamData?.total_count ?? 0) > 0 && activeCat !== 'updated' && (
@@ -627,6 +722,7 @@ export function RuleRepositories() {
               onToggleSelectAll={toggleSelectAll}
               onSelectRule={setSelectedRuleId}
               onAction={handleRowAction}
+              getActionAccess={getRuleActionAccess}
               activeCat={activeCat}
             />
           )}
@@ -642,6 +738,16 @@ export function RuleRepositories() {
             onImport={handlePreviewImport}
             onAction={openOrAct}
             importing={importMutation.isPending}
+            previewAccess={previewAccess}
+            diffAccess={diffAccess}
+            dismissAccess={dismissAccess}
+            getImportAccess={(mode) =>
+              selectedRule
+                ? importAccessForRule(selectedRule, mode)
+                : ruleImportAccess(hasPermission, [])
+            }
+            primaryActionAccess={liveRuleViewAccess}
+            inventoryAccess={inventoryAccess}
           />
         )}
       </div>
@@ -660,6 +766,7 @@ export function RuleRepositories() {
         rules={selectedRules}
         availableSourceTypes={availableSourceTypes}
         onConfirm={handleBulkConfirm}
+        getImportAccess={accessForBulkItems}
         progress={
           batchImportMutation.isPending
             ? { running: true, total: selectedRules.length }

@@ -11,7 +11,7 @@ use axum::{
     http::{Response, StatusCode},
     middleware::Next,
 };
-use nanosiem_core::db::repository::RateLimitRepository;
+use nanosiem_core::{auth::permissions, db::repository::RateLimitRepository};
 use sqlx::PgPool;
 use std::net::SocketAddr;
 
@@ -74,6 +74,20 @@ pub struct RateLimitConfig {
     pub kafka_probe_max_requests: u32,
     /// Time window for Kafka broker-probe rate limiting
     pub kafka_probe_window_seconds: u64,
+    /// Max GitHub connection probes per authenticated principal and push target.
+    /// The handler decrypts a stored PAT and makes an outbound request, so the
+    /// bucket is deliberately tight and API keys are isolated from their owner.
+    pub detection_code_probe_max_requests: u32,
+    /// Time window for detection-code target connection probes.
+    pub detection_code_probe_window_seconds: u64,
+    /// Max marketplace previews per authenticated principal. Preview decrypts
+    /// credentials and runs code, so API keys are isolated from their owners.
+    pub marketplace_preview_principal_max_requests: u32,
+    /// Max marketplace previews for one provider across all principals. This
+    /// bounds spend against the provider's shared external API quota.
+    pub marketplace_preview_provider_max_requests: u32,
+    /// Time window for marketplace enrichment previews.
+    pub marketplace_preview_window_seconds: u64,
 }
 
 impl Default for RateLimitConfig {
@@ -101,6 +115,11 @@ impl Default for RateLimitConfig {
             dry_resolve_window_seconds: 60,  // per minute
             kafka_probe_max_requests: 6,     // 6 broker probes per user
             kafka_probe_window_seconds: 60,  // per minute (heavy: DNS + TCP × N)
+            detection_code_probe_max_requests: 6, // 6 credentialed GitHub probes per principal/target
+            detection_code_probe_window_seconds: 60, // per minute
+            marketplace_preview_principal_max_requests: 6, // 6 sandbox runs per principal
+            marketplace_preview_provider_max_requests: 30, // 30 runs per provider across principals
+            marketplace_preview_window_seconds: 60, // per minute
         }
     }
 }
@@ -181,6 +200,34 @@ impl RateLimitState {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
+            detection_code_probe_max_requests: std::env::var("RATE_LIMIT_DETECTION_CODE_PROBE_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(6),
+            detection_code_probe_window_seconds: std::env::var(
+                "RATE_LIMIT_DETECTION_CODE_PROBE_WINDOW_SECS",
+            )
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60),
+            marketplace_preview_principal_max_requests: std::env::var(
+                "RATE_LIMIT_MARKETPLACE_PREVIEW_PRINCIPAL_MAX",
+            )
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6),
+            marketplace_preview_provider_max_requests: std::env::var(
+                "RATE_LIMIT_MARKETPLACE_PREVIEW_PROVIDER_MAX",
+            )
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
+            marketplace_preview_window_seconds: std::env::var(
+                "RATE_LIMIT_MARKETPLACE_PREVIEW_WINDOW_SECS",
+            )
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60),
         };
         Self::new(pool, config)
     }
@@ -525,6 +572,166 @@ pub async fn kafka_probe_rate_limit_middleware(
     }
 }
 
+/// Rate-limit detection-as-code target connection tests (NAN-2064).
+///
+/// The endpoint decrypts a stored GitHub PAT and spends third-party API budget.
+/// Buckets include the target ID and distinguish an interactive user from each
+/// delegated API key so one credential cannot exhaust another's allowance.
+pub async fn detection_code_probe_rate_limit_middleware(
+    State(state): State<RateLimitState>,
+    req: Request,
+    next: Next,
+) -> Response<Body> {
+    let target = req
+        .uri()
+        .path()
+        .trim_end_matches('/')
+        .strip_suffix("/test")
+        .and_then(|path| path.rsplit('/').next())
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or("unknown");
+
+    let (category, principal) = match req.extensions().get::<crate::middleware::AuthContext>() {
+        Some(auth) => match auth.api_key_id {
+            Some(api_key_id) => ("detection_code_probe_api_key", api_key_id.to_string()),
+            None => ("detection_code_probe_user", auth.user_id().to_string()),
+        },
+        None => {
+            tracing::warn!(
+                "detection_code_probe_rate_limit_middleware: AuthContext missing, falling back to IP"
+            );
+            ("detection_code_probe_ip", extract_client_ip(&req))
+        }
+    };
+    let key = format!("{principal}:{target}");
+
+    match state
+        .check(
+            category,
+            &key,
+            state.config.detection_code_probe_window_seconds,
+            state.config.detection_code_probe_max_requests,
+        )
+        .await
+    {
+        Ok(_) => next.run(req).await,
+        Err(retry_after) => {
+            tracing::warn!(%key, "Detection-code connection-probe rate limit exceeded");
+            let error = RateLimitError {
+                error: "Too many connection-test requests. Please try again later.".to_string(),
+                retry_after_seconds: retry_after,
+            };
+            let body = serde_json::to_string(&error)
+                .unwrap_or_else(|_| r#"{"error":"Too many requests"}"#.to_string());
+
+            Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("Content-Type", "application/json")
+                .header("Retry-After", retry_after.to_string())
+                .body(Body::from(body))
+                .unwrap()
+        }
+    }
+}
+
+fn marketplace_preview_provider(path: &str) -> &str {
+    path.trim_end_matches('/')
+        .strip_suffix("/preview")
+        .and_then(|path| path.rsplit('/').next())
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or("unknown")
+}
+
+struct MarketplacePreviewBuckets {
+    category: &'static str,
+    principal: String,
+    provider: String,
+}
+
+/// Return quota buckets only for callers authorized to execute a preview.
+/// The handler remains the authoritative 403 boundary; this prevents a
+/// low-privilege caller from exhausting shared provider quota with requests
+/// that will never execute.
+fn marketplace_preview_buckets(req: &Request) -> Option<MarketplacePreviewBuckets> {
+    let auth = req.extensions().get::<crate::middleware::AuthContext>()?;
+    if !auth.has_permission(permissions::ENRICHMENTS_CONFIGURE) {
+        return None;
+    }
+
+    let (category, principal) = match auth.api_key_id {
+        Some(api_key_id) => ("marketplace_preview_api_key", api_key_id.to_string()),
+        None => ("marketplace_preview_user", auth.user_id().to_string()),
+    };
+
+    Some(MarketplacePreviewBuckets {
+        category,
+        principal,
+        provider: marketplace_preview_provider(req.uri().path()).to_string(),
+    })
+}
+
+/// Rate-limit credentialed marketplace sandbox previews (NAN-2062).
+///
+/// One bucket distinguishes an interactive user from each delegated API key;
+/// a second bucket is shared by provider slug. Together they prevent one
+/// principal from consuming another's allowance and bound each provider's
+/// external API quota across all callers.
+pub async fn marketplace_preview_rate_limit_middleware(
+    State(state): State<RateLimitState>,
+    req: Request,
+    next: Next,
+) -> Response<Body> {
+    let Some(buckets) = marketplace_preview_buckets(&req) else {
+        return next.run(req).await;
+    };
+    let result = match state
+        .check(
+            buckets.category,
+            &buckets.principal,
+            state.config.marketplace_preview_window_seconds,
+            state.config.marketplace_preview_principal_max_requests,
+        )
+        .await
+    {
+        Ok(()) => {
+            state
+                .check(
+                    "marketplace_preview_provider",
+                    &buckets.provider,
+                    state.config.marketplace_preview_window_seconds,
+                    state.config.marketplace_preview_provider_max_requests,
+                )
+                .await
+        }
+        Err(retry_after) => Err(retry_after),
+    };
+
+    match result {
+        Ok(_) => next.run(req).await,
+        Err(retry_after) => {
+            tracing::warn!(
+                principal = %buckets.principal,
+                provider = %buckets.provider,
+                "Marketplace preview rate limit exceeded"
+            );
+            let error = RateLimitError {
+                error: "Too many marketplace preview requests. Please try again later."
+                    .to_string(),
+                retry_after_seconds: retry_after,
+            };
+            let body = serde_json::to_string(&error)
+                .unwrap_or_else(|_| r#"{"error":"Too many requests"}"#.to_string());
+
+            Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("Content-Type", "application/json")
+                .header("Retry-After", retry_after.to_string())
+                .body(Body::from(body))
+                .unwrap()
+        }
+    }
+}
+
 /// Middleware for rate limiting upload requests
 /// SECURITY: Prevents DoS attacks via repeated large file uploads
 pub async fn upload_rate_limit_middleware(
@@ -568,6 +775,42 @@ pub async fn upload_rate_limit_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nanosiem_core::auth::api_key::ApiKeyInfo;
+    use nanosiem_core::auth::token::{DEFAULT_TOKEN_AUDIENCE, DEFAULT_TOKEN_ISSUER};
+    use nanosiem_core::auth::TokenClaims;
+    use uuid::Uuid;
+
+    fn session(permissions: &[&str]) -> crate::middleware::AuthContext {
+        crate::middleware::AuthContext::from_jwt(TokenClaims {
+            iss: DEFAULT_TOKEN_ISSUER.to_string(),
+            aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
+            sub: Uuid::now_v7(),
+            roles: Vec::new(),
+            permissions: permissions.iter().map(ToString::to_string).collect(),
+            exp: chrono::Utc::now().timestamp() + 60,
+            iat: chrono::Utc::now().timestamp(),
+            jti: Uuid::now_v7(),
+            purpose: "access".to_string(),
+        })
+    }
+
+    fn api_key(permissions: &[&str]) -> crate::middleware::AuthContext {
+        crate::middleware::AuthContext::from_api_key(&ApiKeyInfo {
+            id: Uuid::now_v7(),
+            name: "marketplace-preview".to_string(),
+            permissions: permissions.iter().map(ToString::to_string).collect(),
+            user_id: Some(Uuid::now_v7()),
+        })
+    }
+
+    fn preview_request(auth: crate::middleware::AuthContext) -> Request {
+        let mut request = Request::builder()
+            .uri("/api/marketplace/catalog/virustotal/preview")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(auth);
+        request
+    }
 
     #[test]
     fn test_default_config_values() {
@@ -588,6 +831,11 @@ mod tests {
         assert_eq!(config.upload_window_seconds, 60);
         assert_eq!(config.dry_resolve_max_requests, 30);
         assert_eq!(config.dry_resolve_window_seconds, 60);
+        assert_eq!(config.detection_code_probe_max_requests, 6);
+        assert_eq!(config.detection_code_probe_window_seconds, 60);
+        assert_eq!(config.marketplace_preview_principal_max_requests, 6);
+        assert_eq!(config.marketplace_preview_provider_max_requests, 30);
+        assert_eq!(config.marketplace_preview_window_seconds, 60);
     }
 
     #[test]
@@ -606,5 +854,57 @@ mod tests {
         let json = serde_json::to_string(&error).unwrap();
         assert!(json.contains("300"));
         assert!(json.contains("Too many requests"));
+    }
+
+    #[test]
+    fn marketplace_preview_bucket_extracts_provider_slug() {
+        assert_eq!(
+            marketplace_preview_provider("/api/marketplace/catalog/virustotal/preview"),
+            "virustotal"
+        );
+        assert_eq!(
+            marketplace_preview_provider("/api/marketplace/catalog/threatfox/preview/"),
+            "threatfox"
+        );
+        assert_eq!(marketplace_preview_provider("/preview"), "unknown");
+    }
+
+    #[test]
+    fn denied_jwt_and_api_key_callers_are_excluded_from_preview_accounting() {
+        let missing_auth = Request::builder()
+            .uri("/api/marketplace/catalog/virustotal/preview")
+            .body(Body::empty())
+            .unwrap();
+        assert!(marketplace_preview_buckets(&missing_auth).is_none());
+
+        for auth in [
+            session(&[]),
+            session(&[permissions::ENRICHMENTS_VIEW]),
+            session(&[permissions::SEARCH_VIEW]),
+            api_key(&[]),
+            api_key(&[permissions::ENRICHMENTS_VIEW]),
+            api_key(&[permissions::SEARCH_VIEW]),
+        ] {
+            assert!(marketplace_preview_buckets(&preview_request(auth)).is_none());
+        }
+    }
+
+    #[test]
+    fn configured_jwt_and_api_key_callers_receive_isolated_preview_buckets() {
+        let session_auth = session(&[permissions::ENRICHMENTS_CONFIGURE]);
+        let session_id = session_auth.user_id().to_string();
+        let session_buckets =
+            marketplace_preview_buckets(&preview_request(session_auth)).unwrap();
+        assert_eq!(session_buckets.category, "marketplace_preview_user");
+        assert_eq!(session_buckets.principal, session_id);
+        assert_eq!(session_buckets.provider, "virustotal");
+
+        let api_key_auth = api_key(&[permissions::ENRICHMENTS_CONFIGURE]);
+        let api_key_id = api_key_auth.api_key_id.unwrap().to_string();
+        let api_key_buckets =
+            marketplace_preview_buckets(&preview_request(api_key_auth)).unwrap();
+        assert_eq!(api_key_buckets.category, "marketplace_preview_api_key");
+        assert_eq!(api_key_buckets.principal, api_key_id);
+        assert_eq!(api_key_buckets.provider, "virustotal");
     }
 }

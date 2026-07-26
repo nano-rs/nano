@@ -60,6 +60,9 @@ impl GroupApiError {
             GroupRepositoryError::CannotDeleteSystemGroup(_) => {
                 (StatusCode::FORBIDDEN, "cannot_delete_system_group")
             }
+            GroupRepositoryError::GrantAuthorityChanged => {
+                (StatusCode::CONFLICT, "grant_authority_changed")
+            }
             GroupRepositoryError::DatabaseError(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "database_error")
             }
@@ -197,8 +200,9 @@ pub async fn get_group(
     request_body = CreateGroupRequest,
     responses(
         (status = 201, description = "Group created successfully", body = GroupWithDetails),
+        (status = 400, description = "Bad request - unknown role id", body = GroupApiError),
         (status = 403, description = "Forbidden - insufficient permissions", body = GroupApiError),
-        (status = 409, description = "Conflict - group name already exists", body = GroupApiError),
+        (status = 409, description = "Conflict - group name exists or grant authority changed", body = GroupApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -211,10 +215,26 @@ pub async fn create_group(
     check_permission(&auth, permissions::GROUPS_CREATE)
         .map_err(|(s, j)| (s, Json(GroupApiError::new(&j.error, &j.message))))?;
 
-    let group = state.group_repo.create_group(&request).await.map_err(|e| {
-        let (status, err) = GroupApiError::from_repo_error(&e);
-        (status, Json(err))
-    })?;
+    // NAN-2121: groups:create authorizes creating the group, NOT granting the
+    // privileges its roles confer. Deny unless the caller holds every permission
+    // conferred by the assigned roles (prevents an Admin-role-bearing group).
+    let grant_stamp = crate::handlers::grant_authz::ensure_can_grant_roles(
+        &auth,
+        &state.pool,
+        permissions::GROUPS_CREATE,
+        &request.role_ids,
+    )
+    .await
+    .map_err(|g| (g.status, Json(GroupApiError::new(g.code, &g.message))))?;
+
+    let group = state
+        .group_repo
+        .create_group_authorized(&request, grant_stamp)
+        .await
+        .map_err(|e| {
+            let (status, err) = GroupApiError::from_repo_error(&e);
+            (status, Json(err))
+        })?;
 
     let roles = state
         .group_repo
@@ -380,8 +400,10 @@ pub struct UpdateGroupRolesRequest {
     request_body = UpdateGroupRolesRequest,
     responses(
         (status = 200, description = "Group roles updated successfully", body = GroupWithDetails),
+        (status = 400, description = "Bad request - unknown role id", body = GroupApiError),
         (status = 403, description = "Forbidden - insufficient permissions or system group", body = GroupApiError),
         (status = 404, description = "Group not found", body = GroupApiError),
+        (status = 409, description = "Grant authority changed; retry the request", body = GroupApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -395,9 +417,21 @@ pub async fn update_group_roles(
     check_permission(&auth, permissions::GROUPS_EDIT)
         .map_err(|(s, j)| (s, Json(GroupApiError::new(&j.error, &j.message))))?;
 
+    // NAN-2121: deny unless the caller holds every permission conferred by the
+    // roles it is assigning to the group (groups:edit is not authority to grant
+    // Admin — including to system groups like `Everyone`).
+    let grant_stamp = crate::handlers::grant_authz::ensure_can_grant_roles(
+        &auth,
+        &state.pool,
+        permissions::GROUPS_EDIT,
+        &request.role_ids,
+    )
+    .await
+    .map_err(|g| (g.status, Json(GroupApiError::new(g.code, &g.message))))?;
+
     state
         .group_repo
-        .set_group_roles(*id, &request.role_ids)
+        .set_group_roles_authorized(*id, &request.role_ids, grant_stamp)
         .await
         .map_err(|e| {
             let (status, err) = GroupApiError::from_repo_error(&e);

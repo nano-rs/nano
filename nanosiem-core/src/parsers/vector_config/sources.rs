@@ -7,7 +7,6 @@
 
 use super::VectorConfigManager;
 use crate::parsers::types::Parser;
-use crate::source_configs::service::normalize_pubsub_subscription;
 
 impl VectorConfigManager {
     /// Generate source configuration for a parser
@@ -24,9 +23,7 @@ impl VectorConfigManager {
                 let router_input = format!("source_router.{}", safe_name);
                 (String::new(), router_input)
             }
-            "kafka" | "aws_s3" | "aws_sqs" | "gcp_pubsub"
-                if parser.dispatch_route_name.is_some() =>
-            {
+            "kafka" | "aws_s3" | "aws_sqs" | "s3" | "gcp_pubsub" | "pubsub" => {
                 // NAN-928: fetch-source parser bound to a deployed source
                 // configuration via the "DISPATCH FROM" picker. Mirror the
                 // HEC shape — `filter` on the source-config's routing
@@ -34,12 +31,19 @@ impl VectorConfigManager {
                 // The user's source config owns the connection; this parser
                 // only consumes its already-routed output.
                 let filter_name = format!("{}_filter", safe_name);
-                let route_name = parser
-                    .dispatch_route_name
-                    .as_deref()
-                    .expect("checked by match guard");
-                let match_values: &[String] =
-                    parser.match_values.as_deref().unwrap_or(&[]);
+                let Some(route_name) = parser.dispatch_route_name.as_deref() else {
+                    // All deployment entry points call
+                    // resolve_parser_dispatch_routes first, which rejects this
+                    // state. Keep direct config-string generation non-secret
+                    // and source-free as a defense-in-depth fallback.
+                    tracing::error!(
+                        parser = %parser.name,
+                        source_type = %parser.source_type,
+                        "fetch parser has no source-configuration dispatch; refusing to emit a parser-owned source",
+                    );
+                    return (String::new(), format!("source_router.{}", safe_name));
+                };
+                let match_values: &[String] = parser.match_values.as_deref().unwrap_or(&[]);
                 let config = self.generate_dispatch_route_filter(
                     &filter_name,
                     route_name,
@@ -47,21 +51,6 @@ impl VectorConfigManager {
                     &parser.name,
                 );
                 (config, filter_name)
-            }
-            "kafka" => {
-                let source_name = format!("{}_source", safe_name);
-                let config = self.generate_kafka_source(parser, &source_name);
-                (config, source_name)
-            }
-            "aws_s3" | "aws_sqs" => {
-                let source_name = format!("{}_source", safe_name);
-                let config = self.generate_s3_source(parser, &source_name);
-                (config, source_name)
-            }
-            "gcp_pubsub" => {
-                let source_name = format!("{}_source", safe_name);
-                let config = self.generate_gcp_pubsub_source(parser, &source_name);
-                (config, source_name)
             }
             "splunk_hec" | "splunk" | "hec" => {
                 // NAN-921: HEC events arrive on the OOTB splunk_hec_ingest
@@ -72,15 +61,9 @@ impl VectorConfigManager {
                 // through a per-parser filter on `.source_type`, so each
                 // parser only sees the events its `match_values` declares.
                 let filter_name = format!("{}_filter", safe_name);
-                let match_values: &[String] = parser
-                    .match_values
-                    .as_deref()
-                    .unwrap_or(&[]);
-                let config = self.generate_splunk_hec_filter(
-                    &filter_name,
-                    match_values,
-                    &parser.name,
-                );
+                let match_values: &[String] = parser.match_values.as_deref().unwrap_or(&[]);
+                let config =
+                    self.generate_splunk_hec_filter(&filter_name, match_values, &parser.name);
                 (config, filter_name)
             }
             "opentelemetry" | "otlp" => {
@@ -95,10 +78,7 @@ impl VectorConfigManager {
                 // parsers entirely — they go straight to the spans/metrics raw
                 // ClickHouse tables and are mapped by a MATERIALIZED VIEW.
                 let filter_name = format!("{}_filter", safe_name);
-                let match_values: &[String] = parser
-                    .match_values
-                    .as_deref()
-                    .unwrap_or(&[]);
+                let match_values: &[String] = parser.match_values.as_deref().unwrap_or(&[]);
                 let config = self.generate_dispatch_route_filter(
                     &filter_name,
                     "otlp_logs_prep",
@@ -128,252 +108,6 @@ impl VectorConfigManager {
                 (String::new(), router_input)
             }
         }
-    }
-
-    /// Generate Kafka source configuration with optional SASL/TLS authentication
-    ///
-    /// SASL mechanisms supported: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
-    /// TLS: optional CA certificate for server verification
-    fn generate_kafka_source(&self, parser: &Parser, source_name: &str) -> String {
-        let config = &parser.source_config;
-        let bootstrap_servers = config["bootstrap_servers"]
-            .as_str()
-            .unwrap_or("localhost:9092");
-        let topics = config["topics"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| format!("\"{}\"", s))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_else(|| "\"logs\"".to_string());
-        let group_id = config["group_id"].as_str().unwrap_or("nanosiem");
-        let auto_offset_reset = config["auto_offset_reset"].as_str().unwrap_or("largest");
-
-        let mut source_config = format!(
-            "[sources.{}]\n\
-             type = \"kafka\"\n\
-             bootstrap_servers = \"{}\"\n\
-             topics = [{}]\n\
-             group_id = \"{}\"\n\
-             auto_offset_reset = \"{}\"\n",
-            source_name, bootstrap_servers, topics, group_id, auto_offset_reset
-        );
-
-        // Check for embedded credentials (decrypted and passed via source_config)
-        if let Some(creds) = config.get("_credentials") {
-            // SASL authentication
-            if let Some(mechanism) = creds["sasl_mechanism"].as_str() {
-                if !mechanism.is_empty() {
-                    let username = creds["sasl_username"].as_str().unwrap_or("");
-                    let password = creds["sasl_password"].as_str().unwrap_or("");
-
-                    source_config.push_str(&format!(
-                        "\n[sources.{}.sasl]\n\
-                         enabled = true\n\
-                         mechanism = \"{}\"\n\
-                         username = \"{}\"\n\
-                         password = \"{}\"\n",
-                        source_name, mechanism, username, password
-                    ));
-                }
-            }
-
-            // TLS configuration
-            let tls_enabled = creds["tls_enabled"].as_bool().unwrap_or(false);
-            if tls_enabled {
-                source_config.push_str(&format!(
-                    "\n[sources.{}.tls]\n\
-                     enabled = true\n",
-                    source_name
-                ));
-
-                // Optional CA certificate - written to parsers_dir for S3/GCS sync
-                if let Some(ca_cert) = creds["tls_ca_cert"].as_str() {
-                    if !ca_cert.is_empty() {
-                        let safe = Self::safe_name(&parser.name);
-                        let ca_path = self.parser_creds_runtime(&format!("kafka_{}_ca.pem", safe));
-                        source_config.push_str(&format!("ca_file = \"{}\"\n", ca_path));
-                    }
-                }
-            }
-        }
-
-        source_config
-    }
-
-    /// Generate AWS S3 source configuration
-    ///
-    /// IMPORTANT: Vector's aws_s3 source requires an SQS queue configured to receive
-    /// S3 bucket notifications. It does NOT poll S3 directly.
-    ///
-    /// Required config:
-    /// - sqs_queue_url: The SQS queue URL that receives S3 notifications
-    /// - region: AWS region
-    ///
-    /// Optional config:
-    /// - compression: auto, gzip, zstd, none
-    /// - endpoint: S3-compatible endpoint (MinIO, etc.)
-    /// - _credentials: AWS credentials (access_key_id, secret_access_key, etc.)
-    fn generate_s3_source(&self, parser: &Parser, source_name: &str) -> String {
-        let config = &parser.source_config;
-        let sqs_queue_url = config["sqs_queue_url"].as_str().unwrap_or("");
-        let region = config["region"].as_str().unwrap_or("us-east-1");
-
-        // Check for S3-compatible endpoint (MinIO, etc.)
-        let endpoint_config = if let Some(endpoint) = config["endpoint"].as_str() {
-            format!("endpoint = \"{}\"\n", endpoint)
-        } else {
-            String::new()
-        };
-
-        // Compression handling
-        let compression_config = match config["compression"].as_str() {
-            Some("gzip") => "compression = \"gzip\"\n",
-            Some("zstd") => "compression = \"zstd\"\n",
-            Some("none") => "compression = \"none\"\n",
-            _ => "", // Auto-detect
-        };
-
-        // Check for embedded credentials (decrypted and passed via source_config)
-        let auth_config = if let Some(creds) = config.get("_credentials") {
-            let access_key = creds["access_key_id"].as_str().unwrap_or("");
-            let secret_key = creds["secret_access_key"].as_str().unwrap_or("");
-
-            if !access_key.is_empty() && !secret_key.is_empty() {
-                let mut auth = format!(
-                    "\n[sources.{}.auth]\n\
-                     access_key_id = \"{}\"\n\
-                     secret_access_key = \"{}\"\n\
-                     region = \"{}\"\n",
-                    source_name, access_key, secret_key, region
-                );
-
-                // Add session token if present
-                if let Some(token) = creds["session_token"].as_str() {
-                    if !token.is_empty() {
-                        auth.push_str(&format!("session_token = \"{}\"\n", token));
-                    }
-                }
-
-                // Add assume role if present
-                if let Some(role) = creds["assume_role_arn"].as_str() {
-                    if !role.is_empty() {
-                        auth.push_str(&format!("assume_role = \"{}\"\n", role));
-                    }
-                }
-
-                auth
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        };
-
-        // SQS configuration section
-        let sqs_config = format!(
-            "\n[sources.{}.sqs]\n\
-             queue_url = \"{}\"\n\
-             poll_secs = 15\n\
-             delete_message = true\n",
-            source_name, sqs_queue_url
-        );
-
-        format!(
-            "[sources.{}]\n\
-             type = \"aws_s3\"\n\
-             region = \"{}\"\n\
-             {}\
-             {}\
-             {}\
-             {}\n",
-            source_name,
-            region,
-            endpoint_config,
-            compression_config,
-            sqs_config.trim_end(),
-            auth_config.trim_end()
-        )
-    }
-
-    /// Generate GCP Pub/Sub source configuration
-    ///
-    /// Vector's gcp_pubsub source pulls messages from a subscription.
-    ///
-    /// Required config:
-    /// - project: GCP project ID
-    /// - subscription: Pub/Sub subscription name
-    ///
-    /// Optional config:
-    /// - ack_deadline_secs: Acknowledgement deadline (default: 600)
-    /// - endpoint: Custom Pub/Sub endpoint (for emulators)
-    /// - _credentials: Service account JSON key (written to file, referenced via credentials_path)
-    ///
-    /// Authentication (in order of precedence):
-    /// 1. credentials_path - Path to service account JSON file
-    /// 2. api_key - GCP API key
-    /// 3. GOOGLE_APPLICATION_CREDENTIALS env var
-    /// 4. Instance metadata (GCE/GKE)
-    fn generate_gcp_pubsub_source(&self, parser: &Parser, source_name: &str) -> String {
-        let config = &parser.source_config;
-        let project = config["project"].as_str().unwrap_or("");
-        let subscription_raw = config["subscription"].as_str().unwrap_or("");
-        let subscription = normalize_pubsub_subscription(subscription_raw);
-        let ack_deadline = config["ack_deadline_secs"].as_u64().unwrap_or(600);
-
-        if project.is_empty() || subscription.is_empty() {
-            tracing::warn!(
-                "GCP Pub/Sub source '{}' missing project or subscription",
-                parser.name
-            );
-            return format!(
-                "# WARNING: GCP Pub/Sub source requires project and subscription\n\
-                 # Please configure source_config for this parser\n\
-                 [sources.{}]\n\
-                 type = \"gcp_pubsub\"\n\
-                 project = \"<MISSING>\"\n\
-                 subscription = \"<MISSING>\"\n",
-                source_name
-            );
-        }
-
-        let mut source_config = format!(
-            "[sources.{}]\n\
-             type = \"gcp_pubsub\"\n\
-             project = \"{}\"\n\
-             subscription = \"{}\"\n\
-             ack_deadline_secs = {}\n",
-            source_name, project, subscription, ack_deadline
-        );
-
-        // Optional custom endpoint (for emulators or private endpoints)
-        if let Some(endpoint) = config["endpoint"].as_str() {
-            if !endpoint.is_empty() {
-                source_config.push_str(&format!("endpoint = \"{}\"\n", endpoint));
-            }
-        }
-
-        // Check for embedded credentials (decrypted and passed via source_config)
-        // Vector uses credentials_path to point to a service account JSON file
-        if let Some(creds) = config.get("_credentials") {
-            if let Some(credentials_json) = creds["credentials_json"].as_str() {
-                if !credentials_json.is_empty() {
-                    // Credentials are written to parsers_dir for S3/GCS sync.
-                    // Runtime path resolves to where Vector reads parser configs.
-                    let safe = Self::safe_name(&parser.name);
-                    let creds_path = self.parser_creds_runtime(&format!("gcp_{}.creds", safe));
-                    source_config.push_str(&format!("credentials_path = \"{}\"\n", creds_path));
-                }
-            }
-        } else {
-            source_config
-                .push_str("# Using default GCP credentials (ADC, env var, or instance metadata)\n");
-        }
-
-        source_config
     }
 
     /// Generate Splunk HEC source configuration
@@ -453,14 +187,11 @@ fn build_hec_filter_condition(match_values: &[String], parser_name: &str) -> Str
     // `to_string(.source_type) ?? ""` coerces a missing/non-string field to
     // an empty string so `includes` doesn't error and drop the event for
     // the wrong reason.
-    format!(
-        "includes([{}], to_string(.source_type) ?? \"\")",
-        list
-    )
+    format!("includes([{}], to_string(.source_type) ?? \"\")", list)
 }
 
-/// Escape backslashes, double-quotes, and newlines for safe interpolation
-/// into a VRL double-quoted string literal.
+/// Escape backslashes, double-quotes, and control characters for safe
+/// interpolation into a VRL double-quoted string literal.
 pub(super) fn escape_vrl_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -469,6 +200,9 @@ pub(super) fn escape_vrl_string(s: &str) -> String {
             '"' => out.push_str("\\\""),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 || (c as u32) == 0x7f => {
+                out.push_str(&format!("\\u{:04x}", c as u32))
+            }
             _ => out.push(ch),
         }
     }
@@ -486,7 +220,11 @@ mod hec_filter_tests {
     #[test]
     fn build_filter_condition_lists_all_match_values() {
         let condition = build_hec_filter_condition(
-            &["apache_http_server".to_string(), "apache".to_string(), "apache_access".to_string()],
+            &[
+                "apache_http_server".to_string(),
+                "apache".to_string(),
+                "apache_access".to_string(),
+            ],
             "apache_http_server",
         );
         assert_eq!(
@@ -516,9 +254,15 @@ mod hec_filter_tests {
             &[r#"weird"\value"#.to_string(), "with\nnewline".to_string()],
             "p",
         );
-        assert!(condition.contains(r#""weird\"\\value""#), "got: {condition}");
+        assert!(
+            condition.contains(r#""weird\"\\value""#),
+            "got: {condition}"
+        );
         assert!(condition.contains(r#""with\nnewline""#), "got: {condition}");
-        assert!(!condition.contains('\n'), "literal newline leaked: {condition}");
+        assert!(
+            !condition.contains('\n'),
+            "literal newline leaked: {condition}"
+        );
     }
 }
 
@@ -537,8 +281,8 @@ mod hec_filter_tests {
 //   - When `dispatch_route_name` is `Some`, the kafka/aws_s3/gcp_pubsub
 //     branches emit a `filter` on that route (same shape as HEC), not a
 //     parser-owned source.
-//   - When `None`, fall back to the legacy parser-owned source so parsers
-//     imported pre-fix keep generating identical config.
+//   - When `None`, never emit a parser-owned transport. Deployment resolution
+//     rejects that state; direct generation remains source-free.
 
 #[cfg(test)]
 mod dispatch_source_tests {
@@ -553,11 +297,9 @@ mod dispatch_source_tests {
             name: "Apache HTTP Server".to_string(),
             description: None,
             source_type: source_type.to_string(),
-            source_config: serde_json::json!({}),
             parser_vrl: String::new(),
             output_fields: None,
             feed_id: None,
-            credential_id: None,
             dispatch_source_config_id: dispatch_route.map(|_| Uuid::new_v4()),
             dispatch_route_name: dispatch_route.map(|s| s.to_string()),
             enabled: true,
@@ -637,24 +379,25 @@ mod dispatch_source_tests {
         assert!(!config.contains("project ="));
     }
 
-    /// Backward-compat: a Kafka parser with no dispatch route still gets a
-    /// parser-owned Kafka source. Pre-NAN-928 imports rely on this.
+    /// A Kafka parser with no dispatch route must never recreate the removed
+    /// parser-owned transport path.
     #[test]
-    fn kafka_without_dispatch_route_falls_back_to_owned_source() {
+    fn kafka_without_dispatch_route_never_emits_owned_source() {
         let parser = make_parser("kafka", None);
-        let (config, _input) = run_generator(&parser);
+        let (config, input) = run_generator(&parser);
         assert!(
-            config.contains("type = \"kafka\""),
-            "expected parser-owned kafka source as fallback, got:\n{config}",
+            !config.contains("type = \"kafka\""),
+            "must not emit a parser-owned kafka source, got:\n{config}",
         );
         assert!(
-            config.contains("bootstrap_servers"),
-            "owned source must carry its own connection config, got:\n{config}",
+            !config.contains("bootstrap_servers"),
+            "must not carry embedded connection config, got:\n{config}",
         );
         assert!(
             !config.contains("type = \"filter\""),
             "must NOT emit a filter when no dispatch route is bound, got:\n{config}",
         );
+        assert_eq!(input, "source_router.apache_http_server");
     }
 
     /// NAN-1528: an `opentelemetry` parser fans out from the OOTB
@@ -698,7 +441,9 @@ mod dispatch_source_tests {
         let parser = make_parser("kafka", Some("kafka_route_x"));
         let (config, _input) = run_generator(&parser);
         assert!(
-            config.contains(r#"includes(["apache_access", "apache"], to_string(.source_type) ?? "")"#),
+            config.contains(
+                r#"includes(["apache_access", "apache"], to_string(.source_type) ?? "")"#
+            ),
             "expected source_type filter condition, got:\n{config}",
         );
     }

@@ -70,6 +70,7 @@ impl SearchService {
         &self,
         mut results: Vec<serde_json::Value>,
         prevalence_commands: &[PrevalenceCommandInfo],
+        artifact_scope: &crate::auth::ArtifactScope,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
         let prevalence_service = match &self.prevalence_service {
             Some(service) => service,
@@ -85,7 +86,12 @@ impl SearchService {
             if cmd.enrich {
                 // Enrichment mode: add _prevalence field to all results
                 results = self
-                    .apply_prevalence_enrichment(results, prevalence_service, time_window)
+                    .apply_prevalence_enrichment(
+                        results,
+                        prevalence_service,
+                        time_window,
+                        artifact_scope,
+                    )
                     .await?;
             } else if !cmd.conditions.is_empty() {
                 // Filtering mode: filter results based on prevalence conditions
@@ -99,6 +105,7 @@ impl SearchService {
                             &condition.operator,
                             &condition.threshold,
                             time_window,
+                            artifact_scope,
                         )
                         .await?;
                 }
@@ -120,6 +127,7 @@ impl SearchService {
         operator: &PrevalenceOperator,
         threshold: &PrevalenceThreshold,
         time_window: PrevalenceTimeWindow,
+        artifact_scope: &crate::auth::ArtifactScope,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
         if results.is_empty() {
             return Ok(results);
@@ -197,7 +205,7 @@ impl SearchService {
         let mut prevalence_map: std::collections::HashMap<String, u64> =
             std::collections::HashMap::new();
         match prevalence_service
-            .get_bulk_prevalence_via_dict(artifacts.as_slice(), time_window)
+            .get_bulk_prevalence_via_dict(artifacts.as_slice(), time_window, artifact_scope)
             .await
         {
             Ok(prevalence_data) => {
@@ -234,9 +242,14 @@ impl SearchService {
             .filter(|a| !prevalence_map.contains_key(&a.to_lowercase()))
             .cloned()
             .collect();
-        if !missing.is_empty() {
+        // Restricted "dict" lookups are already rerouted to the attributed
+        // summary because the dictionary has no source dimension. Their misses
+        // are therefore terminal; rescuing them would repeat the identical
+        // source-summary query. Unrestricted callers retain the real-time
+        // summary rescue for dictionary negative-cache misses.
+        if !missing.is_empty() && artifact_scope.is_unrestricted() {
             match prevalence_service
-                .get_bulk_summary_prevalence(&missing, time_window)
+                .get_bulk_summary_prevalence(&missing, time_window, artifact_scope)
                 .await
             {
                 Ok(rescued) => {
@@ -320,6 +333,7 @@ impl SearchService {
         mut results: Vec<serde_json::Value>,
         prevalence_service: &PrevalenceService,
         time_window: PrevalenceTimeWindow,
+        artifact_scope: &crate::auth::ArtifactScope,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
         if results.is_empty() {
             tracing::debug!("Prevalence enrichment: no results to enrich");
@@ -522,7 +536,7 @@ impl SearchService {
 
         if !combined.is_empty() {
             match prevalence_service
-                .get_bulk_prevalence_via_dict(&combined, time_window)
+                .get_bulk_prevalence_via_dict(&combined, time_window, artifact_scope)
                 .await
             {
                 Ok(data) => {
@@ -912,6 +926,7 @@ impl SearchService {
         scope: &crate::auth::ScopeSet,
     ) -> Result<crate::prevalence::PrevalenceScatterData, SearchError> {
         use crate::prevalence::{PrevalenceScatterData, TimeWindow};
+        let artifact_scope = crate::auth::ArtifactScope::from_scope(scope);
 
         // Need ClickHouse for this operation
         let clickhouse = self.ch_client.as_ref().ok_or_else(|| {
@@ -1143,7 +1158,7 @@ impl SearchService {
             let mut hash_points: Vec<PrevalenceScatterPoint> = Vec::new();
             for chunk in hashes.chunks(batch_size) {
                 let results = prevalence
-                    .get_bulk_prevalence(chunk, time_window)
+                    .get_bulk_prevalence(chunk, time_window, &artifact_scope)
                     .await
                     .map_err(|e| SearchError::PrevalenceError(e.to_string()))?;
                 hash_points.extend(results.into_iter().map(PrevalenceScatterPoint::from));
@@ -1153,7 +1168,7 @@ impl SearchService {
             let mut domain_points: Vec<PrevalenceScatterPoint> = Vec::new();
             for chunk in domains.chunks(batch_size) {
                 let results = prevalence
-                    .get_bulk_prevalence(chunk, time_window)
+                    .get_bulk_prevalence(chunk, time_window, &artifact_scope)
                     .await
                     .map_err(|e| SearchError::PrevalenceError(e.to_string()))?;
                 domain_points.extend(results.into_iter().map(PrevalenceScatterPoint::from));
@@ -1163,7 +1178,7 @@ impl SearchService {
             let mut ip_points: Vec<PrevalenceScatterPoint> = Vec::new();
             for chunk in ips.chunks(batch_size) {
                 let results = prevalence
-                    .get_bulk_prevalence(chunk, time_window)
+                    .get_bulk_prevalence(chunk, time_window, &artifact_scope)
                     .await
                     .map_err(|e| SearchError::PrevalenceError(e.to_string()))?;
                 ip_points.extend(results.into_iter().map(PrevalenceScatterPoint::from));

@@ -1,7 +1,7 @@
 {
   "name": "vite-react-typescript-starter",
   "private": true,
-  "version": "0.1.682",
+  "version": "0.1.683",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -13,6 +13,8 @@
     "test:tuning-contract": "node --test src/enterprise/api/tuning-response.test.mjs",
     "test:mitre-readiness": "node --test src/components/mitre/types.test.ts",
     "test:log-source-transports": "node --test src/lib/log-source-transports.test.ts",
+    "test:notification-permissions": "node --test src/components/notification-query-policy.test.ts",
+    "test:repository-permissions": "node --test src/components/repositories/repository-action-policy.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.app.json",
     "test:deadlinks": "node tests/e2e/check-dead-links.mjs",
     "test:e2e:404": "node tests/e2e/crawl-404.mjs"

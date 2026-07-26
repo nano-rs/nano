@@ -11,8 +11,8 @@ use uuid::Uuid;
 
 use crate::auth::password::hash_password;
 use crate::auth::types::{
-    builtin_groups, CreateUserRequest, GroupSummary, LandingPage, QueryMode,
-    SearchHubStyle, TimeRangePreset, UpdateUserRequest, User, UserPreferences,
+    builtin_groups, CreateUserRequest, GroupSummary, LandingPage, QueryMode, SearchHubStyle,
+    TimeRangePreset, UpdateUserRequest, User, UserPreferences,
 };
 
 #[derive(Error, Debug)]
@@ -31,6 +31,8 @@ pub enum UserRepositoryError {
     InvalidResetToken,
     #[error("Password reset token expired")]
     ResetTokenExpired,
+    #[error("grant authority changed during validation; retry the request")]
+    GrantAuthorityChanged,
 }
 
 /// Repository for user operations
@@ -104,6 +106,59 @@ impl UserRepository {
         Ok(user)
     }
 
+    /// Create a user and all requested memberships under the generation
+    /// returned by the authoritative privilege-grant validator.
+    pub async fn create_user_authorized(
+        &self,
+        request: &CreateUserRequest,
+        stamp: crate::auth::GrantAuthorityStamp,
+    ) -> Result<User, UserRepositoryError> {
+        let pwd = request.password.clone();
+        let password_hash = tokio::task::spawn_blocking(move || hash_password(&pwd))
+            .await
+            .map_err(|e| UserRepositoryError::PasswordHashError(e.to_string()))?
+            .map_err(|e| UserRepositoryError::PasswordHashError(e.to_string()))?;
+
+        let mut tx = self.pool.begin().await?;
+        if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
+            return Err(UserRepositoryError::GrantAuthorityChanged);
+        }
+        let user = sqlx::query_as::<_, User>(
+            r#"
+            INSERT INTO users (email, name, password_hash, status)
+            VALUES ($1, $2, $3, 'active')
+            RETURNING *
+            "#,
+        )
+        .bind(&request.email)
+        .bind(&request.name)
+        .bind(&password_hash)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(ref db_err) = e {
+                if db_err.constraint() == Some("users_email_key") {
+                    return UserRepositoryError::EmailExists(request.email.clone());
+                }
+            }
+            UserRepositoryError::DatabaseError(e)
+        })?;
+
+        for group_id in &request.group_ids {
+            if *group_id != builtin_groups::EVERYONE_ID {
+                sqlx::query(
+                    "INSERT INTO user_groups (user_id, group_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                )
+                .bind(user.id)
+                .bind(group_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(user)
+    }
+
     /// Get a user by ID
     pub async fn get_user_by_id(&self, id: Uuid) -> Result<User, UserRepositoryError> {
         sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
@@ -172,15 +227,25 @@ impl UserRepository {
         id: Uuid,
         request: &UpdateUserRequest,
     ) -> Result<User, UserRepositoryError> {
-        // Check if user exists
+        self.update_user_with_groups(id, request, None).await
+    }
+
+    /// Update a user's profile and, optionally, replace their group memberships
+    /// in a SINGLE transaction (NAN-2121). Committing the profile write and the
+    /// membership replacement together means a failure in EITHER rolls back the
+    /// whole request — the endpoint can no longer persist an
+    /// email/password/name/status change while the membership update fails (which
+    /// also skipped the success audit). `group_ids = None` leaves memberships
+    /// untouched; `Some(&[])` clears all non-Everyone memberships.
+    pub async fn update_user_with_groups(
+        &self,
+        id: Uuid,
+        request: &UpdateUserRequest,
+        group_ids: Option<&[Uuid]>,
+    ) -> Result<User, UserRepositoryError> {
+        // Read current values (for field defaults) and hash the password BEFORE
+        // opening the transaction (bcrypt is CPU-intensive → spawn_blocking).
         let existing = self.get_user_by_id(id).await?;
-
-        // Build update query dynamically
-        let email = request.email.as_ref().unwrap_or(&existing.email);
-        let name = request.name.as_ref().unwrap_or(&existing.name);
-        let status = request.status.as_ref().unwrap_or(&existing.status);
-
-        // Handle password update (use spawn_blocking as bcrypt is CPU-intensive)
         let password_hash = if let Some(ref new_password) = request.password {
             let pwd = new_password.clone();
             Some(
@@ -193,8 +258,65 @@ impl UserRepository {
             existing.password_hash.clone()
         };
 
+        let mut tx = self.pool.begin().await?;
+        let user =
+            Self::apply_profile_update_in(&mut tx, id, &existing, request, password_hash).await?;
+        if let Some(group_ids) = group_ids {
+            Self::replace_user_groups_in(&mut tx, id, group_ids).await?;
+        }
+        tx.commit().await?;
+        Ok(user)
+    }
+
+    /// Update profile fields and memberships only while the authoritative
+    /// privilege-grant generation remains current.
+    pub async fn update_user_with_groups_authorized(
+        &self,
+        id: Uuid,
+        request: &UpdateUserRequest,
+        group_ids: Option<&[Uuid]>,
+        stamp: crate::auth::GrantAuthorityStamp,
+    ) -> Result<User, UserRepositoryError> {
+        let existing = self.get_user_by_id(id).await?;
+        let password_hash = if let Some(ref new_password) = request.password {
+            let pwd = new_password.clone();
+            Some(
+                tokio::task::spawn_blocking(move || hash_password(&pwd))
+                    .await
+                    .map_err(|e| UserRepositoryError::PasswordHashError(e.to_string()))?
+                    .map_err(|e| UserRepositoryError::PasswordHashError(e.to_string()))?,
+            )
+        } else {
+            existing.password_hash.clone()
+        };
+
+        let mut tx = self.pool.begin().await?;
+        if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
+            return Err(UserRepositoryError::GrantAuthorityChanged);
+        }
+        let user =
+            Self::apply_profile_update_in(&mut tx, id, &existing, request, password_hash).await?;
+        if let Some(group_ids) = group_ids {
+            Self::replace_user_groups_in(&mut tx, id, group_ids).await?;
+        }
+        tx.commit().await?;
+        Ok(user)
+    }
+
+    /// Apply the profile-column update within a caller-provided transaction.
+    async fn apply_profile_update_in(
+        conn: &mut sqlx::PgConnection,
+        id: Uuid,
+        existing: &User,
+        request: &UpdateUserRequest,
+        password_hash: Option<String>,
+    ) -> Result<User, UserRepositoryError> {
+        let email = request.email.as_ref().unwrap_or(&existing.email);
+        let name = request.name.as_ref().unwrap_or(&existing.name);
+        let status = request.status.as_ref().unwrap_or(&existing.status);
+
         // Rely on unique constraint for email uniqueness (race-condition safe)
-        let user = sqlx::query_as::<_, User>(
+        sqlx::query_as::<_, User>(
             r#"
             UPDATE users SET
                 email = $2,
@@ -211,7 +333,7 @@ impl UserRepository {
         .bind(name)
         .bind(status)
         .bind(password_hash)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *conn)
         .await
         .map_err(|e| {
             // Check for unique constraint violation
@@ -221,13 +343,29 @@ impl UserRepository {
                 }
             }
             UserRepositoryError::DatabaseError(e)
-        })?;
-
-        Ok(user)
+        })
     }
 
     /// Delete a user
     pub async fn delete_user(&self, id: Uuid) -> Result<(), UserRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Serialize assignment with deletion before touching any dependent
+        // rows. A concurrent approval insert takes a foreign-key key-share lock
+        // on this row: it either commits before this lock (and is withdrawn
+        // below) or waits until deletion commits and then fails its FK check.
+        // Without the lock, an assignment could land after the withdrawal
+        // statement and be converted to an open approval by ON DELETE SET NULL.
+        let locked: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if locked.is_none() {
+            tx.rollback().await?;
+            return Err(UserRepositoryError::NotFound(id));
+        }
+
         // F-32: delete the user's API keys first. The api_keys.created_by FK is
         // ON DELETE SET NULL, which would orphan the keys (created_by => NULL)
         // and let them keep authenticating with the deleted user's permissions
@@ -235,18 +373,47 @@ impl UserRepository {
         // Removing them makes deletion a real revocation.
         sqlx::query("DELETE FROM api_keys WHERE created_by = $1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+
+        // NAN-2098: an assigned playbook approval must not become an OPEN
+        // approval when its reviewer is hard-deleted. The FK below is
+        // intentionally ON DELETE SET NULL, so terminalize pending assignments
+        // before deleting the user. Otherwise an API key (which has no human
+        // assignee claim) could answer the now-NULL row despite the
+        // human-only orphan-recovery rule.
+        //
+        // Keep this repository usable against minimal/auth-only schemas used by
+        // tests and tooling, where the enterprise playbook tables may not exist.
+        let approvals_exist: bool =
+            sqlx::query_scalar("SELECT to_regclass('public.playbook_approvals') IS NOT NULL")
+                .fetch_one(&mut *tx)
+                .await?;
+        if approvals_exist {
+            sqlx::query(
+                r#"UPDATE playbook_approvals
+                      SET status = 'withdrawn',
+                          response = COALESCE(
+                              response,
+                              'Assigned reviewer was deleted; resubmit for review'
+                          ),
+                          responded_at = NOW()
+                    WHERE approver_id = $1
+                      AND status = 'pending'"#,
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         let result = sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
-        if result.rows_affected() == 0 {
-            return Err(UserRepositoryError::NotFound(id));
-        }
+        debug_assert_eq!(result.rows_affected(), 1);
 
+        tx.commit().await?;
         Ok(())
     }
 
@@ -428,11 +595,52 @@ impl UserRepository {
         // Verify user exists
         self.get_user_by_id(user_id).await?;
 
+        // Replace atomically so a bad group_id (FK violation) cannot leave the
+        // user with their prior non-Everyone memberships already deleted
+        // (NAN-2121 partial-mutation hardening).
+        let mut tx = self.pool.begin().await?;
+        Self::replace_user_groups_in(&mut tx, user_id, group_ids).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Replace memberships under an authoritative privilege-grant generation.
+    pub async fn set_user_groups_authorized(
+        &self,
+        user_id: Uuid,
+        group_ids: &[Uuid],
+        stamp: crate::auth::GrantAuthorityStamp,
+    ) -> Result<(), UserRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
+            return Err(UserRepositoryError::GrantAuthorityChanged);
+        }
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)")
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if !exists {
+            return Err(UserRepositoryError::NotFound(user_id));
+        }
+        Self::replace_user_groups_in(&mut tx, user_id, group_ids).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Replace a user's non-Everyone group memberships within a caller-provided
+    /// transaction. Everyone (built-in) is deliberately preserved (`group_id !=
+    /// EVERYONE_ID`), so every user always retains baseline membership. Shared by
+    /// `set_user_groups` and `update_user_with_groups` so the two stay in lock-step.
+    async fn replace_user_groups_in(
+        conn: &mut sqlx::PgConnection,
+        user_id: Uuid,
+        group_ids: &[Uuid],
+    ) -> Result<(), UserRepositoryError> {
         // Remove existing group memberships (except Everyone)
         sqlx::query("DELETE FROM user_groups WHERE user_id = $1 AND group_id != $2")
             .bind(user_id)
             .bind(builtin_groups::EVERYONE_ID)
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
 
         // Add new group memberships
@@ -442,7 +650,7 @@ impl UserRepository {
             )
             .bind(user_id)
             .bind(group_id)
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
         }
 

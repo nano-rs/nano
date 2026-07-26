@@ -33,7 +33,10 @@ const SCALAR_SECRET_KEYS: &[&str] = &["password", "secret_access_key", "session_
 const ARRAY_SECRET_KEYS: &[&str] = &["valid_tokens"];
 
 /// Marker that replaces secret values in persisted snapshots.
-pub const REDACTED_PLACEHOLDER: &str = "***REDACTED***";
+///
+/// Re-exported from [`crate::config_secrets`] so snapshot masking and config-JSON
+/// masking (NAN-2067/2068/2069) share one sentinel.
+pub use crate::config_secrets::REDACTED_PLACEHOLDER;
 
 /// Return a copy of the Vector TOML with secret-bearing key/value lines
 /// scrubbed. Idempotent — safe to call on already-redacted output.

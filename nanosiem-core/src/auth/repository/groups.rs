@@ -24,6 +24,8 @@ pub enum GroupRepositoryError {
     CannotModifySystemGroup(String),
     #[error("Cannot delete system group: {0}")]
     CannotDeleteSystemGroup(String),
+    #[error("grant authority changed during validation; retry the request")]
+    GrantAuthorityChanged,
 }
 
 /// Repository for group operations
@@ -96,6 +98,51 @@ impl GroupRepository {
             .await?;
         }
 
+        Ok(group)
+    }
+
+    /// Create a group only if the authoritative grant snapshot is still
+    /// current, and keep the generation locked through the role assignments.
+    pub async fn create_group_authorized(
+        &self,
+        request: &CreateGroupRequest,
+        stamp: crate::auth::GrantAuthorityStamp,
+    ) -> Result<Group, GroupRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
+            return Err(GroupRepositoryError::GrantAuthorityChanged);
+        }
+
+        let group = sqlx::query_as::<_, Group>(
+            r#"
+            INSERT INTO groups (name, description, is_system)
+            VALUES ($1, $2, FALSE)
+            RETURNING *
+            "#,
+        )
+        .bind(&request.name)
+        .bind(&request.description)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(ref db_err) = e {
+                if db_err.constraint() == Some("groups_name_key") {
+                    return GroupRepositoryError::NameExists(request.name.clone());
+                }
+            }
+            GroupRepositoryError::DatabaseError(e)
+        })?;
+
+        for role_id in &request.role_ids {
+            sqlx::query(
+                "INSERT INTO group_roles (group_id, role_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            )
+            .bind(group.id)
+            .bind(role_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(group)
     }
 
@@ -194,6 +241,28 @@ impl GroupRepository {
         Ok(roles)
     }
 
+    /// Get the restricted `source_type` values this group is granted visibility
+    /// into (NAN-1797 per-source RBAC). Group membership therefore confers DATA
+    /// visibility beyond role permissions: any member sees these otherwise-hidden
+    /// sources. Used by the NAN-2121 privilege-grant validator so a source-scoped
+    /// caller cannot place an account in a group that can see a source the caller
+    /// itself is denied. Raw string values (not log_sources UUIDs); the caller
+    /// normalizes (trim + lowercase) before comparing, matching
+    /// `SourceScopeResolver`.
+    pub async fn get_group_source_type_grants(
+        &self,
+        group_id: Uuid,
+    ) -> Result<Vec<String>, GroupRepositoryError> {
+        let sources = sqlx::query_scalar::<_, String>(
+            "SELECT source_type FROM source_type_grants WHERE group_id = $1",
+        )
+        .bind(group_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(sources)
+    }
+
     /// Set roles for a group (replaces existing)
     /// Requirements: 6.2
     pub async fn set_group_roles(
@@ -201,26 +270,78 @@ impl GroupRepository {
         group_id: Uuid,
         role_ids: &[Uuid],
     ) -> Result<(), GroupRepositoryError> {
-        // Verify group exists
-        self.get_group(group_id).await?;
+        // Verify group exists. NAN-2121: the built-in Everyone group has a FIXED
+        // baseline role set that must not be mutated at runtime — a `groups:edit`
+        // principal passing an empty/reduced role_ids list would strip Everyone's
+        // seeded ReadOnly role and revoke baseline permissions for every user (the
+        // empty-list case even slips past the privilege-grant subset check, since
+        // granting nothing is vacuously allowed). Guard EVERYONE specifically:
+        // other system groups (Admins, and the Triage/Tier queue groups from
+        // migration 154, which set is_system only to prevent DELETION) legitimately
+        // accept role changes.
+        let group = self.get_group(group_id).await?;
+        if group_id == builtin_groups::EVERYONE_ID {
+            return Err(GroupRepositoryError::CannotModifySystemGroup(group.name));
+        }
 
-        // Remove existing role assignments
+        // Replace atomically so a bad role_id (FK violation) cannot leave the
+        // group with its old assignments already deleted (partial mutation).
+        let mut tx = self.pool.begin().await?;
+
         sqlx::query("DELETE FROM group_roles WHERE group_id = $1")
             .bind(group_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
-        // Add new role assignments
         for role_id in role_ids {
             sqlx::query(
                 "INSERT INTO group_roles (group_id, role_id) VALUES ($1, $2) ON CONFLICT DO NOTHING"
             )
             .bind(group_id)
             .bind(role_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         }
 
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Replace group roles under the generation returned by the authoritative
+    /// privilege-grant validator.
+    pub async fn set_group_roles_authorized(
+        &self,
+        group_id: Uuid,
+        role_ids: &[Uuid],
+        stamp: crate::auth::GrantAuthorityStamp,
+    ) -> Result<(), GroupRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
+            return Err(GroupRepositoryError::GrantAuthorityChanged);
+        }
+        let group = sqlx::query_as::<_, Group>("SELECT * FROM groups WHERE id = $1 FOR UPDATE")
+            .bind(group_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(GroupRepositoryError::NotFound(group_id))?;
+        if group_id == builtin_groups::EVERYONE_ID {
+            return Err(GroupRepositoryError::CannotModifySystemGroup(group.name));
+        }
+
+        sqlx::query("DELETE FROM group_roles WHERE group_id = $1")
+            .bind(group_id)
+            .execute(&mut *tx)
+            .await?;
+        for role_id in role_ids {
+            sqlx::query(
+                "INSERT INTO group_roles (group_id, role_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            )
+            .bind(group_id)
+            .bind(role_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 

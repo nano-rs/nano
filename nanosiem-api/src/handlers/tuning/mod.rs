@@ -28,6 +28,28 @@ pub use types::*;
 pub use versions::*;
 
 // =============================================================================
+// SHARED HELPERS
+// =============================================================================
+
+/// NAN-2085 / NAN-2088: the reader's effective per-source deny scope for AI
+/// tuning artifacts — the per-source RBAC deny set unioned with `audit` unless
+/// the caller holds `audit:view`, from the canonical
+/// `AuthContext::effective_source_deny_set()`.
+///
+/// Every route that can surface source-derived tuning data resolves the scope
+/// through this single helper: metrics, baselines, breach history, proposal
+/// list/detail/mutations, and logs that nest a proposal. That keeps current
+/// source restrictions authoritative for every persisted artifact.
+/// Background/system callers — the orchestrator, PR recovery, and scheduler —
+/// instead use `TuningScope::system()`; their execution scope is never a
+/// viewer's authorization.
+pub(crate) fn effective_tuning_scope(
+    auth: &crate::middleware::AuthContext,
+) -> nanosiem_core::tuning::scope::TuningScope {
+    nanosiem_core::tuning::scope::TuningScope::from_denied(&auth.effective_source_deny_set())
+}
+
+// =============================================================================
 // OPENAPI DOCUMENTATION
 // =============================================================================
 

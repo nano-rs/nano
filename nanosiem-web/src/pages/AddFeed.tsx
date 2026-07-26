@@ -729,7 +729,6 @@ export function AddFeed() {
         namespace: namespaceFull,
         timezone,
         source_type: 'routed',
-        source_config: {},
         // NAN-1906: carry the picked transport into the draft too, so a feed
         // later deployed from this draft still shows its real transport. May be
         // unset while the source config hasn't been chosen yet.
@@ -781,7 +780,6 @@ export function AddFeed() {
         namespace: namespaceFull,
         timezone,
         source_type: 'routed',
-        source_config: {},
         dispatch_source_config_id: sourceConfigId || undefined,
         parser_vrl: vrl,
         category: category || undefined,
@@ -877,7 +875,6 @@ export function AddFeed() {
         namespace: namespaceFull,
         timezone,
         source_type: 'routed',
-        source_config: {},
         dispatch_source_config_id: sourceConfigId,
         parser_vrl: vrl,
         category: category || undefined,

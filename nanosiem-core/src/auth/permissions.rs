@@ -88,6 +88,11 @@ pub const CREDENTIALS_VIEW: &str = "credentials:view";
 pub const CREDENTIALS_CREATE: &str = "credentials:create";
 pub const CREDENTIALS_EDIT: &str = "credentials:edit";
 pub const CREDENTIALS_DELETE: &str = "credentials:delete";
+/// Attach or use stored credential material in a runtime integration.
+///
+/// Deliberately separate from `credentials:view`: viewing credential metadata
+/// must not authorize a caller to cause secret material to be decrypted.
+pub const CREDENTIALS_USE: &str = "credentials:use";
 
 // Enrichment permissions
 pub const ENRICHMENTS_VIEW: &str = "enrichments:view";
@@ -293,6 +298,7 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     CREDENTIALS_CREATE,
     CREDENTIALS_EDIT,
     CREDENTIALS_DELETE,
+    CREDENTIALS_USE,
     // Enrichments
     ENRICHMENTS_VIEW,
     ENRICHMENTS_CONFIGURE,

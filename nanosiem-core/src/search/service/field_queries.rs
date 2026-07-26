@@ -295,13 +295,14 @@ impl SearchService {
             .generate(&field_values_query, &tr)
             .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
 
-        // Resolve the field to its physical access expression via the per-query
-        // dataset profile (NAN-1241/NAN-1559): OCSF promoted columns
-        // (`traffic.bytes_out`, `activity`) and spans/metrics map keys → the
-        // escaped dotted column / direct column / `attributes['k']`, not the UDM
-        // `ext.{field}` spill. Byte-identical for UDM (ExplicitColumn → bare
-        // column; Unknown → `ext.{field}`).
-        let field_expr = generator.field_access_expr(field, "String");
+        // Resolve the value returned to the endpoint through the per-query
+        // dataset profile. In addition to normal promoted/tail access
+        // (NAN-1241/NAN-1559), NAN-2149 makes this the shared display seam for
+        // both field-values endpoints: OCSF class-split concepts group on their
+        // indexed unified value, and numeric enums display their human label
+        // column/table. UDM has neither feature, so its expression — and thus its
+        // complete SQL — stays byte-identical.
+        let field_expr = generator.field_values_display_expr(field);
 
         // Build simple GROUP BY query for this single field
         let field_values_sql = ch_executor.build_field_values_sql(&base_sql, &field_expr, limit);
@@ -570,9 +571,18 @@ impl SearchService {
 
     /// Get top values for a specific UDM field
     ///
-    /// NAN-1799: previously applied NO source gate. The caller's deny-set is
-    /// now bound as a `text[]` parameter (`<> ALL($4)`) — parameterized, so no
-    /// literal-escaping concerns on the PostgreSQL path.
+    /// NAN-2146: top-values for a UDM field over the time window.
+    ///
+    /// Logs live only in ClickHouse; the PG-only log fallback was removed by
+    /// NAN-800, so the previous hand-built `FROM logs` PostgreSQL query 500'd
+    /// (`relation "logs" does not exist`) for every legitimate caller. Delegate
+    /// to the canonical ClickHouse field-values path ([`get_field_values`]) with
+    /// a match-all (`*`) query. That path resolves the field to its physical
+    /// column via the active schema profile, applies the NAN-1799 source-scope
+    /// deny-set, excludes empty ClickHouse defaults, and applies the top-N limit
+    /// inside the aggregate — none of which the removed PG query did. UDM is
+    /// exact; NAN-2149's shared display expression makes OCSF class-split concepts
+    /// and enum labels exact through this same delegation as well.
     #[instrument(skip(self, scope))]
     pub async fn get_udm_field_values(
         &self,
@@ -582,57 +592,13 @@ impl SearchService {
         scope: &ScopeSet,
     ) -> Result<Vec<(String, u64)>, SearchError> {
         time_range.validate()?;
-
-        let column = field.column_name();
         let limit = limit.unwrap_or(self.config.top_values_count);
 
-        // Values are lowercased once here; the predicate compares
-        // lower(source_type) so the gate is case-safe.
-        let denied: Vec<String> = scope
-            .deny_set()
-            .iter()
-            .map(|s| s.to_lowercase())
-            .collect();
-        let scope_clause = if denied.is_empty() {
-            ""
-        } else {
-            "AND lower(source_type) <> ALL($4)"
-        };
+        let values = self
+            .get_field_values(field.column_name(), "*", time_range, limit, None, scope)
+            .await?;
 
-        // Use PostgreSQL for this query
-        let sql = format!(
-            r#"
-            SELECT "{}" as value, COUNT(*) as count
-            FROM logs
-            WHERE timestamp BETWEEN $1 AND $2
-              AND "{}" IS NOT NULL
-              {}
-            GROUP BY "{}"
-            ORDER BY count DESC
-            LIMIT $3
-            "#,
-            column, column, scope_clause, column
-        );
-
-        let mut query = sqlx::query(&sql)
-            .bind(time_range.start)
-            .bind(time_range.end)
-            .bind(limit as i64);
-        if !denied.is_empty() {
-            query = query.bind(denied);
-        }
-        let rows = query.fetch_all(&self.pg_pool).await?;
-
-        let values: Vec<(String, u64)> = rows
-            .iter()
-            .map(|row| {
-                let value: String = row.try_get("value").unwrap_or_default();
-                let count: i64 = row.try_get("count").unwrap_or(0);
-                (value, count as u64)
-            })
-            .collect();
-
-        Ok(values)
+        Ok(values.into_iter().map(|v| (v.value, v.count)).collect())
     }
 
     /// Validate a regex pattern for safety and correctness
@@ -866,6 +832,91 @@ mod tests {
     /// (the old `exclude_audit: true`).
     fn audit_scope() -> BTreeSet<String> {
         std::iter::once("audit".to_string()).collect()
+    }
+
+    fn field_values_sql(
+        generator: &ClickHouseSqlGenerator,
+        table: &str,
+        field: &str,
+    ) -> String {
+        let executor = ClickHouseExecutor::new(clickhouse::Client::default());
+        let base_sql = format!(
+            "SELECT * FROM {table} ORDER BY timestamp DESC SETTINGS optimize_read_in_order=1"
+        );
+        executor.build_field_values_sql(
+            &base_sql,
+            &generator.field_values_display_expr(field),
+            25,
+        )
+    }
+
+    /// NAN-2149 endpoint-path snapshot: both POST /api/search/field-values and
+    /// GET /api/fields/{name}/values reach this shared SQL builder. An OCSF UDM
+    /// alias must aggregate the indexed class-spanning value, not `user.name`.
+    #[test]
+    fn ocsf_field_values_sql_groups_class_split_user_on_unified_value() {
+        let generator = ClickHouseSqlGenerator::new().with_profile(std::sync::Arc::new(
+            crate::schema::OcsfProfile::new(),
+        ));
+        assert_eq!(
+            field_values_sql(&generator, "ocsf_logs", "user"),
+            "SELECT toString(user_unified) as value, count() as cnt FROM \
+             (SELECT * FROM ocsf_logs) AS _fv WHERE user_unified IS NOT NULL AND \
+             toString(user_unified) != '' GROUP BY value ORDER BY cnt DESC LIMIT 25"
+        );
+    }
+
+    /// NAN-2149 endpoint-path snapshot: class-scoped activity IDs group on the
+    /// human sibling label. The already-native label spelling is identical.
+    #[test]
+    fn ocsf_field_values_sql_groups_event_type_and_activity_on_label() {
+        let generator = ClickHouseSqlGenerator::new().with_profile(std::sync::Arc::new(
+            crate::schema::OcsfProfile::new(),
+        ));
+        let expected = "SELECT toString(activity) as value, count() as cnt FROM \
+                        (SELECT * FROM ocsf_logs) AS _fv WHERE activity IS NOT NULL AND \
+                        toString(activity) != '' GROUP BY value ORDER BY cnt DESC LIMIT 25";
+        assert_eq!(
+            field_values_sql(&generator, "ocsf_logs", "event_type"),
+            expected
+        );
+        assert_eq!(
+            field_values_sql(&generator, "ocsf_logs", "activity"),
+            expected
+        );
+    }
+
+    /// NAN-2149 endpoint-path snapshot: a fixed numeric enum is decoded before
+    /// projection, filtering, and grouping, so callers receive labels and counts
+    /// are combined by the returned display value.
+    #[test]
+    fn ocsf_field_values_sql_groups_severity_ids_on_labels() {
+        let generator = ClickHouseSqlGenerator::new().with_profile(std::sync::Arc::new(
+            crate::schema::OcsfProfile::new(),
+        ));
+        let transform = "transform(severity_id, [0, 1, 2, 3, 4, 5, 6, 99], \
+                         ['unknown', 'informational', 'low', 'medium', 'high', \
+                         'critical', 'fatal', 'other'], toString(severity_id))";
+        assert_eq!(
+            field_values_sql(&generator, "ocsf_logs", "severity_id"),
+            format!(
+                "SELECT toString({transform}) as value, count() as cnt FROM \
+                 (SELECT * FROM ocsf_logs) AS _fv WHERE {transform} IS NOT NULL AND \
+                 toString({transform}) != '' GROUP BY value ORDER BY cnt DESC LIMIT 25"
+            )
+        );
+    }
+
+    /// NAN-2149 UDM parity snapshot: the shared display seam must not alter even
+    /// one byte of the complete field-values aggregate under the default profile.
+    #[test]
+    fn udm_field_values_sql_remains_byte_identical() {
+        assert_eq!(
+            field_values_sql(&ClickHouseSqlGenerator::new(), "logs", "user"),
+            "SELECT toString(\"user\") as value, count() as cnt FROM \
+             (SELECT * FROM logs) AS _fv WHERE \"user\" IS NOT NULL AND \
+             toString(\"user\") != '' GROUP BY value ORDER BY cnt DESC LIMIT 25"
+        );
     }
 
     /// NAN-1427: requested-columns reduction — exact-match intersection with

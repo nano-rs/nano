@@ -33,6 +33,7 @@ import { importParserBundle } from '@/lib/api/airgap';
 import { cn } from '@/lib/utils';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useToast } from '@/hooks/use-toast';
+import { useAuth } from '@/contexts/AuthContext';
 import { api } from '@/lib/api';
 import type {
   CreateParserRepositoryRequest,
@@ -59,6 +60,19 @@ import {
   type ParserRepoView,
   type RepoParserView,
 } from '@/components/parser-repositories/helpers';
+import { PermissionAction } from '@/components/repositories/PermissionAction';
+import {
+  logSourceViewAccess,
+  logSourceDeployAccess,
+  parserApplyAccess,
+  parserDiffAccess,
+  parserDismissAccess,
+  parserImportAccess,
+  parserPreviewAccess,
+  repositoryQueryEnabled,
+  sourceConfigInventoryAccess,
+  type ActionAccess,
+} from '@/components/repositories/repository-action-policy';
 
 // Maps a SourceConfiguration.config_type to the source_type / ingestion_method
 // values the parser-import endpoint expects. Mirrors the legacy SOURCE_TYPE_MAP.
@@ -76,6 +90,15 @@ export function ParserRepositories() {
   const { toast } = useToast();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const { hasPermission } = useAuth();
+  const previewAccess = parserPreviewAccess(hasPermission);
+  const diffAccess = parserDiffAccess(hasPermission);
+  const dismissAccess = parserDismissAccess(hasPermission);
+  const applyAccess = parserApplyAccess(hasPermission);
+  const updateAndDeployAccess = parserApplyAccess(hasPermission, true);
+  const viewLogSourceAccess = logSourceViewAccess(hasPermission);
+  const deployAccess = logSourceDeployAccess(hasPermission);
+  const configInventoryAccess = sourceConfigInventoryAccess(hasPermission);
 
   // Air-gap mode: parser repositories sync from Git over the internet, which is
   // unavailable offline. The page stays usable (browse + import); the egress
@@ -157,11 +180,24 @@ export function ParserRepositories() {
     enabled: !!activeRepoId,
   });
 
-  const { data: deployedConfigs = [] } = useQuery<SourceConfiguration[]>({
-    queryKey: ['source-configs-deployed'],
-    queryFn: () => api.listSourceConfigs({ deployed: true }),
+  const { data: cachedSourceConfigs = [] } = useQuery<SourceConfiguration[]>({
+    queryKey: ['source-configs-repository-import'],
+    queryFn: () => api.listSourceConfigs(),
+    enabled: repositoryQueryEnabled(configInventoryAccess),
     staleTime: 60_000,
   });
+  const sourceConfigs = useMemo(
+    // A disabled query may still expose data cached before a role change.
+    () => (configInventoryAccess.allowed ? cachedSourceConfigs : []),
+    [cachedSourceConfigs, configInventoryAccess.allowed],
+  );
+  const deployedConfigs = useMemo(
+    () => sourceConfigs.filter((config) => config.deployed),
+    [sourceConfigs],
+  );
+  const sourceConfigTypes = configInventoryAccess.allowed
+    ? sourceConfigs.map((config) => config.config_type)
+    : null;
 
   // When the active repo finishes syncing, refresh parser list + upstream
   // updates and show a result toast (count of pending upstream changes if any).
@@ -243,6 +279,83 @@ export function ParserRepositories() {
   );
   const categories = categoryCounts(parserViews);
 
+  const ingestionMethodForConfig = (configId: string | null): string => {
+    const selectedConfig = sourceConfigs.find((config) => config.id === configId);
+    return selectedConfig
+      ? (SOURCE_TYPE_MAP[selectedConfig.config_type]?.sourceType ?? 'routed')
+      : 'routed';
+  };
+
+  const importAccessForParser = (
+    parser: RepoParserView,
+    configId: string | null = null,
+    ingestionMethod = ingestionMethodForConfig(configId),
+  ): ActionAccess =>
+    parserImportAccess(
+      hasPermission,
+      [
+        {
+          kind: parser.raw.kind,
+          ingestionMethod,
+          dispatchSourceConfigId: configId,
+        },
+      ],
+      sourceConfigTypes,
+    );
+
+  const visibleSelectedConfigId = configInventoryAccess.allowed ? selectedConfigId : null;
+  const selectedImportAccess = selectedParser
+    ? importAccessForParser(selectedParser, visibleSelectedConfigId)
+    : parserImportAccess(hasPermission, [], sourceConfigTypes);
+
+  const getParserActionAccess = (parser: RepoParserView): ActionAccess => {
+    if (parser.status === 'IMPORTED') return viewLogSourceAccess;
+    if (parser.status === 'DRIFT') return diffAccess;
+    if (parser.status === 'UPDATED') return updateAndDeployAccess;
+    if (parser.status === 'DELETED') return previewAccess;
+    return importAccessForParser(parser);
+  };
+
+  const bulkImportAccess = parserImportAccess(
+    hasPermission,
+    selectedRawParsers.map((parser) => ({
+      kind: parser.kind,
+      ingestionMethod: 'routed',
+    })),
+    sourceConfigTypes,
+  );
+
+  const accessForBatchItems = (
+    items: {
+      path: string;
+      ingestion_method?: string;
+      dispatch_source_config_id?: string | null;
+    }[],
+  ): ActionAccess =>
+    parserImportAccess(
+      hasPermission,
+      items.flatMap((item) => {
+        const parser = parsersData.find((candidate) => candidate.file_path === item.path);
+        if (!parser) return [];
+        return [
+          {
+            kind: parser.kind,
+            ingestionMethod: item.ingestion_method,
+            dispatchSourceConfigId: item.dispatch_source_config_id,
+          },
+        ];
+      }),
+      sourceConfigTypes,
+    );
+
+  const showDeniedAction = (title: string, access: ActionAccess) => {
+    toast({
+      title,
+      description: access.reason ?? 'This action is not available.',
+      variant: 'destructive',
+    });
+  };
+
   // ----------------------------------------------------------------
   // Preview state — reset when a different parser is selected
   // ----------------------------------------------------------------
@@ -281,6 +394,7 @@ export function ParserRepositories() {
   useEffect(() => {
     if (!activeRepoId || !selectedParser) return;
     if (selectedParser.status === 'IMPORTED' || selectedParser.status === 'DELETED') return;
+    if (!previewAccess.allowed) return;
     previewMutation.mutate({ repoId: activeRepoId, path: selectedParser.raw.file_path });
   }, [selectedParserId, activeRepoId]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -464,6 +578,12 @@ export function ParserRepositories() {
   };
 
   const handleRowAction = (parser: RepoParserView) => {
+    const access = getParserActionAccess(parser);
+    if (!access.allowed) {
+      showDeniedAction('Action unavailable', access);
+      return;
+    }
+
     if (parser.status === 'IMPORTED') {
       const id = parser.raw.linked_log_source_id;
       if (id) navigate(`/ingestion/log-sources/${id}`);
@@ -502,6 +622,10 @@ export function ParserRepositories() {
 
   const handleImport = () => {
     if (!activeRepoId || !selectedParser) return;
+    if (!selectedImportAccess.allowed) {
+      showDeniedAction('Import unavailable', selectedImportAccess);
+      return;
+    }
     // NAN-1149: enrichment parsers route by enrich_source into target_table —
     // they have no source-type routing rule and no dispatch config. Force both
     // to empty so the mutation skips routing-rule creation and dispatch wiring,
@@ -510,7 +634,7 @@ export function ParserRepositories() {
     importMutation.mutate({
       repoId: activeRepoId,
       path: selectedParser.raw.file_path,
-      configId: isEnrichment ? null : selectedConfigId,
+      configId: isEnrichment ? null : visibleSelectedConfigId,
       sourceType: isEnrichment ? '' : sourceTypeInput,
       mode: importMode,
     });
@@ -662,6 +786,7 @@ export function ParserRepositories() {
               onQueryChange={setQuery}
               onBulkImport={() => setBulkOpen(true)}
               onBulkClear={() => setSelected(new Set())}
+              bulkImportAccess={bulkImportAccess}
             />
             <FilterRow categories={categories} activeId={activeCat} onActivate={setActiveCat} />
             {upstreamCount > 0 && activeCat !== 'updated' && (
@@ -673,12 +798,14 @@ export function ParserRepositories() {
                 onReview={() => setActiveCat('updated')}
                 running={updateAndDeployAllMutation.isPending}
                 progress={updateDeployProgress}
+                updateAccess={updateAndDeployAccess}
               />
             )}
             {showUpstreamList && upstreamData && upstreamData.updates.length > 0 && (
               <UpstreamList
                 updates={upstreamData.updates}
                 onViewDiff={(id) => setDiffModalLogSourceId(id)}
+                diffAccess={diffAccess}
               />
             )}
             {parsersLoading ? (
@@ -694,6 +821,7 @@ export function ParserRepositories() {
                 onToggleSelectAll={toggleSelectAll}
                 onSelectParser={setSelectedParserId}
                 onAction={handleRowAction}
+                getActionAccess={getParserActionAccess}
                 activeCat={activeCat}
               />
             )}
@@ -706,7 +834,7 @@ export function ParserRepositories() {
               previewLoading={previewMutation.isPending}
               importMode={importMode}
               onChangeImportMode={setImportMode}
-              selectedConfigId={selectedConfigId}
+              selectedConfigId={visibleSelectedConfigId}
               onChangeConfigId={setSelectedConfigId}
               sourceTypeInput={sourceTypeInput}
               onChangeSourceType={setSourceTypeInput}
@@ -716,6 +844,9 @@ export function ParserRepositories() {
               onClose={() => setSelectedParserId(null)}
               onViewDiff={(id) => setDiffModalLogSourceId(id)}
               onOpenLogSource={(id) => navigate(`/ingestion/log-sources/${id}`)}
+              importAccess={selectedImportAccess}
+              diffAccess={diffAccess}
+              openLogSourceAccess={viewLogSourceAccess}
             />
           )}
         </div>
@@ -739,6 +870,7 @@ export function ParserRepositories() {
             queryClient.invalidateQueries({ queryKey: ['parser-repository-parsers', activeRepoId] });
             queryClient.invalidateQueries({ queryKey: ['log-sources'] });
           }}
+          getImportAccess={accessForBatchItems}
         />
 
         {diffModalLogSourceId && (
@@ -748,6 +880,10 @@ export function ParserRepositories() {
             onOpenChange={(open) => {
               if (!open) setDiffModalLogSourceId(null);
             }}
+            diffAccess={diffAccess}
+            dismissAccess={dismissAccess}
+            applyAccess={applyAccess}
+            deployAccess={deployAccess}
           />
         )}
 
@@ -777,6 +913,7 @@ function UpstreamBanner({
   onReview,
   running,
   progress,
+  updateAccess,
 }: {
   count: number;
   expanded: boolean;
@@ -785,6 +922,7 @@ function UpstreamBanner({
   onReview: () => void;
   running: boolean;
   progress: string | null;
+  updateAccess: ActionAccess;
 }) {
   return (
     <div className="border-b border-warning/30 bg-warning/5 px-3.5 py-2 flex items-center gap-2">
@@ -812,29 +950,31 @@ function UpstreamBanner({
         Filter <ArrowUpRight className="w-[10px] h-[10px]" strokeWidth={1.5} />
       </button>
       <span className="flex-1" />
-      <button
-        type="button"
-        onClick={onUpdateAll}
-        disabled={running}
-        className={cn(
-          'h-[26px] px-2.5 rounded-md text-[11.5px] font-medium flex items-center gap-1.5',
-          running
-            ? 'bg-primary/60 text-primary-foreground cursor-not-allowed'
-            : 'bg-primary text-primary-foreground hover:bg-primary/90',
-        )}
-      >
-        {running ? (
-          <>
-            <Loader2 className="w-[11px] h-[11px] animate-spin" strokeWidth={1.5} />
-            {progress ?? 'Working…'}
-          </>
-        ) : (
-          <>
-            <Rocket className="w-[11px] h-[11px]" strokeWidth={1.5} />
-            Update & Deploy All
-          </>
-        )}
-      </button>
+      <PermissionAction access={updateAccess}>
+        <button
+          type="button"
+          onClick={onUpdateAll}
+          disabled={running || !updateAccess.allowed}
+          className={cn(
+            'h-[26px] px-2.5 rounded-md text-[11.5px] font-medium flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed',
+            running
+              ? 'bg-primary/60 text-primary-foreground cursor-not-allowed'
+              : 'bg-primary text-primary-foreground hover:bg-primary/90',
+          )}
+        >
+          {running ? (
+            <>
+              <Loader2 className="w-[11px] h-[11px] animate-spin" strokeWidth={1.5} />
+              {progress ?? 'Working…'}
+            </>
+          ) : (
+            <>
+              <Rocket className="w-[11px] h-[11px]" strokeWidth={1.5} />
+              Update & Deploy All
+            </>
+          )}
+        </button>
+      </PermissionAction>
     </div>
   );
 }
@@ -842,9 +982,11 @@ function UpstreamBanner({
 function UpstreamList({
   updates,
   onViewDiff,
+  diffAccess,
 }: {
   updates: NonNullable<Awaited<ReturnType<typeof api.parserRepositories.getUpstreamUpdates>>>['updates'];
   onViewDiff: (logSourceId: string) => void;
+  diffAccess: ActionAccess;
 }) {
   return (
     <div className="border-b border-border bg-card/30 px-3.5 py-2 max-h-[260px] overflow-y-auto space-y-1.5">
@@ -862,14 +1004,17 @@ function UpstreamList({
           <span className="font-mono text-[9px] uppercase tracking-wider text-muted-foreground border border-border rounded px-1 py-px ml-2">
             {u.import_type}
           </span>
-          <button
-            type="button"
-            onClick={() => onViewDiff(u.log_source_id)}
-            className="ml-2 h-[24px] px-2 rounded-md border border-border bg-card hover:bg-muted text-[10.5px] font-mono text-foreground/70 inline-flex items-center gap-1"
-          >
-            <Eye className="w-[10px] h-[10px]" strokeWidth={1.5} />
-            View diff
-          </button>
+          <PermissionAction access={diffAccess}>
+            <button
+              type="button"
+              onClick={() => onViewDiff(u.log_source_id)}
+              disabled={!diffAccess.allowed}
+              className="ml-2 h-[24px] px-2 rounded-md border border-border bg-card hover:bg-muted text-[10.5px] font-mono text-foreground/70 inline-flex items-center gap-1 disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              <Eye className="w-[10px] h-[10px]" strokeWidth={1.5} />
+              View diff
+            </button>
+          </PermissionAction>
         </div>
       ))}
     </div>

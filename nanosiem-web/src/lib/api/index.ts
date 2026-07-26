@@ -969,6 +969,10 @@ class ApiClient {
   }
 
   // AI Providers (LiteLLM multi-provider support)
+  async getAiAvailability(): Promise<import('./types').AiAvailability> {
+    return this._melod.getAiAvailability();
+  }
+
   async listAiProviders(): Promise<import('./types').ProviderCredentials[]> {
     return this._melod.listAiProviders();
   }

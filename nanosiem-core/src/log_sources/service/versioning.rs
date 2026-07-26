@@ -138,10 +138,7 @@ impl LogSourceService {
         // Update working copy to match reverted version
         // Pass empty string for extension_vrl when target had None — the COALESCE
         // pattern in repository::update interprets empty string as "set NULL".
-        let extension_vrl_for_update = target
-            .extension_vrl
-            .clone()
-            .or_else(|| Some(String::new()));
+        let extension_vrl_for_update = target.extension_vrl.clone().or_else(|| Some(String::new()));
         self.repository()
             .update(
                 log_source_id,
@@ -186,10 +183,7 @@ impl LogSourceService {
         // Restore extension state too. None in the snapshot means "no extension on
         // the active version" — use empty string to drive the repository COALESCE
         // pattern that clears the column.
-        let extension_vrl_for_update = active
-            .extension_vrl
-            .clone()
-            .or_else(|| Some(String::new()));
+        let extension_vrl_for_update = active.extension_vrl.clone().or_else(|| Some(String::new()));
 
         let updated = self
             .repository()

@@ -14,6 +14,7 @@ import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
 import { Sheet, SheetContent } from '@/components/ui/sheet';
 import { PreviewModal } from './PreviewModal';
+import { useAuth } from '@/contexts/AuthContext';
 import { api } from '@/lib/api';
 import type { CredentialFieldDef, MarketplaceCatalogEntry } from '@/lib/api/marketplace';
 import { useToast } from '@/hooks/use-toast';
@@ -40,6 +41,10 @@ interface MarketplaceDrawerProps {
 
 export function MarketplaceDrawer({ slug, open, onOpenChange, onUpdated }: MarketplaceDrawerProps) {
   const { toast } = useToast();
+  const { hasPermission } = useAuth();
+  const canPreview = hasPermission('enrichments:configure');
+  const canViewCode =
+    hasPermission('enrichments:view') && hasPermission('enrichments:code');
   // Air-gap mode — shared cache with the catalog page's query key. When the
   // entry needs network, the egress "Sync now" action is replaced by an
   // import-from-file route so the drawer stays honest offline (NAN-1212).
@@ -215,6 +220,7 @@ export function MarketplaceDrawer({ slug, open, onOpenChange, onUpdated }: Marke
           ) : (
             <DrawerInner
               entry={entry}
+              canViewCode={canViewCode}
               airGap={airGap}
               tab={tab}
               setTab={setTab}
@@ -235,6 +241,7 @@ export function MarketplaceDrawer({ slug, open, onOpenChange, onUpdated }: Marke
               updating={updating}
               exporting={exporting}
               savingCreds={savingCreds}
+              canPreview={canPreview}
               onOpenPreview={() => setPreviewOpen(true)}
             />
           )}
@@ -252,6 +259,7 @@ export function MarketplaceDrawer({ slug, open, onOpenChange, onUpdated }: Marke
 
 interface DrawerInnerProps {
   entry: MarketplaceCatalogEntry;
+  canViewCode: boolean;
   airGap: boolean;
   tab: TabId;
   setTab: (t: TabId) => void;
@@ -272,16 +280,18 @@ interface DrawerInnerProps {
   updating: boolean;
   exporting: boolean;
   savingCreds: boolean;
+  canPreview: boolean;
   onOpenPreview: () => void;
 }
 
 function DrawerInner(props: DrawerInnerProps) {
   const {
-    entry, airGap, tab, setTab,
+    entry, canViewCode, airGap, tab, setTab,
     credentials, setCredentials, credsDirty, markCredsDirty,
     showSecrets, setShowSecrets, generateToken,
     handleToggleEnabled, handleSync, handleUninstall, handleUpdate, handleExport, handleSaveCredentials,
     syncing, updating, exporting, savingCreds,
+    canPreview,
     onOpenPreview,
   } = props;
 
@@ -315,7 +325,7 @@ function DrawerInner(props: DrawerInnerProps) {
 
       {/* Tabs */}
       <div className="border-b border-border flex items-center px-2 bg-muted/20">
-        {TABS.map(t => {
+        {TABS.filter(t => t.id !== 'code' || canViewCode).map(t => {
           const Tg = t.icon;
           return (
             <button
@@ -335,8 +345,14 @@ function DrawerInner(props: DrawerInnerProps) {
         <button
           type="button"
           onClick={onOpenPreview}
-          disabled={!entry.installed}
-          title={entry.installed ? 'Run the enrichment against a sample artifact' : 'Install first to preview'}
+          disabled={!entry.installed || !canPreview}
+          title={
+            !canPreview
+              ? 'Requires permission to configure enrichments'
+              : entry.installed
+                ? 'Run the enrichment against a sample artifact'
+                : 'Install first to preview'
+          }
           className="h-7 px-2 rounded text-[11px] text-muted-foreground hover:text-foreground hover:bg-muted/40 disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1 font-mono"
         >
           <Eye className="w-[11px] h-[11px]" /> preview output
@@ -368,7 +384,9 @@ function DrawerInner(props: DrawerInnerProps) {
             updating={updating}
           />
         )}
-        {tab === 'code' && <CodeTab entry={entry} handleExport={handleExport} exporting={exporting} />}
+        {tab === 'code' && canViewCode && (
+          <CodeTab entry={entry} handleExport={handleExport} exporting={exporting} />
+        )}
         {tab === 'perms' && <PermissionsTab entry={entry} />}
       </div>
 

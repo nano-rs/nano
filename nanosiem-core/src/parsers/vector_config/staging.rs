@@ -320,50 +320,7 @@ impl VectorConfigManager {
         let staging_parsers_dir = self.staging_dir.join("sources").join("parsers");
         fs::create_dir_all(&staging_parsers_dir).await?;
         let combiner_path = staging_parsers_dir.join("_combiner.toml");
-
-        let enabled_parsers: Vec<_> = parsers.iter().filter(|p| p.enabled).collect();
-
-        let mut config = String::from(
-            "# Auto-generated combiner for all DB parsers\n\
-             # DO NOT EDIT - changes will be overwritten\n\n",
-        );
-
-        if enabled_parsers.is_empty() {
-            // No parsers enabled — use a filter that drops everything so Vector
-            // has a valid input (empty inputs = [] is rejected by Vector).
-            config.push_str(
-                "# No enabled parsers\n\
-                 [transforms.db_parsers_combined]\n\
-                 type = \"filter\"\n\
-                 inputs = [\"prepare_output\"]\n\
-                 condition = \"false\"\n",
-            );
-        } else {
-            let inputs: Vec<String> = enabled_parsers
-                .iter()
-                .map(|p| {
-                    let safe = Self::safe_name(&p.name);
-                    let has_sampling = p
-                        .sampling_ratio
-                        .map(|r| r > 0.0 && r < 1.0)
-                        .unwrap_or(false);
-                    if has_sampling {
-                        format!("\"{}_sample\"", safe)
-                    } else {
-                        format!("\"{}_output\"", safe)
-                    }
-                })
-                .collect();
-
-            config.push_str(&format!(
-                "[transforms.db_parsers_combined]\n\
-                 type = \"remap\"\n\
-                 inputs = [{}]\n\
-                 source = '''\n. = .\n'''\n",
-                inputs.join(", ")
-            ));
-        }
-
+        let config = Self::combiner_config_content_for(parsers, Self::ocsf_mode());
         fs::write(&combiner_path, &config).await?;
         Ok(())
     }

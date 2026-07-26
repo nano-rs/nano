@@ -1,5 +1,6 @@
 //! Attack scenarios for the injector tool
 
+pub mod drive_by;
 pub mod exfil;
 pub mod lateral;
 pub mod persistence;

@@ -17,6 +17,7 @@ use super::types::{
     SourceConfigDeployment, SourceConfigType, SourceConfiguration, SourceConfigurationWithRules,
     UpdateRoutingRule, UpdateSourceConfiguration,
 };
+use crate::auth::CredentialUseGrant;
 use crate::log_telemetry::repository::is_safe_source_type;
 use crate::parsers::{
     base_router_inputs, hec_normalize_present, redact_config_snapshot, CredentialRepository,
@@ -50,6 +51,8 @@ pub enum SourceConfigServiceError {
     DeploymentFailed(String),
     #[error("Credential error: {0}")]
     CredentialError(String),
+    #[error("Missing permission: credentials:use")]
+    CredentialUseRequired,
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
     #[error("Credentials backend error: {0}")]
@@ -169,32 +172,57 @@ impl SourceConfigService {
     // Source Configuration CRUD
     // ========================================================================
 
-    /// List source configurations
+    // NAN-2067: every public read below returns a REDACTED row. These methods
+    // exist to serve HTTP handlers; deploy/generation paths inside this service
+    // read plaintext straight from `self.repository` (see `list_deployed` /
+    // `list_enabled` in the deploy section), so masking here cannot starve
+    // config generation of real credentials.
+
+    /// List source configurations, with `connection_config` secrets masked.
     pub async fn list(
         &self,
         params: Option<ListParams>,
     ) -> Result<Vec<SourceConfiguration>, SourceConfigServiceError> {
-        Ok(self.repository.list(params).await?)
+        Ok(self
+            .repository
+            .list(params)
+            .await?
+            .into_iter()
+            .map(SourceConfiguration::redacted)
+            .collect())
     }
 
-    /// Get a source configuration by ID
+    /// Get a source configuration by ID, with `connection_config` secrets masked.
     pub async fn get(&self, id: Uuid) -> Result<SourceConfiguration, SourceConfigServiceError> {
-        Ok(self.repository.get(id).await?)
+        Ok(self.repository.get(id).await?.redacted())
     }
 
-    /// Get a source configuration with its routing rules
+    /// Get a source configuration with its routing rules, with
+    /// `connection_config` secrets masked.
     pub async fn get_with_rules(
         &self,
         id: Uuid,
     ) -> Result<SourceConfigurationWithRules, SourceConfigServiceError> {
-        Ok(self.repository.get_with_rules(id).await?)
+        Ok(self.repository.get_with_rules(id).await?.redacted())
     }
 
     /// Create a new source configuration
     pub async fn create(
         &self,
-        request: NewSourceConfiguration,
+        mut request: NewSourceConfiguration,
+        credential_use: CredentialUseGrant,
     ) -> Result<SourceConfiguration, SourceConfigServiceError> {
+        // Authorization precedes validation and credential metadata lookup so
+        // an under-scoped caller cannot probe whether a credential ID exists.
+        Self::ensure_credential_use(request.credential_id, credential_use)?;
+
+        // NAN-2067: a client that copied a redacted read (or a UI that echoes
+        // the mask on a "save as new") would otherwise persist the literal
+        // placeholder as if it were the secret. There is no stored row to
+        // restore from on create, so masked keys are dropped instead.
+        request.connection_config =
+            crate::config_secrets::merge_config_secrets(request.connection_config, None);
+
         // Validate config type
         if super::types::SourceConfigType::from_str(&request.config_type).is_none() {
             return Err(SourceConfigServiceError::InvalidConfig(format!(
@@ -249,7 +277,7 @@ impl SourceConfigService {
                 .map_err(|e| SourceConfigServiceError::CredentialError(e.to_string()))?;
         }
 
-        Ok(self.repository.create(request).await?)
+        Ok(self.repository.create(request).await?.redacted())
     }
 
     /// NAN-883: drivers where only one source configuration may exist per
@@ -285,8 +313,13 @@ impl SourceConfigService {
     pub async fn update(
         &self,
         id: Uuid,
-        request: UpdateSourceConfiguration,
+        mut request: UpdateSourceConfiguration,
+        credential_use: CredentialUseGrant,
     ) -> Result<SourceConfiguration, SourceConfigServiceError> {
+        // A caller that explicitly supplies a credential reference must be
+        // denied before any resource or credential lookup.
+        Self::ensure_credential_use(request.credential_id, credential_use)?;
+
         // Validate config type if provided
         if let Some(ref config_type) = request.config_type {
             if super::types::SourceConfigType::from_str(config_type).is_none() {
@@ -302,15 +335,41 @@ impl SourceConfigService {
             Self::validate_name(name)?;
         }
 
+        // Load once and use this same snapshot for the credential decision,
+        // secret merge, effective driver, and rename cleanup.
+        let existing = self.repository.get(id).await?;
+        Self::ensure_credential_use(
+            request.credential_id.or(existing.credential_id),
+            credential_use,
+        )?;
+
         // Validate the connection_config payload (when present) against the
         // effective driver: prefer the patched config_type, fall back to the
         // existing one when the patch only touches connection_config (NAN-689).
-        if let Some(ref conn) = request.connection_config {
+        //
+        // NAN-2067: reads now mask secrets, so the UI's read-modify-write
+        // (SourceConfigurationDetail.tsx hydrates from GET and PUTs the whole
+        // object back) would persist `***REDACTED***` over a live credential
+        // and break ingestion. Merge against the stored row FIRST, so both
+        // validation and the write see real material — and so a caller that
+        // never read the secret cannot wipe it.
+        // NAN-2150: when request.expected_updated_at is present, it is
+        // forwarded unchanged to the repository's atomic UPDATE predicate. A
+        // credential rotation landing after this read then makes the write fail
+        // with StaleVersion instead of persisting the merged stale snapshot.
+        if let Some(conn) = request.connection_config.take() {
+            let merged = crate::config_secrets::merge_config_secrets(
+                conn,
+                Some(&existing.connection_config),
+            );
+
             let effective_type = match request.config_type.as_deref() {
                 Some(ct) => ct.to_string(),
-                None => self.repository.get(id).await?.config_type,
+                None => existing.config_type.clone(),
             };
-            Self::validate_connection_config(&effective_type, conn)?;
+            Self::validate_connection_config(&effective_type, &merged)?;
+
+            request.connection_config = Some(merged);
         }
 
         // NAN-1919: a patched default_source_type is interpolated into the
@@ -337,14 +396,34 @@ impl SourceConfigService {
         // safe_name(name) and the path changes on rename.
         let pre_update_snapshot: Option<(String, String, PathBuf, bool)> =
             if request.name.is_some() {
-                let existing = self.repository.get(id).await?;
                 let old_path = self.get_config_file_path(&existing.config_type, &existing.name);
-                Some((existing.config_type, existing.name, old_path, existing.deployed))
+                Some((
+                    existing.config_type,
+                    existing.name,
+                    old_path,
+                    existing.deployed,
+                ))
             } else {
                 None
             };
 
-        let updated = self.repository.update(id, request).await?;
+        let updated = match self
+            .repository
+            .update_with_credential_guard(id, request, existing.credential_id)
+            .await
+        {
+            Ok(updated) => updated,
+            Err(SourceConfigRepositoryError::CredentialChanged(_)) if !credential_use.allows() => {
+                return Err(SourceConfigServiceError::CredentialUseRequired);
+            }
+            Err(SourceConfigRepositoryError::CredentialChanged(_)) => {
+                return Err(SourceConfigServiceError::Conflict(
+                    "Source configuration credentials changed concurrently; retry the update"
+                        .to_string(),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
 
         if let Some((old_type, old_name, old_path, was_deployed)) = pre_update_snapshot {
             let stem_changed = Self::rename_changes_on_disk_stem(
@@ -389,7 +468,7 @@ impl SourceConfigService {
             }
         }
 
-        Ok(updated)
+        Ok(updated.redacted())
     }
 
     /// Reject control chars / newlines in a source-config name. The name lands
@@ -586,13 +665,13 @@ impl SourceConfigService {
         Ok(self.repository.delete(id).await?)
     }
 
-    /// Toggle enabled status
+    /// Toggle enabled status. Returns the row with secrets masked (NAN-2067).
     pub async fn toggle(
         &self,
         id: Uuid,
         enabled: bool,
     ) -> Result<SourceConfiguration, SourceConfigServiceError> {
-        Ok(self.repository.toggle_enabled(id, enabled).await?)
+        Ok(self.repository.toggle_enabled(id, enabled).await?.redacted())
     }
 
     // ========================================================================
@@ -1067,9 +1146,17 @@ impl SourceConfigService {
     }
 
     /// Deploy a source configuration to Vector
-    pub async fn deploy(&self, id: Uuid) -> Result<DeploymentResult, SourceConfigServiceError> {
+    pub async fn deploy(
+        &self,
+        id: Uuid,
+        credential_use: CredentialUseGrant,
+    ) -> Result<DeploymentResult, SourceConfigServiceError> {
         let config_with_rules = self.repository.get_with_rules(id).await?;
         let config = &config_with_rules.config;
+
+        // Re-evaluate against the current saved reference immediately before
+        // any generation, credential decryption, deployment audit, or file I/O.
+        Self::ensure_credential_use(config.credential_id, credential_use)?;
 
         // System-level sources (http, vector, splunk_hec) have their ingest
         // source declared in `config/vector/*.toml` and always running. We
@@ -1088,6 +1175,9 @@ impl SourceConfigService {
                 // records add_deployment("failure", reason) and aborts.
                 if let Err(e) = Self::validate_generated_config(config_content) {
                     let reason = e.to_string();
+                    // NAN-2067: match the non-system failure path — never
+                    // persist an unredacted snapshot into deployment history.
+                    let redacted_snapshot = redact_config_snapshot(config_content);
                     if let Err(audit_err) = self
                         .repository
                         .add_deployment(
@@ -1095,7 +1185,7 @@ impl SourceConfigService {
                             "deploy",
                             "failure",
                             Some(&reason),
-                            Some(&config_content),
+                            Some(&redacted_snapshot),
                         )
                         .await
                     {
@@ -1171,6 +1261,13 @@ impl SourceConfigService {
         // fails — and we record the failure for audit.
         if let Err(e) = Self::validate_generated_config(&vector_config) {
             let reason = e.to_string();
+            // NAN-2067: the success paths redact this snapshot (NAN-690) but
+            // the failure path persisted the raw generated TOML — real SASL
+            // password, AWS secret_access_key / session_token, HEC tokens —
+            // straight into deployment history, which
+            // `GET /api/source-configurations/{id}/deployments` serves to any
+            // `source_configs:view` holder. Redact here too.
+            let redacted_snapshot = redact_config_snapshot(&vector_config);
             if let Err(audit_err) = self
                 .repository
                 .add_deployment(
@@ -1178,7 +1275,7 @@ impl SourceConfigService {
                     "deploy",
                     "failure",
                     Some(&reason),
-                    Some(&vector_config),
+                    Some(&redacted_snapshot),
                 )
                 .await
             {
@@ -1360,12 +1457,23 @@ impl SourceConfigService {
     }
 
     /// Deploy all enabled source configurations
-    pub async fn deploy_all(&self) -> Result<Vec<DeploymentResult>, SourceConfigServiceError> {
+    pub async fn deploy_all(
+        &self,
+        credential_use: CredentialUseGrant,
+    ) -> Result<Vec<DeploymentResult>, SourceConfigServiceError> {
         let configs = self.repository.list_enabled().await?;
+
+        // Fail closed for the current set before deploying anything. Each
+        // individual deploy checks again so a credential attached after this
+        // preflight still cannot be decrypted without authorization.
+        for config in &configs {
+            Self::ensure_credential_use(config.credential_id, credential_use)?;
+        }
+
         let mut results = Vec::new();
 
         for config in configs {
-            match self.deploy(config.id).await {
+            match self.deploy(config.id, credential_use).await {
                 Ok(result) => results.push(result),
                 Err(e) => {
                     tracing::error!(
@@ -1385,6 +1493,20 @@ impl SourceConfigService {
         }
 
         Ok(results)
+    }
+
+    /// Require explicit credential-use authorization only when a source
+    /// configuration references stored credential material.
+    fn ensure_credential_use(
+        credential_id: Option<Uuid>,
+        grant: CredentialUseGrant,
+    ) -> Result<(), SourceConfigServiceError> {
+        if credential_id.is_some() {
+            grant
+                .ensure()
+                .map_err(|_| SourceConfigServiceError::CredentialUseRequired)?;
+        }
+        Ok(())
     }
 
     /// Render every deployed source configuration into this service's config
@@ -1447,13 +1569,28 @@ impl SourceConfigService {
         Ok(())
     }
 
-    /// Get deployment history
+    /// Get deployment history, with secrets scrubbed from every snapshot.
+    ///
+    /// NAN-2067: redacting only on the write path would leave rows persisted
+    /// BEFORE this fix exposed — an upgraded tenant whose deploy failed while
+    /// the old code was running still has raw generated TOML (real SASL
+    /// password, AWS keys, HEC tokens) in `config_snapshot`, and this endpoint
+    /// serves it to any `source_configs:view` holder. Redacting at the read
+    /// boundary closes the historical rows too, without a backfill migration.
+    /// `redact_config_snapshot` is idempotent, so already-redacted rows are
+    /// unaffected.
     pub async fn get_deployment_history(
         &self,
         id: Uuid,
         limit: Option<i64>,
     ) -> Result<Vec<SourceConfigDeployment>, SourceConfigServiceError> {
-        Ok(self.repository.get_deployments(id, limit).await?)
+        let mut deployments = self.repository.get_deployments(id, limit).await?;
+        for deployment in &mut deployments {
+            if let Some(snapshot) = deployment.config_snapshot.as_deref() {
+                deployment.config_snapshot = Some(redact_config_snapshot(snapshot));
+            }
+        }
+        Ok(deployments)
     }
 
     // ========================================================================

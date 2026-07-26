@@ -164,7 +164,13 @@ async fn main() -> Result<()> {
     // This ensures HTTP ingestion is live on first boot (migration seeds it as deployed=true
     // but Vector config files need to be written).
     tracing::info!("Syncing source configuration deployments...");
-    match state.source_config_service.deploy_all().await {
+    // Startup reconciliation is an explicit trusted system workflow. User
+    // requests receive a principal-derived grant in the source-config handler.
+    match state
+        .source_config_service
+        .deploy_all(nanosiem_core::auth::CredentialUseGrant::system())
+        .await
+    {
         Ok(results) => {
             let ok = results.iter().filter(|r| r.success).count();
             let fail = results.iter().filter(|r| !r.success).count();

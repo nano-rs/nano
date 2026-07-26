@@ -15,6 +15,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::Baseline;
+use crate::auth::{Provenanced, SourceProvenance};
 
 /// Minimum number of days required to establish a provisional baseline
 const MIN_BASELINE_DAYS: i64 = 1; // 24 hours for provisional baseline
@@ -125,6 +126,7 @@ impl BaselineMonitor {
 
         // Calculate baseline statistics
         let baseline = self.calculate_baseline_statistics(rule_id).await?;
+        let value = &baseline.value;
 
         // Insert baseline into database
         sqlx::query(
@@ -139,8 +141,10 @@ impl BaselineMonitor {
                 percentile_99,
                 threshold_breach_level,
                 data_points,
-                baseline_data
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                baseline_data,
+                source_types,
+                source_types_complete
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT (rule_id) DO UPDATE SET
                 last_updated = EXCLUDED.last_updated,
                 mean_alerts_per_hour = EXCLUDED.mean_alerts_per_hour,
@@ -149,23 +153,27 @@ impl BaselineMonitor {
                 percentile_99 = EXCLUDED.percentile_99,
                 threshold_breach_level = EXCLUDED.threshold_breach_level,
                 data_points = EXCLUDED.data_points,
-                baseline_data = EXCLUDED.baseline_data
+                baseline_data = EXCLUDED.baseline_data,
+                source_types = EXCLUDED.source_types,
+                source_types_complete = EXCLUDED.source_types_complete
             "#,
         )
-        .bind(baseline.rule_id)
-        .bind(baseline.established_at)
-        .bind(baseline.last_updated)
-        .bind(baseline.mean_alerts_per_hour)
-        .bind(baseline.std_dev_alerts_per_hour)
-        .bind(baseline.percentile_95)
-        .bind(baseline.percentile_99)
-        .bind(baseline.threshold_breach_level)
-        .bind(baseline.data_points)
+        .bind(value.rule_id)
+        .bind(value.established_at)
+        .bind(value.last_updated)
+        .bind(value.mean_alerts_per_hour)
+        .bind(value.std_dev_alerts_per_hour)
+        .bind(value.percentile_95)
+        .bind(value.percentile_99)
+        .bind(value.threshold_breach_level)
+        .bind(value.data_points)
         .bind(json!({}))
+        .bind(baseline.provenance.source_types())
+        .bind(baseline.provenance.is_complete())
         .execute(&self.pg_pool)
         .await?;
 
-        Ok(baseline)
+        Ok(baseline.value)
     }
 
     /// Update an existing baseline with new metrics
@@ -192,6 +200,7 @@ impl BaselineMonitor {
 
         // Recalculate baseline statistics using rolling window
         let baseline = self.calculate_baseline_statistics(rule_id).await?;
+        let value = &baseline.value;
 
         // Update baseline in database
         sqlx::query(
@@ -203,18 +212,22 @@ impl BaselineMonitor {
                 percentile_95 = $5,
                 percentile_99 = $6,
                 threshold_breach_level = $7,
-                data_points = $8
+                data_points = $8,
+                source_types = $9,
+                source_types_complete = $10
             WHERE rule_id = $1
             "#,
         )
         .bind(rule_id)
-        .bind(baseline.last_updated)
-        .bind(baseline.mean_alerts_per_hour)
-        .bind(baseline.std_dev_alerts_per_hour)
-        .bind(baseline.percentile_95)
-        .bind(baseline.percentile_99)
-        .bind(baseline.threshold_breach_level)
-        .bind(baseline.data_points)
+        .bind(value.last_updated)
+        .bind(value.mean_alerts_per_hour)
+        .bind(value.std_dev_alerts_per_hour)
+        .bind(value.percentile_95)
+        .bind(value.percentile_99)
+        .bind(value.threshold_breach_level)
+        .bind(value.data_points)
+        .bind(baseline.provenance.source_types())
+        .bind(baseline.provenance.is_complete())
         .execute(&self.pg_pool)
         .await?;
 
@@ -232,6 +245,18 @@ impl BaselineMonitor {
         &self,
         rule_id: Uuid,
     ) -> Result<Option<Baseline>, BaselineMonitorError> {
+        Ok(self
+            .get_baseline_with_provenance(rule_id)
+            .await?
+            .map(Provenanced::into_value))
+    }
+
+    /// Load a baseline with the persisted union of every metric origin used to
+    /// calculate it. Legacy/incomplete metrics remain incomplete after folding.
+    pub async fn get_baseline_with_provenance(
+        &self,
+        rule_id: Uuid,
+    ) -> Result<Option<Provenanced<Baseline>>, BaselineMonitorError> {
         let baseline = sqlx::query_as::<_, BaselineRow>(
             r#"
             SELECT 
@@ -243,7 +268,9 @@ impl BaselineMonitor {
                 percentile_95,
                 percentile_99,
                 threshold_breach_level,
-                data_points
+                data_points,
+                source_types,
+                source_types_complete
             FROM detection_rule_baselines
             WHERE rule_id = $1
             "#,
@@ -253,6 +280,8 @@ impl BaselineMonitor {
         .await?;
 
         Ok(baseline.map(|row| {
+            let provenance =
+                SourceProvenance::from_parts(row.source_types, row.source_types_complete);
             let mut b = Baseline {
                 rule_id: row.rule_id,
                 established_at: row.established_at,
@@ -266,7 +295,7 @@ impl BaselineMonitor {
                 status: Default::default(),
             };
             b.compute_status();
-            b
+            Provenanced::new(b, provenance)
         }))
     }
 
@@ -301,14 +330,14 @@ impl BaselineMonitor {
     async fn calculate_baseline_statistics(
         &self,
         rule_id: Uuid,
-    ) -> Result<Baseline, BaselineMonitorError> {
+    ) -> Result<Provenanced<Baseline>, BaselineMonitorError> {
         let now = Utc::now();
         let window_start = now - Duration::days(BASELINE_WINDOW_DAYS);
 
         // Get metrics within the rolling window
         let metrics: Vec<MetricRow> = sqlx::query_as(
             r#"
-            SELECT alert_count_1h, timestamp
+            SELECT alert_count_1h, timestamp, source_types, source_types_complete
             FROM detection_rule_metrics
             WHERE rule_id = $1 AND timestamp >= $2
             ORDER BY timestamp ASC
@@ -322,6 +351,17 @@ impl BaselineMonitor {
         if metrics.is_empty() {
             return Err(BaselineMonitorError::InsufficientData(MIN_BASELINE_DAYS));
         }
+
+        let provenance = metrics
+            .iter()
+            .map(|metric| {
+                SourceProvenance::from_parts(
+                    metric.source_types.iter(),
+                    metric.source_types_complete,
+                )
+            })
+            .reduce(|combined, metric| combined.merge(&metric))
+            .expect("metrics was checked non-empty");
 
         // Extract alert counts
         let alert_counts: Vec<f64> = metrics.iter().map(|m| m.alert_count_1h as f64).collect();
@@ -366,7 +406,7 @@ impl BaselineMonitor {
             status: Default::default(),
         };
         baseline.compute_status();
-        Ok(baseline)
+        Ok(Provenanced::new(baseline, provenance))
     }
 
     /// Calculate a percentile from sorted data
@@ -474,6 +514,8 @@ struct BaselineRow {
     percentile_99: f64,
     threshold_breach_level: f64,
     data_points: i32,
+    source_types: Vec<String>,
+    source_types_complete: bool,
 }
 
 /// Database row for metrics queries
@@ -481,6 +523,8 @@ struct BaselineRow {
 struct MetricRow {
     alert_count_1h: i64,
     timestamp: DateTime<Utc>,
+    source_types: Vec<String>,
+    source_types_complete: bool,
 }
 
 #[cfg(test)]

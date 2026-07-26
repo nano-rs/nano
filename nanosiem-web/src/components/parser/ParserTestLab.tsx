@@ -189,7 +189,9 @@ function EventRowHeader({
           </span>
         ))}
         {previewEntries.length === 0 && result.error && (
-          <span className="text-red-400 text-[10px] truncate">{result.error}</span>
+          <span className="text-red-400 text-[10px] truncate" title={result.error}>
+            {result.error}
+          </span>
         )}
       </div>
 
@@ -384,7 +386,13 @@ export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl, extensi
                           {result.input}
                         </p>
                       </div>
-                      <FieldGrid newFields={newFields} currentFields={currentFields} />
+                      {result.new_parse.error ? (
+                        <pre className="font-mono text-red-400 text-[11px] leading-relaxed whitespace-pre-wrap break-words px-3 py-2">
+                          {result.new_parse.error}
+                        </pre>
+                      ) : (
+                        <FieldGrid newFields={newFields} currentFields={currentFields} />
+                      )}
                     </div>
                   )}
                 </div>

@@ -20,7 +20,10 @@ use std::collections::HashMap;
 use thiserror::Error;
 use uuid::Uuid;
 
-use super::{AlertPattern, RuleMetrics};
+use super::{
+    derive_finding_source_manifest, AlertPattern, FindingProvenance, RuleMetrics,
+};
+use crate::auth::{Provenanced, SourceProvenance, UNRESOLVED_SOURCE_SENTINEL};
 use crate::db::TableNames;
 
 /// True when the env-configured schema profile is OCSF. NAN-1254: drives the
@@ -84,6 +87,18 @@ pub struct Finding {
     pub severity: String,
     pub matched_events: serde_json::Value,
     pub timestamp: DateTime<Utc>,
+    /// NAN-2085: the finding's persisted `origin_source_types` — computed by
+    /// `FindingEvent::origin_source_types_from` over the FULL matched set, not
+    /// the truncated `matched_events_sample` above. Tuning provenance must be
+    /// derived from this: a mixed-source finding whose first few sampled events
+    /// all came from source A would otherwise be stamped "complete for A" while
+    /// the proposal's inputs also covered denied source B.
+    ///
+    /// `None` = the key was absent or the metadata could not be parsed (a
+    /// pre-NAN-1800 finding, or a writer regression) — provenance is unknown
+    /// and every consumer must fail closed.
+    #[serde(default)]
+    pub origin_source_types: Option<Vec<String>>,
 }
 
 /// Row shape returned by the ClickHouse `logs` SELECT for findings.
@@ -97,6 +112,18 @@ struct FindingRow {
     severity: String,
     metadata: String,
     timestamp_us: i64,
+}
+
+/// One exact aggregate over the full seven-day input window. Counts and source
+/// provenance are deliberately read in the same ClickHouse query so a metric
+/// row cannot describe one event set while authorizing against another.
+#[derive(Debug, clickhouse::Row, serde::Deserialize)]
+struct FindingAggregateRow {
+    finding_count_1h: u64,
+    finding_count_24h: u64,
+    finding_count_7d: u64,
+    origin_source_types: Vec<String>,
+    unattributed_count: u64,
 }
 
 /// Metrics collector service.
@@ -132,6 +159,18 @@ impl MetricsCollector {
         &self,
         rule_id: Uuid,
     ) -> Result<RuleMetrics, MetricsCollectorError> {
+        Ok(self
+            .collect_rule_metrics_with_provenance(rule_id)
+            .await?
+            .into_value())
+    }
+
+    /// Collect metrics and the exact origin manifest of the full seven-day
+    /// finding set used by the stored snapshot.
+    pub async fn collect_rule_metrics_with_provenance(
+        &self,
+        rule_id: Uuid,
+    ) -> Result<Provenanced<RuleMetrics>, MetricsCollectorError> {
         let now = Utc::now();
 
         // Verify rule exists
@@ -145,21 +184,14 @@ impl MetricsCollector {
             return Err(MetricsCollectorError::RuleNotFound(rule_id));
         }
 
-        // Count findings in the three rolling windows. All three share the
-        // same `now` anchor as the stored `RuleMetrics.timestamp` so the
-        // row's windows line up exactly with its recorded timestamp.
-        let finding_count_1h = self
-            .count_findings(rule_id, now, Duration::hours(1))
+        // Read the capped entity sample first, then the exact aggregate. A row
+        // arriving between these queries can therefore only make the manifest
+        // more conservative; it can never influence the sample while escaping
+        // the provenance union. Both queries share the stored timestamp anchor.
+        let recent_findings = self
+            .get_recent_findings_at(rule_id, Duration::hours(24), now)
             .await?;
-        let finding_count_24h = self
-            .count_findings(rule_id, now, Duration::hours(24))
-            .await?;
-        let finding_count_7d = self
-            .count_findings(rule_id, now, Duration::days(7))
-            .await?;
-
-        // Get recent findings to extract entity information
-        let recent_findings = self.get_recent_findings(rule_id, Duration::hours(24)).await?;
+        let aggregate = self.aggregate_findings(rule_id, now).await?;
 
         // Extract unique entities from matched events
         let (unique_users, unique_hosts, unique_ips) =
@@ -171,32 +203,46 @@ impl MetricsCollector {
         // For now, execution_time_ms is set to 0 as we don't track this yet
         let execution_time_ms = 0;
 
-        Ok(RuleMetrics {
+        let metrics = RuleMetrics {
             rule_id,
             timestamp: now,
-            alert_count_1h: finding_count_1h,
-            alert_count_24h: finding_count_24h,
-            alert_count_7d: finding_count_7d,
+            alert_count_1h: aggregate.finding_count_1h as i64,
+            alert_count_24h: aggregate.finding_count_24h as i64,
+            alert_count_7d: aggregate.finding_count_7d as i64,
             unique_users,
             unique_hosts,
             unique_ips,
             avg_severity,
             execution_time_ms,
-        })
+        };
+        let mut provenance = SourceProvenance::from_parts(
+            aggregate.origin_source_types,
+            aggregate.finding_count_7d > 0 && aggregate.unattributed_count == 0,
+        );
+        if !recent_findings.is_empty() {
+            let sample_inputs: Vec<FindingProvenance<'_>> = recent_findings
+                .iter()
+                .map(|finding| FindingProvenance {
+                    origin_source_types: finding.origin_source_types.as_deref(),
+                    matched_events: &finding.matched_events,
+                })
+                .collect();
+            let (sample_sources, sample_complete) =
+                derive_finding_source_manifest(&sample_inputs);
+            provenance =
+                provenance.merge(&SourceProvenance::from_parts(sample_sources, sample_complete));
+        }
+
+        Ok(Provenanced::new(metrics, provenance))
     }
 
-    /// Count findings for a rule over the given trailing window.
-    ///
-    /// Hits `nanosiem.logs` (or `logs_distributed` in cluster mode) filtered
-    /// to `source_type='findings'` and the rule's stringified UUID. The
-    /// `rule_id` column is `String` on CH and is populated for every
-    /// finding row by `FindingLogger::log_to_clickhouse`.
-    async fn count_findings(
+    /// Count every finding window and union the authoritative full-match
+    /// origins in one ClickHouse snapshot.
+    async fn aggregate_findings(
         &self,
         rule_id: Uuid,
         now: DateTime<Utc>,
-        window: Duration,
-    ) -> Result<i64, MetricsCollectorError> {
+    ) -> Result<FindingAggregateRow, MetricsCollectorError> {
         // SAFETY: the only value interpolated into `sql` via `format!` is the
         // table name returned by `TableNames::read`, which is a hard-coded
         // constant (`nanosiem.logs` / `nanosiem.logs_distributed`). All
@@ -208,28 +254,45 @@ impl MetricsCollector {
         // EPHEMERAL), so read it directly. UDM stays byte-identical (`rule_id`).
         let is_ocsf = active_profile_is_ocsf();
         let table = self.table_names.read(crate::schema::active_logs_table());
-        let rule_id_col = if is_ocsf {
-            "JSONExtractString(toString(unmapped), 'rule_id')"
+        let (metadata_expr, rule_id_col) = if is_ocsf {
+            (
+                "toString(unmapped)",
+                "JSONExtractString(toString(unmapped), 'rule_id')",
+            )
         } else {
-            "rule_id"
+            ("metadata", "rule_id")
         };
-        let cutoff = now - window;
+        let cutoff_1h = now - Duration::hours(1);
+        let cutoff_24h = now - Duration::hours(24);
+        let cutoff_7d = now - Duration::days(7);
         let sql = format!(
-            "SELECT count() FROM {table} \
+            "WITH JSONExtract({metadata_expr}, 'origin_source_types', 'Array(String)') AS origin_types \
+             SELECT \
+               countIf(timestamp >= fromUnixTimestamp64Micro(?)) AS finding_count_1h, \
+               countIf(timestamp >= fromUnixTimestamp64Micro(?)) AS finding_count_24h, \
+               count() AS finding_count_7d, \
+               arraySort(groupUniqArrayArray(origin_types)) AS origin_source_types, \
+               countIf(empty(origin_types) OR arrayExists(source -> empty(trimBoth(source)), origin_types) OR has( \
+                   arrayMap(source -> lowerUTF8(trimBoth(source)), origin_types), \
+                   '{UNRESOLVED_SOURCE_SENTINEL}' \
+               )) AS unattributed_count \
+             FROM {table} \
              WHERE source_type = 'findings' \
                AND {rule_id_col} = ? \
-               AND timestamp >= fromUnixTimestamp64Micro(?)"
+               AND timestamp >= fromUnixTimestamp64Micro(?) \
+               AND timestamp <= fromUnixTimestamp64Micro(?)"
         );
 
-        let count: u64 = self
-            .ch_client
+        self.ch_client
             .query(&sql)
+            .bind(cutoff_1h.timestamp_micros())
+            .bind(cutoff_24h.timestamp_micros())
             .bind(rule_id.to_string())
-            .bind(cutoff.timestamp_micros())
+            .bind(cutoff_7d.timestamp_micros())
+            .bind(now.timestamp_micros())
             .fetch_one()
-            .await?;
-
-        Ok(count as i64)
+            .await
+            .map_err(Into::into)
     }
 
     /// Get recent findings for a detection rule from ClickHouse.
@@ -243,7 +306,17 @@ impl MetricsCollector {
         rule_id: Uuid,
         duration: Duration,
     ) -> Result<Vec<Finding>, MetricsCollectorError> {
-        let cutoff = Utc::now() - duration;
+        self.get_recent_findings_at(rule_id, duration, Utc::now())
+            .await
+    }
+
+    async fn get_recent_findings_at(
+        &self,
+        rule_id: Uuid,
+        duration: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Finding>, MetricsCollectorError> {
+        let cutoff = now - duration;
         // SAFETY: the only value interpolated into `sql` via `format!` is the
         // table name returned by `TableNames::read`, which is a hard-coded
         // constant (`nanosiem.logs` / `nanosiem.logs_distributed`). All
@@ -271,6 +344,7 @@ impl MetricsCollector {
              WHERE source_type = 'findings' \
                AND {rule_id_col} = ? \
                AND timestamp >= fromUnixTimestamp64Micro(?) \
+               AND timestamp <= fromUnixTimestamp64Micro(?) \
              ORDER BY timestamp DESC \
              LIMIT 1000"
         );
@@ -280,6 +354,7 @@ impl MetricsCollector {
             .query(&sql)
             .bind(rule_id.to_string())
             .bind(cutoff.timestamp_micros())
+            .bind(now.timestamp_micros())
             .fetch_all()
             .await?;
 
@@ -292,21 +367,34 @@ impl MetricsCollector {
                 // skips it — but we log so a finding-writer regression that
                 // starts emitting malformed metadata doesn't silently zero
                 // out baselines (the same failure mode as NAN-866).
-                let matched_events = match serde_json::from_str::<serde_json::Value>(&row.metadata)
-                {
-                    Ok(v) => v
-                        .get("matched_events_sample")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Array(Vec::new())),
-                    Err(e) => {
-                        tracing::warn!(
-                            rule_id = %rule_id,
-                            error = %e,
-                            "Failed to parse finding metadata JSON; treating as empty matched_events"
-                        );
-                        serde_json::Value::Array(Vec::new())
-                    }
-                };
+                let parsed_metadata =
+                    match serde_json::from_str::<serde_json::Value>(&row.metadata) {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            tracing::warn!(
+                                rule_id = %rule_id,
+                                error = %e,
+                                "Failed to parse finding metadata JSON; treating as empty matched_events"
+                            );
+                            None
+                        }
+                    };
+                let matched_events = parsed_metadata
+                    .as_ref()
+                    .and_then(|v| v.get("matched_events_sample").cloned())
+                    .unwrap_or(serde_json::Value::Array(Vec::new()));
+                // NAN-2085: the FULL origin manifest, absent on pre-NAN-1800
+                // findings — `None` there so consumers fail closed.
+                let origin_source_types = parsed_metadata
+                    .as_ref()
+                    .and_then(|v| v.get("origin_source_types"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|s| s.as_str())
+                            .map(|s| s.to_string())
+                            .collect::<Vec<String>>()
+                    });
 
                 // `from_timestamp_micros` only returns `None` for values
                 // outside i64 micros range, which can't happen for CH
@@ -320,6 +408,7 @@ impl MetricsCollector {
                     severity: row.severity,
                     matched_events,
                     timestamp,
+                    origin_source_types,
                 }
             })
             .collect();
@@ -531,23 +620,15 @@ impl MetricsCollector {
         let mut collected_count = 0;
 
         for rule_id in rule_ids {
-            match self.collect_rule_metrics(rule_id).await {
-                Ok(metrics) => {
-                    if let Err(e) = self.store_metrics(&metrics).await {
-                        tracing::warn!(
-                            rule_id = %rule_id,
-                            error = %e,
-                            "Failed to store metrics for rule"
-                        );
-                    } else {
-                        collected_count += 1;
-                    }
+            match self.collect_and_store_rule_metrics(rule_id).await {
+                Ok(_) => {
+                    collected_count += 1;
                 }
                 Err(e) => {
                     tracing::warn!(
                         rule_id = %rule_id,
                         error = %e,
-                        "Failed to collect metrics for rule"
+                        "Failed to collect or store metrics for rule"
                     );
                 }
             }
@@ -556,29 +637,46 @@ impl MetricsCollector {
         Ok(collected_count)
     }
 
+    /// Production collection + persistence path used by the scheduler and
+    /// provenance integration tests.
+    pub async fn collect_and_store_rule_metrics(
+        &self,
+        rule_id: Uuid,
+    ) -> Result<Provenanced<RuleMetrics>, MetricsCollectorError> {
+        let metrics = self.collect_rule_metrics_with_provenance(rule_id).await?;
+        self.store_metrics(&metrics).await?;
+        Ok(metrics)
+    }
+
     /// Store metrics in the PostgreSQL `detection_rule_metrics` table.
-    async fn store_metrics(&self, metrics: &RuleMetrics) -> Result<(), MetricsCollectorError> {
+    async fn store_metrics(
+        &self,
+        metrics: &Provenanced<RuleMetrics>,
+    ) -> Result<(), MetricsCollectorError> {
+        let value = &metrics.value;
         sqlx::query(
             r#"
             INSERT INTO detection_rule_metrics (
                 rule_id, timestamp, alert_count_1h, alert_count_24h, alert_count_7d,
                 unique_users, unique_hosts, unique_ips, avg_severity, execution_time_ms,
-                patterns
+                patterns, source_types, source_types_complete
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             "#,
         )
-        .bind(metrics.rule_id)
-        .bind(metrics.timestamp)
-        .bind(metrics.alert_count_1h)
-        .bind(metrics.alert_count_24h)
-        .bind(metrics.alert_count_7d)
-        .bind(metrics.unique_users)
-        .bind(metrics.unique_hosts)
-        .bind(metrics.unique_ips)
-        .bind(metrics.avg_severity)
-        .bind(metrics.execution_time_ms)
+        .bind(value.rule_id)
+        .bind(value.timestamp)
+        .bind(value.alert_count_1h)
+        .bind(value.alert_count_24h)
+        .bind(value.alert_count_7d)
+        .bind(value.unique_users)
+        .bind(value.unique_hosts)
+        .bind(value.unique_ips)
+        .bind(value.avg_severity)
+        .bind(value.execution_time_ms)
         .bind(serde_json::json!({})) // Empty patterns for now
+        .bind(metrics.provenance.source_types())
+        .bind(metrics.provenance.is_complete())
         .execute(&self.pg_pool)
         .await?;
 
@@ -596,6 +694,7 @@ mod tests {
             severity: severity.to_string(),
             matched_events,
             timestamp: Utc::now(),
+            origin_source_types: None,
         }
     }
 

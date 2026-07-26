@@ -322,11 +322,9 @@
             name: format!("test_{enrich_kind}"),
             description: None,
             source_type: "nano_enrich".to_string(),
-            source_config: serde_json::json!({}),
             parser_vrl: String::new(),
             output_fields: None,
             feed_id: None,
-            credential_id: None,
             dispatch_source_config_id: None,
             dispatch_route_name: None,
             enabled: true,
@@ -359,11 +357,9 @@
             name: name.to_string(),
             description: None,
             source_type: name.to_string(),
-            source_config: serde_json::json!({}),
             parser_vrl: String::new(),
             output_fields: None,
             feed_id: None,
-            credential_id: None,
             dispatch_source_config_id: None,
             dispatch_route_name: None,
             enabled,
@@ -431,6 +427,50 @@
                 "inputs = [\"apache_ocsf_prepare\", \"sysmon_json_ocsf_prepare\", \"generic_ocsf_prepare\"]"
             ),
             "{content}"
+        );
+    }
+
+    #[test]
+    fn parser_health_combiner_bypasses_sampling_and_covers_ocsf_successes() {
+        let mut sampled = log_test_parser("limacharlie", true);
+        sampled.sampling_ratio = Some(0.1);
+        let disabled = log_test_parser("disabled_src", false);
+
+        let udm =
+            VectorConfigManager::combiner_config_content_for(&[sampled.clone(), disabled.clone()], false);
+        assert!(
+            udm.contains("inputs = [\"limacharlie_sample\"]"),
+            "persisted UDM stream must retain configured sampling: {udm}"
+        );
+        assert!(
+            udm.contains("[transforms.db_parser_health]")
+                && udm.contains("inputs = [\"limacharlie_output\"]"),
+            "health must observe the unsampled output and exclude disabled parsers: {udm}"
+        );
+        assert!(!udm.contains("disabled_src_output"), "{udm}");
+
+        let ocsf = VectorConfigManager::combiner_config_content_for(&[sampled, disabled], true);
+        assert!(
+            ocsf.contains(
+                "inputs = [\"limacharlie_output\", \"limacharlie_ocsf_prepare\"]"
+            ),
+            "OCSF health must combine UDM fallback/failures with native successes: {ocsf}"
+        );
+
+        let vrl_blocks = extract_vrl_blocks(&ocsf);
+        let health_vrl = vrl_blocks.last().expect("health mapper VRL");
+        if let Err(diags) = vrl::compiler::compile(health_vrl, &vrl::stdlib::all()) {
+            panic!(
+                "parser-health mapper VRL failed to compile:\n{}",
+                vrl::diagnostic::Formatter::new(health_vrl, diags)
+            );
+        }
+
+        let pipeline = VectorConfigManager::pipeline_config_content();
+        assert!(
+            pipeline.contains("[sinks.clickhouse_parser_health]")
+                && pipeline.contains("table = \"${CLICKHOUSE_PARSER_HEALTH_TABLE:-parser_health_ingest}\""),
+            "the pre-sampling health branch must terminate in the Null-engine ingress: {pipeline}"
         );
     }
 

@@ -3,26 +3,15 @@
 //! Asset and cloud event endpoints: pagination, timeline, pivot, time range, artifacts.
 
 use axum::{Json, extract::State};
-use nanosiem_core::{TimeRangeInput, auth::permissions};
+use nanosiem_core::TimeRangeInput;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
+// NAN-2030: asset/cloud reads hit the same log surface as POST /api/search, so
+// they share the one gate defined in `handlers/mod.rs` (was a local duplicate).
+use super::require_search_execute;
 use crate::error::ErrorResponse;
 use crate::{SearchState, error::SearchError, metrics::record_search_query};
-
-/// NAN-1801: these endpoints run hand-built scans over logs (and, for cloud,
-/// arbitrary client-echoed nPL) — the same data surface as POST /api/search —
-/// so they require the same `search:execute` permission. They were previously
-/// bearer-only.
-fn require_search_execute(auth: &crate::AuthContext) -> Result<(), SearchError> {
-    if auth.claims.has_permission(permissions::SEARCH_EXECUTE) {
-        Ok(())
-    } else {
-        Err(SearchError::Forbidden(
-            "Asset and cloud queries require the search:execute permission".to_string(),
-        ))
-    }
-}
 
 // ============================================================================
 // Asset Events Pagination
@@ -581,13 +570,10 @@ pub async fn get_asset_true_time_range(
     let start = Instant::now();
     require_search_execute(&auth)?;
 
-    // NAN-1801 RESIDUAL: this endpoint reads `entity_time_range_agg`, an
-    // aggregate table that does NOT carry `source_type` — a per-source deny-set
-    // cannot be expressed against it, so the query stays unscoped and the cache
-    // key intentionally stays `unrestricted()` (the result is identical for
-    // every caller). The only P3 fix here is the `search:execute` gate above.
-    // Scoping first/last-seen would require adding source provenance to the
-    // aggregate (tracked in the NAN-1789 threat-model doc).
+    // NAN-2072: the aggregate fast path is safe only for an unrestricted
+    // caller. Restricted callers are routed by the service to a scoped raw
+    // scan, so the effective scope is both execution input and cache identity.
+    let scope = super::search::effective_scope(&auth);
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "atruerange",
         &[
@@ -597,7 +583,7 @@ pub async fn get_asset_true_time_range(
                 .unwrap_or_default()
                 .as_bytes(),
         ],
-        &nanosiem_core::auth::ScopeSet::unrestricted(),
+        &scope,
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
@@ -618,6 +604,7 @@ pub async fn get_asset_true_time_range(
             &request.identifier_field,
             &request.identifier_value,
             &request.identities,
+            &scope,
         )
         .await?;
 
@@ -949,4 +936,102 @@ pub async fn get_asset_artifacts(
         });
     }
     Ok((crate::cache::cache_status_headers(false, None), Json(response)))
+}
+
+#[cfg(test)]
+mod true_time_range_scope_tests {
+    use nanosiem_core::auth::{
+        permissions::{AUDIT_VIEW, SEARCH_EXECUTE},
+        types::TokenClaims,
+        ApiKeyInfo, ScopeSet,
+    };
+    use std::collections::BTreeSet;
+    use uuid::Uuid;
+
+    fn jwt_auth(permissions: &[&str]) -> crate::AuthContext {
+        crate::AuthContext::from_jwt(TokenClaims {
+            iss: "test".to_string(),
+            aud: "test".to_string(),
+            sub: Uuid::now_v7(),
+            roles: vec![],
+            permissions: permissions.iter().map(|item| item.to_string()).collect(),
+            exp: i64::MAX,
+            iat: 0,
+            jti: Uuid::now_v7(),
+            purpose: "access".to_string(),
+        })
+    }
+
+    fn api_key_auth(permissions: &[&str]) -> crate::AuthContext {
+        crate::AuthContext::from_api_key(&ApiKeyInfo {
+            id: Uuid::now_v7(),
+            name: "asset-scope-test".to_string(),
+            permissions: permissions.iter().map(|item| item.to_string()).collect(),
+            user_id: Some(Uuid::now_v7()),
+        })
+    }
+
+    fn set(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn jwt_and_api_key_principals_compose_the_same_effective_scope() {
+        for mut auth in [
+            jwt_auth(&[SEARCH_EXECUTE, AUDIT_VIEW]),
+            api_key_auth(&[SEARCH_EXECUTE, AUDIT_VIEW]),
+        ] {
+            auth.denied_sources = ScopeSet::from_denied(set(&["insider_threat"]));
+            assert_eq!(
+                super::super::search::effective_scope(&auth).deny_set(),
+                &set(&["insider_threat"])
+            );
+        }
+
+        for auth in [jwt_auth(&[SEARCH_EXECUTE]), api_key_auth(&[SEARCH_EXECUTE])] {
+            assert_eq!(
+                super::super::search::effective_scope(&auth).deny_set(),
+                &set(&["audit"]),
+                "missing audit:view must force the raw scoped path for either credential type"
+            );
+        }
+    }
+
+    /// Wiring guard: the planner tests prove the scope decision, while this
+    /// pins the HTTP surface to that decision and to a scope-separated cache.
+    #[test]
+    fn handler_threads_effective_scope_into_cache_and_service() {
+        let source = include_str!("assets.rs");
+        let marker = "pub async fn get_asset_true_time_range(";
+        let start = source.find(marker).expect("true-time-range handler");
+        let tail = &source[start..];
+        let end = tail
+            .find("// ============================================================================")
+            .expect("end of true-time-range handler section");
+        let handler = &tail[..end];
+
+        assert!(handler.contains("let scope = super::search::effective_scope(&auth);"));
+        assert!(
+            !handler.contains("ScopeSet::unrestricted()"),
+            "handler must never substitute an unscoped cache/service identity"
+        );
+
+        let cache_call = handler
+            .split("SearchResultCache::companion_key")
+            .nth(1)
+            .expect("cache key call");
+        assert!(
+            cache_call.contains("&scope"),
+            "effective scope must be part of the true-range cache key"
+        );
+
+        let service_call = handler
+            .split(".query_asset_true_time_range(")
+            .nth(1)
+            .expect("service call");
+        assert!(
+            service_call.contains("&scope"),
+            "handler must pass effective scope to the production query path"
+        );
+    }
 }

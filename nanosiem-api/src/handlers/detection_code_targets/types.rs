@@ -50,5 +50,9 @@ pub struct TestConnectionResponse {
     pub can_read: bool,
     pub can_write: bool,
     pub default_branch: Option<String>,
+    /// Stable machine-readable failure class. Raw provider errors are never
+    /// returned because they may contain repository or credential context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
     pub message: String,
 }

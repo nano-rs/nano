@@ -6,7 +6,7 @@
 
 use super::channels::ChannelType;
 use super::models::*;
-use super::service::parse_egress_allowlist;
+use super::service::{origin_source_types, parse_egress_allowlist};
 use chrono::TimeZone;
 use uuid::Uuid;
 
@@ -211,6 +211,104 @@ fn alert_payload_carries_completeness_fields_and_omits_none() {
         alert_str.starts_with("alert_"),
         "alert_id is a typeid: {alert_str}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Source-provenance extraction (NAN-2155)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn aggregate_engine_stamp_reaches_the_webhook_scope_decision() {
+    let events = serde_json::json!([{
+        "count": 7,
+        "_nano_source_types": [
+            crate::auth::UNRESOLVED_SOURCE_SENTINEL,
+            " Audit "
+        ]
+    }]);
+
+    let (types, fully_attributed) = origin_source_types(&events);
+
+    assert!(fully_attributed);
+    assert_eq!(
+        types,
+        vec![
+            crate::auth::UNRESOLVED_SOURCE_SENTINEL.to_string(),
+            "audit".to_string(),
+        ]
+    );
+    assert!(
+        crate::auth::is_unresolved_provenance(&types),
+        "the production extractor must preserve the sentinel consumed by any_restricted"
+    );
+    assert!(
+        crate::auth::is_always_restricted_origin(&types),
+        "the production extractor must preserve the audit marker consumed by any_restricted"
+    );
+}
+
+#[test]
+fn forged_per_event_sentinel_cannot_claim_engine_provenance() {
+    let events = serde_json::json!([{
+        "source_type": crate::auth::UNRESOLVED_SOURCE_SENTINEL,
+        "_nano_source_types": [crate::auth::UNRESOLVED_SOURCE_SENTINEL],
+        "message": "attacker-controlled"
+    }]);
+
+    assert_eq!(origin_source_types(&events), (vec![], false));
+}
+
+#[test]
+fn engine_shaped_field_beside_a_real_source_is_ignored() {
+    let events = serde_json::json!([{
+        "source_type": "syslog",
+        "_nano_source_types": [crate::auth::UNRESOLVED_SOURCE_SENTINEL],
+        "message": "attacker-controlled"
+    }]);
+
+    assert_eq!(
+        origin_source_types(&events),
+        (vec!["syslog".to_string()], true)
+    );
+}
+
+#[test]
+fn partial_batch_cannot_launder_an_unconditional_origin() {
+    let events = serde_json::json!([
+        {
+            "source_type": "audit",
+            "message": "sensitive"
+        },
+        {
+            "source_type": crate::auth::UNRESOLVED_SOURCE_SENTINEL,
+            "message": "unattributed"
+        }
+    ]);
+
+    let (types, fully_attributed) = origin_source_types(&events);
+    assert!(!fully_attributed);
+    assert_eq!(types, vec!["audit".to_string()]);
+    assert!(
+        crate::auth::requires_unconditional_origin_redaction(&types),
+        "audit must win before the incomplete-manifest registry fallback"
+    );
+}
+
+#[test]
+fn malformed_engine_stamp_cannot_certify_an_aggregate() {
+    for stamp in [
+        serde_json::json!([]),
+        serde_json::json!(["audit", ""]),
+        serde_json::json!(["audit", 7]),
+        serde_json::json!("audit"),
+    ] {
+        let events = serde_json::json!([{
+            "count": 7,
+            "_nano_source_types": stamp
+        }]);
+        let (_, fully_attributed) = origin_source_types(&events);
+        assert!(!fully_attributed, "must not certify stamp {stamp}");
+    }
 }
 
 // ---------------------------------------------------------------------------

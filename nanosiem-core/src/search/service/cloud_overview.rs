@@ -1058,7 +1058,7 @@ impl SearchService {
             })
             .collect();
 
-        let accounts = build_accounts(&account_rows, risk_provider, risk_window).await;
+        let accounts = build_accounts(&account_rows, risk_provider, risk_window, scope).await;
         let top_account_label = accounts
             .first()
             .map(|a| a.name.clone())
@@ -1078,6 +1078,7 @@ impl SearchService {
             risk_provider,
             time_range,
             SERVICE_TREND_BUCKETS,
+            scope,
         )
         .await;
 
@@ -1194,6 +1195,7 @@ async fn build_accounts(
     rows: &[serde_json::Value],
     risk_provider: &dyn CloudRiskProvider,
     risk_window: RiskTimeWindow,
+    scope: &ScopeSet,
 ) -> Vec<CloudOverviewAccount> {
     // First pass: extract account rows
     let mut accounts: Vec<CloudOverviewAccount> = rows
@@ -1254,6 +1256,7 @@ async fn build_accounts(
                 limit: Some(200),
                 offset: None,
             },
+            scope,
         )
         .await;
     if let Ok(rows) = risk_rows {
@@ -1271,7 +1274,7 @@ async fn build_accounts(
     for acc in accounts.iter_mut() {
         if acc.risk == 0 {
             if let Some(ref p) = acc.top_principal {
-                if let Ok(Some(r)) = risk_provider.risk_for_entities(&[p.clone()]).await {
+                if let Ok(Some(r)) = risk_provider.risk_for_entities(&[p.clone()], scope).await {
                     acc.top_principal_risk = r.risk_score.max(0) as u32;
                     acc.risk = (r.risk_score.max(0) as u32).min(100);
                 }
@@ -1291,6 +1294,7 @@ async fn build_risky_principals(
     risk_provider: &dyn CloudRiskProvider,
     time_range: &TimeRange,
     sparkline_buckets: u32,
+    scope: &ScopeSet,
 ) -> Vec<CloudOverviewPrincipal> {
     let mut principals: Vec<CloudOverviewPrincipal> = rows
         .iter()
@@ -1330,7 +1334,7 @@ async fn build_risky_principals(
     // call — mirrors the asset dossier pattern from NAN-393.
     for p in principals.iter_mut() {
         if let Ok(Some(r)) = risk_provider
-            .risk_for_entities(&[p.id.clone()])
+            .risk_for_entities(&[p.id.clone()], scope)
             .await
         {
             p.risk = (r.risk_score.max(0) as u32).min(100);

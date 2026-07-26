@@ -24,9 +24,44 @@ use crate::handlers::AuditExt;
 use crate::middleware::{ensure_permission, AuthContext};
 use crate::state::AppState;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AiSettingsSurface {
+    Providers,
+    AgentModels,
+}
+
+impl AiSettingsSurface {
+    const fn permission(self) -> &'static str {
+        match self {
+            Self::Providers => permissions::SETTINGS_AI_PROVIDERS,
+            Self::AgentModels => permissions::SETTINGS_AGENT_MODELS,
+        }
+    }
+}
+
+/// Keep the purpose-specific AI management capabilities live and independent.
+fn require_ai_settings_surface(
+    auth: &AuthContext,
+    surface: AiSettingsSurface,
+) -> Result<(), ApiError> {
+    ensure_permission(auth, surface.permission())
+}
+
+fn require_ai_availability(auth: &AuthContext) -> Result<(), ApiError> {
+    ensure_permission(auth, permissions::SETTINGS_AI)
+}
+
 // ============================================================================
 // Request/Response Types — Providers
 // ============================================================================
+
+/// Narrow meloD availability probe for callers with the legacy
+/// non-management `settings:ai` capability.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AiAvailabilityResponse {
+    pub connected: bool,
+    pub model_available: bool,
+}
 
 /// Response for a provider's configuration
 #[derive(Debug, Serialize, ToSchema)]
@@ -156,6 +191,55 @@ pub struct ModelCatalogStatusResponse {
 // Provider Handlers
 // ============================================================================
 
+/// Return only whether meloD has a configured provider and selectable model.
+///
+/// GET /api/settings/ai-availability
+#[utoipa::path(
+    get,
+    path = "/api/settings/ai-availability",
+    tag = "settings",
+    responses(
+        (status = 200, description = "AI availability", body = AiAvailabilityResponse),
+        (status = 403, description = "Missing permission", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
+pub async fn get_ai_availability(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<AiAvailabilityResponse>, ApiError> {
+    require_ai_availability(&auth)?;
+
+    let (connected, model_available): (bool, bool) = sqlx::query_as(
+        r#"
+        SELECT
+            EXISTS (
+                SELECT 1
+                FROM provider_credentials
+                WHERE enabled = true
+                  AND credentials_encrypted IS NOT NULL
+            ) AS connected,
+            EXISTS (
+                SELECT 1
+                FROM available_models m
+                JOIN provider_credentials p ON p.provider = m.provider
+                WHERE p.enabled = true
+                  AND p.credentials_encrypted IS NOT NULL
+                  AND m.deprecated = false
+            ) AS model_available
+        "#,
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|e| ApiError::InternalError(e.to_string()))?;
+
+    Ok(Json(AiAvailabilityResponse {
+        connected,
+        model_available,
+    }))
+}
+
 /// List all AI provider configurations
 ///
 /// GET /api/settings/ai-providers
@@ -174,7 +258,7 @@ pub async fn list_ai_providers(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<ProviderCredentialsResponse>>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_AI)?;
+    require_ai_settings_surface(&auth, AiSettingsSurface::Providers)?;
 
     let rows: Vec<sqlx::postgres::PgRow> = sqlx::query(
         r#"
@@ -234,7 +318,7 @@ pub async fn get_ai_provider(
     Extension(auth): Extension<AuthContext>,
     Path(provider): Path<String>,
 ) -> Result<Json<ProviderCredentialsResponse>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_AI)?;
+    require_ai_settings_surface(&auth, AiSettingsSurface::Providers)?;
 
     let row = sqlx::query(
         r#"
@@ -291,8 +375,8 @@ pub async fn update_ai_provider(
     Path(provider): Path<String>,
     Json(request): Json<UpdateProviderCredentialsRequest>,
 ) -> Result<Json<ProviderCredentialsResponse>, ApiError> {
+    require_ai_settings_surface(&auth, AiSettingsSurface::Providers)?;
     check_not_managed(&state)?;
-    ensure_permission(&auth, permissions::SETTINGS_AI)?;
 
     // SSRF guard (NAN-1368): reject a loopback / private / link-local /
     // cloud-metadata base_url before it is ever persisted, so neither the
@@ -603,7 +687,7 @@ pub async fn validate_ai_provider(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use nanosiem_core::crypto::EncryptedData;
 
-    ensure_permission(&auth, permissions::SETTINGS_AI)?;
+    require_ai_settings_surface(&auth, AiSettingsSurface::Providers)?;
 
     // Get credentials for this provider
     use sqlx::Row;
@@ -1060,7 +1144,7 @@ pub async fn list_agent_model_configs(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<AgentModelConfigResponse>>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_AI)?;
+    require_ai_settings_surface(&auth, AiSettingsSurface::AgentModels)?;
 
     let rows: Vec<sqlx::postgres::PgRow> = sqlx::query(
         r#"
@@ -1115,7 +1199,7 @@ pub async fn get_agent_model_config(
     Extension(auth): Extension<AuthContext>,
     Path(agent_id): Path<String>,
 ) -> Result<Json<AgentModelConfigResponse>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_AI)?;
+    require_ai_settings_surface(&auth, AiSettingsSurface::AgentModels)?;
 
     let row = sqlx::query(
         r#"
@@ -1173,7 +1257,7 @@ pub async fn update_agent_model_config(
 ) -> Result<Json<AgentModelConfigResponse>, ApiError> {
     use nanosiem_enterprise::melod::AgentId;
 
-    ensure_permission(&auth, permissions::SETTINGS_AI)?;
+    require_ai_settings_surface(&auth, AiSettingsSurface::AgentModels)?;
 
     // Try to use the registry to update (this invalidates cache)
     let registry_guard = state.agent_config_registry.read().await;
@@ -1301,7 +1385,7 @@ pub async fn list_available_models(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<AvailableModelResponse>>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_AI)?;
+    require_ai_settings_surface(&auth, AiSettingsSurface::AgentModels)?;
 
     let rows: Vec<sqlx::postgres::PgRow> = sqlx::query(
         r#"
@@ -1357,7 +1441,7 @@ pub async fn list_all_available_models(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<AvailableModelResponse>>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_AI)?;
+    require_ai_settings_surface(&auth, AiSettingsSurface::AgentModels)?;
 
     let rows: Vec<sqlx::postgres::PgRow> = sqlx::query(
         r#"
@@ -1413,7 +1497,7 @@ pub async fn create_available_model(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<CreateAvailableModelRequest>,
 ) -> Result<Json<AvailableModelResponse>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_AI)?;
+    require_ai_settings_surface(&auth, AiSettingsSurface::AgentModels)?;
 
     // --- Input validation & sanitization ---
     let model_id = request.model_id.trim().to_string();
@@ -1595,7 +1679,7 @@ pub async fn update_available_model(
     Path(model_id): Path<String>,
     Json(request): Json<UpdateAvailableModelRequest>,
 ) -> Result<Json<AvailableModelResponse>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_AI)?;
+    require_ai_settings_surface(&auth, AiSettingsSurface::AgentModels)?;
 
     // --- Input validation ---
     if let Some(ref dn) = request.display_name {
@@ -1772,7 +1856,7 @@ pub async fn delete_available_model(
     Extension(client): Extension<ClientContext>,
     Path(model_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_AI)?;
+    require_ai_settings_surface(&auth, AiSettingsSurface::AgentModels)?;
 
     // Fetch provider before deleting (needed for client cache invalidation)
     let provider: Option<String> =
@@ -1851,7 +1935,7 @@ pub async fn sync_model_catalog(
     Extension(auth): Extension<AuthContext>,
     Extension(client): Extension<ClientContext>,
 ) -> Result<Json<ModelCatalogSyncResponse>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_AI)?;
+    require_ai_settings_surface(&auth, AiSettingsSurface::AgentModels)?;
 
     let service = nanosiem_enterprise::melod::ModelCatalogSyncService::new(state.pool.clone());
 
@@ -1901,7 +1985,7 @@ pub async fn get_model_catalog_status(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<ModelCatalogStatusResponse>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_AI)?;
+    require_ai_settings_surface(&auth, AiSettingsSurface::AgentModels)?;
 
     let row = sqlx::query(
         r#"
@@ -1943,4 +2027,130 @@ pub async fn get_model_catalog_status(
     };
 
     Ok(Json(response))
+}
+
+#[cfg(test)]
+mod authorization_tests {
+    use super::*;
+    use nanosiem_core::auth::{api_key::ApiKeyInfo, types::TokenClaims};
+
+    fn jwt_auth(permissions: &[&str]) -> AuthContext {
+        AuthContext::from_jwt(TokenClaims {
+            iss: "test".to_string(),
+            aud: "test".to_string(),
+            sub: uuid::Uuid::nil(),
+            roles: Vec::new(),
+            permissions: permissions
+                .iter()
+                .map(|permission| permission.to_string())
+                .collect(),
+            exp: i64::MAX,
+            iat: 0,
+            jti: uuid::Uuid::nil(),
+            purpose: "access".to_string(),
+        })
+    }
+
+    fn api_key_auth(permissions: &[&str]) -> AuthContext {
+        AuthContext::from_api_key(&ApiKeyInfo {
+            id: uuid::Uuid::nil(),
+            name: "test-key".to_string(),
+            permissions: permissions
+                .iter()
+                .map(|permission| permission.to_string())
+                .collect(),
+            user_id: Some(uuid::Uuid::nil()),
+        })
+    }
+
+    fn assert_denied(result: Result<(), ApiError>) {
+        assert!(matches!(result, Err(ApiError::Forbidden(_))));
+    }
+
+    #[test]
+    fn ai_settings_capability_split_is_identical_for_sessions_and_api_keys() {
+        for auth in [
+            jwt_auth(&[]),
+            jwt_auth(&["settings:view"]),
+            api_key_auth(&[]),
+            api_key_auth(&["settings:view"]),
+        ] {
+            assert_denied(require_ai_availability(&auth));
+            assert_denied(require_ai_settings_surface(
+                &auth,
+                AiSettingsSurface::Providers,
+            ));
+            assert_denied(require_ai_settings_surface(
+                &auth,
+                AiSettingsSurface::AgentModels,
+            ));
+        }
+
+        for auth in [
+            jwt_auth(&[permissions::SETTINGS_AI]),
+            api_key_auth(&[permissions::SETTINGS_AI]),
+        ] {
+            assert!(require_ai_availability(&auth).is_ok());
+            assert_denied(require_ai_settings_surface(
+                &auth,
+                AiSettingsSurface::Providers,
+            ));
+            assert_denied(require_ai_settings_surface(
+                &auth,
+                AiSettingsSurface::AgentModels,
+            ));
+        }
+
+        for auth in [
+            jwt_auth(&[permissions::SETTINGS_AI_PROVIDERS]),
+            api_key_auth(&[permissions::SETTINGS_AI_PROVIDERS]),
+        ] {
+            assert_denied(require_ai_availability(&auth));
+            assert!(require_ai_settings_surface(&auth, AiSettingsSurface::Providers).is_ok());
+            assert_denied(require_ai_settings_surface(
+                &auth,
+                AiSettingsSurface::AgentModels,
+            ));
+        }
+
+        for auth in [
+            jwt_auth(&[permissions::SETTINGS_AGENT_MODELS]),
+            api_key_auth(&[permissions::SETTINGS_AGENT_MODELS]),
+        ] {
+            assert_denied(require_ai_availability(&auth));
+            assert_denied(require_ai_settings_surface(
+                &auth,
+                AiSettingsSurface::Providers,
+            ));
+            assert!(require_ai_settings_surface(&auth, AiSettingsSurface::AgentModels).is_ok());
+        }
+    }
+
+    #[test]
+    fn revoking_a_narrow_capability_drops_only_its_management_surface() {
+        for (before_revocation, after_revocation, surface) in [
+            (
+                jwt_auth(&[
+                    permissions::SETTINGS_AI,
+                    permissions::SETTINGS_AI_PROVIDERS,
+                    permissions::SETTINGS_AGENT_MODELS,
+                ]),
+                jwt_auth(&[permissions::SETTINGS_AI, permissions::SETTINGS_AGENT_MODELS]),
+                AiSettingsSurface::Providers,
+            ),
+            (
+                api_key_auth(&[
+                    permissions::SETTINGS_AI,
+                    permissions::SETTINGS_AI_PROVIDERS,
+                    permissions::SETTINGS_AGENT_MODELS,
+                ]),
+                api_key_auth(&[permissions::SETTINGS_AI, permissions::SETTINGS_AI_PROVIDERS]),
+                AiSettingsSurface::AgentModels,
+            ),
+        ] {
+            assert!(require_ai_settings_surface(&before_revocation, surface).is_ok());
+            assert_denied(require_ai_settings_surface(&after_revocation, surface));
+            assert!(require_ai_availability(&after_revocation).is_ok());
+        }
+    }
 }

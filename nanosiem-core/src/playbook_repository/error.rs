@@ -46,6 +46,13 @@ pub enum PlaybookRepositoryError {
     #[error("Repository is disabled")]
     RepositoryDisabled,
 
+    /// The caller holds the repository capability but not a TARGET-resource
+    /// capability the operation consumes (NAN-2119) — e.g. importing a catalog
+    /// playbook into the library without `playbooks:manage`. Message is
+    /// byte-identical to what the canonical route returns.
+    #[error("{0}")]
+    Forbidden(String),
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -68,6 +75,7 @@ impl PlaybookRepositoryError {
             PlaybookRepositoryError::RateLimited(_) => 429,
             PlaybookRepositoryError::SyncInProgress(_) => 409,
             PlaybookRepositoryError::RepositoryDisabled => 403,
+            PlaybookRepositoryError::Forbidden(_) => 403,
             _ => 500,
         }
     }

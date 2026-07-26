@@ -13,8 +13,13 @@
 //! (`observability_slos.rs`): keeping only the definition persisted means the
 //! numbers are always consistent with the recorded probe results.
 //!
-//! Read endpoints require `search:view` (the console is a search-adjacent
-//! surface); mutations require `settings:system` (checks are configuration).
+//! The list endpoint computes the live summary + history from ClickHouse, so it
+//! requires `search:view` AND `search:execute` (NAN-2084): a view-only principal
+//! that is denied canonical search must not be able to run these
+//! summary/history reads through the wrapper. Mutations require
+//! `settings:system` (checks are configuration) and return only the persisted
+//! definition, so they never execute ClickHouse reads as a side effect
+//! (NAN-2139).
 
 use axum::{
     Extension, Json,
@@ -278,7 +283,13 @@ pub async fn list_synthetics(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<ListChecksResponse>, ApiError> {
+    // NAN-2084: this endpoint runs a fleet-wide `synthetic_check_results` summary
+    // plus a per-check history read. Gate on `search:execute` (not just the view
+    // capability) before any query, so a view-only principal cannot reach probe
+    // results through this wrapper. The summary query must not run on a denied
+    // request, so the check precedes it (and the empty-list fanout).
     ensure_permission(&auth, permissions::SEARCH_VIEW)?;
+    ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
 
     let repo = SyntheticCheckRepository::new(state.pool.clone());
     let defs = repo.list().await.map_err(map_repo_err)?;
@@ -308,7 +319,7 @@ pub async fn list_synthetics(
     tag = "observability",
     request_body = CheckRequest,
     responses(
-        (status = 201, description = "Synthetic check created", body = Check),
+        (status = 201, description = "Synthetic check definition created", body = SyntheticCheck),
         (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
     ),
@@ -318,7 +329,7 @@ pub async fn create_synthetic(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Json(req): Json<CheckRequest>,
-) -> Result<(StatusCode, Json<Check>), ApiError> {
+) -> Result<(StatusCode, Json<SyntheticCheck>), ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let v = req.validate()?;
@@ -362,12 +373,7 @@ pub async fn create_synthetic(
         .await
         .map_err(map_repo_err)?;
 
-    // A freshly-created check has no runs yet — empty summaries → has_runs=false,
-    // uptime null, no history (the neutral no-data state, O33).
-    let time_range = summary_time_range();
-    let summaries = std::collections::HashMap::new();
-    let check = enrich(&state, def, &summaries, &time_range).await?;
-    Ok((StatusCode::CREATED, Json(check)))
+    Ok((StatusCode::CREATED, Json(def)))
 }
 
 /// Update an existing synthetic check.
@@ -378,7 +384,7 @@ pub async fn create_synthetic(
     params(("id" = String, Path, description = "Check typeid (synth_<base32>) or bare UUID")),
     request_body = UpdateCheckRequest,
     responses(
-        (status = 200, description = "Synthetic check updated", body = Check),
+        (status = 200, description = "Synthetic check definition updated", body = SyntheticCheck),
         (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Synthetic check not found", body = ErrorResponse),
@@ -390,7 +396,7 @@ pub async fn update_synthetic(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
     Json(req): Json<UpdateCheckRequest>,
-) -> Result<Json<Check>, ApiError> {
+) -> Result<Json<SyntheticCheck>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let repo = SyntheticCheckRepository::new(state.pool.clone());
@@ -423,17 +429,7 @@ pub async fn update_synthetic(
         .await
         .map_err(map_repo_err)?;
 
-    let time_range = summary_time_range();
-    let summaries = state
-        .search_service
-        .observability_synthetics_summary(&time_range)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "synthetics summary fetch failed");
-            ApiError::InternalError("Failed to compute synthetic-check summary".to_string())
-        })?;
-    let check = enrich(&state, def, &summaries, &time_range).await?;
-    Ok(Json(check))
+    Ok(Json(def))
 }
 
 /// Delete a synthetic check.
@@ -477,3 +473,34 @@ pub async fn delete_synthetic(
     components(schemas(Check, ListChecksResponse, CheckRequest, UpdateCheckRequest, SyntheticCheck))
 )]
 pub struct ObservabilitySyntheticsApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use utoipa::OpenApi;
+
+    #[test]
+    fn mutation_responses_are_definition_only() {
+        let spec = serde_json::to_value(ObservabilitySyntheticsApiDoc::openapi())
+            .expect("OpenAPI document serializes");
+
+        for (path, method, status) in [
+            ("/api/observability/synthetics", "post", "201"),
+            ("/api/observability/synthetics/{id}", "put", "200"),
+        ] {
+            assert_eq!(
+                spec["paths"][path][method]["responses"][status]["content"]["application/json"]["schema"]
+                    ["$ref"],
+                "#/components/schemas/SyntheticCheck",
+                "{method} {path} must not promise live search-derived fields"
+            );
+        }
+
+        assert_eq!(
+            spec["paths"]["/api/observability/synthetics"]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/ListChecksResponse",
+            "the read endpoint remains the explicitly enriched surface"
+        );
+    }
+}

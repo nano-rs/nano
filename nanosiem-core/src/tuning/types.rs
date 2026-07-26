@@ -281,15 +281,49 @@ pub struct ThresholdBreach {
 }
 
 /// Safety validation result for a tuning proposal
+///
+/// NAN-2160: every field defaults, because `tuning_proposals.safety_validation`
+/// is `NOT NULL DEFAULT '{}'` — the schema permits a value strict
+/// deserialization rejected, and 21 live rows held `{}` or `{"is_safe": true}`.
+/// A single such row anywhere in a page turned the whole proposal list into a
+/// tenant-wide 500, and its detail read with it.
+///
+/// The defaults are the CONSERVATIVE reading, not merely the zero values: an
+/// absent `is_safe` means "not known to be safe", and an absent
+/// `critical_indicators_preserved` means "not known to preserve them". Absent
+/// checks and warnings are empty because a validation that never ran produced
+/// no findings — not because it found nothing wrong. Explicitly present fields
+/// are always honoured, so `{"is_safe": true}` still reads as safe.
+///
+/// This keeps the read path resilient on mixed-version data during rollout. It
+/// is deliberately NOT the whole fix: the auto-apply gate in
+/// `tuning::repository::application` reads `is_safe` off the raw JSON with the
+/// same fail-closed default, so a legacy row cannot auto-apply through either
+/// path.
+///
+/// The `#[schema(required)]` attributes are load-bearing. `serde(default)`
+/// governs how a stored ROW is read; the API RESPONSE is unaffected, because
+/// nothing here is `skip_serializing_if` — every response still carries all
+/// four fields. Without these, utoipa infers optionality from the serde
+/// attribute and drops the whole `required` list, telling clients a field may
+/// be absent when it never is.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SafetyValidation {
-    /// Whether the proposal is safe to apply
+    /// Whether the proposal is safe to apply. Absent ⇒ `false` (fail closed).
+    #[serde(default)]
+    #[schema(required)]
     pub is_safe: bool,
-    /// Whether critical security indicators are preserved
+    /// Whether critical security indicators are preserved. Absent ⇒ `false`.
+    #[serde(default)]
+    #[schema(required)]
     pub critical_indicators_preserved: bool,
     /// List of validation checks performed
+    #[serde(default)]
+    #[schema(required)]
     pub validation_checks: Vec<SafetyCheck>,
     /// Warnings about the proposal
+    #[serde(default)]
+    #[schema(required)]
     pub warnings: Vec<String>,
 }
 
@@ -335,6 +369,18 @@ pub struct TuningProposal {
     pub changes_summary: Vec<String>,
     /// Alert patterns that triggered this proposal
     pub affected_patterns: Vec<AlertPattern>,
+    /// NAN-2085 / NAN-2088: DISTINCT normalized `source_type` manifest of the
+    /// telemetry this proposal was derived from. Producers populate it via
+    /// [`crate::tuning::scope::normalize_source_manifest`]; readers gate on it
+    /// with [`crate::tuning::scope::TuningScope`].
+    #[serde(default)]
+    pub source_types: Vec<String>,
+    /// NAN-2085 / NAN-2088: whether `source_types` is a COMPLETE account of the
+    /// proposal's origin. `false` — the default, and what every pre-feature row
+    /// carries — denies EVERY source-restricted reader, because the proposal's
+    /// free-form text may contain values from any source.
+    #[serde(default)]
+    pub source_types_complete: bool,
     /// Safety validation results
     pub safety_validation: SafetyValidation,
     /// Current status of the proposal
@@ -671,6 +717,10 @@ pub struct Notification {
     /// When notification was read (if applicable)
     pub read_at: Option<DateTime<Utc>>,
 }
+
+#[cfg(test)]
+#[path = "safety_validation_compat_tests.rs"]
+mod safety_validation_compat_tests;
 
 #[cfg(test)]
 mod tests {

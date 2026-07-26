@@ -97,11 +97,21 @@ impl DetectionService {
     /// - Generates timechart data from ClickHouse for trend analysis
     ///
     /// Default: looks back 7 days
-    #[instrument(skip(self))]
+    ///
+    /// NAN-2054: `scope` is the CALLER's per-source scope. This API's only
+    /// consumers are the user-initiated meloD detection wizards (@tune / the
+    /// false-positive and impact-preview helpers), which previously ran it
+    /// under `ScopeSet::unrestricted()` — so a source-restricted analyst's
+    /// generated tuning advice and returned match counts were computed over
+    /// data they cannot see, and the sample events surfaced to them came from
+    /// it too. Pass `ScopeSet::unrestricted()` ONLY from a genuine
+    /// system/scheduler entry point.
+    #[instrument(skip(self, scope))]
     pub async fn analyze_historical(
         &self,
         rule_id: Uuid,
         days: Option<i64>,
+        scope: &crate::auth::ScopeSet,
     ) -> Result<HistoricalAnalysisResult, DetectionError> {
         let rule = self.get_rule(rule_id).await?;
         let days = days.unwrap_or(self.config.default_historical_days);
@@ -138,13 +148,13 @@ impl DetectionService {
 
         let response = self
             .search_service
-            // SYSTEM caller: detection analysis must see ALL sources.
-            .search(request, &crate::auth::ScopeSet::unrestricted())
+            // NAN-2054: the CALLER's scope, not an unconditional SYSTEM view.
+            .search(request, scope)
             .await
             .map_err(|e| DetectionError::SearchError(e.to_string()))?;
 
         let (matches_by_bucket, bucket_size_seconds) = self
-            .compute_match_buckets(&rule.query, &time_range, rule.dataset.clone())
+            .compute_match_buckets(&rule.query, &time_range, rule.dataset.clone(), scope)
             .await;
         let matches_by_day = derive_daily_counts(&matches_by_bucket);
 
@@ -194,18 +204,23 @@ impl DetectionService {
     /// Run historical analysis using a query string (for testing before creating a rule)
     ///
     /// Uses ClickHouse for historical queries when DualPool is configured (Requirement 6.5).
-    #[instrument(skip(self))]
+    ///
+    /// NAN-2054: `scope` is the CALLER's per-source scope — see
+    /// [`Self::analyze_historical`].
+    #[instrument(skip(self, scope))]
     pub async fn analyze_query_historical(
         &self,
         query: &str,
         days: Option<i64>,
+        scope: &crate::auth::ScopeSet,
     ) -> Result<HistoricalAnalysisResult, DetectionError> {
         let days = days.unwrap_or(self.config.default_historical_days);
         let end = Utc::now();
         let start = end - Duration::days(days);
         let time_range = TimeRangeInput::new(start, end);
 
-        self.analyze_query_with_time_range(query, time_range).await
+        self.analyze_query_with_time_range(query, time_range, scope)
+            .await
     }
 
     /// Stepped historical analysis for a saved rule (NAN-741).
@@ -222,13 +237,17 @@ impl DetectionService {
     /// `execute_rule` in production — so the test path cannot diverge from
     /// the scheduler path in query semantics.
     #[instrument(
-        skip(self, rule),
+        // NAN-2047: never record `scope` — it's the caller's denied-source set
+        // (authorization metadata, high-cardinality).
+        skip(self, rule, scope),
         fields(rule_id = %rule.id, rule_name = %rule.name)
     )]
     pub async fn analyze_rule_stepped(
         &self,
         rule: &DetectionRule,
         time_range: TimeRangeInput,
+        // NAN-2047: caller's effective source scope for the tester's searches.
+        scope: &crate::auth::ScopeSet,
     ) -> Result<HistoricalAnalysisResult, DetectionError> {
         validate_test_range(&time_range)?;
         self.validate_query(&rule.query)?;
@@ -270,6 +289,7 @@ impl DetectionService {
                 &windows,
                 bucket_size_seconds,
                 rule.dataset.clone(),
+                scope,
             )
             .await;
 
@@ -286,7 +306,7 @@ impl DetectionService {
     /// Same semantics as `analyze_rule_stepped` but with no `DetectionRule`
     /// to read schedule/lookback from — the caller passes them explicitly.
     /// Used by `POST /api/rules/test` from the rule editor before save.
-    #[instrument(skip(self, query))]
+    #[instrument(skip(self, query, scope))]
     pub async fn analyze_query_stepped(
         &self,
         query: &str,
@@ -294,6 +314,8 @@ impl DetectionService {
         schedule_cron: Option<&str>,
         lookback_minutes: Option<i64>,
         dataset: Option<String>,
+        // NAN-2047: caller's effective source scope for the tester's searches.
+        scope: &crate::auth::ScopeSet,
     ) -> Result<HistoricalAnalysisResult, DetectionError> {
         validate_test_range(&time_range)?;
         self.validate_query(query)?;
@@ -322,7 +344,7 @@ impl DetectionService {
         );
 
         let result = self
-            .run_stepped_windows(query, &windows, bucket_size_seconds, dataset)
+            .run_stepped_windows(query, &windows, bucket_size_seconds, dataset, scope)
             .await;
 
         Ok(HistoricalAnalysisResult {
@@ -343,11 +365,22 @@ impl DetectionService {
         windows: &[TimeRangeInput],
         bucket_size_seconds: u32,
         dataset: Option<String>,
+        // NAN-2047: the caller's effective source scope — each stepped-window
+        // search runs under it, so the interactive tester cannot read sources
+        // the caller is denied. The test handlers compose it from the caller's
+        // deny set (+ audit gate); this method is only reached from those
+        // user-triggered paths (analyze_rule_stepped / analyze_query_stepped).
+        scope: &crate::auth::ScopeSet,
     ) -> HistoricalAnalysisResult {
         let start_time = std::time::Instant::now();
         let semaphore = Arc::new(Semaphore::new(STEPPED_TESTER_CONCURRENCY));
         let max_samples = self.config.max_events_per_alert;
 
+        // NAN-2047 (codex): share ONE Arc of the caller scope across all queued
+        // window futures instead of deep-cloning the deny-set BTreeSet per
+        // window (a large deny set near the window cap would be O(windows ×
+        // denied) allocations). Each future holds a cheap Arc clone.
+        let scope = Arc::new(scope.clone());
         let mut futures = FuturesUnordered::new();
         for window in windows {
             let sem = semaphore.clone();
@@ -357,12 +390,13 @@ impl DetectionService {
             // NAN-1561: thread the rule's dataset so a spans/metrics backtest
             // queries the right physical table instead of silently scanning logs.
             let ds = dataset.clone();
+            let sc = Arc::clone(&scope);
             futures.push(async move {
                 let _permit = sem
                     .acquire_owned()
                     .await
                     .expect("stepped tester semaphore should not close");
-                let result = svc.evaluate_window(&q, w.clone(), ds).await;
+                let result = svc.evaluate_window(&q, w.clone(), ds, &sc).await;
                 (w, result)
             });
         }
@@ -593,11 +627,15 @@ impl DetectionService {
     ///
     /// Uses ClickHouse for historical queries when DualPool is configured (Requirement 6.5).
     /// Generates timechart data from ClickHouse for trend analysis.
-    #[instrument(skip(self))]
+    ///
+    /// NAN-2054: `scope` is the CALLER's per-source scope — see
+    /// [`Self::analyze_historical`].
+    #[instrument(skip(self, scope))]
     pub async fn analyze_query_with_time_range(
         &self,
         query: &str,
         time_range: TimeRangeInput,
+        scope: &crate::auth::ScopeSet,
     ) -> Result<HistoricalAnalysisResult, DetectionError> {
         // Validate the query
         self.validate_query(query)?;
@@ -634,13 +672,14 @@ impl DetectionService {
 
         let response = self
             .search_service
-            // SYSTEM caller: detection analysis must see ALL sources.
-            .search(request, &crate::auth::ScopeSet::unrestricted())
+            // NAN-2054: the CALLER's scope, not an unconditional SYSTEM view.
+            .search(request, scope)
             .await
             .map_err(|e| DetectionError::SearchError(e.to_string()))?;
 
-        let (matches_by_bucket, bucket_size_seconds) =
-            self.compute_match_buckets(query, &time_range, None).await;
+        let (matches_by_bucket, bucket_size_seconds) = self
+            .compute_match_buckets(query, &time_range, None, scope)
+            .await;
         let matches_by_day = derive_daily_counts(&matches_by_bucket);
 
         let execution_time_ms = start_time.elapsed().as_millis() as u64;
@@ -695,11 +734,15 @@ impl DetectionService {
     /// Returns `(buckets, bucket_size_seconds)`. On any failure (parse error,
     /// search error, etc.) returns `(vec![], 0)` so the endpoint still
     /// responds successfully with sample events.
+    ///
+    /// NAN-2054: `scope` is threaded from the caller so the timechart used for
+    /// the noise assessment counts the same rows the caller may read.
     async fn compute_match_buckets(
         &self,
         query: &str,
         time_range: &TimeRangeInput,
         dataset: Option<String>,
+        scope: &crate::auth::ScopeSet,
     ) -> (Vec<TimeBucket>, u32) {
         let bucket_size = pick_bucket_size_seconds(time_range.end - time_range.start);
 
@@ -725,7 +768,7 @@ impl DetectionService {
         // Cap at MAX_BUCKETS + a small slack for boundary buckets.
         let limit = (MAX_BUCKETS as usize) + 5;
         let buckets = self
-            .fetch_bucket_counts(&timechart_query, time_range, limit, dataset)
+            .fetch_bucket_counts(&timechart_query, time_range, limit, dataset, scope)
             .await;
         (buckets, bucket_size)
     }
@@ -737,6 +780,7 @@ impl DetectionService {
         time_range: &TimeRangeInput,
         limit: usize,
         dataset: Option<String>,
+        scope: &crate::auth::ScopeSet,
     ) -> Vec<TimeBucket> {
         let request = SearchRequest {
             query: timechart_query.to_string(),
@@ -756,12 +800,8 @@ impl DetectionService {
             dataset,
         };
 
-        // SYSTEM caller: detection analysis must see ALL sources.
-        match self
-            .search_service
-            .search(request, &crate::auth::ScopeSet::unrestricted())
-            .await
-        {
+        // NAN-2054: the CALLER's scope, threaded from the analysis entry point.
+        match self.search_service.search(request, scope).await {
             Ok(response) => response
                 .results
                 .iter()

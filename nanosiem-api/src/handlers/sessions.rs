@@ -55,6 +55,20 @@ impl SessionApiError {
     }
 }
 
+/// NAN-2040: 403 for an API key attempting human session self-service. An API
+/// key's `claims.sub` is its owner, so the ownership shortcut would otherwise let
+/// any key act on the owner's browser sessions. API-key session administration
+/// must instead go through the admin capability (users:view / users:edit).
+fn api_key_forbidden() -> (StatusCode, Json<SessionApiError>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(SessionApiError::new(
+            "interactive_session_required",
+            "Session self-service requires an interactive session; API keys need an admin capability.",
+        )),
+    )
+}
+
 /// Query parameters for listing sessions
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct ListSessionsQuery {
@@ -137,6 +151,13 @@ pub async fn list_my_sessions(
     State(state): State<AppState>,
     auth: axum::Extension<AuthContext>,
 ) -> Result<Json<SessionListResponse>, (StatusCode, Json<SessionApiError>)> {
+    // NAN-2040: "my sessions" is human self-service. An API key's subject is its
+    // owner, so without this an unscoped key could enumerate the owner's browser
+    // sessions. This route is interactive-only — there is no admin alternative for
+    // /me (admins list via GET /api/sessions).
+    if auth.is_api_key {
+        return Err(api_key_forbidden());
+    }
     // Users can always view their own sessions, no permission check needed
     let user_id = auth.user_id();
 
@@ -184,8 +205,10 @@ pub async fn get_session(
         (status, Json(err))
     })?;
 
-    // Check if user can view this session (own session or admin)
-    let is_own_session = session.user_id == auth.user_id();
+    // Check if user can view this session (own session or admin).
+    // NAN-2040: the ownership shortcut is interactive-only — an API key must hold
+    // users:view (its owner-subject must not be a self-service shortcut).
+    let is_own_session = !auth.is_api_key && session.user_id == auth.user_id();
     let is_admin = auth.has_permission(permissions::USERS_VIEW);
 
     if !is_own_session && !is_admin {
@@ -237,6 +260,12 @@ pub async fn terminate_session(
     let user_agent = client.user_agent.clone();
     let requesting_user_id = auth.user_id();
     let is_admin = auth.has_permission(permissions::USERS_EDIT);
+    // NAN-2040: an API key must not terminate sessions via the owner-subject
+    // shortcut — it needs users:edit. Interactive users keep own-session control
+    // (the service enforces ownership for non-admins).
+    if auth.is_api_key && !is_admin {
+        return Err(api_key_forbidden());
+    }
 
     state
         .session_service
@@ -293,9 +322,11 @@ pub async fn terminate_user_sessions(
     let requesting_user_id = auth.user_id();
     let is_admin = auth.has_permission(permissions::USERS_EDIT);
 
-    // Security: Verify user can terminate these sessions (own sessions or admin)
-    // Defense-in-depth: service layer also checks, but validate here first
-    if *user_id != requesting_user_id && !is_admin {
+    // Security: Verify user can terminate these sessions (own sessions or admin).
+    // NAN-2040: the own-sessions shortcut is interactive-only — an API key must
+    // hold users:edit (its owner-subject must not grant self-service).
+    // Defense-in-depth: service layer also checks, but validate here first.
+    if (*user_id != requesting_user_id || auth.is_api_key) && !is_admin {
         return Err((
             StatusCode::FORBIDDEN,
             Json(SessionApiError::new(

@@ -11,9 +11,12 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
+
+use crate::auth::ScopeSet;
 
 use super::admission::QueryPriority;
 use super::types::{SearchRequest, SearchResponse};
@@ -124,11 +127,20 @@ pub struct SearchJob {
     pub result: Option<SearchResponse>,
     /// Error message (when failed)
     pub error: Option<String>,
+    /// NAN-2096: the effective source-scope deny-set the job EXECUTED under,
+    /// stamped atomically at creation and immutable thereafter.
+    ///
+    /// `None` means the provenance is UNKNOWN — the job predates the stamp (a
+    /// rolling upgrade left it in a shared Redis store) or its stored payload
+    /// failed to decode. Unknown is never treated as `Some(empty)`; see
+    /// [`SearchJob::result_visible_under`] for the (deliberately narrow) rule
+    /// that governs it.
+    pub scope_deny: Option<BTreeSet<String>>,
 }
 
 impl SearchJob {
-    /// Create a new running job
-    pub fn new(id: String, request: SearchRequest) -> Self {
+    /// Create a new running job under `scope`.
+    pub fn new(id: String, request: SearchRequest, scope: &ScopeSet) -> Self {
         Self {
             id,
             status: SearchJobStatus::Running,
@@ -141,15 +153,17 @@ impl SearchJob {
             request,
             result: None,
             error: None,
+            scope_deny: Some(scope.deny_set().clone()),
         }
     }
 
-    /// Create a new job in Queued state with user and priority
+    /// Create a new job in Queued state with user, priority and execution scope.
     pub fn new_queued(
         id: String,
         request: SearchRequest,
         user_id: Uuid,
         priority: QueryPriority,
+        scope: &ScopeSet,
     ) -> Self {
         Self {
             id,
@@ -163,6 +177,39 @@ impl SearchJob {
             request,
             result: None,
             error: None,
+            scope_deny: Some(scope.deny_set().clone()),
+        }
+    }
+
+    /// NAN-2096: may a caller whose CURRENT effective source-scope deny-set is
+    /// `current_deny` read this job's stored status/result?
+    ///
+    /// A completed result is a frozen snapshot of rows that were visible under
+    /// the deny-set captured at submission. Ownership plus `search:execute` is
+    /// not authorization to that snapshot after the caller's data scope
+    /// narrows, so the read is re-decided here on every poll:
+    ///
+    /// * `current_deny ⊆ scope_deny` → every source that could have contributed
+    ///   to the result is still visible to the caller. Allowed. (Widening the
+    ///   caller's visibility is always safe — the result can only under-report.)
+    /// * anything in `current_deny` that was NOT denied at submission → a source
+    ///   the caller may no longer see could be in the result. Denied.
+    /// * `scope_deny == None` (unknown provenance) → readable ONLY by a caller
+    ///   whose deny-set is empty. That is not a fail-open exception: a caller
+    ///   denied nothing may already read every source directly, so the snapshot
+    ///   can hold nothing they are not entitled to. Every *restricted* caller is
+    ///   refused, which is the fail-closed half that matters.
+    ///
+    /// This is deliberately set-based rather than row-level: results carry no
+    /// per-row source manifest, so a mixed-source result fails closed as soon as
+    /// ONE contributing source could be denied. Re-checking at READ time (rather
+    /// than refusing to persist) is what makes revocation retroactive — an
+    /// already-running job keeps executing under its submission scope, but its
+    /// output stops being readable the moment the scope narrows.
+    pub fn result_visible_under(&self, current_deny: &BTreeSet<String>) -> bool {
+        match &self.scope_deny {
+            Some(submitted) => current_deny.is_subset(submitted),
+            None => current_deny.is_empty(),
         }
     }
 
@@ -281,14 +328,21 @@ pub struct AdminSearchJobSummary {
 #[async_trait]
 pub trait SearchJobStore: Send + Sync + std::fmt::Debug {
     /// Create a new Running job. Returns None if max jobs exceeded.
-    async fn create(&self, request: SearchRequest) -> Option<String>;
+    ///
+    /// `scope` (NAN-2096) is the effective source-scope deny-set the job will
+    /// execute under. It is stamped on the job in the SAME write that creates
+    /// it, so a job can never exist with an unknown execution scope.
+    async fn create(&self, request: SearchRequest, scope: &ScopeSet) -> Option<String>;
 
     /// Create a new Queued job with user/priority. Returns None if max jobs exceeded.
+    ///
+    /// See [`SearchJobStore::create`] for `scope`.
     async fn create_queued(
         &self,
         request: SearchRequest,
         user_id: Uuid,
         priority: QueryPriority,
+        scope: &ScopeSet,
     ) -> Option<String>;
 
     /// Get a job by ID (without result payload to avoid large clones).
@@ -324,8 +378,15 @@ pub trait SearchJobStore: Send + Sync + std::fmt::Debug {
     /// List jobs for a specific user.
     async fn list_for_user(&self, user_id: Uuid) -> Vec<SearchJobSummary>;
 
-    /// List all jobs (admin view).
-    async fn list_all(&self) -> Vec<AdminSearchJobSummary>;
+    /// List all jobs (admin view), filtered to those the viewer may see.
+    ///
+    /// NAN-2096/NAN-2109: the admin summary carries every principal's query
+    /// preview, so the source-scope predicate lives INSIDE this call rather than
+    /// in the handler — a caller cannot list a job whose result the poll route
+    /// would refuse them. Pass an EMPTY `viewer_deny` for internal, non-user
+    /// consumers (metrics, admission accounting): an empty deny-set is a subset
+    /// of every stamp, so nothing is filtered out.
+    async fn list_all(&self, viewer_deny: &BTreeSet<String>) -> Vec<AdminSearchJobSummary>;
 
     /// Count of active (Running + Queued) jobs.
     async fn active_count(&self) -> usize;
@@ -381,7 +442,7 @@ impl InMemoryJobStore {
 
 #[async_trait]
 impl SearchJobStore for InMemoryJobStore {
-    async fn create(&self, request: SearchRequest) -> Option<String> {
+    async fn create(&self, request: SearchRequest, scope: &ScopeSet) -> Option<String> {
         self.cleanup_expired();
 
         if self.jobs.len() >= MAX_JOBS {
@@ -390,7 +451,7 @@ impl SearchJobStore for InMemoryJobStore {
         }
 
         let job_id = Uuid::now_v7().to_string();
-        let job = SearchJob::new(job_id.clone(), request);
+        let job = SearchJob::new(job_id.clone(), request, scope);
         self.jobs.insert(job_id.clone(), job);
 
         tracing::debug!("Created async search job: {}", job_id);
@@ -402,6 +463,7 @@ impl SearchJobStore for InMemoryJobStore {
         request: SearchRequest,
         user_id: Uuid,
         priority: QueryPriority,
+        scope: &ScopeSet,
     ) -> Option<String> {
         self.cleanup_expired();
 
@@ -411,7 +473,7 @@ impl SearchJobStore for InMemoryJobStore {
         }
 
         let job_id = Uuid::now_v7().to_string();
-        let job = SearchJob::new_queued(job_id.clone(), request, user_id, priority);
+        let job = SearchJob::new_queued(job_id.clone(), request, user_id, priority, scope);
         self.jobs.insert(job_id.clone(), job);
 
         tracing::debug!(
@@ -438,6 +500,7 @@ impl SearchJobStore for InMemoryJobStore {
                 request: job.request.clone(),
                 result: None,
                 error: job.error.clone(),
+                scope_deny: job.scope_deny.clone(),
             }
         })
     }
@@ -533,9 +596,10 @@ impl SearchJobStore for InMemoryJobStore {
             .collect()
     }
 
-    async fn list_all(&self) -> Vec<AdminSearchJobSummary> {
+    async fn list_all(&self, viewer_deny: &BTreeSet<String>) -> Vec<AdminSearchJobSummary> {
         self.jobs
             .iter()
+            .filter(|r| r.value().result_visible_under(viewer_deny))
             .map(|r| {
                 let job = r.value();
                 let query = truncate_query_preview(&job.request.query);
@@ -662,6 +726,30 @@ impl RedisJobStore {
         serde_json::from_slice(&json_bytes).ok()
     }
 
+    /// NAN-2096: serialize the execution deny-set for the `scope_deny` hash
+    /// field. An UNRESTRICTED scope round-trips as `"[]"`, which is distinct
+    /// from a missing field (a pre-NAN-2096 job) — the reader must be able to
+    /// tell "denied nothing" from "we don't know what this ran under".
+    ///
+    /// A serialization failure (unreachable for `BTreeSet<String>`) degrades to
+    /// the EMPTY STRING, which decodes back as "unknown", not as `[]`. Falling
+    /// back to `[]` would silently stamp a restricted job as unrestricted — the
+    /// one direction that fails open.
+    fn encode_scope_deny(scope: &ScopeSet) -> String {
+        serde_json::to_string(scope.deny_set()).unwrap_or_default()
+    }
+
+    /// Inverse of [`Self::encode_scope_deny`]. An absent field (legacy job) or
+    /// unparseable payload yields `None` — unknown provenance, which
+    /// [`SearchJob::result_visible_under`] treats as fail-closed.
+    fn decode_scope_deny(raw: Option<&str>) -> Option<BTreeSet<String>> {
+        let raw = raw?;
+        if raw.is_empty() {
+            return None;
+        }
+        serde_json::from_str(raw).ok()
+    }
+
     /// Apply completion TTL to job key and indexes.
     async fn set_completion_ttl(&self, job_id: &str, user_id: Option<&str>) {
         let mut conn = self.conn.clone();
@@ -683,7 +771,7 @@ impl RedisJobStore {
 
 #[async_trait]
 impl SearchJobStore for RedisJobStore {
-    async fn create(&self, request: SearchRequest) -> Option<String> {
+    async fn create(&self, request: SearchRequest, scope: &ScopeSet) -> Option<String> {
         let mut conn = self.conn.clone();
 
         // Check job limit
@@ -723,6 +811,8 @@ impl SearchJobStore for RedisJobStore {
             .arg(&request_json)
             .arg("error")
             .arg("")
+            .arg("scope_deny")
+            .arg(Self::encode_scope_deny(scope))
             .query_async(&mut conn)
             .await;
 
@@ -742,6 +832,7 @@ impl SearchJobStore for RedisJobStore {
         request: SearchRequest,
         user_id: Uuid,
         priority: QueryPriority,
+        scope: &ScopeSet,
     ) -> Option<String> {
         let mut conn = self.conn.clone();
 
@@ -781,6 +872,8 @@ impl SearchJobStore for RedisJobStore {
             .arg(&request_json)
             .arg("error")
             .arg("")
+            .arg("scope_deny")
+            .arg(Self::encode_scope_deny(scope))
             .query_async(&mut conn)
             .await;
 
@@ -811,7 +904,12 @@ impl SearchJobStore for RedisJobStore {
         let mut conn = self.conn.clone();
         let key = Self::job_key(job_id);
 
-        let fields: Vec<String> = redis::cmd("HMGET")
+        // `Vec<Option<String>>`, NOT `Vec<String>`: redis-rs 1.x fails the WHOLE
+        // conversion if any HMGET slot is nil, and `scope_deny` is absent on
+        // jobs written before NAN-2096. Decoding into `Option` makes a missing
+        // field a `None` slot instead of turning the entire `get()` into `None`
+        // (which would break ownership resolution and cancel for legacy jobs).
+        let fields: Vec<Option<String>> = redis::cmd("HMGET")
             .arg(&key)
             .arg("status")
             .arg("query_id")
@@ -822,43 +920,55 @@ impl SearchJobStore for RedisJobStore {
             .arg("completed_at_ms")
             .arg("request_json")
             .arg("error")
+            .arg("scope_deny")
             .query_async(&mut conn)
             .await
             .ok()?;
 
-        if fields.len() < 9 || fields[0].is_empty() {
+        let field = |idx: usize| -> &str {
+            fields
+                .get(idx)
+                .and_then(|v| v.as_deref())
+                .unwrap_or_default()
+        };
+
+        if fields.len() < 9 || field(0).is_empty() {
             return None;
         }
 
-        let status: SearchJobStatus = fields[0].parse().ok()?;
-        let query_id = fields[1].clone();
-        let user_id = if fields[2].is_empty() {
+        let status: SearchJobStatus = field(0).parse().ok()?;
+        let query_id = field(1).to_string();
+        let user_id = if field(2).is_empty() {
             None
         } else {
-            Uuid::parse_str(&fields[2]).ok()
+            Uuid::parse_str(field(2)).ok()
         };
-        let priority: QueryPriority = fields[3].parse().unwrap_or(QueryPriority::Interactive);
-        let queue_position: Option<u32> = if fields[4].is_empty() {
+        let priority: QueryPriority = field(3).parse().unwrap_or(QueryPriority::Interactive);
+        let queue_position: Option<u32> = if field(4).is_empty() {
             None
         } else {
-            fields[4].parse().ok()
+            field(4).parse().ok()
         };
-        let created_at_ms: i64 = fields[5].parse().unwrap_or(0);
+        let created_at_ms: i64 = field(5).parse().unwrap_or(0);
         let created_at = DateTime::from_timestamp_millis(created_at_ms).unwrap_or_else(Utc::now);
-        let completed_at = if fields[6].is_empty() {
+        let completed_at = if field(6).is_empty() {
             None
         } else {
-            fields[6]
+            field(6)
                 .parse::<i64>()
                 .ok()
                 .and_then(DateTime::from_timestamp_millis)
         };
-        let request: SearchRequest = serde_json::from_str(&fields[7]).ok()?;
-        let error = if fields[8].is_empty() {
+        let request: SearchRequest = serde_json::from_str(field(7)).ok()?;
+        let error = if field(8).is_empty() {
             None
         } else {
-            Some(fields[8].clone())
+            Some(field(8).to_string())
         };
+        // Slot 9 goes through the same bounds-safe helper as every other slot;
+        // "" (nil, or a short response) and a missing field both decode to
+        // `None` — unknown provenance, which the read path fails closed on.
+        let scope_deny = Self::decode_scope_deny(Some(field(9)));
 
         Some(SearchJob {
             id: job_id.to_string(),
@@ -872,6 +982,7 @@ impl SearchJobStore for RedisJobStore {
             request,
             result: None, // Don't load result here — use get_status() for that
             error,
+            scope_deny,
         })
     }
 
@@ -1121,7 +1232,7 @@ impl SearchJobStore for RedisJobStore {
         summaries
     }
 
-    async fn list_all(&self) -> Vec<AdminSearchJobSummary> {
+    async fn list_all(&self, viewer_deny: &BTreeSet<String>) -> Vec<AdminSearchJobSummary> {
         let mut conn = self.conn.clone();
 
         let job_ids: Vec<String> = redis::cmd("SMEMBERS")
@@ -1133,6 +1244,10 @@ impl SearchJobStore for RedisJobStore {
         let mut summaries = Vec::new();
         for jid in job_ids {
             if let Some(job) = self.get(&jid).await {
+                // `get` already decoded the stamp, so the filter is free.
+                if !job.result_visible_under(viewer_deny) {
+                    continue;
+                }
                 let query = truncate_query_preview(&job.request.query);
                 let created_at_ms = job.created_at_ms();
                 let elapsed_ms = job.elapsed_ms();
@@ -1161,7 +1276,9 @@ impl SearchJobStore for RedisJobStore {
     async fn active_count(&self) -> usize {
         // For Redis, we iterate all jobs and count active ones.
         // In practice this set is small (<1000 by MAX_JOBS limit).
-        let all = self.list_all().await;
+        // Internal accounting, not a user-facing read: an EMPTY viewer deny-set
+        // is a subset of every stamp, so no job is filtered out of the count.
+        let all = self.list_all(&BTreeSet::new()).await;
         all.iter()
             .filter(|j| j.status == SearchJobStatus::Running || j.status == SearchJobStatus::Queued)
             .count()
@@ -1227,7 +1344,10 @@ mod tests {
     #[tokio::test]
     async fn test_create_and_get_job() {
         let store = InMemoryJobStore::new();
-        let job_id = store.create(make_test_request()).await.unwrap();
+        let job_id = store
+            .create(make_test_request(), &ScopeSet::unrestricted())
+            .await
+            .unwrap();
 
         let job = store.get(&job_id).await.unwrap();
         assert_eq!(job.status, SearchJobStatus::Running);
@@ -1238,7 +1358,10 @@ mod tests {
     #[tokio::test]
     async fn test_complete_job() {
         let store = InMemoryJobStore::new();
-        let job_id = store.create(make_test_request()).await.unwrap();
+        let job_id = store
+            .create(make_test_request(), &ScopeSet::unrestricted())
+            .await
+            .unwrap();
 
         let result = SearchResponse::empty();
         store.complete(&job_id, result).await;
@@ -1251,7 +1374,10 @@ mod tests {
     #[tokio::test]
     async fn test_fail_job() {
         let store = InMemoryJobStore::new();
-        let job_id = store.create(make_test_request()).await.unwrap();
+        let job_id = store
+            .create(make_test_request(), &ScopeSet::unrestricted())
+            .await
+            .unwrap();
 
         store.fail(&job_id, "Test error".to_string()).await;
 
@@ -1263,7 +1389,10 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_job() {
         let store = InMemoryJobStore::new();
-        let job_id = store.create(make_test_request()).await.unwrap();
+        let job_id = store
+            .create(make_test_request(), &ScopeSet::unrestricted())
+            .await
+            .unwrap();
 
         store.cancel(&job_id).await;
 
@@ -1274,7 +1403,10 @@ mod tests {
     #[tokio::test]
     async fn test_set_query_id() {
         let store = InMemoryJobStore::new();
-        let job_id = store.create(make_test_request()).await.unwrap();
+        let job_id = store
+            .create(make_test_request(), &ScopeSet::unrestricted())
+            .await
+            .unwrap();
 
         store
             .set_query_id(&job_id, "ch-query-123".to_string())
@@ -1289,7 +1421,12 @@ mod tests {
         let store = InMemoryJobStore::new();
         let user_id = Uuid::now_v7();
         let job_id = store
-            .create_queued(make_test_request(), user_id, QueryPriority::Interactive)
+            .create_queued(
+                make_test_request(),
+                user_id,
+                QueryPriority::Interactive,
+                &ScopeSet::unrestricted(),
+            )
             .await
             .unwrap();
 
@@ -1311,15 +1448,30 @@ mod tests {
         let user2 = Uuid::now_v7();
 
         let _j1 = store
-            .create_queued(make_test_request(), user1, QueryPriority::Interactive)
+            .create_queued(
+                make_test_request(),
+                user1,
+                QueryPriority::Interactive,
+                &ScopeSet::unrestricted(),
+            )
             .await
             .unwrap();
         let _j2 = store
-            .create_queued(make_test_request(), user1, QueryPriority::Analytics)
+            .create_queued(
+                make_test_request(),
+                user1,
+                QueryPriority::Analytics,
+                &ScopeSet::unrestricted(),
+            )
             .await
             .unwrap();
         let _j3 = store
-            .create_queued(make_test_request(), user2, QueryPriority::Interactive)
+            .create_queued(
+                make_test_request(),
+                user2,
+                QueryPriority::Interactive,
+                &ScopeSet::unrestricted(),
+            )
             .await
             .unwrap();
 
@@ -1335,7 +1487,12 @@ mod tests {
         let store = InMemoryJobStore::new();
         let user_id = Uuid::now_v7();
         let job_id = store
-            .create_queued(make_test_request(), user_id, QueryPriority::Interactive)
+            .create_queued(
+                make_test_request(),
+                user_id,
+                QueryPriority::Interactive,
+                &ScopeSet::unrestricted(),
+            )
             .await
             .unwrap();
 
@@ -1344,12 +1501,194 @@ mod tests {
         assert_eq!(status.queue_position, Some(3));
     }
 
+    // ========================================================================
+    // NAN-2096 — async results must not survive source-scope revocation
+    // ========================================================================
+
+    fn deny(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn job_stamped_with(scope: &[&str]) -> SearchJob {
+        SearchJob::new_queued(
+            "job-1".to_string(),
+            make_test_request(),
+            Uuid::now_v7(),
+            QueryPriority::Interactive,
+            &ScopeSet::from_denied(deny(scope)),
+        )
+    }
+
+    /// The reported repro: a job runs while `windows_sysmon` is visible, then the
+    /// source is restricted. Polling the completed job must no longer expose it.
+    #[test]
+    fn scope_narrowed_after_submission_hides_the_result() {
+        let job = job_stamped_with(&["audit"]);
+        // Same scope as submission → still readable.
+        assert!(job.result_visible_under(&deny(&["audit"])));
+        // `windows_sysmon` newly restricted → the snapshot may contain it.
+        assert!(!job.result_visible_under(&deny(&["audit", "windows_sysmon"])));
+    }
+
+    /// Widening the caller's visibility is always safe — the stored result can
+    /// only under-report relative to what they may now see.
+    #[test]
+    fn scope_widened_after_submission_still_returns_the_result() {
+        let job = job_stamped_with(&["audit", "insider_threat"]);
+        assert!(job.result_visible_under(&deny(&["audit"])));
+        assert!(job.result_visible_under(&BTreeSet::new()));
+    }
+
+    /// A result built from several sources fails closed as soon as ONE of them
+    /// could now be denied — results carry no per-row source manifest, so there
+    /// is nothing to re-filter against.
+    #[test]
+    fn mixed_source_result_fails_closed_on_one_new_denial() {
+        let job = job_stamped_with(&[]);
+        assert!(job.result_visible_under(&BTreeSet::new()));
+        assert!(!job.result_visible_under(&deny(&["aws_cloudtrail"])));
+    }
+
+    /// Swapping one denied source for another is NOT a subset relation: the
+    /// newly denied source could be in the result even though the deny-set is
+    /// the same size.
+    #[test]
+    fn equal_size_but_different_denial_fails_closed() {
+        let job = job_stamped_with(&["insider_threat"]);
+        assert!(!job.result_visible_under(&deny(&["windows_sysmon"])));
+    }
+
+    /// Legacy jobs (written before the stamp existed) have unknown provenance.
+    /// Unknown is never "unrestricted": only a caller denied nothing at all may
+    /// read them.
+    #[test]
+    fn unstamped_legacy_job_fails_closed_for_restricted_callers() {
+        let mut job = job_stamped_with(&[]);
+        job.scope_deny = None;
+        assert!(!job.result_visible_under(&deny(&["audit"])));
+        assert!(!job.result_visible_under(&deny(&["windows_sysmon"])));
+        assert!(job.result_visible_under(&BTreeSet::new()));
+    }
+
+    /// The stamp is written by the CREATING call, so no job can exist without
+    /// one — verified through the store rather than the constructor.
+    #[tokio::test]
+    async fn in_memory_store_stamps_the_execution_scope_at_creation() {
+        let store = InMemoryJobStore::new();
+        let scope = ScopeSet::from_denied(deny(&["audit", "insider_threat"]));
+
+        let queued = store
+            .create_queued(
+                make_test_request(),
+                Uuid::now_v7(),
+                QueryPriority::Interactive,
+                &scope,
+            )
+            .await
+            .unwrap();
+        let job = store.get(&queued).await.unwrap();
+        assert_eq!(job.scope_deny.as_ref(), Some(&deny(&["audit", "insider_threat"])));
+        assert!(!job.result_visible_under(&deny(&["audit", "insider_threat", "windows_sysmon"])));
+
+        // The non-queued constructor stamps identically.
+        let running = store
+            .create(make_test_request(), &scope)
+            .await
+            .unwrap();
+        let job = store.get(&running).await.unwrap();
+        assert_eq!(job.scope_deny.as_ref(), Some(&deny(&["audit", "insider_threat"])));
+    }
+
+    /// NAN-2109 + NAN-2096: the admin list carries every principal's query
+    /// preview, so the scope predicate lives INSIDE `list_all` — an admin cannot
+    /// enumerate a job whose result the poll route would refuse them. Internal
+    /// consumers pass an empty deny-set and still see everything.
+    #[tokio::test]
+    async fn admin_list_hides_jobs_the_viewer_could_not_poll() {
+        let store = InMemoryJobStore::new();
+        let visible = store
+            .create_queued(
+                make_test_request(),
+                Uuid::now_v7(),
+                QueryPriority::Interactive,
+                &ScopeSet::from_denied(deny(&["audit", "windows_sysmon"])),
+            )
+            .await
+            .unwrap();
+        let hidden = store
+            .create_queued(
+                make_test_request(),
+                Uuid::now_v7(),
+                QueryPriority::Interactive,
+                &ScopeSet::from_denied(deny(&["audit"])),
+            )
+            .await
+            .unwrap();
+
+        // Viewer denied `windows_sysmon` sees only the job that already
+        // excluded it.
+        let viewer = deny(&["audit", "windows_sysmon"]);
+        let ids: Vec<String> = store
+            .list_all(&viewer)
+            .await
+            .into_iter()
+            .map(|j| j.job_id)
+            .collect();
+        assert!(ids.contains(&visible));
+        assert!(!ids.contains(&hidden));
+
+        // Internal / unrestricted consumers (admission accounting) see all.
+        assert_eq!(store.list_all(&BTreeSet::new()).await.len(), 2);
+        assert_eq!(store.active_count().await, 2);
+    }
+
+    /// Redis parity: an UNRESTRICTED scope must round-trip as "denied nothing",
+    /// distinct from a legacy row where the hash field is simply absent. If
+    /// these collapsed, either every unrestricted job would fail closed or every
+    /// legacy job would be treated as unrestricted.
+    #[test]
+    fn redis_scope_encoding_distinguishes_unrestricted_from_missing() {
+        let unrestricted = RedisJobStore::encode_scope_deny(&ScopeSet::unrestricted());
+        assert_eq!(unrestricted, "[]");
+        assert_eq!(
+            RedisJobStore::decode_scope_deny(Some(&unrestricted)),
+            Some(BTreeSet::new())
+        );
+
+        let restricted =
+            RedisJobStore::encode_scope_deny(&ScopeSet::from_denied(deny(&["audit", "zeek"])));
+        assert_eq!(
+            RedisJobStore::decode_scope_deny(Some(&restricted)),
+            Some(deny(&["audit", "zeek"]))
+        );
+
+        // Legacy row: field absent (nil → None) or empty. Both are "unknown".
+        assert_eq!(RedisJobStore::decode_scope_deny(None), None);
+        assert_eq!(RedisJobStore::decode_scope_deny(Some("")), None);
+        // Corrupt payload is unknown too, never silently unrestricted.
+        assert_eq!(RedisJobStore::decode_scope_deny(Some("{not json")), None);
+
+        // A restricted scope must never encode to the unrestricted stamp. The
+        // encoder's `unwrap_or_default()` failure path yields "" (which decodes
+        // to `None`/unknown) precisely so that a serialization failure cannot
+        // downgrade a restricted job to "denied nothing" — the one fail-open
+        // direction. Serialization of `BTreeSet<String>` cannot actually fail,
+        // so the branch is asserted by construction rather than executed.
+        assert_ne!(restricted, "[]");
+        assert_ne!(RedisJobStore::encode_scope_deny(&ScopeSet::unrestricted()), "");
+    }
+
     #[tokio::test]
     async fn test_queued_status_in_response() {
         let store = InMemoryJobStore::new();
         let user_id = Uuid::now_v7();
         let job_id = store
-            .create_queued(make_test_request(), user_id, QueryPriority::Interactive)
+            .create_queued(
+                make_test_request(),
+                user_id,
+                QueryPriority::Interactive,
+                &ScopeSet::unrestricted(),
+            )
             .await
             .unwrap();
 

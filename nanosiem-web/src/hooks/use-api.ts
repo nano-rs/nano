@@ -729,21 +729,13 @@ export function useDeleteCredential() {
 }
 
 // meloD status hook — derives AI availability from provider data (no legacy endpoint)
-export function useMelodStatus() {
-  const { data: providers, loading, error, refetch } = useAiProviders();
-  const providersArray = Array.isArray(providers) ? providers : [];
-  const hasAnyEnabled = providersArray.some(p => p.enabled && p.has_credentials);
-  return {
-    data: hasAnyEnabled ? { connected: true, model_available: true } : { connected: false, model_available: false },
-    loading,
-    error,
-    refetch,
-  };
+export function useMelodStatus(options?: UseQueryOptions) {
+  return useQuery(() => api.getAiAvailability(), [], options);
 }
 
 // Organizational Context hooks
-export function useOrganizationalContext() {
-  return useQuery(() => api.getOrganizationalContext(), []);
+export function useOrganizationalContext(options?: UseQueryOptions) {
+  return useQuery(() => api.getOrganizationalContext(), [], options);
 }
 
 export function useUpdateOrganizationalContext() {
@@ -1189,8 +1181,8 @@ export function useAgentEnrichmentUsage() {
 // AI Provider Credentials Hooks (LiteLLM multi-provider support)
 // ============================================================================
 
-export function useAiProviders() {
-  return useQuery(() => api.listAiProviders(), []);
+export function useAiProviders(options?: UseQueryOptions) {
+  return useQuery(() => api.listAiProviders(), [], options);
 }
 
 export function useAiProvider(provider: string | undefined) {

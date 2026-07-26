@@ -74,7 +74,7 @@ pub struct SystemOverview {
     params(SystemMetricsQuery),
     responses(
         (status = 200, description = "System overview retrieved successfully", body = SystemOverview),
-        (status = 403, description = "Missing permission: settings:view"),
+        (status = 403, description = "Missing permission: settings:view, search:execute, alerts:view or detections:view"),
     ),
     security(("api_key" = []))
 )]
@@ -83,23 +83,43 @@ pub async fn get_system_overview(
     Extension(auth): Extension<AuthContext>,
     Query(params): Query<SystemMetricsQuery>,
 ) -> Result<Json<SystemOverview>, ApiError> {
+    // NAN-2060: this is a COMPOSITE endpoint — one response fans out across
+    // three separately-governed data domains. `settings:view` alone was letting
+    // an under-scoped settings reader infer tenant ingestion volume and
+    // operating pattern, alert volume/severity, and detection-fleet size, none
+    // of which it holds a capability for.
+    //
+    // Policy chosen (option 1 of the finding): require the CONJUNCTION of every
+    // capability the response represents. The alternative — neutralizing each
+    // domain the caller lacks — was rejected because zeroed alert counters are
+    // actively misleading on a SOC dashboard: "0 critical alerts" must never
+    // mean "you can't see them". Blast radius is nil for seeded roles: Admin,
+    // Editor and `DEMO_PERMISSIONS` hold all four, and ReadOnly (which lacks
+    // `settings:view`) was already 403'd by the pre-existing gate.
     ensure_permission(&auth, permissions::SETTINGS_VIEW)?;
+    ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
+    ensure_permission(&auth, permissions::ALERTS_VIEW)?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     let hours = params.hours.unwrap_or(24);
     let now = Utc::now();
     let start_time = now - Duration::hours(hours as i64);
 
+    // NAN-2060: one deny-set drives every log-derived number below.
+    let log_deny = auth.effective_source_deny_set();
+
     // Get event counts for current and previous periods
-    let events_current = get_event_count(&state, start_time, now).await?;
+    let events_current = get_event_count(&state, start_time, now, &log_deny).await?;
     let events_previous = get_event_count(
         &state,
         start_time - Duration::hours(hours as i64),
         start_time,
+        &log_deny,
     )
     .await?;
 
     // Get event counts for last hour
-    let events_1h = get_event_count(&state, now - Duration::hours(1), now).await?;
+    let events_1h = get_event_count(&state, now - Duration::hours(1), now, &log_deny).await?;
 
     // Calculate trend
     let events_trend = if events_previous > 0 {
@@ -180,7 +200,7 @@ pub async fn get_system_overview(
     };
 
     // Get activity timeline (hourly buckets for the last 24 hours)
-    let activity = get_activity_timeline(&state, now - Duration::hours(24), now).await?;
+    let activity = get_activity_timeline(&state, now - Duration::hours(24), now, &log_deny).await?;
 
     tracing::debug!(
         events_24h = events_current,
@@ -204,12 +224,38 @@ pub async fn get_system_overview(
     }))
 }
 
-/// Get event count for a time range
+/// Get event count for a time range.
+///
+/// NAN-2060: the fast `system.parts` path CANNOT honor a per-source boundary —
+/// `system.parts` has no `source_type` dimension at all, only partition row
+/// totals. So a restricted caller is served from the per-source rollup instead,
+/// which does carry `source_type`. An unrestricted caller (empty deny set, i.e.
+/// no source restrictions AND `audit:view`) keeps the original near-instant
+/// partition read, byte-identical.
+///
+/// The two paths differ in more than scope: `system.parts` counts whole
+/// partitions from `start` onward (a deliberate over-count traded for speed),
+/// while the rollup sums the actual window. Restricted callers therefore get a
+/// MORE accurate number, capped at the rollup's 7-day retention. Under-reporting
+/// beyond that window is the fail-closed direction.
 async fn get_event_count(
     state: &AppState,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
+    deny: &std::collections::BTreeSet<String>,
 ) -> Result<i64, ApiError> {
+    if !deny.is_empty() {
+        return timeout(
+            TokioDuration::from_secs(DASHBOARD_QUERY_TIMEOUT_SECS),
+            state
+                .log_telemetry_service
+                .total_events_range(start, end, deny),
+        )
+        .await
+        .map_err(|_| ApiError::Timeout("Dashboard log count query timed out".to_string()))?
+        .map_err(|e| ApiError::InternalError(e.to_string()));
+    }
+
     get_event_count_clickhouse(
         state.dual_pool.clickhouse(),
         state.dual_pool.is_clustered(),
@@ -281,16 +327,14 @@ async fn get_event_count_clickhouse(
 /// the dashboard's headline alert tiles can't count restricted-source alerts a
 /// denied viewer must never see.
 fn alert_count_deny_vec(auth: &AuthContext) -> Option<Vec<String>> {
-    let deny = auth.effective_source_deny_set();
-    if deny.is_empty() {
+    // NAN-2155: the shared normalizer also denies the unresolved-provenance
+    // sentinel for a restricted caller, so an aggregate alert the engine could
+    // not attribute to a source is not counted into their headline tiles.
+    let denied = nanosiem_core::auth::deny_bind_values(&auth.effective_source_deny_set());
+    if denied.is_empty() {
         None
     } else {
-        Some(
-            deny.iter()
-                .map(|s| s.trim().to_lowercase())
-                .filter(|s| !s.is_empty())
-                .collect(),
-        )
+        Some(denied)
     }
 }
 
@@ -391,6 +435,7 @@ async fn get_activity_timeline(
     state: &AppState,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
+    deny: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<ActivityPoint>, ApiError> {
     // Read from the per-source 5-minute rollup (NAN-736). Replaces an
     // un-scoped `count(*) * 10 SAMPLE 0.1 FROM logs` per page load with a
@@ -399,9 +444,11 @@ async fn get_activity_timeline(
     let window_hours = (end - start).num_hours().max(1);
     let points = timeout(
         TokioDuration::from_secs(DASHBOARD_QUERY_TIMEOUT_SECS),
-        state
-            .log_telemetry_service
-            .buckets_all(window_hours, nanosiem_core::LogTelemetryBucketSize::Hour),
+        state.log_telemetry_service.buckets_all(
+            window_hours,
+            nanosiem_core::LogTelemetryBucketSize::Hour,
+            deny,
+        ),
     )
     .await
     .map_err(|_| {

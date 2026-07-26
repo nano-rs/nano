@@ -83,6 +83,11 @@ impl UserApiError {
                 "reset_token_expired",
                 "Reset token has expired",
             ),
+            UserRepositoryError::GrantAuthorityChanged => (
+                StatusCode::CONFLICT,
+                "grant_authority_changed",
+                "Authorization changed while the request was being validated; retry",
+            ),
             UserRepositoryError::DatabaseError(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -222,6 +227,7 @@ pub async fn get_user(
         (status = 201, description = "User created successfully", body = UserWithGroups),
         (status = 400, description = "Bad request - validation error", body = UserApiError),
         (status = 403, description = "Forbidden - insufficient permissions", body = UserApiError),
+        (status = 409, description = "Email exists or grant authority changed", body = UserApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -233,6 +239,19 @@ pub async fn create_user(
 ) -> Result<(StatusCode, Json<UserWithGroups>), (StatusCode, Json<UserApiError>)> {
     check_permission(&auth, permissions::USERS_CREATE)
         .map_err(|(s, j)| (s, Json(UserApiError::new(&j.error, &j.message))))?;
+
+    // NAN-2121: users:create authorizes creating the account, NOT placing it in
+    // privileged groups. Deny unless the caller holds every permission the
+    // requested groups transitively confer (prevents creating an Admin-group
+    // member).
+    let grant_stamp = crate::handlers::grant_authz::ensure_can_grant_groups(
+        &auth,
+        &state.pool,
+        permissions::USERS_CREATE,
+        &request.group_ids,
+    )
+    .await
+    .map_err(|g| (g.status, Json(UserApiError::new(g.code, &g.message))))?;
 
     // Tier enforcement: check team member limit
     let tier_settings = nanosiem_core::TierSettings::new(state.pool.clone());
@@ -264,10 +283,14 @@ pub async fn create_user(
         })?;
     }
 
-    let user = state.user_repo.create_user(&request).await.map_err(|e| {
-        let (status, err) = UserApiError::from_repo_error(&e);
-        (status, Json(err))
-    })?;
+    let user = state
+        .user_repo
+        .create_user_authorized(&request, grant_stamp)
+        .await
+        .map_err(|e| {
+            let (status, err) = UserApiError::from_repo_error(&e);
+            (status, Json(err))
+        })?;
 
     let groups = state
         .user_repo
@@ -304,6 +327,7 @@ pub async fn create_user(
         (status = 400, description = "Bad request - validation error", body = UserApiError),
         (status = 403, description = "Forbidden - insufficient permissions", body = UserApiError),
         (status = 404, description = "User not found", body = UserApiError),
+        (status = 409, description = "Email exists or grant authority changed", body = UserApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -317,30 +341,57 @@ pub async fn update_user(
     check_permission(&auth, permissions::USERS_EDIT)
         .map_err(|(s, j)| (s, Json(UserApiError::new(&j.error, &j.message))))?;
 
-    let user = state
-        .user_repo
-        .update_user(*id, &request)
-        .await
-        .map_err(|e| {
-            let (status, err) = UserApiError::from_repo_error(&e);
-            (status, Json(err))
-        })?;
-
-    // Update group memberships if provided
-    if let Some(ref group_id_strings) = request.group_ids {
-        let group_uuids: Vec<uuid::Uuid> = group_id_strings
+    // NAN-2121 P1 #4: decode + authorize the requested group grants BEFORE any
+    // write. `update_user` commits email/password/name/status, so running the
+    // grant check afterwards left a denied request returning 403 while the
+    // profile change had already persisted (and the success audit was skipped).
+    // Decode once and reuse for both the check and the write so they cannot
+    // diverge.
+    let group_uuids: Option<Vec<uuid::Uuid>> = request.group_ids.as_ref().map(|group_id_strings| {
+        group_id_strings
             .iter()
             .filter_map(|s| nanosiem_core::typeid::decode("group", s).ok())
-            .collect();
-        state
-            .user_repo
-            .set_user_groups(*id, &group_uuids)
+            .collect()
+    });
+    let grant_stamp = if let Some(ref group_uuids) = group_uuids {
+        // deny unless the caller holds every permission the requested groups
+        // confer (users:edit is not authority to add someone to Admins).
+        Some(
+            crate::handlers::grant_authz::ensure_can_grant_groups(
+                &auth,
+                &state.pool,
+                permissions::USERS_EDIT,
+                group_uuids,
+            )
             .await
-            .map_err(|e| {
-                let (status, err) = UserApiError::from_repo_error(&e);
-                (status, Json(err))
-            })?;
+            .map_err(|g| (g.status, Json(UserApiError::new(g.code, &g.message))))?,
+        )
+    } else {
+        None
+    };
+
+    // NAN-2121: commit the profile change and the (already-authorized) group
+    // membership replacement in ONE transaction so a downstream membership
+    // failure rolls back the profile write too (no partial commit, no skipped
+    // success audit).
+    let user = match grant_stamp {
+        Some(stamp) => {
+            state
+                .user_repo
+                .update_user_with_groups_authorized(*id, &request, group_uuids.as_deref(), stamp)
+                .await
+        }
+        None => {
+            state
+                .user_repo
+                .update_user_with_groups(*id, &request, None)
+                .await
+        }
     }
+    .map_err(|e| {
+        let (status, err) = UserApiError::from_repo_error(&e);
+        (status, Json(err))
+    })?;
 
     let groups = state
         .user_repo
@@ -434,8 +485,10 @@ pub struct UpdateUserGroupsRequest {
     request_body = UpdateUserGroupsRequest,
     responses(
         (status = 200, description = "User groups updated successfully", body = UserWithGroups),
+        (status = 400, description = "Bad request - unknown group id", body = UserApiError),
         (status = 403, description = "Forbidden - insufficient permissions", body = UserApiError),
         (status = 404, description = "User not found", body = UserApiError),
+        (status = 409, description = "Grant authority changed; retry the request", body = UserApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -449,9 +502,20 @@ pub async fn update_user_groups(
     check_permission(&auth, permissions::USERS_EDIT)
         .map_err(|(s, j)| (s, Json(UserApiError::new(&j.error, &j.message))))?;
 
+    // NAN-2121: deny unless the caller holds every permission the requested
+    // groups confer (users:edit is not authority to add a user to Admins).
+    let grant_stamp = crate::handlers::grant_authz::ensure_can_grant_groups(
+        &auth,
+        &state.pool,
+        permissions::USERS_EDIT,
+        &request.group_ids,
+    )
+    .await
+    .map_err(|g| (g.status, Json(UserApiError::new(g.code, &g.message))))?;
+
     state
         .user_repo
-        .set_user_groups(*id, &request.group_ids)
+        .set_user_groups_authorized(*id, &request.group_ids, grant_stamp)
         .await
         .map_err(|e| {
             let (status, err) = UserApiError::from_repo_error(&e);
@@ -664,6 +728,20 @@ pub async fn enable_user(
     Ok(Json(UserWithGroups { user, groups }))
 }
 
+/// NAN-2099: 403 for an API key on interactive preference self-service. An API
+/// key's `claims.sub` is its owner, so the ownership shortcut would let any key
+/// read or mutate the human owner's UI preferences. Preferences are interactive
+/// session state, not a machine capability.
+fn preferences_interactive_only() -> (StatusCode, Json<UserApiError>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(UserApiError::new(
+            "interactive_session_required",
+            "Preference self-service requires an interactive session; API keys are not permitted.",
+        )),
+    )
+}
+
 /// Get current user's preferences
 ///
 /// GET /api/users/me/preferences
@@ -673,14 +751,18 @@ pub async fn enable_user(
     tag = "users",
     responses(
         (status = 200, description = "User preferences", body = UserPreferences),
+        (status = 403, description = "Forbidden — interactive session required (API keys not permitted)", body = UserApiError),
         (status = 404, description = "User not found", body = UserApiError),
     ),
-    security(("bearer_auth" = []), ("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn get_my_preferences(
     State(state): State<AppState>,
     auth: axum::Extension<AuthContext>,
 ) -> Result<Json<UserPreferences>, (StatusCode, Json<UserApiError>)> {
+    if auth.is_api_key {
+        return Err(preferences_interactive_only());
+    }
     let preferences = state
         .user_repo
         .get_preferences(auth.user_id())
@@ -703,15 +785,19 @@ pub async fn get_my_preferences(
     request_body = UpdateUserPreferencesRequest,
     responses(
         (status = 200, description = "User preferences updated successfully", body = UserPreferences),
+        (status = 403, description = "Forbidden — interactive session required (API keys not permitted)", body = UserApiError),
         (status = 404, description = "User not found", body = UserApiError),
     ),
-    security(("bearer_auth" = []), ("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn update_my_preferences(
     State(state): State<AppState>,
     auth: axum::Extension<AuthContext>,
     Json(request): Json<UpdateUserPreferencesRequest>,
 ) -> Result<Json<UserPreferences>, (StatusCode, Json<UserApiError>)> {
+    if auth.is_api_key {
+        return Err(preferences_interactive_only());
+    }
     let preferences = state
         .user_repo
         .update_preferences(

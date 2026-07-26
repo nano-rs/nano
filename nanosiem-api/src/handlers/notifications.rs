@@ -12,11 +12,12 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
+use nanosiem_core::auth::permissions;
 use nanosiem_core::db::repository::{NotificationError, NotificationRepository};
 use nanosiem_core::models::{Notification, UnreadCountResponse};
 use nanosiem_core::typeid::TypeIdParam;
 
-use crate::middleware::AuthContext;
+use crate::middleware::{check_permission, AuthContext};
 use crate::state::AppState;
 
 /// Error response for notification endpoints
@@ -76,6 +77,31 @@ pub struct ListNotificationsQuery {
     pub unread_only: Option<bool>,
 }
 
+/// NAN-2041: 403 for an API key on a human notification self-feed. Mirrors the
+/// reusable `ensure_interactive_session` guard but returns this module's error
+/// shape. Notification feeds aggregate capability-protected data (cases, alerts,
+/// notebooks, reports, …); an API key's owner-subject must not read them.
+fn interactive_session_only() -> (StatusCode, Json<NotificationApiError>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(NotificationApiError::new(
+            "interactive_session_required",
+            "Notification feeds require an interactive session; API keys are not permitted.",
+        )),
+    )
+}
+
+/// NAN-2124: enforce the seeded `notifications:view` capability on the JWT path.
+/// Ownership is an object boundary, not the capability boundary — a zero-permission
+/// interactive user must not read/mutate a feed that aggregates capability-protected
+/// data (cases, alerts, notebooks, reports, …) it is otherwise denied.
+fn require_notifications_view(
+    auth: &AuthContext,
+) -> Result<(), (StatusCode, Json<NotificationApiError>)> {
+    check_permission(auth, permissions::NOTIFICATIONS_VIEW)
+        .map_err(|(s, j)| (s, Json(NotificationApiError::new(&j.error, &j.message))))
+}
+
 /// List notifications for the current user
 ///
 /// GET /api/notifications
@@ -86,15 +112,20 @@ pub struct ListNotificationsQuery {
     params(ListNotificationsQuery),
     responses(
         (status = 200, description = "Notifications retrieved successfully", body = NotificationListResponse),
+        (status = 403, description = "Forbidden — interactive session required (API keys not permitted)", body = NotificationApiError),
         (status = 500, description = "Internal server error", body = NotificationApiError),
     ),
-    security(("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn list_notifications(
     State(state): State<AppState>,
     auth: axum::Extension<AuthContext>,
     Query(query): Query<ListNotificationsQuery>,
 ) -> Result<Json<NotificationListResponse>, (StatusCode, Json<NotificationApiError>)> {
+    if auth.is_api_key {
+        return Err(interactive_session_only());
+    }
+    require_notifications_view(&auth)?;
     let repo = NotificationRepository::new(state.pool.clone());
     let limit = query.limit.unwrap_or(50);
     let unread_only = query.unread_only.unwrap_or(false);
@@ -119,14 +150,19 @@ pub async fn list_notifications(
     tag = "notifications",
     responses(
         (status = 200, description = "Unread count retrieved successfully", body = UnreadCountResponse),
+        (status = 403, description = "Forbidden — interactive session required (API keys not permitted)", body = NotificationApiError),
         (status = 500, description = "Internal server error", body = NotificationApiError),
     ),
-    security(("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn get_unread_count(
     State(state): State<AppState>,
     auth: axum::Extension<AuthContext>,
 ) -> Result<Json<UnreadCountResponse>, (StatusCode, Json<NotificationApiError>)> {
+    if auth.is_api_key {
+        return Err(interactive_session_only());
+    }
+    require_notifications_view(&auth)?;
     let repo = NotificationRepository::new(state.pool.clone());
 
     let count = repo.get_unread_count(auth.user_id()).await.map_err(|e| {
@@ -152,13 +188,17 @@ pub async fn get_unread_count(
         (status = 403, description = "Forbidden", body = NotificationApiError),
         (status = 404, description = "Not found", body = NotificationApiError),
     ),
-    security(("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn mark_notification_read(
     State(state): State<AppState>,
     auth: axum::Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<NotificationResponse>, (StatusCode, Json<NotificationApiError>)> {
+    if auth.is_api_key {
+        return Err(interactive_session_only());
+    }
+    require_notifications_view(&auth)?;
     let repo = NotificationRepository::new(state.pool.clone());
 
     // First verify the notification belongs to this user
@@ -194,14 +234,19 @@ pub async fn mark_notification_read(
     tag = "notifications",
     responses(
         (status = 200, description = "All notifications marked as read", body = MarkAllReadResponse),
+        (status = 403, description = "Forbidden — interactive session required (API keys not permitted)", body = NotificationApiError),
         (status = 500, description = "Internal server error", body = NotificationApiError),
     ),
-    security(("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn mark_all_notifications_read(
     State(state): State<AppState>,
     auth: axum::Extension<AuthContext>,
 ) -> Result<Json<MarkAllReadResponse>, (StatusCode, Json<NotificationApiError>)> {
+    if auth.is_api_key {
+        return Err(interactive_session_only());
+    }
+    require_notifications_view(&auth)?;
     let repo = NotificationRepository::new(state.pool.clone());
 
     let marked_count = repo.mark_all_read(auth.user_id()).await.map_err(|e| {

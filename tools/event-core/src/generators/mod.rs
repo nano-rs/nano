@@ -13,6 +13,6 @@ pub mod winevt;
 pub use apache::ApacheGenerator;
 pub use cloudtrail::CloudTrailGenerator;
 pub use lateral_chain::LateralChainGenerator;
-pub use proxy::ProxyGenerator;
+pub use proxy::{ProxyGenerator, ScriptedProxyEvent};
 pub use sysmon::SysmonGenerator;
 pub use winevt::WindowsEventGenerator;

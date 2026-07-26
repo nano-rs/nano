@@ -361,7 +361,8 @@ impl SearchService {
             ch_client: self.ch_client.as_ref(),
             findings_source: crate::risk::clickhouse_sql::RiskFindingsSource::resolve(
                 self.table_names.is_clustered(),
-            ),
+            )
+            .with_source_scope(scope),
             config: self.risk_query_config.resolve().await,
         };
         let graph_payload =

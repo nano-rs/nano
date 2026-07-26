@@ -196,7 +196,14 @@ impl FindingEvent {
             }
         };
         for event in events {
-            if let Some(st) = event.get("source_type").and_then(|v| v.as_str()) {
+            // NAN-2155 (codex round 3): the per-event `source_type` is
+            // ingest-controlled; only the engine's `_nano_source_types` stamp
+            // may carry the reserved unresolved-provenance sentinel.
+            if let Some(st) = event
+                .get("source_type")
+                .and_then(|v| v.as_str())
+                .filter(|st| !crate::auth::is_reserved_source_type(st))
+            {
                 insert_normalized(st);
             }
             if let Some(arr) = event.get("_nano_source_types").and_then(|v| v.as_array()) {
@@ -495,35 +502,6 @@ impl FindingLogger {
         }
     }
 
-    /// `source_type` origins ALWAYS treated as restricted for finding redaction
-    /// (NAN-2001), independent of the PG `restricted_source_types` registry.
-    ///
-    /// Audit content re-enters `logs`/`ocsf_logs` as `source_type='findings'`
-    /// rows that embed the matched audit event (`message`, `risk_entity`,
-    /// `matched_events_sample`, `risk_factors`). The raw-SQL noaudit row policy
-    /// (`lower(source_type)!='audit'`) hides rows literally stamped
-    /// `source_type='audit'` but NOT this re-injected finding content, and
-    /// app-layer field redaction does not protect a raw-SQL read (it reads the
-    /// raw stored bytes). Redacting audit-origin evidence at WRITE time is the
-    /// storage-layer guarantee that DOES protect a raw-SQL read. Hard-wired as a
-    /// sentinel (never seeded through the registry, so it cannot be un-seeded)
-    /// so audit findings redact on every deployment, including those that never
-    /// configured per-source scoping. Detection is unaffected — this is strictly
-    /// post-match (audit rules still fire).
-    const ALWAYS_RESTRICTED_ORIGINS: &'static [&'static str] = &["audit"];
-
-    /// True if any origin `source_type` is an always-restricted sentinel
-    /// ([`ALWAYS_RESTRICTED_ORIGINS`] — currently `'audit'`). Pure so the
-    /// sentinel classification is unit-testable without a database. Inputs are
-    /// normalized (trim + lowercase) defensively; `origin_source_types_from`
-    /// already normalizes, but a directly-constructed `FindingEvent` may not.
-    fn is_always_restricted_origin(origin_source_types: &[String]) -> bool {
-        origin_source_types.iter().any(|st| {
-            let normalized = st.trim().to_lowercase();
-            Self::ALWAYS_RESTRICTED_ORIGINS.contains(&normalized.as_str())
-        })
-    }
-
     /// NAN-1800 / NAN-2001: should this finding's matched-event evidence be
     /// redacted?
     ///
@@ -545,7 +523,7 @@ impl FindingLogger {
     async fn origin_restricted(&self, finding: &FindingEvent) -> bool {
         // NAN-2001: audit origin is ALWAYS restricted — short-circuit before any
         // PG access so this holds on every deployment and during a PG outage.
-        if Self::is_always_restricted_origin(&finding.origin_source_types) {
+        if crate::auth::is_always_restricted_origin(&finding.origin_source_types) {
             return true;
         }
         if finding.origin_source_types.is_empty() {
@@ -1239,7 +1217,7 @@ mod redaction_tests {
     #[test]
     fn audit_origin_is_always_restricted_sentinel() {
         let audit = |v: &[&str]| {
-            FindingLogger::is_always_restricted_origin(
+            crate::auth::is_always_restricted_origin(
                 &v.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             )
         };
@@ -1294,8 +1272,12 @@ mod redaction_tests {
         // Snapshot the non-audit finding's serialization up front; the audit
         // path must not touch it, so it stays byte-identical.
         let nonaudit_before = nonaudit.to_log_json();
-        assert!(FindingLogger::is_always_restricted_origin(&audit.origin_source_types));
-        assert!(!FindingLogger::is_always_restricted_origin(&nonaudit.origin_source_types));
+        assert!(crate::auth::is_always_restricted_origin(
+            &audit.origin_source_types
+        ));
+        assert!(!crate::auth::is_always_restricted_origin(
+            &nonaudit.origin_source_types
+        ));
 
         // Apply exactly what `log_finding` applies when the origin is restricted.
         audit.redact_matched_events();

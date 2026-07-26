@@ -120,7 +120,16 @@ pub fn distinct_source_types(matched_events: &serde_json::Value) -> Vec<String> 
     let mut set: BTreeSet<String> = BTreeSet::new();
     if let Some(events) = matched_events.as_array() {
         for event in events {
-            if let Some(st) = event.get("source_type").and_then(|v| v.as_str()) {
+            // NAN-2155 (codex round 3): the PER-EVENT `source_type` is
+            // ingest-controlled, so a sender could name their source after the
+            // unresolved-provenance sentinel and have their own detections
+            // hidden from every restricted analyst. Only the engine's
+            // `_nano_source_types` annotation below may carry it.
+            if let Some(st) = event
+                .get("source_type")
+                .and_then(|v| v.as_str())
+                .filter(|st| !crate::auth::is_reserved_source_type(st))
+            {
                 insert_normalized(st, &mut set);
             }
             if let Some(arr) = event.get("_nano_source_types").and_then(|v| v.as_array()) {
@@ -144,12 +153,16 @@ pub fn distinct_source_types(matched_events: &serde_json::Value) -> Vec<String> 
 /// normalized (trimmed + lowercased) deny values to bind at `$N`. A row is
 /// visible iff NONE of its stamped source_types is denied; rows stamped `'{}'`
 /// (pre-feature / non-source-derived) never overlap and stay visible.
+///
+/// NAN-2155: for a RESTRICTED caller the bound values additionally carry
+/// [`UNRESOLVED_SOURCE_SENTINEL`](crate::auth::UNRESOLVED_SOURCE_SENTINEL), the
+/// marker the detection engine stamps when it could not determine an aggregate
+/// window's source provenance. `'{}'` still means "known to have no source" and
+/// stays visible; "we could not tell" is now a DIFFERENT, hidden-from-restricted
+/// value instead of being conflated with it. Unrestricted callers are unaffected
+/// — no clause is emitted at all, so the SQL is byte-identical.
 fn scope_clause(deny: &BTreeSet<String>, column: &str, param: usize) -> (String, Option<Vec<String>>) {
-    let denied: Vec<String> = deny
-        .iter()
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let denied = crate::auth::deny_bind_values(deny);
     if denied.is_empty() {
         (String::new(), None)
     } else {
@@ -1114,9 +1127,17 @@ mod tests {
             sql,
             " AND ($7::text[] = '{}' OR NOT (a.source_types && $7::text[]))"
         );
+        // NAN-2155: a restricted caller also denies the unresolved-provenance
+        // sentinel, so an aggregate alert whose source could not be determined
+        // is hidden from them instead of being conflated with the legitimately
+        // sourceless `'{}'` rows.
         assert_eq!(
             bind,
-            Some(vec!["audit".to_string(), "insider_threat".to_string()])
+            Some(vec![
+                crate::auth::UNRESOLVED_SOURCE_SENTINEL.to_string(),
+                "audit".to_string(),
+                "insider_threat".to_string(),
+            ])
         );
     }
 

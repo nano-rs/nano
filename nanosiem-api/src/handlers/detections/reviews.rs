@@ -11,11 +11,13 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use nanosiem_core::auth::permissions;
+use nanosiem_core::detection::match_scope::DetectionMatchRepository;
 use nanosiem_core::typeid::TypeIdParam;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use super::stats::effective_match_scope;
 use crate::middleware::{ensure_permission, AuthContext};
 use crate::{
     error::{ApiError, ErrorResponse},
@@ -74,25 +76,20 @@ pub async fn mark_match_reviewed(
 ) -> Result<Json<MatchReviewResponse>, ApiError> {
     ensure_permission(&auth, permissions::DETECTIONS_EDIT)?;
 
-    // Verify the match exists so we can return a clean 404 (the FK would also
-    // reject, but its error message is opaque).
-    let exists: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM detection_matches WHERE id = $1")
-            .bind(*id)
-            .fetch_optional(&state.pool)
-            .await?;
-    if exists.is_none() {
-        return Err(ApiError::NotFound(format!("Match not found: {}", *id)));
-    }
-
+    // NAN-2071: the existence check used to be `WHERE id = $1` with no source
+    // predicate, and the write followed it — so a caller denied every source on
+    // the match could both confirm the match existed and flip its review state.
+    // Visibility is now part of the mutating statement itself (no probe, no
+    // TOCTOU window) and a denied match is reported exactly like a missing one.
+    let repo = DetectionMatchRepository::new(state.pool.clone());
+    let scope = effective_match_scope(&auth);
     let user_id = auth.user_id();
 
     if !body.reviewed {
         // Treat reviewed=false as an explicit clear.
-        sqlx::query("DELETE FROM match_reviews WHERE match_id = $1")
-            .bind(*id)
-            .execute(&state.pool)
-            .await?;
+        if !repo.clear_review(*id, &scope).await? {
+            return Err(ApiError::NotFound(format!("Match not found: {}", *id)));
+        }
         tracing::info!(match_id = %*id, user_id = %user_id, "match review cleared");
         return Ok(Json(MatchReviewResponse {
             reviewed: false,
@@ -103,31 +100,20 @@ pub async fn mark_match_reviewed(
     }
 
     let now = Utc::now();
-    let row: (DateTime<Utc>, Option<Uuid>, Option<String>) = sqlx::query_as(
-        r#"
-        INSERT INTO match_reviews (match_id, reviewed_at, reviewed_by, note)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (match_id) DO UPDATE
-        SET reviewed_at = EXCLUDED.reviewed_at,
-            reviewed_by = EXCLUDED.reviewed_by,
-            note        = EXCLUDED.note
-        RETURNING reviewed_at, reviewed_by, note
-        "#,
-    )
-    .bind(*id)
-    .bind(now)
-    .bind(user_id)
-    .bind(body.note.as_deref())
-    .fetch_one(&state.pool)
-    .await?;
+    let Some(review) = repo
+        .mark_reviewed(*id, now, user_id, body.note.as_deref(), &scope)
+        .await?
+    else {
+        return Err(ApiError::NotFound(format!("Match not found: {}", *id)));
+    };
 
     tracing::info!(match_id = %*id, user_id = %user_id, "match marked reviewed");
 
     Ok(Json(MatchReviewResponse {
         reviewed: true,
-        reviewed_at: Some(row.0),
-        reviewed_by: row.1,
-        note: row.2,
+        reviewed_at: Some(review.reviewed_at),
+        reviewed_by: review.reviewed_by,
+        note: review.note,
     }))
 }
 
@@ -140,6 +126,7 @@ pub async fn mark_match_reviewed(
     responses(
         (status = 200, description = "Review cleared", body = MatchReviewResponse),
         (status = 403, description = "Missing permission: detections:edit", body = ErrorResponse),
+        (status = 404, description = "Match not found or not visible to the caller", body = ErrorResponse),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -150,10 +137,17 @@ pub async fn unmark_match_reviewed(
 ) -> Result<Json<MatchReviewResponse>, ApiError> {
     ensure_permission(&auth, permissions::DETECTIONS_EDIT)?;
 
-    sqlx::query("DELETE FROM match_reviews WHERE match_id = $1")
-        .bind(*id)
-        .execute(&state.pool)
-        .await?;
+    // NAN-2071: same scoped, single-statement clear as the POST route. This
+    // used to delete by match id alone, so a denied-source match's review flag
+    // was mutable by anyone holding `detections:edit`. It also used to answer
+    // 200 unconditionally; a denied or missing match is now a 404 (identical
+    // for both, so still no existence oracle).
+    if !DetectionMatchRepository::new(state.pool.clone())
+        .clear_review(*id, &effective_match_scope(&auth))
+        .await?
+    {
+        return Err(ApiError::NotFound(format!("Match not found: {}", *id)));
+    }
 
     Ok(Json(MatchReviewResponse {
         reviewed: false,

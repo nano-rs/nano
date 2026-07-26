@@ -1047,6 +1047,71 @@
         );
     }
 
+    /// NAN-2149: UDM has no class-split or enum-int display metadata. The new
+    /// field-values seam must therefore return the exact access expression the
+    /// endpoint used before this change for every UDM field (plus an ext key).
+    #[test]
+    fn field_values_display_expr_is_byte_identical_for_udm() {
+        use crate::schema::{SchemaProfile, UdmProfile};
+
+        let profile = UdmProfile::new();
+        let gen = ClickHouseSqlGenerator::new();
+        for field in profile
+            .fields()
+            .iter()
+            .map(|def| def.name)
+            .chain(std::iter::once("custom_tail"))
+        {
+            assert_eq!(
+                gen.field_values_display_expr(field),
+                gen.field_access_expr(field, "String"),
+                "UDM field-values expression changed for {field}"
+            );
+        }
+    }
+
+    /// NAN-2149: the OCSF `user` concept is split between `user.name` and
+    /// `actor.user.name` by event class. Top-values must group on the indexed
+    /// unified value instead of the first manifest mapping (`user.name`).
+    #[test]
+    fn ocsf_field_values_display_expr_uses_unified_user() {
+        use crate::schema::OcsfProfile;
+
+        let gen = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
+        assert_eq!(gen.field_access_expr("user", "String"), "\"user.name\"");
+        assert_eq!(gen.field_values_display_expr("user"), "user_unified");
+    }
+
+    /// NAN-2149: activity IDs are class-scoped (ID 1 can mean Logon, Create,
+    /// Launch, …), so both the UDM-semantic `event_type` alias and the native
+    /// `activity_id` must display the sibling `activity` label. Asking for the
+    /// already-human `activity` column remains a direct access.
+    #[test]
+    fn ocsf_field_values_display_expr_uses_activity_labels() {
+        use crate::schema::OcsfProfile;
+
+        let gen = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
+        assert_eq!(gen.field_values_display_expr("event_type"), "activity");
+        assert_eq!(gen.field_values_display_expr("activity_id"), "activity");
+        assert_eq!(gen.field_values_display_expr("activity"), "activity");
+    }
+
+    /// NAN-2149: fixed enum-int fields are decoded into stable human labels.
+    /// The native `severity` sibling is already a String and stays direct.
+    #[test]
+    fn ocsf_field_values_display_expr_decodes_severity_ids() {
+        use crate::schema::OcsfProfile;
+
+        let gen = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
+        assert_eq!(
+            gen.field_values_display_expr("severity_id"),
+            "transform(severity_id, [0, 1, 2, 3, 4, 5, 6, 99], \
+             ['unknown', 'informational', 'low', 'medium', 'high', 'critical', \
+             'fatal', 'other'], toString(severity_id))"
+        );
+        assert_eq!(gen.field_values_display_expr("severity"), "severity");
+    }
+
     /// NAN-1321: an OCSF search FILTER on a class-split concept (`src_host="x"`)
     /// must match the union (so it finds the host on `device.hostname` endpoint
     /// events) — never a single primary column that would silently drop every

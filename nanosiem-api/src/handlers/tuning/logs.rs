@@ -11,6 +11,7 @@ use nanosiem_core::tuning::{ProposalType, TuningLogEntry};
 use nanosiem_core::typeid::TypeIdParam;
 use uuid::Uuid;
 
+use super::effective_tuning_scope;
 use super::types::{ApprovalResponse, ListLogsQuery, RevertRequest};
 use super::versions::{
     detection_mode_name, ensure_revert_permissions, map_version_error, reconcile_reverted_runtime,
@@ -72,14 +73,14 @@ pub async fn list_logs(
         // Get logs for a specific rule
         state
             .tuning_repository
-            .get_logs_for_rule(rule_id)
+            .get_logs_for_rule(rule_id, &effective_tuning_scope(&auth))
             .await
             .map_err(|e| ApiError::InternalError(format!("Failed to list logs: {}", e)))?
     } else {
         // Get recent logs across all rules
         state
             .tuning_repository
-            .get_recent_logs(query.limit as i32)
+            .get_recent_logs(query.limit as i32, &effective_tuning_scope(&auth))
             .await
             .map_err(|e| ApiError::InternalError(format!("Failed to list logs: {}", e)))?
     };
@@ -131,7 +132,7 @@ pub async fn get_log(
     // Get log entry by ID
     let log = state
         .tuning_repository
-        .get_log_entry(*id)
+        .get_log_entry(*id, &effective_tuning_scope(&auth))
         .await
         .map_err(|e| ApiError::InternalError(format!("Failed to get log entry: {}", e)))?
         .ok_or_else(|| ApiError::NotFound("Log entry not found".to_string()))?;
@@ -182,7 +183,7 @@ pub async fn revert_tuning(
 
     let log = state
         .tuning_repository
-        .get_log_entry(*id)
+        .get_log_entry(*id, &effective_tuning_scope(&auth))
         .await
         .map_err(|e| ApiError::InternalError(format!("Failed to get tuning log: {e}")))?
         .ok_or_else(|| ApiError::NotFound("Tuning log not found".to_string()))?;

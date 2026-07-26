@@ -14,7 +14,7 @@ use nanosiem_core::playbooks::{
 };
 use nanosiem_core::typeid::TypeIdParam;
 
-use super::types::{ListPlaybooksParams, ListPlaybooksResponse};
+use super::types::{playbook_principal, ListPlaybooksParams, ListPlaybooksResponse};
 use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
@@ -52,7 +52,8 @@ pub async fn list_playbooks(
         offset: params.offset,
         adaptive: params.adaptive,
     };
-    let result = service.list(&query).await?;
+    let principal = playbook_principal(&state, &auth).await?;
+    let result = service.list(&query, &principal).await?;
     Ok(Json(ListPlaybooksResponse {
         playbooks: result.playbooks,
         total: result.total,
@@ -80,7 +81,8 @@ pub async fn get_playbook(
     ensure_permission(&auth, permissions::PLAYBOOKS_VIEW)?;
 
     let service = get_service(&state);
-    let pb = service.get(*id).await?;
+    let principal = playbook_principal(&state, &auth).await?;
+    let pb = service.get(*id, &principal).await?;
     Ok(Json(pb))
 }
 
@@ -129,11 +131,33 @@ pub async fn update_playbook(
     Path(id): Path<TypeIdParam>,
     Json(req): Json<UpdatePlaybookRequest>,
 ) -> Result<Json<Playbook>, ApiError> {
-    ensure_permission(&auth, permissions::PLAYBOOKS_MANAGE)?;
+    ensure_update_permissions(&auth, &req)?;
 
     let service = get_service(&state);
-    let pb = service.update(*id, req, Some(auth.user_id())).await?;
+    let principal = playbook_principal(&state, &auth).await?;
+    let pb = service
+        .update(*id, req, Some(auth.user_id()), &principal)
+        .await?;
     Ok(Json(pb))
+}
+
+/// A generic PATCH always needs edit authority. Explicitly setting the
+/// lifecycle to `live` is also a publish operation, even when bundled with
+/// metadata edits, so require both coarse capabilities before resolving the
+/// per-playbook ACL in the repository. An edit to an existing live playbook
+/// that omits `status` is returned to draft by the repository.
+fn ensure_update_permissions(
+    auth: &AuthContext,
+    req: &UpdatePlaybookRequest,
+) -> Result<(), ApiError> {
+    ensure_permission(auth, permissions::PLAYBOOKS_MANAGE)?;
+    if matches!(
+        req.status,
+        Some(nanosiem_core::playbooks::PlaybookStatus::Live)
+    ) {
+        ensure_permission(auth, permissions::PLAYBOOKS_PUBLISH)?;
+    }
+    Ok(())
 }
 
 /// Archive a playbook (soft-delete — sets status = 'archived')
@@ -157,7 +181,8 @@ pub async fn archive_playbook(
     ensure_permission(&auth, permissions::PLAYBOOKS_MANAGE)?;
 
     let service = get_service(&state);
-    service.archive(*id).await?;
+    let principal = playbook_principal(&state, &auth).await?;
+    service.archive(*id, &principal).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -185,7 +210,8 @@ pub async fn delete_playbook_permanent(
     ensure_permission(&auth, permissions::PLAYBOOKS_MANAGE)?;
 
     let service = get_service(&state);
-    service.delete(*id).await?;
+    let principal = playbook_principal(&state, &auth).await?;
+    service.delete(*id, &principal).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -212,7 +238,10 @@ pub async fn fork_playbook(
     ensure_permission(&auth, permissions::PLAYBOOKS_MANAGE)?;
 
     let service = get_service(&state);
-    let pb = service.fork(*id, req, Some(auth.user_id())).await?;
+    let principal = playbook_principal(&state, &auth).await?;
+    let pb = service
+        .fork(*id, req, Some(auth.user_id()), &principal)
+        .await?;
     Ok(Json(pb))
 }
 
@@ -261,7 +290,8 @@ pub async fn list_versions(
     ensure_permission(&auth, permissions::PLAYBOOKS_VIEW)?;
 
     let service = get_service(&state);
-    let versions = service.list_versions(*id).await?;
+    let principal = playbook_principal(&state, &auth).await?;
+    let versions = service.list_versions(*id, &principal).await?;
     Ok(Json(VersionsResponse { versions }))
 }
 
@@ -284,9 +314,15 @@ pub async fn list_runs(
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<RunsResponse>, ApiError> {
     ensure_permission(&auth, permissions::PLAYBOOKS_VIEW)?;
+    // NAN-2044: these runs carry linked-case run_context. `cases:view` is the
+    // capability floor; the runs are then filtered per-case so a run whose case
+    // the caller cannot see is excluded (the same predicate as
+    // CaseRepository::check_user_access, pushed into the list query).
+    ensure_permission(&auth, permissions::CASES_VIEW)?;
 
     let service = get_service(&state);
-    let runs = service.list_runs(*id).await?;
+    let principal = playbook_principal(&state, &auth).await?;
+    let runs = service.list_runs(*id, auth.user_id(), &principal).await?;
     Ok(Json(RunsResponse { runs }))
 }
 
@@ -311,7 +347,8 @@ pub async fn list_permissions(
     ensure_permission(&auth, permissions::PLAYBOOKS_VIEW)?;
 
     let service = get_service(&state);
-    let permissions = service.list_permissions(*id).await?;
+    let principal = playbook_principal(&state, &auth).await?;
+    let permissions = service.list_permissions(*id, &principal).await?;
     Ok(Json(PermissionsResponse { permissions }))
 }
 
@@ -336,6 +373,71 @@ pub async fn list_approvals(
     ensure_permission(&auth, permissions::PLAYBOOKS_VIEW)?;
 
     let service = get_service(&state);
-    let approvals = service.list_approvals(*id).await?;
+    let principal = playbook_principal(&state, &auth).await?;
+    let approvals = service.list_approvals(*id, &principal).await?;
     Ok(Json(ApprovalsResponse { approvals }))
+}
+
+#[cfg(test)]
+mod tests {
+    use nanosiem_core::auth::token::{DEFAULT_TOKEN_AUDIENCE, DEFAULT_TOKEN_ISSUER};
+    use nanosiem_core::auth::{permissions, TokenClaims};
+    use nanosiem_core::playbooks::{PlaybookStatus, UpdatePlaybookRequest};
+    use uuid::Uuid;
+
+    use super::ensure_update_permissions;
+    use crate::error::ApiError;
+    use crate::middleware::AuthContext;
+
+    fn auth(permissions: &[&str]) -> AuthContext {
+        AuthContext::from_jwt(TokenClaims {
+            iss: DEFAULT_TOKEN_ISSUER.to_string(),
+            aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
+            sub: Uuid::now_v7(),
+            roles: vec!["Editor".to_string()],
+            permissions: permissions.iter().map(|value| value.to_string()).collect(),
+            exp: i64::MAX,
+            iat: 0,
+            jti: Uuid::now_v7(),
+            purpose: "access".to_string(),
+        })
+    }
+
+    #[test]
+    fn live_patch_requires_manage_and_publish_capabilities() {
+        let req = UpdatePlaybookRequest {
+            status: Some(PlaybookStatus::Live),
+            ..Default::default()
+        };
+
+        let manage_only = auth(&[permissions::PLAYBOOKS_MANAGE]);
+        assert!(matches!(
+            ensure_update_permissions(&manage_only, &req),
+            Err(ApiError::Forbidden(message))
+                if message == "Missing permission: playbooks:publish"
+        ));
+
+        let publish_only = auth(&[permissions::PLAYBOOKS_PUBLISH]);
+        assert!(matches!(
+            ensure_update_permissions(&publish_only, &req),
+            Err(ApiError::Forbidden(message))
+                if message == "Missing permission: playbooks:manage"
+        ));
+
+        let both = auth(&[
+            permissions::PLAYBOOKS_MANAGE,
+            permissions::PLAYBOOKS_PUBLISH,
+        ]);
+        assert!(ensure_update_permissions(&both, &req).is_ok());
+    }
+
+    #[test]
+    fn ordinary_patch_does_not_require_publish_capability() {
+        let req = UpdatePlaybookRequest {
+            title: Some("revised title".to_string()),
+            ..Default::default()
+        };
+        let manage_only = auth(&[permissions::PLAYBOOKS_MANAGE]);
+        assert!(ensure_update_permissions(&manage_only, &req).is_ok());
+    }
 }

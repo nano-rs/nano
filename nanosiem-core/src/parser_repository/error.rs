@@ -50,6 +50,13 @@ pub enum ParserRepositoryError {
     #[error("Log source service error: {0}")]
     LogSourceService(String),
 
+    /// The caller holds the repository capability but not the target-resource
+    /// capability the operation would consume (NAN-2117/2111/2120). Carries the
+    /// canonical permission string so the HTTP layer renders the same
+    /// `Missing permission: <capability>` body as the direct log-source route.
+    #[error("Missing permission: {0}")]
+    Forbidden(String),
+
     /// Caller passed a syntactically valid but semantically unacceptable
     /// request (e.g. a dispatch_source_config_id whose config_type doesn't
     /// match the parser's ingestion_method). Maps to 400.
@@ -88,6 +95,7 @@ impl ParserRepositoryError {
             ParserRepositoryError::RateLimited(_) => 429,
             ParserRepositoryError::SyncInProgress(_) => 409,
             ParserRepositoryError::RepositoryDisabled => 403,
+            ParserRepositoryError::Forbidden(_) => 403,
             _ => 500,
         }
     }

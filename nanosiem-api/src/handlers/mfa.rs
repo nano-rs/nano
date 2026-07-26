@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::handlers::auth::{build_access_token_cookie, build_refresh_token_cookie};
 use crate::handlers::AuditExt;
-use crate::middleware::AuthContext;
+use crate::middleware::{require_session_auth, AuthContext};
 use crate::state::AppState;
 use crate::utils::{extract_client_ip, extract_user_agent};
 use nanosiem_core::audit::{actions as audit_actions, AuditEvent, AuditSource, ClientContext};
@@ -33,6 +33,23 @@ use nanosiem_core::typeid::TypeIdParam;
 pub struct MfaApiError {
     pub error: String,
     pub message: String,
+}
+
+/// NAN-2080: adapt a `require_session_auth` rejection into this module's error
+/// shape. Used to gate MFA-state read/mutation to interactive sessions only —
+/// an owner-bound API key must never be able to inspect or remove the second
+/// factor, even with the owner's password.
+fn mfa_session_error(
+    err: (StatusCode, Json<crate::middleware::AuthErrorResponse>),
+) -> (StatusCode, Json<MfaApiError>) {
+    let (status, body) = err;
+    (
+        status,
+        Json(MfaApiError {
+            error: body.error.clone(),
+            message: body.message.clone(),
+        }),
+    )
 }
 
 /// Pull a Bearer token from the `Authorization` header, if present + valid.
@@ -584,13 +601,17 @@ pub async fn verify_mfa_challenge(
     tag = "mfa",
     responses(
         (status = 200, description = "MFA status", body = MfaStatusResponse),
+        (status = 403, description = "Session-only endpoint — API keys are rejected", body = MfaApiError),
     ),
-    security(("bearer_auth" = []), ("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn get_mfa_status(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<MfaStatusResponse>, (StatusCode, Json<MfaApiError>)> {
+    // NAN-2080: MFA state is session-only (see `disable_mfa`).
+    require_session_auth(&auth).map_err(mfa_session_error)?;
+
     let user = state
         .user_repo
         .get_user_by_id(auth.claims.sub)
@@ -628,9 +649,10 @@ pub async fn get_mfa_status(
     request_body = MfaDisableRequest,
     responses(
         (status = 204, description = "MFA disabled"),
+        (status = 403, description = "Session-only endpoint — API keys are rejected", body = MfaApiError),
         (status = 400, description = "Invalid password or MFA not enabled", body = MfaApiError),
     ),
-    security(("bearer_auth" = []), ("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn disable_mfa(
     State(state): State<AppState>,
@@ -639,6 +661,11 @@ pub async fn disable_mfa(
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<MfaDisableRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<MfaApiError>)> {
+    // NAN-2080: removing the second factor is session-only. Password confirmation
+    // below is re-auth, not proof of an MFA-completed session — an owner-bound
+    // API key plus the owner's password must not be able to disable MFA.
+    require_session_auth(&auth).map_err(mfa_session_error)?;
+
     let ip_address = extract_client_ip(&headers, Some(&addr));
     let user_agent = extract_user_agent(&headers);
     let client_ctx = ClientContext::new(ip_address, user_agent);
@@ -742,15 +769,21 @@ pub async fn disable_mfa(
     request_body = MfaRegenerateBackupCodesRequest,
     responses(
         (status = 200, description = "New backup codes generated", body = MfaSetupCompleteResponse),
+        (status = 403, description = "Session-only endpoint — API keys are rejected", body = MfaApiError),
         (status = 400, description = "Invalid password or MFA not enabled", body = MfaApiError),
     ),
-    security(("bearer_auth" = []), ("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn regenerate_backup_codes(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<MfaRegenerateBackupCodesRequest>,
 ) -> Result<Json<MfaSetupCompleteResponse>, (StatusCode, Json<MfaApiError>)> {
+    // NAN-2080: minting fresh recovery credentials is session-only (see
+    // `disable_mfa`) — an owner-bound API key must not be able to regenerate
+    // backup codes with only the owner's password.
+    require_session_auth(&auth).map_err(mfa_session_error)?;
+
     let user = state
         .user_repo
         .get_user_by_id(auth.claims.sub)
@@ -1071,5 +1104,28 @@ mod tests {
         let id = Uuid::now_v7();
         let extracted = TypeIdParam::from_str(&id.to_string()).expect("bare uuid should parse");
         assert_eq!(*extracted, id);
+    }
+
+    /// NAN-2080: `get_mfa_status`, `disable_mfa`, and `regenerate_backup_codes`
+    /// are session-only. An owner-bound API key (whose `sub` maps to the owner)
+    /// must be rejected with 403 by `require_session_auth` before any user lookup
+    /// — password confirmation in those handlers is re-auth, not proof of an
+    /// MFA-completed session. Also guards the `mfa_session_error` mapping.
+    #[test]
+    fn mfa_endpoints_reject_api_key_principals() {
+        use nanosiem_core::auth::ApiKeyInfo;
+
+        let api_key_ctx = AuthContext::from_api_key(&ApiKeyInfo {
+            id: Uuid::now_v7(),
+            name: "automation".to_string(),
+            permissions: vec![],
+            user_id: Some(Uuid::now_v7()),
+        });
+
+        let err = require_session_auth(&api_key_ctx)
+            .map_err(mfa_session_error)
+            .expect_err("api-key principal must be rejected on MFA endpoints");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(!err.1.message.is_empty(), "403 body should carry a message");
     }
 }

@@ -88,6 +88,18 @@ async fn count_table(pool: &PgPool, table: &str) -> i64 {
     .unwrap_or(-1)
 }
 
+async fn count_column(pool: &PgPool, table: &str, column: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2",
+    )
+    .bind(table)
+    .bind(column)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(-1)
+}
+
 async fn migration_row_count(pool: &PgPool) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
         .fetch_one(pool)
@@ -145,6 +157,13 @@ async fn nan749_fresh_init_path_creates_open_schema_and_backfills_history() {
             0,
             "snapshot leaked enterprise table `notebooks` into open schema"
         );
+        for removed in ["source_config", "credential_id", "parser_only"] {
+            assert_eq!(
+                count_column(&pool, "log_sources", removed).await,
+                0,
+                "NAN-2126: fresh schema retained retired log_sources.{removed}"
+            );
+        }
         // Backfill brought 175+ rows into _sqlx_migrations
         let rows = migration_row_count(&pool).await;
         assert!(
@@ -180,9 +199,17 @@ async fn nan749_fresh_init_path_creates_open_schema_and_backfills_history() {
 
         // All tables present (legacy path = today's behavior)
         assert_eq!(count_table(&pool, "users").await, 1);
-        assert_eq!(count_table(&pool, "cases").await, 1, "legacy path runs all 175");
+        assert_eq!(
+            count_table(&pool, "cases").await,
+            1,
+            "legacy path runs all 175"
+        );
         let rows = migration_row_count(&pool).await;
-        assert!(rows >= 175, "expected ≥175 _sqlx_migrations rows, got {}", rows);
+        assert!(
+            rows >= 175,
+            "expected ≥175 _sqlx_migrations rows, got {}",
+            rows
+        );
     }
 
     // ------------------------------------------------------------------

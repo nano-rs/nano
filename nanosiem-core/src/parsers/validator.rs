@@ -20,6 +20,7 @@
 //! - Suspicious patterns that may indicate obfuscation
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 use std::time::Instant;
 use thiserror::Error;
 
@@ -106,6 +107,53 @@ fn safe_vrl_functions() -> Vec<Box<dyn vrl::compiler::Function>> {
         .into_iter()
         .filter(|f| !BLOCKED_VRL_FUNCTIONS.contains(&f.identifier()))
         .collect()
+}
+
+/// Replace VRL's runtime byte spans (`at (START:END)`) with the 1-based line
+/// and column an analyst sees in the parser editor.
+///
+/// VRL deliberately exposes source byte offsets in runtime errors. Those are
+/// useful to a compiler but look like impossible line numbers in the UI, and
+/// UTF-8 before the failing expression means they cannot be treated as
+/// character offsets. Invalid or unrecognized spans are left untouched so this
+/// formatter never hides upstream diagnostic information.
+fn humanize_runtime_spans(vrl_code: &str, error: &str) -> String {
+    static RUNTIME_SPAN: OnceLock<regex::Regex> = OnceLock::new();
+    let span_pattern = RUNTIME_SPAN.get_or_init(|| {
+        regex::Regex::new(r"\bat \((\d+):(\d+)\)").expect("static VRL span regex must compile")
+    });
+
+    span_pattern
+        .replace_all(error, |captures: &regex::Captures<'_>| {
+            let Some(start) = captures
+                .get(1)
+                .and_then(|m| m.as_str().parse::<usize>().ok())
+            else {
+                return captures[0].to_string();
+            };
+            let Some(end) = captures
+                .get(2)
+                .and_then(|m| m.as_str().parse::<usize>().ok())
+            else {
+                return captures[0].to_string();
+            };
+
+            let valid_span = start <= end
+                && end <= vrl_code.len()
+                && vrl_code.is_char_boundary(start)
+                && vrl_code.is_char_boundary(end);
+            if !valid_span {
+                return captures[0].to_string();
+            }
+
+            let source_before = &vrl_code[..start];
+            let line = source_before.bytes().filter(|byte| *byte == b'\n').count() + 1;
+            let line_start = source_before.rfind('\n').map_or(0, |offset| offset + 1);
+            let column = vrl_code[line_start..start].chars().count() + 1;
+
+            format!("at line {line}, column {column}")
+        })
+        .into_owned()
 }
 
 /// Maximum allowed VRL code size (1MB)
@@ -635,6 +683,73 @@ impl VrlValidator {
         }
     }
 
+    /// Test one VRL program against multiple sample inputs.
+    ///
+    /// The live parser editor fetches several events at once. Compiling the
+    /// same parser separately for every event made that request scale with
+    /// `events × parser versions`; this validates and compiles each distinct
+    /// parser once, then reuses the immutable program for every input.
+    pub async fn test_vrl_batch(
+        &self,
+        vrl_code: &str,
+        sample_inputs: &[String],
+    ) -> Result<Vec<ParserTestResult>, VrlValidatorError> {
+        let start = Instant::now();
+
+        let validation = self.validate_vrl(vrl_code).await?;
+        if !validation.valid {
+            return Ok(sample_inputs
+                .iter()
+                .map(|sample_input| ParserTestResult {
+                    success: false,
+                    input: sample_input.clone(),
+                    output: None,
+                    error: validation.error.clone(),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                })
+                .collect());
+        }
+
+        let program = self
+            .compile_program(vrl_code)
+            .map_err(VrlValidatorError::ExecutionError)?;
+
+        Ok(sample_inputs
+            .iter()
+            .map(|sample_input| {
+                let input_json: serde_json::Value = match serde_json::from_str(sample_input) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return ParserTestResult {
+                            success: false,
+                            input: sample_input.clone(),
+                            output: None,
+                            error: Some(format!("Invalid JSON input: {}", error)),
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        };
+                    }
+                };
+
+                match self.execute_program(vrl_code, &program, &input_json) {
+                    Ok(output) => ParserTestResult {
+                        success: true,
+                        input: sample_input.clone(),
+                        output: Some(output),
+                        error: None,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    },
+                    Err(error) => ParserTestResult {
+                        success: false,
+                        input: sample_input.clone(),
+                        output: None,
+                        error: Some(format!("Execution error: {}", error)),
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    },
+                }
+            })
+            .collect())
+    }
+
     /// Test a chain of VRL stages against sample input (NAN-874).
     ///
     /// Each stage runs sequentially: output of stage N becomes input to stage N+1.
@@ -732,23 +847,37 @@ impl VrlValidator {
         vrl_code: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        use vrl::compiler::{compile, TargetValue};
+        let program = self.compile_program(vrl_code)?;
+        self.execute_program(vrl_code, &program, input)
+    }
+
+    /// Compile an executable VRL program. Kept separate from execution so batch
+    /// callers can reuse the same program across multiple independent events.
+    fn compile_program(&self, vrl_code: &str) -> Result<vrl::compiler::Program, String> {
+        use vrl::compiler::compile;
         use vrl::diagnostic::Formatter;
-        use vrl::value::{Secrets, Value};
 
         let fns = safe_vrl_functions();
+        compile(vrl_code, &fns)
+            .map(|result| result.program)
+            .map_err(|diagnostics| {
+                diagnostics
+                    .into_iter()
+                    .map(|diagnostic| Formatter::new(vrl_code, diagnostic).to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+    }
 
-        // Compile the VRL program
-        let result = compile(vrl_code, &fns).map_err(|diagnostics| {
-            diagnostics
-                .into_iter()
-                .map(|d| {
-                    let formatter = Formatter::new(vrl_code, d);
-                    formatter.to_string()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        })?;
+    /// Execute a precompiled VRL program against one event.
+    fn execute_program(
+        &self,
+        vrl_code: &str,
+        program: &vrl::compiler::Program,
+        input: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        use vrl::compiler::TargetValue;
+        use vrl::value::{Secrets, Value};
 
         // Convert JSON input to VRL Value
         let vrl_input = json_to_vrl_value(input);
@@ -763,13 +892,16 @@ impl VrlValidator {
         let timezone = vrl::compiler::TimeZone::Local;
         let mut runtime = vrl::compiler::runtime::Runtime::default();
 
-        match runtime.resolve(&mut target, &result.program, &timezone) {
+        match runtime.resolve(&mut target, program, &timezone) {
             Ok(_) => {
                 // Convert the transformed value back to JSON
                 let output_json = vrl_value_to_json(&target.value);
                 Ok(output_json)
             }
-            Err(e) => Err(format!("VRL runtime error: {}", e)),
+            Err(e) => Err(format!(
+                "VRL runtime error: {}",
+                humanize_runtime_spans(vrl_code, &e.to_string())
+            )),
         }
     }
 }
@@ -1339,6 +1471,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_byte_span_is_rendered_as_editor_line_and_column() {
+        let vrl = "# UTF-8 separator: ───\n.value = string!(.value)";
+        let start = vrl.find("string!").expect("test expression exists");
+        let end = start + "string!(.value)".len();
+        let runtime_error = format!(
+            "function call error for \"string\" at ({start}:{end}): expected string, got integer"
+        );
+
+        assert_eq!(
+            humanize_runtime_spans(vrl, &runtime_error),
+            "function call error for \"string\" at line 2, column 10: expected string, got integer"
+        );
+    }
+
+    #[test]
+    fn invalid_or_unrecognized_runtime_spans_are_preserved() {
+        let vrl = ".value = string!(.value)";
+        let out_of_range = "function call error at (999:1000): bad value";
+        let malformed = "function call error at (abc:def): bad value";
+        let ordinary = "parser aborted without a source span";
+
+        assert_eq!(humanize_runtime_spans(vrl, out_of_range), out_of_range);
+        assert_eq!(humanize_runtime_spans(vrl, malformed), malformed);
+        assert_eq!(humanize_runtime_spans(vrl, ordinary), ordinary);
+    }
+
+    #[tokio::test]
+    async fn test_vrl_runtime_error_reports_human_readable_location() {
+        let v = validator();
+        let vrl = "# UTF-8 separator: ───\n.value = string!(.value)";
+        let result = v.test_vrl(vrl, r#"{"value": 1}"#).await.unwrap();
+        let error = result.error.expect("runtime error");
+
+        assert!(!result.success);
+        assert!(
+            error.contains("at line 2, column 10"),
+            "error should contain editor coordinates: {error}"
+        );
+        assert!(
+            !error.contains("at ("),
+            "valid byte span should not leak into the user-facing error: {error}"
+        );
+    }
+
+    #[test]
     fn check_normalize_vrl_safety_blocks_breakouts_allows_real_mapping() {
         let v = VrlValidator::new();
         // Realistic identity normalize VRL — must NOT be a false positive.
@@ -1700,6 +1877,60 @@ mod tests {
             result.error
         );
         assert!(result.output.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_vrl_batch_executes_every_input_independently() {
+        let v = validator();
+        let inputs = vec![
+            r#"{"message":"first"}"#.to_string(),
+            r#"{"message":"second"}"#.to_string(),
+        ];
+
+        let results = v
+            .test_vrl_batch(".parsed = upcase!(.message)", &inputs)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.success));
+        assert_eq!(
+            results[0]
+                .output
+                .as_ref()
+                .and_then(|output| output.get("parsed"))
+                .and_then(|value| value.as_str()),
+            Some("FIRST")
+        );
+        assert_eq!(
+            results[1]
+                .output
+                .as_ref()
+                .and_then(|output| output.get("parsed"))
+                .and_then(|value| value.as_str()),
+            Some("SECOND")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vrl_batch_keeps_per_input_failures() {
+        let v = validator();
+        let inputs = vec![
+            r#"{"message":"ok"}"#.to_string(),
+            r#"{"message":42}"#.to_string(),
+        ];
+
+        let results = v
+            .test_vrl_batch(".parsed = upcase!(.message)", &inputs)
+            .await
+            .unwrap();
+
+        assert!(results[0].success);
+        assert!(!results[1].success);
+        assert!(results[1]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("line 1, column")));
     }
 
     #[tokio::test]

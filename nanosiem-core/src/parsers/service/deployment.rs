@@ -17,38 +17,24 @@ impl ParserService {
     /// root, so no pod-local live tree is treated as shared state.
     pub async fn render_to_vector_config(&self) -> Result<(), ParserServiceError> {
         let parsers = self.list().await?;
-        let mut parsers_with_creds = self.inject_credentials_for_all(&parsers).await?;
-        crate::parsers::resolve_parser_dispatch_routes(
-            &self.pool,
-            &mut parsers_with_creds,
-        )
-        .await
-        .map_err(|e| ParserServiceError::DeploymentFailed(e.to_string()))?;
-        self.vector_config
-            .render_parsers(&parsers_with_creds)
-            .await?;
+        let mut parsers = parsers;
+        crate::parsers::resolve_parser_dispatch_routes(&self.pool, &mut parsers)
+            .await
+            .map_err(|e| ParserServiceError::DeploymentFailed(e.to_string()))?;
+        self.vector_config.render_parsers(&parsers).await?;
         Ok(())
     }
 
     /// Deploy all enabled parsers to Vector
     pub async fn deploy_to_vector(&self) -> Result<(), ParserServiceError> {
         let parsers = self.list().await?;
-        // Inject credentials for cloud sources before deployment
-        let mut parsers_with_creds = self.inject_credentials_for_all(&parsers).await?;
-        // NAN-930 follow-up: this path runs at API startup and after parser-
-        // only mutations. Without resolving dispatch_route_name here the
-        // generator falls through to the legacy parser-owned-source branch
-        // even for parsers bound to a source-config — re-introducing the
-        // double-write topology NAN-930 fixed for the log-source-publish path.
-        crate::parsers::resolve_parser_dispatch_routes(
-            &self.pool,
-            &mut parsers_with_creds,
-        )
-        .await
-        .map_err(|e| ParserServiceError::DeploymentFailed(e.to_string()))?;
-        self.vector_config
-            .deploy_and_reload(&parsers_with_creds)
-            .await?;
+        let mut parsers = parsers;
+        // NAN-2126: resolve every fetch parser to its source-configuration.
+        // Missing/orphaned bindings fail closed before config generation.
+        crate::parsers::resolve_parser_dispatch_routes(&self.pool, &mut parsers)
+            .await
+            .map_err(|e| ParserServiceError::DeploymentFailed(e.to_string()))?;
+        self.vector_config.deploy_and_reload(&parsers).await?;
         Ok(())
     }
 
@@ -141,25 +127,13 @@ impl ParserService {
             }
         }
 
-        // Inject credentials for cloud sources before staging
-        let mut all_parsers_with_creds = self.inject_credentials_for_all(&all_parsers).await?;
-        // NAN-930 follow-up: stamp dispatch_route_name on every parser bound
-        // to a source-config so the generator's match arm picks the
-        // filter-on-dispatch-route branch instead of emitting a parser-owned
-        // Vector source. Mirrors the resolution call in `deploy_to_vector`.
-        crate::parsers::resolve_parser_dispatch_routes(
-            &self.pool,
-            &mut all_parsers_with_creds,
-        )
-        .await
-        .map_err(|e| ParserServiceError::DeploymentFailed(e.to_string()))?;
+        // Stamp dispatch_route_name on every parser bound to a source-config.
+        crate::parsers::resolve_parser_dispatch_routes(&self.pool, &mut all_parsers)
+            .await
+            .map_err(|e| ParserServiceError::DeploymentFailed(e.to_string()))?;
 
         // Stage all enabled parsers including this one
-        if let Err(e) = self
-            .vector_config
-            .stage_parsers(&all_parsers_with_creds)
-            .await
-        {
+        if let Err(e) = self.vector_config.stage_parsers(&all_parsers).await {
             let error_msg = format!("Failed to stage config: {}", e);
             tracing::error!("{}", error_msg);
 
@@ -300,11 +274,7 @@ impl ParserService {
         // Step 4: Deploy with health verification and auto-rollback
         // This: backs up config, writes all files atomically, reloads Vector,
         // polls health for 10s, and auto-rolls back if Vector becomes unhealthy.
-        if let Err(e) = self
-            .vector_config
-            .deploy_and_verify(&all_parsers_with_creds)
-            .await
-        {
+        if let Err(e) = self.vector_config.deploy_and_verify(&all_parsers).await {
             let error_msg = format!("{}", e);
             tracing::error!("Deploy failed for parser '{}': {}", parser.name, error_msg);
 

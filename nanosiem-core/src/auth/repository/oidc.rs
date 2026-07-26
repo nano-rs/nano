@@ -45,6 +45,8 @@ pub enum OidcRepositoryError {
     MappingNotFound(Uuid),
     #[error("OIDC auth transaction not found, already consumed, or expired")]
     AuthTransactionInvalid,
+    #[error("grant authority changed during validation; retry the request")]
+    GrantAuthorityChanged,
 }
 
 /// Repository for OIDC provider operations
@@ -208,6 +210,54 @@ impl OidcRepository {
         Ok(provider)
     }
 
+    /// Create an enabled provider under the authoritative grant generation
+    /// that approved its implicit Everyone/JIT entitlement.
+    pub async fn create_provider_authorized(
+        &self,
+        request: &CreateOidcProviderRequest,
+        stamp: crate::auth::GrantAuthorityStamp,
+    ) -> Result<OidcProvider, OidcRepositoryError> {
+        let encrypted_secret = self.encrypt_secret(&request.client_secret)?;
+        let scopes = request.scopes.clone().unwrap_or_else(|| {
+            vec![
+                "openid".to_string(),
+                "profile".to_string(),
+                "email".to_string(),
+            ]
+        });
+        let mut tx = self.pool.begin().await?;
+        if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
+            return Err(OidcRepositoryError::GrantAuthorityChanged);
+        }
+        let provider = sqlx::query_as::<_, OidcProvider>(
+            r#"
+            INSERT INTO oidc_providers
+                (name, slug, issuer, client_id, client_secret_encrypted, scopes, group_claim, enabled)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
+            RETURNING *
+            "#,
+        )
+        .bind(&request.name)
+        .bind(&request.slug)
+        .bind(&request.issuer)
+        .bind(&request.client_id)
+        .bind(&encrypted_secret)
+        .bind(&scopes)
+        .bind(&request.group_claim)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(ref db_err) = e {
+                if db_err.constraint() == Some("oidc_providers_slug_key") {
+                    return OidcRepositoryError::SlugExists(request.slug.clone());
+                }
+            }
+            OidcRepositoryError::DatabaseError(e)
+        })?;
+        tx.commit().await?;
+        Ok(provider)
+    }
+
     /// Update an OIDC provider
     /// Requirements: 11.4
     pub async fn update_provider(
@@ -257,6 +307,60 @@ impl OidcRepository {
         .fetch_one(&self.pool)
         .await?;
 
+        Ok(provider)
+    }
+
+    /// Update a provider while holding the grant generation that approved an
+    /// enabled/JIT-capable final state.
+    pub async fn update_provider_authorized(
+        &self,
+        id: Uuid,
+        request: &UpdateOidcProviderRequest,
+        stamp: crate::auth::GrantAuthorityStamp,
+    ) -> Result<OidcProvider, OidcRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
+            return Err(OidcRepositoryError::GrantAuthorityChanged);
+        }
+        let existing = sqlx::query_as::<_, OidcProvider>(
+            "SELECT * FROM oidc_providers WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(OidcRepositoryError::NotFound(id))?;
+        let name = request.name.as_ref().unwrap_or(&existing.name);
+        let issuer = request.issuer.as_ref().unwrap_or(&existing.issuer);
+        let client_id = request.client_id.as_ref().unwrap_or(&existing.client_id);
+        let scopes = request.scopes.as_ref().unwrap_or(&existing.scopes);
+        let group_claim = request.group_claim.clone().or(existing.group_claim);
+        let enabled = request.enabled.unwrap_or(existing.enabled);
+        let encrypted_secret = if let Some(ref new_secret) = request.client_secret {
+            self.encrypt_secret(new_secret)?
+        } else {
+            existing.client_secret_encrypted
+        };
+        let provider = sqlx::query_as::<_, OidcProvider>(
+            r#"
+            UPDATE oidc_providers SET
+                name = $2, issuer = $3, client_id = $4,
+                client_secret_encrypted = $5, scopes = $6,
+                group_claim = $7, enabled = $8, updated_at = NOW()
+            WHERE id = $1
+            RETURNING *
+            "#,
+        )
+        .bind(id)
+        .bind(name)
+        .bind(issuer)
+        .bind(client_id)
+        .bind(&encrypted_secret)
+        .bind(scopes)
+        .bind(&group_claim)
+        .bind(enabled)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(provider)
     }
 
@@ -370,6 +474,55 @@ impl OidcRepository {
 
         // Return the new mappings
         self.get_group_mappings(provider_id).await
+    }
+
+    /// Replace mappings under the grant generation that authorized every
+    /// mapped local group's current effective entitlement.
+    pub async fn set_group_mappings_authorized(
+        &self,
+        provider_id: Uuid,
+        mappings: &[(String, Uuid)],
+        stamp: crate::auth::GrantAuthorityStamp,
+    ) -> Result<Vec<OidcGroupMapping>, OidcRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
+            return Err(OidcRepositoryError::GrantAuthorityChanged);
+        }
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM oidc_providers WHERE id = $1)")
+                .bind(provider_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !exists {
+            return Err(OidcRepositoryError::NotFound(provider_id));
+        }
+        sqlx::query("DELETE FROM oidc_group_mappings WHERE provider_id = $1")
+            .bind(provider_id)
+            .execute(&mut *tx)
+            .await?;
+        for (oidc_group, local_group_id) in mappings {
+            sqlx::query(
+                r#"
+                INSERT INTO oidc_group_mappings (provider_id, oidc_group, local_group_id)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (provider_id, oidc_group)
+                DO UPDATE SET local_group_id = EXCLUDED.local_group_id
+                "#,
+            )
+            .bind(provider_id)
+            .bind(oidc_group)
+            .bind(local_group_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let rows = sqlx::query_as::<_, OidcGroupMapping>(
+            "SELECT * FROM oidc_group_mappings WHERE provider_id = $1 ORDER BY oidc_group ASC",
+        )
+        .bind(provider_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows)
     }
 
     /// Add a single group mapping

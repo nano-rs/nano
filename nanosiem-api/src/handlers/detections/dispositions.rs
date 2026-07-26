@@ -12,10 +12,12 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use nanosiem_core::auth::permissions;
+use nanosiem_core::detection::match_scope::DetectionMatchRepository;
 use nanosiem_core::typeid::TypeIdParam;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
+use super::stats::effective_match_scope;
 use crate::middleware::{ensure_permission, AuthContext};
 use crate::{
     error::{ApiError, ErrorResponse},
@@ -98,34 +100,20 @@ pub async fn get_rule_disposition_stats(
     let window_end = Utc::now();
     let window_start = window_end - chrono::Duration::days(days);
 
-    // One pass, FILTER per disposition. Avoids 4 round trips and uses the new
-    // composite index (rule_id, disposition, detected_at).
-    let row: (i64, i64, i64, i64, i64) = sqlx::query_as(
-        r#"
-        SELECT
-            COUNT(*) AS total,
-            COUNT(*) FILTER (WHERE disposition = 'unclassified')   AS unclassified,
-            COUNT(*) FILTER (WHERE disposition = 'true_positive')  AS true_positive,
-            COUNT(*) FILTER (WHERE disposition = 'false_positive') AS false_positive,
-            COUNT(*) FILTER (WHERE disposition = 'benign')         AS benign
-        FROM detection_matches
-        WHERE rule_id = $1
-          AND detected_at >= $2
-          AND detected_at <= $3
-        "#,
-    )
-    .bind(*id)
-    .bind(window_start)
-    .bind(window_end)
-    .fetch_one(&state.pool)
-    .await?;
+    // NAN-2071: the rollup must count exactly the rows `/api/rules/{id}/matches`
+    // would return. An unscoped rollup let a caller denied every source on a
+    // match still learn that the match happened, when, and how it was
+    // classified — a count oracle over the data the row read path hides.
+    let stats = DetectionMatchRepository::new(state.pool.clone())
+        .disposition_stats(*id, window_start, window_end, &effective_match_scope(&auth))
+        .await?;
 
     Ok(Json(DispositionStatsResponse {
-        total: row.0,
-        unclassified: row.1,
-        true_positive: row.2,
-        false_positive: row.3,
-        benign: row.4,
+        total: stats.total,
+        unclassified: stats.unclassified,
+        true_positive: stats.true_positive,
+        false_positive: stats.false_positive,
+        benign: stats.benign,
         window_start,
         window_end,
     }))
@@ -162,15 +150,16 @@ pub async fn set_match_disposition(
         )));
     }
 
-    let updated: Option<(String,)> = sqlx::query_as(
-        "UPDATE detection_matches SET disposition = $2 WHERE id = $1 RETURNING disposition",
-    )
-    .bind(*id)
-    .bind(&body.disposition)
-    .fetch_optional(&state.pool)
-    .await?;
+    // NAN-2071: the source-scope predicate is part of the UPDATE, so a match
+    // stamped with a denied source is never written — this was an IDOR that let
+    // `detections:edit` reclassify matches the caller cannot read. A denied
+    // match and a nonexistent one both fall out as `None` → identical 404, so
+    // the route is not an existence oracle either.
+    let updated = DetectionMatchRepository::new(state.pool.clone())
+        .set_disposition(*id, &body.disposition, &effective_match_scope(&auth))
+        .await?;
 
-    let Some((disposition,)) = updated else {
+    let Some(disposition) = updated else {
         return Err(ApiError::NotFound(format!("Match not found: {}", *id)));
     };
 

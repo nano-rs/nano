@@ -684,6 +684,31 @@ impl Entity {
             .spawn_with_random_parent(name, path, cmdline, user)
     }
 
+    /// Spawn a process from a specific process already present in this entity's
+    /// process tree. Scripted injector campaigns use this to preserve causal
+    /// parentage (for example `explorer.exe -> wscript.exe -> powershell.exe`)
+    /// instead of accepting the random parent selection used for background
+    /// traffic generation.
+    pub fn spawn_process_from(
+        &self,
+        parent: &Process,
+        name: &str,
+        path: &str,
+        cmdline: &str,
+        user: Option<&str>,
+    ) -> (Process, Process) {
+        let user = user.unwrap_or(&self.user);
+        let mut tree = self.process_tree.lock();
+        let actual_parent = tree
+            .processes
+            .get(&parent.pid)
+            .cloned()
+            .or_else(|| tree.get_explorer().cloned())
+            .unwrap_or_else(|| tree.processes.get(&4).cloned().unwrap());
+        let child = tree.spawn(name, path, cmdline, user, actual_parent.pid);
+        (child, actual_parent)
+    }
+
     pub fn next_browse_request(&self) -> (String, String, String) {
         self.browsing_session.lock().next_request()
     }

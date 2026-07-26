@@ -77,7 +77,6 @@ import { useMelodJob } from '@/enterprise/hooks/use-melod-job';
 import { useMelodStatus } from '@/hooks/use-api';
 import type { MelodEditParserResponse } from '@/lib/api';
 import { Send } from 'lucide-react';
-import { SourceConfigForm } from '@/components/log-sources/SourceConfigForm';
 import { PivtIcon } from '@/enterprise/icons/PivtIcon';
 
 import { api } from '@/lib/api';
@@ -375,7 +374,13 @@ export function LogSourceDetail() {
 
   const handleRevertVersion = async (version: LogSourceVersion) => {
     try {
-      await updateLogSource({ id: logSource.id, data: { parser_vrl: version.parser_vrl } });
+      await updateLogSource({
+        id: logSource.id,
+        data: {
+          parser_vrl: version.parser_vrl,
+          expected_updated_at: logSource.updated_at,
+        },
+      });
       toast({
         title: 'Draft updated',
         description: `Working copy set to v${version.version_number}'s parser. Publish when ready.`,
@@ -397,7 +402,6 @@ export function LogSourceDetail() {
       name: logSource.name,
       description: logSource.description || '',
       source_type: logSource.source_type,
-      source_config: logSource.source_config,
       category: logSource.category,
       vendor: logSource.vendor,
       product: logSource.product,
@@ -415,8 +419,6 @@ export function LogSourceDetail() {
       if (formData.name !== logSource.name) changed.name = formData.name;
       if (formData.description !== (logSource.description || '')) changed.description = formData.description;
       if (formData.source_type !== logSource.source_type) changed.source_type = formData.source_type;
-      if (JSON.stringify(formData.source_config) !== JSON.stringify(logSource.source_config))
-        changed.source_config = formData.source_config;
       if (formData.category !== logSource.category) changed.category = formData.category;
       if (formData.vendor !== logSource.vendor) changed.vendor = formData.vendor;
       if (formData.product !== logSource.product) changed.product = formData.product;
@@ -434,6 +436,7 @@ export function LogSourceDetail() {
         setIsEditingConfig(false);
         return;
       }
+      changed.expected_updated_at = logSource.updated_at;
       await updateLogSource({ id: logSource.id, data: changed });
       toast({ title: 'Configuration updated', description: `"${logSource.name}" has been updated.` });
       setIsEditingConfig(false);
@@ -524,7 +527,13 @@ export function LogSourceDetail() {
   const handleSaveVrlConfirmed = async () => {
     try {
       setVrlHistory((prev) => [...prev, logSource.parser_vrl]);
-      await updateLogSource({ id: logSource.id, data: { parser_vrl: editedVrl } });
+      await updateLogSource({
+        id: logSource.id,
+        data: {
+          parser_vrl: editedVrl,
+          expected_updated_at: logSource.updated_at,
+        },
+      });
       toast({ title: 'VRL saved', description: 'Parser code updated. Deploy to apply changes.' });
       setIsEditingVrl(false);
       setSaveVrlDialogOpen(false);
@@ -559,7 +568,13 @@ export function LogSourceDetail() {
   const handleAcceptDiffConfirmed = async () => {
     try {
       setVrlHistory((prev) => [...prev, logSource.parser_vrl || '']);
-      await updateLogSource({ id: logSource.id, data: { parser_vrl: editedVrl } });
+      await updateLogSource({
+        id: logSource.id,
+        data: {
+          parser_vrl: editedVrl,
+          expected_updated_at: logSource.updated_at,
+        },
+      });
       setCurrentDiff(null);
       setAcceptDiffDialogOpen(false);
       setIsEditingVrl(false);
@@ -659,7 +674,11 @@ export function LogSourceDetail() {
               onSave={async ({ extension_vrl, extension_enabled }) => {
                 await updateLogSource({
                   id: logSource.id,
-                  data: { extension_vrl, extension_enabled },
+                  data: {
+                    extension_vrl,
+                    extension_enabled,
+                    expected_updated_at: logSource.updated_at,
+                  },
                 });
                 refetch();
                 refetchDraftStatus();
@@ -1136,6 +1155,9 @@ function OverviewTab({
     | {
         health_status?: string;
         error_rate_24h?: number | null;
+        parse_errors_24h?: number;
+        parse_attempts_24h?: number;
+        parse_success_rate_24h?: number | null;
         events_last_24h?: number;
         events_last_hour?: number;
         last_event_at?: string | null;
@@ -1145,7 +1167,9 @@ function OverviewTab({
   sparklinePoints: number[];
 }) {
   const isLive = source.deployed && (sparklinePoints.length > 0 || (health?.events_last_24h ?? 0) > 0);
-  const errRate = health?.error_rate_24h;
+  const parseErrors = health?.parse_errors_24h ?? 0;
+  const parseAttempts = health?.parse_attempts_24h ?? 0;
+  const parseSuccessRate = health?.parse_success_rate_24h;
   return (
     <div className="p-4 space-y-4">
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -1192,7 +1216,17 @@ function OverviewTab({
           }
         >
           <LSRow label="Status">
-            {health?.health_status === 'healthy' ? (
+            {health?.health_status === 'error' ? (
+              <span className="inline-flex items-center gap-1.5 text-red-500">
+                <XCircle className="w-3.5 h-3.5" />
+                <span className="text-[12px]">Errors detected</span>
+              </span>
+            ) : source.deployed && parseErrors > 0 ? (
+              <span className="inline-flex items-center gap-1.5 text-amber-500">
+                <AlertTriangle className="w-3.5 h-3.5" />
+                <span className="text-[12px]">Parsing degraded</span>
+              </span>
+            ) : health?.health_status === 'healthy' ? (
               <span className="inline-flex items-center gap-1.5 text-emerald-500">
                 <Check className="w-3.5 h-3.5" />
                 <span className="text-[12px]">Healthy</span>
@@ -1202,29 +1236,40 @@ function OverviewTab({
                 <AlertTriangle className="w-3.5 h-3.5" />
                 <span className="text-[12px]">Stale — no recent events</span>
               </span>
-            ) : health?.health_status === 'error' ? (
-              <span className="inline-flex items-center gap-1.5 text-red-500">
-                <XCircle className="w-3.5 h-3.5" />
-                <span className="text-[12px]">Errors detected</span>
-              </span>
             ) : !source.deployed ? (
               <span className="text-foreground/80 text-[12px]">Ready to deploy</span>
             ) : (
               <span className="text-muted-foreground text-[12px]">No data yet</span>
             )}
           </LSRow>
-          <LSRow label="Error rate" mono>
-            {errRate == null ? (
+          <LSRow label="Parse success" mono>
+            {parseSuccessRate == null ? (
               <span className="text-muted-foreground">—</span>
             ) : (
               <span
                 className={cn(
-                  errRate > 0.01 ? 'text-amber-500' : errRate > 0 ? 'text-foreground/80' : 'text-emerald-500',
+                  parseSuccessRate < 0.99
+                    ? 'text-red-500'
+                    : parseSuccessRate < 1
+                      ? 'text-amber-500'
+                      : 'text-emerald-500',
                 )}
               >
-                {(errRate * 100).toFixed(2)}%
+                {(parseSuccessRate * 100).toFixed(2)}%
               </span>
             )}
+          </LSRow>
+          <LSRow label="Failures (24h)" mono>
+            <div>
+              <span className={parseErrors > 0 ? 'text-amber-500' : 'text-foreground'}>
+                {fmtCount(parseErrors)}
+              </span>
+              {parseAttempts > 0 && (
+                <div className="mt-0.5 text-[10.5px] font-sans text-muted-foreground">
+                  of {fmtCount(parseAttempts)} production events
+                </div>
+              )}
+            </div>
           </LSRow>
           <LSRow label="Events (24h)" mono>
             <span className="text-foreground">{fmtCount(health?.events_last_24h)}</span>
@@ -1240,6 +1285,11 @@ function OverviewTab({
           <LSRow label="Deployed" mono>
             <span className="text-foreground/80">{source.deployed_at ? formatUTCCompact(source.deployed_at) : '—'}</span>
           </LSRow>
+          <div className="px-4 py-2.5 text-[10.5px] leading-relaxed text-muted-foreground">
+            Runtime failures are preserved as searchable events in{' '}
+            <code className="font-mono text-foreground/70">metadata.parse_error</code>. Static VRL validation is not
+            included.
+          </div>
         </LSCard>
       </div>
 
@@ -1480,22 +1530,6 @@ function ConfigurationTab({
             <span className="text-[10.5px] font-mono text-foreground/80">{transportLabel}</span>
           </span>
         </LSRow>
-        {sourceType !== 'routed' && (
-          <div className="px-4 py-3 border-b border-border last:border-b-0">
-            <SourceConfigForm
-              sourceType={sourceType}
-              config={
-                (formData.source_config as Record<string, unknown>) ||
-                (source.source_config as Record<string, unknown>) ||
-                {}
-              }
-              onConfigChange={(config) => setFormData({ ...formData, source_config: config })}
-              credentialId={(formData.credential_id as string) || source.credential_id || undefined}
-              onCredentialChange={(id) => setFormData({ ...formData, credential_id: id })}
-              disabled={!isEditing}
-            />
-          </div>
-        )}
       </LSCard>
 
       <LSCard

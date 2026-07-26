@@ -254,7 +254,7 @@ pub async fn store_query_explanation(
 
     let repo = QueryExplanationRepository::new(state.pool.clone());
     let explanation = repo
-        .upsert(&new_explanation)
+        .upsert(&new_explanation, &explanation_scope_fingerprint(&auth))
         .await
         .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
 
@@ -270,6 +270,7 @@ pub async fn store_query_explanation(
     params(GetExplanationParams),
     responses(
         (status = 200, description = "Query explanation found", body = QueryExplanationResponse),
+        (status = 403, description = "Missing search:execute permission"),
         (status = 404, description = "No explanation found for this query"),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
@@ -279,18 +280,53 @@ pub async fn get_query_explanation(
     Extension(auth): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<GetExplanationParams>,
 ) -> Result<Json<QueryExplanationResponse>, ApiError> {
-    ensure_permission(&auth, permissions::SEARCH_VIEW)?;
+    // NAN-2049: this returns the generated ClickHouse SQL plus the AI prompt /
+    // reasoning for a query — the same sensitive output as POST /api/search/explain,
+    // which requires search:execute (NAN-2028). Match it; search:view (which the
+    // cache previously accepted) let an under-scoped principal read generated SQL.
+    ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
     use nanosiem_core::db::repository::QueryExplanationRepository;
 
     let repo = QueryExplanationRepository::new(state.pool.clone());
-    let explanation = repo.find_by_query(&params.q).await.map_err(|e| match e {
-        nanosiem_core::db::repository::QueryExplanationError::NotFound(_) => {
-            ApiError::NotFound("No explanation found for this query".to_string())
-        }
-        _ => ApiError::DatabaseError(e.to_string()),
-    })?;
+    // NAN-2049: bind the lookup to the caller's effective source scope so a
+    // source-restricted principal cannot resolve an explanation (and its
+    // scope-specific generated SQL) cached under a broader-scope principal.
+    let explanation = repo
+        .find_by_query(&params.q, &explanation_scope_fingerprint(&auth))
+        .await
+        .map_err(|e| match e {
+            nanosiem_core::db::repository::QueryExplanationError::NotFound(_) => {
+                ApiError::NotFound("No explanation found for this query".to_string())
+            }
+            _ => ApiError::DatabaseError(e.to_string()),
+        })?;
 
     Ok(Json(query_explanation_to_response(explanation)))
+}
+
+/// NAN-2049: fingerprint the caller's effective source-scope deny-set for the
+/// query-explanation cache key. The deny-set is a sorted `BTreeSet`, so the
+/// encoding is stable across requests: callers with the same effective
+/// visibility share cache entries (shared-URL explanations keep working), while
+/// a differently-scoped caller gets a distinct key and its own scope-correct
+/// entry. The empty (unrestricted) deny-set yields `""`.
+fn explanation_scope_fingerprint(auth: &AuthContext) -> String {
+    let deny = auth.effective_source_deny_set();
+    encode_scope_fingerprint(deny.iter().map(String::as_str))
+}
+
+/// Canonical, injective encoding of a set of source-type names (NAN-2049).
+///
+/// Each element is length-prefixed (`<byte-len>:<value>`) so the concatenation
+/// is unambiguous even when a value contains the delimiter — source names are
+/// only trimmed/lowercased on the way in and PostgreSQL accepts embedded
+/// newlines, so a naive `join` would let `{"a","b"}` and `{"a\nb"}` collide and
+/// reopen the cross-scope cache bypass this fix closes (codex). The length
+/// prefix is a byte count, so a reader consumes exactly that many bytes and the
+/// two sets can never produce the same string. Input order must be stable
+/// (the caller passes a sorted `BTreeSet`).
+fn encode_scope_fingerprint<'a>(sources: impl Iterator<Item = &'a str>) -> String {
+    sources.map(|s| format!("{}:{}", s.len(), s)).collect()
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -356,3 +392,40 @@ fn query_explanation_to_response(
     )
 )]
 pub struct SearchApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::encode_scope_fingerprint;
+
+    #[test]
+    fn scope_fingerprint_is_injective_across_delimiter_boundaries() {
+        // codex (NAN-2049): a source_type may contain the delimiter (names are
+        // only trimmed/lowercased; PostgreSQL accepts embedded newlines), so the
+        // encoding of {"a","b"} must NOT equal the encoding of {"a\nb"} — else
+        // two differently-scoped principals share a cache key.
+        assert_ne!(
+            encode_scope_fingerprint(["a", "b"].into_iter()),
+            encode_scope_fingerprint(["a\nb"].into_iter()),
+        );
+        // Same ambiguity via a colon (the length-prefix separator).
+        assert_ne!(
+            encode_scope_fingerprint(["a", "b"].into_iter()),
+            encode_scope_fingerprint(["a:b"].into_iter()),
+        );
+        // A value that itself looks like a length-prefixed element must not let
+        // {"1:a"} collide with {"a"}-style encodings.
+        assert_ne!(
+            encode_scope_fingerprint(["1:a"].into_iter()),
+            encode_scope_fingerprint(["a"].into_iter()),
+        );
+    }
+
+    #[test]
+    fn scope_fingerprint_is_stable_and_empty_for_unrestricted() {
+        assert_eq!(encode_scope_fingerprint(std::iter::empty()), "");
+        assert_eq!(
+            encode_scope_fingerprint(["sysmon", "wineventlog"].into_iter()),
+            encode_scope_fingerprint(["sysmon", "wineventlog"].into_iter()),
+        );
+    }
+}

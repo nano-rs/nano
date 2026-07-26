@@ -27,6 +27,126 @@ fn dataset_exposes_source_type(dataset: Option<&str>) -> bool {
     crate::query::Dataset::from_selector(dataset.unwrap_or("logs")) == crate::query::Dataset::Logs
 }
 
+/// NAN-2155: what the `… | stats count by source_type` companion proved about a
+/// window's provenance.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CompanionProvenance {
+    /// Every companion group carried a usable `source_type`. These are the
+    /// window's real sources (normalized, sorted, deduped) — stamp them.
+    Attributed(Vec<String>),
+    /// Provenance was not fully established: the companion returned nothing, or
+    /// at least one group had a blank / missing / non-string `source_type`, i.e.
+    /// a slice of the window whose source is unknown. Fail closed.
+    Unresolved { any_unattributed: bool },
+    /// Every group was attributed, and every value was a reserved marker. The
+    /// window IS attributed — to a name we refuse to honour. Not unresolved.
+    ReservedOnly,
+}
+
+/// Classify a companion result set (NAN-2155, codex rounds 4-7).
+///
+/// Pure so the whole decision matrix is unit-testable without a search service —
+/// and so the tests exercise the REAL branch rather than a re-implementation of
+/// it, which is how the round 5/6/7 defects survived their own tests.
+///
+/// Precedence matters, and every ordering here was a codex finding:
+///
+/// 1. **Partial attribution loses to nothing.** If ANY group is unattributed the
+///    window is `Unresolved`, even when other groups named real sources (round
+///    7). Stamping just the known sources would let a viewer denied some OTHER
+///    source see an aggregate that includes the unattributed slice — provenance
+///    that was never established. This also matches the over-inclusive intent
+///    `source_type_companion_query` already documents: over-stamping hides the
+///    row from MORE scoped viewers, never fewer.
+/// 2. **Reserved values are dropped, not honoured** (round 4). The companion
+///    reads the ingest-controlled `logs.source_type` column, so it is the second
+///    route by which a forged `X-Source-Type` could reach the trusted
+///    `_nano_source_types` stamp; the per-event filter in
+///    `distinct_source_types` never sees this path.
+/// 3. **A fully attributed but reserved-only window is NOT unresolved**
+///    (round 5). Failing closed there would let one forged header hide an
+///    aggregate detection from every scoped analyst — the mirror image of the
+///    bug this all fixes. The forged name cannot be in the restricted registry
+///    (the registry write boundary rejects it), so nobody is denied it.
+///
+/// A window mixing a real source with a reserved one is `Attributed` on the real
+/// source's strength, so a forged value can never mask a restricted source.
+pub(super) fn classify_companion_rows(rows: &[serde_json::Value]) -> CompanionProvenance {
+    let mut named: Vec<String> = Vec::new();
+    let mut any_unattributed = false;
+    for row in rows {
+        match row
+            .get("source_type")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+        {
+            Some(source_type) => named.push(source_type),
+            None => any_unattributed = true,
+        }
+    }
+
+    // (1) Partial attribution — or no rows at all — is unresolved, regardless of
+    // what the attributed groups said.
+    if any_unattributed || named.is_empty() {
+        return CompanionProvenance::Unresolved { any_unattributed };
+    }
+
+    // (2) Drop reserved markers; (3) an all-reserved window is still attributed.
+    let mut types: Vec<String> = named
+        .into_iter()
+        .filter(|s| !crate::auth::is_reserved_source_type(s))
+        .collect();
+    types.sort();
+    types.dedup();
+    if types.is_empty() {
+        CompanionProvenance::ReservedOnly
+    } else {
+        CompanionProvenance::Attributed(types)
+    }
+}
+
+/// NAN-2155: THE fail-closed `_nano_source_types` stamp, used by every branch
+/// of `annotate_source_types_for_scoping` that could not determine the window's
+/// real source types.
+///
+/// One function rather than two so the "registry known" and "registry
+/// unavailable" branches cannot drift: pass whatever restricted set is
+/// available (possibly empty). Three ingredients, each doing a different job:
+///
+/// * `restricted` — the registry snapshot. Every restricted principal's deny
+///   set is a SUBSET of the registry (`denied = restricted − granted`), so
+///   stamping the whole registry overlaps all of them. This is the precise
+///   part: it is what makes the row hidden from exactly the scoped viewers.
+/// * [`UNRESOLVED_SOURCE_SENTINEL`](crate::auth::UNRESOLVED_SOURCE_SENTINEL) —
+///   carried by EVERY restricted principal's deny bind
+///   ([`crate::auth::deny_bind_values`]). This is the part that does NOT
+///   depend on the snapshot being fresh or even present, so the stamp stays
+///   fail-closed when the registry is stale (a just-restricted source the
+///   snapshot has not picked up) or entirely unavailable.
+/// * `audit` — an ALWAYS-restricted origin independent of the registry
+///   (`FindingLogger::origin_restricted`, `WebhookService::origin_restricted`),
+///   so the ClickHouse finding evidence and the webhook egress for this match
+///   are redacted too, with no PostgreSQL access required. Without it, those
+///   two write-time redactions would see a "known origin" they cannot prove
+///   restricted and let the sample through.
+///
+/// Unrestricted principals bind no deny array at all, so none of this hides the
+/// row from them — the detection stays triageable.
+///
+/// Returned sorted + deduped so the stamp is deterministic (it feeds no dedup
+/// hash — `_nano_*` is stripped — but a stable value keeps tests/logs readable).
+pub(super) fn fail_closed_stamp(
+    restricted: &std::collections::BTreeSet<String>,
+) -> serde_json::Value {
+    let mut values: Vec<String> = restricted.iter().cloned().collect();
+    values.push(crate::auth::UNRESOLVED_SOURCE_SENTINEL.to_string());
+    values.push("audit".to_string());
+    values.sort();
+    values.dedup();
+    serde_json::Value::Array(values.into_iter().map(serde_json::Value::String).collect())
+}
+
 impl DetectionService {
     // ========================================================================
     // Rule Execution
@@ -41,7 +161,9 @@ impl DetectionService {
     /// (many windows in parallel) call this so they cannot diverge in
     /// query semantics.
     #[instrument(
-        skip(self, query),
+        // NAN-2047: `scope` is authorization metadata (caller's denied-source
+        // set) — never emit it into spans.
+        skip(self, query, scope),
         fields(window_start = %time_range.start, window_end = %time_range.end)
     )]
     pub async fn evaluate_window(
@@ -49,12 +171,17 @@ impl DetectionService {
         query: &str,
         time_range: TimeRangeInput,
         dataset: Option<String>,
+        // NAN-2047: source scope for the window search (see
+        // `evaluate_window_with_options`). Scheduled/real-time callers pass
+        // `ScopeSet::unrestricted()`; the Test Rule path passes the caller scope.
+        scope: &crate::auth::ScopeSet,
     ) -> Result<Vec<serde_json::Value>, DetectionError> {
         self.evaluate_window_with_limit(
             query,
             time_range,
             dataset,
             crate::query::ClickHouseSqlGenerator::DEFAULT_RESULT_LIMIT,
+            scope,
         )
         .await
     }
@@ -69,8 +196,9 @@ impl DetectionService {
         time_range: TimeRangeInput,
         dataset: Option<String>,
         result_limit: usize,
+        scope: &crate::auth::ScopeSet,
     ) -> Result<Vec<serde_json::Value>, DetectionError> {
-        self.evaluate_window_with_options(query, time_range, dataset, result_limit, None, None)
+        self.evaluate_window_with_options(query, time_range, dataset, result_limit, None, None, scope)
             .await
     }
 
@@ -96,10 +224,14 @@ impl DetectionService {
             result_limit,
             Some(query_id),
             Some(execution_limits),
+            // Autonomous tuning is a SYSTEM caller — unrestricted like scheduled
+            // execution (NAN-2047).
+            &crate::auth::ScopeSet::unrestricted(),
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn evaluate_window_with_options(
         &self,
         query: &str,
@@ -108,6 +240,13 @@ impl DetectionService {
         result_limit: usize,
         request_id: Option<String>,
         execution_limits: Option<SearchExecutionLimits>,
+        // NAN-2047: the source-scope the window search runs under. Scheduled /
+        // real-time / tuning execution is SYSTEM and passes
+        // `ScopeSet::unrestricted()` (a rule must match across ALL sources,
+        // including restricted + audit). The interactive "Test Rule" path passes
+        // the CALLER's effective deny set so a source-restricted user cannot use
+        // the tester as an unrestricted alternate search surface.
+        scope: &crate::auth::ScopeSet,
     ) -> Result<Vec<serde_json::Value>, DetectionError> {
         // Enrich aggregation queries with timestamp bounds so results always carry
         // _first_seen/_last_seen for detection latency calculation.
@@ -140,9 +279,10 @@ impl DetectionService {
             |limits| self.search_service.clone().with_execution_limits(limits),
         );
         search_service
-            // SYSTEM caller: detection rules must match across ALL sources
-            // (including audit + per-source-restricted), so run unrestricted.
-            .search(request, &crate::auth::ScopeSet::unrestricted())
+            // NAN-2047: run under the caller-supplied scope. SYSTEM callers pass
+            // `ScopeSet::unrestricted()` (match across ALL sources); the Test
+            // Rule path passes the caller's effective deny set.
+            .search(request, scope)
             .await
             .map(|r| r.results)
             .map_err(|e| DetectionError::SearchError(e.to_string()))
@@ -186,9 +326,28 @@ impl DetectionService {
     /// (raw/grouped-raw and vendor pass-through rules — the common case, no
     /// extra query). The `_nano_` prefix keeps the stamp out of every dedup
     /// hash (both `compute_event_hash` and the matched-event overlap hash
-    /// strip `_nano_*`). Best-effort: a companion failure logs a warning and
-    /// leaves the stamp empty (back-compat visible) rather than dropping the
-    /// alert — losing a detection is worse than losing its scoping stamp.
+    /// strip `_nano_*`).
+    ///
+    /// NAN-2155: NO path through this function may leave a row unstamped. The
+    /// detection is never dropped (losing a detection is worse than losing its
+    /// scoping stamp) but the stamp itself always fails CLOSED — every failure
+    /// branch writes a value that hides the row from restricted viewers while
+    /// keeping it visible to unrestricted ones:
+    ///
+    /// * registry known (fresh, or last-known after a PG error) → the full
+    ///   restricted set, which by construction overlaps EVERY restricted
+    ///   principal's deny set (`denied ⊆ restricted`);
+    /// * registry never loaded → [`UNRESOLVED_SOURCE_SENTINEL`], which every
+    ///   restricted principal's deny bind carries
+    ///   ([`crate::auth::deny_bind_values`]).
+    ///
+    /// Leaving the stamp EMPTY is never an option here: `'{}'` is the read
+    /// side's "known not to be source-derived" value and is visible to
+    /// everyone, so an empty stamp on this path would publish a restricted
+    /// match to every principal, permanently — the row is written once and its
+    /// provenance can never be recovered.
+    ///
+    /// [`UNRESOLVED_SOURCE_SENTINEL`]: crate::auth::UNRESOLVED_SOURCE_SENTINEL
     async fn annotate_source_types_for_scoping(
         &self,
         rule: &DetectionRule,
@@ -204,23 +363,46 @@ impl DetectionService {
         if !results.iter().any(lacks_source_type) {
             return;
         }
-
-        // Restricted registry = the fail-closed authority. If nothing is
-        // restricted, any/empty stamp is harmless (scoping is a no-op). Shares
-        // the alert-write PG, so an error here would also fail the alert insert.
-        let mut restricted: std::collections::BTreeSet<String> = match sqlx::query_scalar::<_, String>(
-            "SELECT source_type FROM restricted_source_types",
-        )
-        .fetch_all(&self.pg_pool)
-        .await
-        {
-            Ok(rows) => rows.into_iter().map(|s| s.trim().to_lowercase()).collect(),
-            Err(e) => {
-                warn!(rule_id = %rule.id, error = %e,
-                    "NAN-1800: could not load restricted registry for aggregate stamping; skipping");
-                return;
+        let apply = |results: &mut [serde_json::Value], stamp: &serde_json::Value| {
+            for event in results.iter_mut() {
+                if lacks_source_type(event) {
+                    if let Some(obj) = event.as_object_mut() {
+                        obj.insert("_nano_source_types".to_string(), stamp.clone());
+                    }
+                }
             }
         };
+
+        // Restricted registry = the fail-closed authority. If nothing is
+        // restricted, any/empty stamp is harmless (scoping is a no-op).
+        //
+        // NAN-2155: read it through `SourceScopeResolver`, the same authority
+        // the READ side resolves deny sets from, rather than a raw SELECT. The
+        // resolver retains its last-known registry past a refresh failure, so a
+        // transient PG error degrades to deny-all-restricted here exactly as it
+        // does in `SourceScopeResolver::resolve` — previously the write path
+        // returned early on that error and silently stamped `'{}'`, i.e. it
+        // failed OPEN while the resolve path failed CLOSED.
+        let mut restricted: std::collections::BTreeSet<String> =
+            match self.source_scopes.restricted_snapshot().await {
+                Ok(set) => set,
+                Err(e) => {
+                    // Registry has NEVER loaded in this process and PG is
+                    // unreachable — there is no restricted set to stamp with.
+                    // Stamp the unresolved-provenance marker: hidden from every
+                    // restricted principal, still visible to unrestricted ones,
+                    // and distinguishable from a legitimately sourceless row so
+                    // it can be re-triaged later.
+                    warn!(rule_id = %rule.id, error = %e,
+                        "NAN-2155: restricted registry unavailable for aggregate stamping; \
+                         stamping unresolved-provenance marker (fail closed)");
+                    apply(
+                        results,
+                        &fail_closed_stamp(&std::collections::BTreeSet::new()),
+                    );
+                    return;
+                }
+            };
         // NAN-2001: 'audit' is an ALWAYS-restricted ORIGIN for finding redaction
         // (hard-wired sentinel, see `FindingLogger::origin_restricted`), so the
         // effective set is never empty. Seeding it here means the source_type
@@ -239,24 +421,18 @@ impl DetectionService {
         // aggregate alert overlaps ANY scoped viewer's deny set and defaults to
         // HIDDEN — used whenever the companion can't produce a trustworthy
         // per-window source_type list (NAN-1800 review).
-        let restricted_stamp = || {
-            serde_json::Value::Array(
-                restricted
-                    .iter()
-                    .cloned()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            )
-        };
-        let apply = |results: &mut [serde_json::Value], stamp: &serde_json::Value| {
-            for event in results.iter_mut() {
-                if lacks_source_type(event) {
-                    if let Some(obj) = event.as_object_mut() {
-                        obj.insert("_nano_source_types".to_string(), stamp.clone());
-                    }
-                }
-            }
-        };
+        //
+        // NAN-2155 (codex round 4): the restricted set alone is NOT sufficient
+        // here. This service builds its own `SourceScopeResolver`, which the
+        // API's source-scope CRUD does not invalidate directly — it converges
+        // via the cross-process version poll, so the snapshot can lag a
+        // just-restricted source by up to `VERSION_CHECK_SECS`. The stamp is
+        // IRREVERSIBLE, so even a few seconds of staleness would permanently
+        // under-stamp a match: a caller denied the newly-restricted source but
+        // holding `audit:view` would keep seeing that row forever, long after
+        // every cache converged. `fail_closed_stamp` therefore also unions the
+        // freshness-independent sentinel — see its doc for the full breakdown.
+        let restricted_stamp = || fail_closed_stamp(&restricted);
 
         // NAN-2024: the companion is logs-shaped (`… | stats count by source_type`),
         // but non-Logs datasets (risk/spans/metrics) are derived grains whose outer
@@ -278,26 +454,33 @@ impl DetectionService {
         };
 
         match self
-            .evaluate_window(&companion, time_range.clone(), rule.dataset.clone())
+            .evaluate_window(
+                &companion,
+                time_range.clone(),
+                rule.dataset.clone(),
+                // Scheduled/real-time SYSTEM execution — unrestricted (NAN-2047).
+                &crate::auth::ScopeSet::unrestricted(),
+            )
             .await
         {
             Ok(rows) => {
-                let mut types: Vec<String> = rows
-                    .iter()
-                    .filter_map(|r| r.get("source_type").and_then(|v| v.as_str()))
-                    .map(|s| s.trim().to_lowercase())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                types.sort();
-                types.dedup();
-                let stamp = if types.is_empty() {
-                    warn!(rule_id = %rule.id,
-                        "NAN-1800: source_type companion returned no source types; failing closed with the full restricted set");
-                    restricted_stamp()
-                } else {
-                    serde_json::Value::Array(
+                let stamp = match classify_companion_rows(&rows) {
+                    CompanionProvenance::Attributed(types) => serde_json::Value::Array(
                         types.into_iter().map(serde_json::Value::String).collect(),
-                    )
+                    ),
+                    CompanionProvenance::Unresolved { any_unattributed } => {
+                        warn!(rule_id = %rule.id, any_unattributed,
+                            "NAN-1800: source_type companion did not fully attribute the window; failing closed with the full restricted set");
+                        restricted_stamp()
+                    }
+                    CompanionProvenance::ReservedOnly => {
+                        warn!(rule_id = %rule.id,
+                            "NAN-2155: source_type companion attributed the window ONLY to reserved \
+                             marker values (forged X-Source-Type?); treating it as \
+                             attributed-but-unrestricted rather than failing closed, which would be a \
+                             detection-suppression primitive");
+                        serde_json::Value::Array(Vec::new())
+                    }
                 };
                 apply(results, &stamp);
             }
@@ -392,7 +575,13 @@ impl DetectionService {
         // tester so test ≡ prod by construction. (`time_range` is kept for the
         // NAN-1800 source_type companion in the alerting branch below.)
         let mut results = self
-            .evaluate_window(&rule.query, time_range.clone(), rule.dataset.clone())
+            .evaluate_window(
+                &rule.query,
+                time_range.clone(),
+                rule.dataset.clone(),
+                // Scheduled/real-time SYSTEM execution — unrestricted (NAN-2047).
+                &crate::auth::ScopeSet::unrestricted(),
+            )
             .await?;
 
         // Audit D19: if a single window hit the 1M safety cap the rule is far too

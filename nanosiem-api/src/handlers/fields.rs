@@ -65,6 +65,7 @@ pub struct FieldValue {
     ),
     responses(
         (status = 200, description = "Top values for the field", body = FieldValuesResponse),
+        (status = 403, description = "Missing search:execute permission"),
         (status = 404, description = "Field not found"),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
@@ -75,21 +76,24 @@ pub async fn get_field_values(
     Path(field_name): Path<String>,
     Query(query): Query<FieldValuesQuery>,
 ) -> Result<Json<FieldValuesResponse>, ApiError> {
+    // NAN-2038/NAN-2055: reading real field values over logs is a log-data READ,
+    // so it takes `search:execute` — the same capability `/api/search` requires.
+    // NAN-2038 originally set this to `search:view` "to match the source-types
+    // metadata policy"; NAN-2055 found that policy itself to be the bug, and
+    // `source_type` is a UDM field, so leaving this route on `search:view` would
+    // have kept the exact source inventory + per-source counts NAN-2055 closes on
+    // `/api/source-types` reachable through `/api/fields/source_type/values`.
+    // See `get_source_types` below for the full rationale and blast radius.
+    ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
+
     // Parse the field name
     let field: UdmField = field_name
         .parse()
         .map_err(|_| ApiError::NotFound(format!("Unknown field: {}", field_name)))?;
 
-    // NAN-1799: compose the effective deny-set (per-source RBAC + audit gate) and
-    // let the service apply it. Union the `audit` source unless the caller holds
-    // `audit:view`; an unrestricted `audit:view` caller yields byte-identical SQL.
-    let scope = {
-        let mut deny = auth.denied_sources.deny_set().clone();
-        if !auth.has_permission(permissions::AUDIT_VIEW) {
-            deny.insert("audit".to_string());
-        }
-        nanosiem_core::auth::ScopeSet::from_denied(deny)
-    };
+    // NAN-1799: apply the effective deny-set (per-source RBAC + audit gate); an
+    // unrestricted `audit:view` caller yields byte-identical SQL.
+    let scope = auth.effective_viewer_scope();
 
     let time_range = query.time_range();
     let values = state
@@ -108,6 +112,43 @@ pub async fn get_field_values(
     }))
 }
 
+/// Build the source-inventory SQL for `GET /api/source-types`.
+///
+/// NAN-2055: extracted as a pure function so the source-scope boundary is
+/// unit-testable — the finding's whole impact was a missing `AND` here, which
+/// no serialization or routing test would have caught.
+///
+/// `scope` is the caller's EFFECTIVE deny-set (per-source RBAC ∪ `audit` unless
+/// they hold `audit:view`). Without it the inventory disclosed the NAME and
+/// exact COUNT of sources canonical search deliberately hides — the product
+/// contradicted itself, returning 0 rows from `/api/search` and the true volume
+/// here. An unrestricted caller yields no predicate and byte-identical SQL.
+fn build_source_types_sql(
+    table: &str,
+    time_range: &TimeRangeInput,
+    scope: &nanosiem_core::auth::ScopeSet,
+) -> String {
+    let scope_predicate =
+        nanosiem_core::search::service::source_scope_sql_predicate("source_type", scope.deny_set())
+            .map(|p| format!("\n              AND {p}"))
+            .unwrap_or_default();
+    format!(
+        r#"
+            SELECT source_type, count(*) as count
+            FROM {}
+            WHERE timestamp >= '{}'
+              AND timestamp < '{}'
+              AND source_type != ''{}
+            GROUP BY source_type
+            ORDER BY count DESC
+            "#,
+        table,
+        time_range.start.format("%Y-%m-%d %H:%M:%S"),
+        time_range.end.format("%Y-%m-%d %H:%M:%S"),
+        scope_predicate
+    )
+}
+
 /// Get distinct source types from the logs table
 #[utoipa::path(
     get,
@@ -116,6 +157,7 @@ pub async fn get_field_values(
     params(FieldValuesQuery),
     responses(
         (status = 200, description = "List of source types with counts", body = Vec<(String, i64)>),
+        (status = 403, description = "Requires search:execute, log_sources:create, detections:view, or source_scopes:view"),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -124,7 +166,24 @@ pub async fn get_source_types(
     Extension(auth): Extension<AuthContext>,
     Query(query): Query<FieldValuesQuery>,
 ) -> Result<Json<Vec<(String, i64)>>, ApiError> {
-    ensure_permission(&auth, permissions::SEARCH_VIEW)?;
+    // NAN-2055: this scans the live logs table and returns every source_type
+    // with an exact event count — a log-data read. It previously took
+    // `search:view` (NAN-1089), which let a principal that canonical search
+    // 403s enumerate the tenant's data sources and their volumes.
+    //
+    // Gate: `search:execute` OR the capability that routes one of this
+    // endpoint's non-search consumers. NAN-2159 moved that policy — and the
+    // reasoning behind each of the four capabilities — into
+    // `nanosiem_api_lib::source_inventory`, because rule-import preview answers
+    // the same question and had drifted onto the pre-NAN-2055 gate. Do not
+    // inline a copy here.
+    //
+    // This still 403s the finding's attacker, whose key held `search:view` and
+    // nothing else. And the capability gate is NOT the confidentiality boundary
+    // here: the source-scope + audit deny-set below applies to EVERY caller
+    // regardless of which branch admitted them, so no path through this gate can
+    // see a denied source or the audit feed.
+    nanosiem_api_lib::ensure_source_inventory_access(&auth)?;
 
     let time_range = query.time_range();
 
@@ -146,20 +205,7 @@ pub async fn get_source_types(
 
         // Both profiles expose `source_type` and a `timestamp` column, so only
         // the FROM target varies between schemas here.
-        let sql = format!(
-            r#"
-            SELECT source_type, count(*) as count
-            FROM {}
-            WHERE timestamp >= '{}'
-              AND timestamp < '{}'
-              AND source_type != ''
-            GROUP BY source_type
-            ORDER BY count DESC
-            "#,
-            table,
-            time_range.start.format("%Y-%m-%d %H:%M:%S"),
-            time_range.end.format("%Y-%m-%d %H:%M:%S")
-        );
+        let sql = build_source_types_sql(&table, &time_range, &auth.effective_viewer_scope());
 
         // Use JSONEachRow format for dynamic results
         let mut cursor = ch_client
@@ -232,6 +278,7 @@ pub struct ExtFieldsQuery {
     params(ExtFieldsQuery),
     responses(
         (status = 200, description = "List of ext field names", body = Vec<String>),
+        (status = 403, description = "Missing search:execute permission"),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -240,6 +287,18 @@ pub async fn get_ext_fields(
     Extension(auth): Extension<AuthContext>,
     Query(params): Query<ExtFieldsQuery>,
 ) -> Result<Json<Vec<String>>, ApiError> {
+    // NAN-2038/NAN-2055: BOTH forms of this call scan the logs table — the
+    // no-query form enumerates `ext`/`unmapped` leaf paths over a recent window,
+    // which is a log-DATA read even though it returns only key names (and those
+    // names are themselves disclosive: `ext.patient_id`, `ext.ssn_last4`).
+    // NAN-2038 split the gate, giving the no-query form `search:view` to keep a
+    // "view-only fields picker" working; NAN-2055 established that `search:view`
+    // must not authorize any log-data read, and the seed guard in
+    // `log_read_capability_seed_guard.rs` shows no seeded role actually holds
+    // view without execute — so that concession protected nobody real while
+    // leaving this route weaker than `/api/search`. One gate now.
+    ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
+
     // Only scope when BOTH bounds are present; a half-specified range falls back
     // to the recent default rather than silently using "now" for the missing end.
     let time_range = match (params.start, params.end) {
@@ -247,16 +306,10 @@ pub async fn get_ext_fields(
         _ => None,
     };
 
-    // NAN-1799: compose the effective deny-set (per-source RBAC + audit gate) so
+    // NAN-1799: apply the effective deny-set (per-source RBAC + audit gate) so
     // the enumerator never surfaces `ext`/`unmapped` leaf paths from source types
     // the caller can't see. The service injects the deny-set into its predicate.
-    let scope = {
-        let mut deny = auth.denied_sources.deny_set().clone();
-        if !auth.has_permission(permissions::AUDIT_VIEW) {
-            deny.insert("audit".to_string());
-        }
-        nanosiem_core::auth::ScopeSet::from_denied(deny)
-    };
+    let scope = auth.effective_viewer_scope();
 
     let names = state
         .search_service
@@ -312,12 +365,18 @@ pub struct SchemaFieldsResponse {
     tag = "fields",
     responses(
         (status = 200, description = "Active schema profile field universe", body = SchemaFieldsResponse),
+        (status = 403, description = "Missing search:view permission"),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
 pub async fn get_schema_fields(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<SchemaFieldsResponse>, ApiError> {
+    // NAN-2037: internal schema/field discovery is search metadata — gate on
+    // search:view, matching GET /api/source-types. Was authenticated-only.
+    ensure_permission(&auth, permissions::SEARCH_VIEW)?;
+
     Ok(Json(build_schema_fields_response(
         state.config.schema_profile().as_ref(),
     )))
@@ -389,10 +448,16 @@ fn serde_field_value<T: Serialize>(v: &T) -> String {
     tag = "fields",
     responses(
         (status = 200, description = "All UDM fields with metadata", body = UdmFieldsResponse),
+        (status = 403, description = "Missing search:view permission"),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
-pub async fn get_udm_fields() -> Result<Json<UdmFieldsResponse>, ApiError> {
+pub async fn get_udm_fields(
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<UdmFieldsResponse>, ApiError> {
+    // NAN-2037: gate schema/field discovery on search:view (see get_schema_fields).
+    ensure_permission(&auth, permissions::SEARCH_VIEW)?;
+
     let fields: Vec<UdmFieldInfo> = UdmField::all()
         .iter()
         .map(|field| {
@@ -408,6 +473,167 @@ pub async fn get_udm_fields() -> Result<Json<UdmFieldsResponse>, ApiError> {
         .collect();
 
     Ok(Json(UdmFieldsResponse { fields }))
+}
+
+#[cfg(test)]
+mod authz_parity_tests {
+    /// NAN-2038: every field/metadata handler that reads over logs (or exposes
+    /// the schema) must gate on a search capability. This source-scan fails if any
+    /// of them silently drops its `ensure_permission(&auth, …)` gate — the sibling
+    /// divergence that let `source-types` stay gated while `ext`/`values` did not.
+    #[test]
+    fn field_handlers_all_gate_on_a_search_capability() {
+        let src = include_str!("fields.rs");
+        const MARKER: &str = "pub async fn ";
+        // Bound the scan to the handler region so this test module (which contains
+        // the literal `ensure_permission(&auth`) can't satisfy the last handler.
+        let scan_end = src.find("mod authz_parity_tests").unwrap_or(src.len());
+        let starts: Vec<usize> = src
+            .match_indices(MARKER)
+            .map(|(i, _)| i)
+            .filter(|&i| i < scan_end)
+            .collect();
+        for name in [
+            "get_source_types",
+            "get_schema_fields",
+            "get_udm_fields",
+            "get_ext_fields",
+            "get_field_values",
+        ] {
+            let sig = format!("{MARKER}{name}(");
+            let start = src
+                .find(&sig)
+                .unwrap_or_else(|| panic!("handler {name} not found in fields.rs"));
+            let end = starts
+                .iter()
+                .copied()
+                .find(|&s| s > start)
+                .unwrap_or(scan_end);
+            // Accepted gate shapes: the single-capability `ensure_permission`,
+            // an explicit OR-form `Forbidden` guard, and the shared
+            // source-inventory policy `get_source_types` delegates to
+            // (NAN-2055 gate, extracted in NAN-2159). Anything else means the
+            // gate was dropped.
+            let body = &src[start..end];
+            assert!(
+                body.contains("ensure_permission(&auth")
+                    || body.contains("return Err(ApiError::Forbidden(")
+                    || body.contains("ensure_source_inventory_access(&auth)"),
+                "{name} no longer gates on any capability"
+            );
+        }
+    }
+
+    /// NAN-2055: presence of *a* gate is not enough — the finding was that the
+    /// gate was the WRONG capability. These two handlers read live log DATA
+    /// (a full scan of the active logs table), so they must require the same
+    /// capability `/api/search` does. A silent revert to `SEARCH_VIEW` would
+    /// re-open the source inventory to a principal canonical search 403s, and
+    /// would pass the presence check above.
+    #[test]
+    fn log_data_readers_require_search_execute_not_search_view() {
+        let src = include_str!("fields.rs");
+        const MARKER: &str = "pub async fn ";
+        let scan_end = src.find("mod authz_parity_tests").unwrap_or(src.len());
+        let starts: Vec<usize> = src
+            .match_indices(MARKER)
+            .map(|(i, _)| i)
+            .filter(|&i| i < scan_end)
+            .collect();
+
+        for name in ["get_field_values", "get_ext_fields"] {
+            let sig = format!("{MARKER}{name}(");
+            let start = src
+                .find(&sig)
+                .unwrap_or_else(|| panic!("handler {name} not found in fields.rs"));
+            let end = starts
+                .iter()
+                .copied()
+                .find(|&s| s > start)
+                .unwrap_or(scan_end);
+            let body = &src[start..end];
+            assert!(
+                body.contains("ensure_permission(&auth, permissions::SEARCH_EXECUTE)"),
+                "{name} must gate on SEARCH_EXECUTE — it reads live log data"
+            );
+            assert!(
+                !body.contains("ensure_permission(&auth, permissions::SEARCH_VIEW)"),
+                "{name} regressed to SEARCH_VIEW (NAN-2055): a caller that \
+                 /api/search rejects could enumerate sources and their volumes"
+            );
+        }
+    }
+
+    /// NAN-2149: the UDM convenience endpoint must stay on the canonical
+    /// profile-aware field-values service path. A handler-local query would
+    /// bypass the shared OCSF class-split/enum display expression.
+    #[test]
+    fn udm_field_values_endpoint_delegates_to_shared_service_path() {
+        let src = include_str!("fields.rs");
+        const MARKER: &str = "pub async fn ";
+        let scan_end = src.find("mod authz_parity_tests").unwrap_or(src.len());
+        let start = src
+            .find(&format!("{MARKER}get_field_values("))
+            .expect("get_field_values handler not found");
+        let end = src
+            .match_indices(MARKER)
+            .map(|(i, _)| i)
+            .filter(|&i| i < scan_end)
+            .find(|&i| i > start)
+            .unwrap_or(scan_end);
+        let body = &src[start..end];
+
+        assert!(
+            body.contains(".get_udm_field_values("),
+            "GET /api/fields/{{name}}/values must delegate to the shared \
+             profile-aware field-values service"
+        );
+    }
+
+    /// NAN-2055: `get_source_types` takes the OR-form gate — `search:execute`
+    /// OR a content-management capability — because `AddFeed` and
+    /// `RuleRepositories` need the inventory without being able to search.
+    /// What must NEVER come back is `search:view` satisfying it on its own:
+    /// that was the finding's repro.
+    ///
+    /// NAN-2159 moved the capability list itself into
+    /// `nanosiem_api_lib::source_inventory` (asserted there, against the real
+    /// constant rather than the source text). What this test still owns is that
+    /// this handler DELEGATES to that policy instead of growing a second copy —
+    /// a local copy is precisely how rule preview drifted onto the stale gate.
+    #[test]
+    fn source_types_delegates_to_the_shared_inventory_policy() {
+        let src = include_str!("fields.rs");
+        const MARKER: &str = "pub async fn ";
+        let scan_end = src.find("mod authz_parity_tests").unwrap_or(src.len());
+        let start = src
+            .find(&format!("{MARKER}get_source_types("))
+            .expect("get_source_types not found");
+        let end = src
+            .match_indices(MARKER)
+            .map(|(i, _)| i)
+            .filter(|&i| i < scan_end)
+            .find(|&s| s > start)
+            .unwrap_or(scan_end);
+        let body = &src[start..end];
+
+        assert!(
+            body.contains("ensure_source_inventory_access(&auth)"),
+            "get_source_types no longer delegates to the shared source-inventory \
+             policy — a local capability list here can drift from rule preview's \
+             (NAN-2159)"
+        );
+        assert!(
+            !body.contains("SEARCH_VIEW"),
+            "get_source_types regressed to accepting SEARCH_VIEW (NAN-2055): \
+             that is exactly the capability the finding's attacker held"
+        );
+        // The data-level boundary is not optional on any branch of the gate.
+        assert!(
+            body.contains("effective_viewer_scope()"),
+            "get_source_types must apply the source deny-set on every path"
+        );
+    }
 }
 
 // =============================================================================
@@ -484,5 +710,72 @@ mod tests {
         let resp = build_schema_fields_response(&OcsfProfile::new());
         assert_eq!(resp.schema, "ocsf");
         assert!(!resp.fields.is_empty());
+    }
+
+    fn test_range() -> TimeRangeInput {
+        TimeRangeInput::new(
+            chrono::DateTime::parse_from_rfc3339("2026-07-24T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            chrono::DateTime::parse_from_rfc3339("2026-07-25T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        )
+    }
+
+    fn deny(items: &[&str]) -> nanosiem_core::auth::ScopeSet {
+        nanosiem_core::auth::ScopeSet::from_denied(
+            items
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<std::collections::BTreeSet<_>>(),
+        )
+    }
+
+    #[test]
+    fn source_types_sql_is_byte_identical_for_an_unrestricted_viewer() {
+        // NAN-2055: the scope gate is additive. An unrestricted caller (no
+        // source restrictions AND `audit:view`) must emit exactly the
+        // pre-scoping query, so the source picker's plan is unchanged.
+        let sql = build_source_types_sql(
+            "nanosiem.logs",
+            &test_range(),
+            &nanosiem_core::auth::ScopeSet::unrestricted(),
+        );
+        assert!(!sql.contains("lower(source_type)"), "got: {sql}");
+        assert!(sql.contains("WHERE timestamp >= '2026-07-24 00:00:00'"), "got: {sql}");
+        assert!(sql.contains("AND source_type != ''"), "got: {sql}");
+        assert!(sql.contains("GROUP BY source_type"), "got: {sql}");
+    }
+
+    #[test]
+    fn source_types_sql_hides_denied_sources_and_audit() {
+        // The finding's exact repro: a key holding only `search:view` listed the
+        // restricted `windows_sysmon` source with its true 856,794 event count,
+        // and `audit` with 4,863, while `/api/search` returned 403. The
+        // capability raise closes the first half; this predicate closes the
+        // second — the inventory can no longer name a source canonical search
+        // hides, nor report its volume.
+        let sql = build_source_types_sql(
+            "nanosiem.logs",
+            &test_range(),
+            &deny(&["audit", "windows_sysmon"]),
+        );
+        assert!(sql.contains("lower(source_type) NOT IN ("), "got: {sql}");
+        assert!(sql.contains("'audit'") && sql.contains("'windows_sysmon'"), "got: {sql}");
+
+        // A single denied source uses the inequality form.
+        let one = build_source_types_sql("nanosiem.logs", &test_range(), &deny(&["audit"]));
+        assert!(one.contains("lower(source_type) != 'audit'"), "got: {one}");
+    }
+
+    #[test]
+    fn source_types_scope_predicate_lands_before_group_by() {
+        // Appended after GROUP BY this would be a syntax error; appended after
+        // ORDER BY it would silently do nothing. Pin the position.
+        let sql = build_source_types_sql("nanosiem.logs", &test_range(), &deny(&["audit"]));
+        let scope_at = sql.find("lower(source_type)").expect("scope predicate present");
+        let group_at = sql.find("GROUP BY").expect("group clause present");
+        assert!(scope_at < group_at, "got: {sql}");
     }
 }

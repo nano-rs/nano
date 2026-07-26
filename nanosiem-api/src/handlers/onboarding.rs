@@ -18,7 +18,7 @@ use nanosiem_core::onboarding::{
 use tracing::warn;
 
 use crate::error::ApiError;
-use crate::middleware::{ensure_permission, AuthContext};
+use crate::middleware::{ensure_interactive_session, ensure_permission, AuthContext};
 use crate::state::AppState;
 use nanosiem_core::auth::permissions;
 
@@ -33,13 +33,17 @@ use nanosiem_core::auth::permissions;
     tag = "onboarding",
     responses(
         (status = 200, description = "Onboarding progress (null if not started)", body = Option<OnboardingProgress>),
+        (status = 403, description = "Forbidden — interactive session required (API keys not permitted)"),
     ),
-    security(("bearer_auth" = []), ("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn get_onboarding_progress(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Option<OnboardingProgress>>, ApiError> {
+    // NAN-2099: onboarding is human wizard self-service; an API key's subject is
+    // its owner, so gate to interactive sessions only (no owner-subject shortcut).
+    ensure_interactive_session(&auth)?;
     let progress = state
         .onboarding_repo
         .get_progress(auth.user_id())
@@ -57,14 +61,17 @@ pub async fn get_onboarding_progress(
     request_body = UpdateProgressRequest,
     responses(
         (status = 200, description = "Updated progress", body = OnboardingProgress),
+        (status = 403, description = "Forbidden — interactive session required (API keys not permitted)"),
     ),
-    security(("bearer_auth" = []), ("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn update_onboarding_progress(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Json(body): Json<UpdateProgressRequest>,
 ) -> Result<Json<OnboardingProgress>, ApiError> {
+    // NAN-2099: interactive-session only (see get_onboarding_progress).
+    ensure_interactive_session(&auth)?;
     let mut progress = state
         .onboarding_repo
         .get_progress(auth.user_id())
@@ -101,14 +108,17 @@ pub async fn update_onboarding_progress(
     request_body = StepActionRequest,
     responses(
         (status = 200, description = "Updated progress", body = OnboardingProgress),
+        (status = 403, description = "Forbidden — interactive session required (API keys not permitted)"),
     ),
-    security(("bearer_auth" = []), ("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn complete_onboarding_step(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Json(body): Json<StepActionRequest>,
 ) -> Result<Json<OnboardingProgress>, ApiError> {
+    // NAN-2099: interactive-session only (see get_onboarding_progress).
+    ensure_interactive_session(&auth)?;
     let progress = state
         .onboarding_repo
         .complete_step(auth.user_id(), body.step, body.data)
@@ -126,14 +136,17 @@ pub async fn complete_onboarding_step(
     request_body = StepActionRequest,
     responses(
         (status = 200, description = "Updated progress", body = OnboardingProgress),
+        (status = 403, description = "Forbidden — interactive session required (API keys not permitted)"),
     ),
-    security(("bearer_auth" = []), ("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn skip_onboarding_step(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Json(body): Json<StepActionRequest>,
 ) -> Result<Json<OnboardingProgress>, ApiError> {
+    // NAN-2099: interactive-session only (see get_onboarding_progress).
+    ensure_interactive_session(&auth)?;
     let progress = state
         .onboarding_repo
         .skip_step(auth.user_id(), body.step)
@@ -150,14 +163,15 @@ pub async fn skip_onboarding_step(
     tag = "onboarding",
     responses(
         (status = 200, description = "Wizard dismissed", body = OnboardingProgress),
+        (status = 403, description = "Forbidden — interactive session with settings:view required"),
     ),
-    security(("bearer_auth" = []), ("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn dismiss_onboarding(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<OnboardingProgress>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_VIEW)?;
+    ensure_onboarding_settings_access(&auth)?;
 
     let progress = state
         .onboarding_repo
@@ -175,14 +189,15 @@ pub async fn dismiss_onboarding(
     tag = "onboarding",
     responses(
         (status = 200, description = "Wizard reset", body = OnboardingProgress),
+        (status = 403, description = "Forbidden — interactive session with settings:view required"),
     ),
-    security(("bearer_auth" = []), ("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn reset_onboarding(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<OnboardingProgress>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_VIEW)?;
+    ensure_onboarding_settings_access(&auth)?;
 
     let progress = state
         .onboarding_repo
@@ -200,14 +215,15 @@ pub async fn reset_onboarding(
     tag = "onboarding",
     responses(
         (status = 200, description = "System config checklist", body = OnboardingStatus),
+        (status = 403, description = "Forbidden — interactive session with settings:view required"),
     ),
-    security(("bearer_auth" = []), ("api_key" = []))
+    security(("bearer_auth" = []))
 )]
 pub async fn get_onboarding_status(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<OnboardingStatus>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_VIEW)?;
+    ensure_onboarding_settings_access(&auth)?;
 
     // Check if any AI provider is configured. AI providers live in the
     // enterprise meloD stack — open-core builds always report `false`.
@@ -284,6 +300,15 @@ pub async fn get_onboarding_status(
     }))
 }
 
+/// Onboarding is a human wizard, not an API-key automation surface. API keys
+/// authenticate as their owner, so the existing `settings:view` check alone
+/// would let a delegated credential dismiss/reset the owner's UI state and
+/// inventory tenant setup through the wizard checklist.
+fn ensure_onboarding_settings_access(auth: &AuthContext) -> Result<(), ApiError> {
+    ensure_interactive_session(auth)?;
+    ensure_permission(auth, permissions::SETTINGS_VIEW)
+}
+
 // ============================================================================
 // OpenAPI Doc
 // ============================================================================
@@ -311,3 +336,48 @@ pub async fn get_onboarding_status(
     )
 )]
 pub struct OnboardingApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nanosiem_core::auth::api_key::ApiKeyInfo;
+    use nanosiem_core::auth::token::{DEFAULT_TOKEN_AUDIENCE, DEFAULT_TOKEN_ISSUER};
+    use nanosiem_core::auth::TokenClaims;
+    use uuid::Uuid;
+
+    fn session(permissions: &[&str]) -> AuthContext {
+        AuthContext::from_jwt(TokenClaims {
+            iss: DEFAULT_TOKEN_ISSUER.to_string(),
+            aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
+            sub: Uuid::now_v7(),
+            roles: Vec::new(),
+            permissions: permissions.iter().map(ToString::to_string).collect(),
+            exp: chrono::Utc::now().timestamp() + 60,
+            iat: chrono::Utc::now().timestamp(),
+            jti: Uuid::now_v7(),
+            purpose: "access".to_string(),
+        })
+    }
+
+    fn api_key(permissions: &[&str]) -> AuthContext {
+        AuthContext::from_api_key(&ApiKeyInfo {
+            id: Uuid::now_v7(),
+            name: "onboarding-automation".to_string(),
+            permissions: permissions.iter().map(ToString::to_string).collect(),
+            user_id: Some(Uuid::now_v7()),
+        })
+    }
+
+    #[test]
+    fn onboarding_settings_routes_are_interactive_only() {
+        assert!(matches!(
+            ensure_onboarding_settings_access(&api_key(&[permissions::SETTINGS_VIEW])),
+            Err(ApiError::Forbidden(_))
+        ));
+        assert!(matches!(
+            ensure_onboarding_settings_access(&session(&[])),
+            Err(ApiError::Forbidden(_))
+        ));
+        assert!(ensure_onboarding_settings_access(&session(&[permissions::SETTINGS_VIEW])).is_ok());
+    }
+}

@@ -178,6 +178,9 @@ type = "remap"
 inputs = ["prepare_output", "db_parsers_combined"]
 source = '''
 .id = uuid_v7()
+# Internal marker exists only long enough for the per-parser sample transform
+# to retain failures. The durable diagnostic lives in metadata.parse_error.
+del(._nano_parser_failure)
 if !exists(.timestamp) {
     .timestamp = format_timestamp!(now(), format: "%Y-%m-%d %H:%M:%S")
 } else if is_string(.timestamp) {
@@ -429,6 +432,51 @@ max_events = ${VECTOR_BATCH_MAX_EVENTS:-50000}
 timeout_secs = ${VECTOR_BATCH_TIMEOUT_SECS:-10}
 
 [sinks.clickhouse_logs.request]
+concurrency = "adaptive"
+timeout_secs = 120
+retry_initial_backoff_secs = 1
+retry_max_duration_secs = 300
+
+# =============================================================================
+# Parser Health Sink (NAN-2164)
+#
+# `db_parser_health` sees parser output before optional sampling and reduces
+# each attempt to parser_id/source_type/observed_at/failure. The destination is
+# ENGINE=Null; its materialized view retains only five-minute aggregates.
+# =============================================================================
+[sinks.clickhouse_parser_health]
+type = "clickhouse"
+inputs = ["db_parser_health"]
+
+endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
+database = "${CLICKHOUSE_DATABASE:-nanosiem}"
+table = "${CLICKHOUSE_PARSER_HEALTH_TABLE:-parser_health_ingest}"
+
+auth.strategy = "basic"
+auth.user = "${CLICKHOUSE_USER:-nanosiem}"
+auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
+
+compression = "gzip"
+date_time_best_effort = true
+skip_unknown_fields = true
+
+[sinks.clickhouse_parser_health.query_settings.async_insert_settings]
+deduplicate = true
+
+[sinks.clickhouse_parser_health.buffer]
+type = "memory"
+max_events = 100000
+when_full = "drop_newest"
+
+[sinks.clickhouse_parser_health.acknowledgements]
+enabled = false
+
+[sinks.clickhouse_parser_health.batch]
+max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}
+max_events = ${VECTOR_BATCH_MAX_EVENTS:-50000}
+timeout_secs = ${VECTOR_BATCH_TIMEOUT_SECS:-10}
+
+[sinks.clickhouse_parser_health.request]
 concurrency = "adaptive"
 timeout_secs = 120
 retry_initial_backoff_secs = 1

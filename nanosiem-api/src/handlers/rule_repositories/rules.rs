@@ -4,10 +4,14 @@ use axum::{
     extract::{Path, Query, State},
     Extension, Json,
 };
-use nanosiem_core::audit::{AuditEvent, AuditSource, ClientContext, RULE_IMPORTED};
+use nanosiem_core::audit::{
+    AuditEvent, AuditSource, ClientContext, RULE_CREATED, RULE_IMPORTED, RULE_UPDATED,
+};
 use nanosiem_core::auth::permissions;
 use nanosiem_core::typeid::TypeIdParam;
-use nanosiem_core::{ImportPreview, ImportRequest, RepositoryRule, RepositoryRuleFilter};
+use nanosiem_core::{
+    ImportOutcome, ImportPreview, ImportRequest, RepositoryRule, RepositoryRuleFilter,
+};
 use uuid::Uuid;
 
 use super::{
@@ -18,6 +22,7 @@ use super::{
     },
     AuditExt,
 };
+use crate::handlers::repository_target_authz::{ensure_target_effects, held_target_grants};
 use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
@@ -163,10 +168,45 @@ pub async fn preview_import(
 ) -> Result<Json<ImportPreview>, ApiError> {
     ensure_permission(&auth, permissions::RULE_REPOSITORIES_VIEW)?;
 
+    // NAN-2081: the preview's `available_source_types` and coverage decision come
+    // from an all-time scan of live telemetry — the same inventory
+    // `GET /api/source-types` gates, further narrowed by per-source RBAC. Both
+    // bars apply: without the live-data capability the preview returns its
+    // catalog half only, and with it the inventory is still filtered by the
+    // caller's effective deny set (per-source RBAC ∪ implicit `audit` without
+    // `audit:view`).
+    let scope = nanosiem_core::auth::ScopeSet::from_denied(auth.effective_source_deny_set());
+    let access = live_inventory_access(&auth, &scope);
+
     let service = get_rule_repo_service(&state)?;
-    let preview = service.preview_import(*id, &path).await?;
+    let preview = service.preview_import(*id, &path, &access).await?;
 
     Ok(Json(preview))
+}
+
+/// Resolve how much of the live telemetry inventory this caller may observe.
+///
+/// NAN-2081: repository visibility is not a live-data capability — without an
+/// inventory capability a repository viewer gets no inventory at all, and with
+/// one the inventory is still filtered by their per-source RBAC scope.
+///
+/// NAN-2159: the admission policy is `nanosiem_api_lib::source_inventory`, the
+/// same one `GET /api/source-types` applies. This function previously carried
+/// its own copy that still admitted `search:view` — the gate that predated
+/// NAN-2055 — which made preview an alternate route around that fix (a
+/// `search:view` key refused by `/api/source-types` still got the full all-time
+/// inventory here) while refusing a legitimate `search:execute` holder. Do not
+/// reintroduce a local capability check: preview and `/api/source-types` must
+/// never disagree about whether a principal may enumerate live sources.
+pub(crate) fn live_inventory_access<'a>(
+    auth: &AuthContext,
+    scope: &'a nanosiem_core::auth::ScopeSet,
+) -> nanosiem_core::rule_repository::LiveInventoryAccess<'a> {
+    if nanosiem_api_lib::permits_source_inventory(auth) {
+        nanosiem_core::rule_repository::LiveInventoryAccess::Scoped(scope)
+    } else {
+        nanosiem_core::rule_repository::LiveInventoryAccess::Denied
+    }
 }
 
 /// Import a rule from a repository
@@ -182,7 +222,7 @@ pub async fn preview_import(
     responses(
         (status = 200, description = "Rule imported successfully", body = ImportRuleResponse),
         (status = 400, description = "Bad request"),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Forbidden — missing rule_repositories:import, or the detections:create / detections:edit / detections:promote capability the import consumes"),
         (status = 404, description = "Not found"),
     ),
     security(("api_key" = []))
@@ -201,6 +241,33 @@ pub async fn import_rule(
     // Get the repository rule to check if it needs conversion
     let repo_rule = service.get_rule(*id, &path).await?;
     let repo = service.get_repository(*id).await?;
+
+    let import_type = match req.import_type.as_str() {
+        "forked" => nanosiem_core::ImportType::Forked,
+        _ => nanosiem_core::ImportType::Linked,
+    };
+
+    // NAN-2118: `rule_repositories:import` authorizes reading the catalog — it is
+    // NOT a substitute for the capabilities governing the detection this import
+    // materializes or rewrites. Preflight the target outcome and enforce the
+    // complete policy HERE, before AI conversion, credit charging,
+    // materialized-view work, or any database mutation.
+    let mut import_request = ImportRequest {
+        import_type,
+        folder: req.folder.clone(),
+        name: req.name.clone(),
+        severity: req.severity.clone(),
+        mode: req.mode.clone(),
+        custom_npl: None,
+        ai_triage_hints: None,
+        source_type_mappings: req.source_type_mappings.clone(),
+        merge_to_single_source_type: req.merge_to_single_source_type.clone(),
+    };
+    let plan = service.plan_import(*id, &path, &import_request).await?;
+    ensure_target_effects(&auth, &plan.required_effects())?;
+    // Re-checked inside the service at the exact create/update branch so a
+    // concurrent import that flips the outcome cannot launder a missing cap.
+    let grants = held_target_grants(&auth);
 
     // Determine the nPL query and triage hints - either custom, already converted, or convert now via AI
     let (npl_query, ai_triage_hints) = if let Some(custom) = req.custom_npl.clone() {
@@ -312,27 +379,20 @@ pub async fn import_rule(
         (None, None)
     };
 
-    let import_type = match req.import_type.as_str() {
-        "forked" => nanosiem_core::ImportType::Forked,
-        _ => nanosiem_core::ImportType::Linked,
-    };
-
-    let import_request = ImportRequest {
-        import_type,
-        folder: req.folder,
-        name: req.name,
-        severity: req.severity,
-        mode: req.mode,
-        custom_npl: npl_query,
-        ai_triage_hints,
-        source_type_mappings: req.source_type_mappings,
-        merge_to_single_source_type: req.merge_to_single_source_type,
-    };
+    import_request.custom_npl = npl_query;
+    import_request.ai_triage_hints = ai_triage_hints;
 
     let mv_gen = state.materialized_view_generator.as_ref();
 
-    let (detection_rule_id, _outcome) = service
-        .import_rule(*id, &path, import_request, Some(auth.user_id()), mv_gen)
+    let (detection_rule_id, outcome) = service
+        .import_rule(
+            *id,
+            &path,
+            import_request,
+            Some(auth.user_id()),
+            &grants,
+            mv_gen,
+        )
         .await?;
 
     state.emit_audit(
@@ -341,6 +401,33 @@ pub async fn import_rule(
             .api_key(auth.api_key_id, auth.api_key_name.clone())
             .resource("rule", None, Some(path.clone()))
             .client_context(&client)
+            .build(),
+    );
+
+    // NAN-2118: also emit the TARGET-resource record. `rule_imported` alone left
+    // an audit blind spot — a detection appeared (or was rewritten) with no
+    // rule_created/rule_updated entry naming it. Uses the canonical
+    // `detection_rule` resource type + the target's own name, so repository
+    // imports show up in the same audit filters as `POST /api/rules`.
+    let target_action = match outcome {
+        ImportOutcome::Created => RULE_CREATED,
+        ImportOutcome::Updated => RULE_UPDATED,
+    };
+    state.emit_audit(
+        AuditEvent::builder(AuditSource::RuleRepo, target_action)
+            .actor(Some(auth.user_id()), None)
+            .api_key(auth.api_key_id, auth.api_key_name.clone())
+            .resource(
+                "detection_rule",
+                Some(detection_rule_id),
+                Some(plan.resolved_name.clone()),
+            )
+            .client_context(&client)
+            .details(serde_json::json!({
+                "source": "rule_repository_import",
+                "repository_id": id.to_string(),
+                "repository_path": path.clone(),
+            }))
             .build(),
     );
 

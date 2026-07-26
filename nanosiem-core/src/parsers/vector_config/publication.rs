@@ -1454,6 +1454,19 @@ mod tests {
         );
     }
 
+    /// NAN-2165: NAN-2164 changed the generated parser topology after the
+    /// 0.1.682 release. The renderer identity must advance even when the
+    /// parser/source revision does not, otherwise publication rejects the new
+    /// content hash as a divergent render from the same renderer.
+    #[test]
+    fn parser_health_renderer_supersedes_pre_health_release() {
+        let committed = committed_state(12, 12, "pre-health", 0, "0.1.682");
+        assert_eq!(
+            decide_publication(&committed, 12, "with-health", 0, RENDERER_VERSION).unwrap(),
+            PublicationDecision::PublishNew
+        );
+    }
+
     #[test]
     fn higher_epoch_allows_intentional_semver_rollback() {
         let committed = committed_state(12, 12, "old-render", 3, "2.0.0");

@@ -231,8 +231,14 @@ pub struct MarketplaceCatalogEntry {
     #[sqlx(skip)]
     #[serde(default)]
     pub has_credentials: bool,
+    // NOTE: `config` below is NOT `skip_serializing` like the two encrypted
+    // fields above. New custom-enrichment publications strip the publisher's
+    // secrets (NAN-2151), but installed entries may hold consumer-supplied
+    // config and historical rows may predate that policy. Always use
+    // `redacted()` before serializing into an API response — NAN-2069.
 
     // Code
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     pub allowed_domains: Vec<String>,
     #[schema(value_type = serde_json::Value)]
@@ -276,6 +282,37 @@ pub struct MarketplaceCatalogEntry {
 }
 
 impl MarketplaceCatalogEntry {
+    /// NAN-2069: mask secret values in `config` before this entry is
+    /// serialized into an API response.
+    ///
+    /// Historical publications copied cleartext `auth_config` into
+    /// `marketplace_catalog`, and installed entries may contain a consumer's
+    /// own configuration. The catalog list endpoint has no per-entry filter,
+    /// so redaction remains a required defense even though NAN-2151 prevents
+    /// new publications from duplicating the publisher's credentials.
+    ///
+    /// Applied at the API boundary, not in the repository: the installer
+    /// (`install_service`) and the Deno provider may read consumer-supplied
+    /// values from the same rows and need the real values.
+    #[must_use]
+    pub fn redacted(self) -> Self {
+        self.redacted_with_code_access(false)
+    }
+
+    /// Redact secret config and conditionally include executable source.
+    ///
+    /// The default [`Self::redacted`] path is deliberately fail-closed. API
+    /// handlers must make the composite `enrichments:view` +
+    /// `enrichments:code` decision explicitly before returning source.
+    #[must_use]
+    pub fn redacted_with_code_access(mut self, include_code: bool) -> Self {
+        crate::config_secrets::redact_config_secrets(&mut self.config.0);
+        if !include_code {
+            self.code = None;
+        }
+        self
+    }
+
     /// Derive [`Self::requires_network`] from the execution backend +
     /// allowed_domains. See the field doc for the rule. Called from the
     /// repository's `hydrate` so every returned entry carries the flag.

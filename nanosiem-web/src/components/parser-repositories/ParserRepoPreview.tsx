@@ -19,6 +19,8 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { PermissionAction } from '@/components/repositories/PermissionAction';
+import type { ActionAccess } from '@/components/repositories/repository-action-policy';
 import type { SourceConfiguration } from '@/lib/api/types';
 import type { ParserImportPreview } from '@/lib/api/parser-repositories';
 import { CategoryChip, StatusChip, TransportChip } from './chips';
@@ -40,6 +42,9 @@ interface PreviewProps {
   onClose: () => void;
   onViewDiff: (logSourceId: string) => void;
   onOpenLogSource: (logSourceId: string) => void;
+  importAccess: ActionAccess;
+  diffAccess: ActionAccess;
+  openLogSourceAccess: ActionAccess;
 }
 
 export function ParserRepoPreview({
@@ -58,6 +63,9 @@ export function ParserRepoPreview({
   onClose,
   onViewDiff,
   onOpenLogSource,
+  importAccess,
+  diffAccess,
+  openLogSourceAccess,
 }: PreviewProps) {
   const [tab, setTab] = useState<'overview' | 'vrl' | 'schema' | 'import'>('overview');
 
@@ -168,6 +176,7 @@ export function ParserRepoPreview({
             sourceTypeInput={sourceTypeInput}
             onChangeSourceType={onChangeSourceType}
             configs={configs}
+            diffAccess={diffAccess}
           />
         )}
         {tab === 'vrl' && <VrlPane parser={parser} />}
@@ -191,39 +200,56 @@ export function ParserRepoPreview({
               <Check className="w-[11px] h-[11px] text-success" strokeWidth={2} />
               Feeding the imported log source
             </div>
-            <button
-              type="button"
-              onClick={() => onOpenLogSource(linkedLogSourceId)}
-              className="h-[28px] px-3 rounded-md border border-border bg-card hover:bg-muted text-[11.5px] font-medium text-foreground/80"
-            >
-              View log source
-            </button>
+            <PermissionAction access={openLogSourceAccess}>
+              <button
+                type="button"
+                onClick={() => onOpenLogSource(linkedLogSourceId)}
+                disabled={!openLogSourceAccess.allowed}
+                className="h-[28px] px-3 rounded-md border border-border bg-card hover:bg-muted text-[11.5px] font-medium text-foreground/80 disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                View log source
+              </button>
+            </PermissionAction>
           </>
         ) : isDeleted ? (
           <>
             <div className="flex-1 text-[11px] text-muted-foreground">
               This parser was removed upstream.
             </div>
-            <button
-              type="button"
-              className="h-[28px] px-3 rounded-md text-destructive hover:bg-destructive/5 text-[11.5px]"
-            >
-              Remove
-            </button>
           </>
         ) : isDrift && linkedLogSourceId ? (
           <>
             <div className="flex-1 text-[11px] text-muted-foreground">
               Forked copy diverges from upstream.
             </div>
-            <button
-              type="button"
-              onClick={() => onViewDiff(linkedLogSourceId)}
-              className="h-[28px] px-3 rounded-md border border-border bg-card hover:bg-muted text-[11.5px] font-medium text-foreground/80 flex items-center gap-1.5"
-            >
-              <Eye className="w-[12px] h-[12px]" strokeWidth={1.5} />
-              Resolve
-            </button>
+            <PermissionAction access={diffAccess}>
+              <button
+                type="button"
+                onClick={() => onViewDiff(linkedLogSourceId)}
+                disabled={!diffAccess.allowed}
+                className="h-[28px] px-3 rounded-md border border-border bg-card hover:bg-muted text-[11.5px] font-medium text-foreground/80 flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                <Eye className="w-[12px] h-[12px]" strokeWidth={1.5} />
+                Resolve
+              </button>
+            </PermissionAction>
+          </>
+        ) : isUpdated && linkedLogSourceId ? (
+          <>
+            <div className="flex-1 text-[11px] text-muted-foreground">
+              A linked parser update is available.
+            </div>
+            <PermissionAction access={diffAccess}>
+              <button
+                type="button"
+                onClick={() => onViewDiff(linkedLogSourceId)}
+                disabled={!diffAccess.allowed}
+                className="h-[28px] px-3 rounded-md border border-border bg-card hover:bg-muted text-[11.5px] font-medium text-foreground/80 flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                <Eye className="w-[12px] h-[12px]" strokeWidth={1.5} />
+                View diff
+              </button>
+            </PermissionAction>
           </>
         ) : (
           <>
@@ -250,22 +276,29 @@ export function ParserRepoPreview({
             >
               Options
             </button>
-            <button
-              type="button"
-              onClick={onImport}
-              disabled={importing || previewLoading || (preview?.already_imported ?? false)}
-              className={cn(
-                'h-[28px] px-3 rounded-md text-[11.5px] font-medium flex items-center gap-1.5 shrink-0',
-                importing || previewLoading
-                  ? 'bg-primary/60 text-primary-foreground cursor-not-allowed'
-                  : 'bg-primary text-primary-foreground hover:bg-primary/90',
-              )}
-            >
-              {importing ? (
-                <Loader2 className="w-[12px] h-[12px] animate-spin" strokeWidth={2} />
-              ) : null}
-              {isUpdated ? 'Update' : isDrift ? 'Resolve' : 'Import'}
-            </button>
+            <PermissionAction access={importAccess}>
+              <button
+                type="button"
+                onClick={onImport}
+                disabled={
+                  importing ||
+                  previewLoading ||
+                  (preview?.already_imported ?? false) ||
+                  !importAccess.allowed
+                }
+                className={cn(
+                  'h-[28px] px-3 rounded-md text-[11.5px] font-medium flex items-center gap-1.5 shrink-0 disabled:opacity-60 disabled:cursor-not-allowed',
+                  importing || previewLoading
+                    ? 'bg-primary/60 text-primary-foreground cursor-not-allowed'
+                    : 'bg-primary text-primary-foreground hover:bg-primary/90',
+                )}
+              >
+                {importing ? (
+                  <Loader2 className="w-[12px] h-[12px] animate-spin" strokeWidth={2} />
+                ) : null}
+                Import
+              </button>
+            </PermissionAction>
           </>
         )}
       </div>
@@ -324,6 +357,7 @@ function OverviewPane({
   sourceTypeInput,
   onChangeSourceType,
   configs,
+  diffAccess,
 }: {
   parser: RepoParserView;
   onViewDiff: (logSourceId: string) => void;
@@ -333,6 +367,7 @@ function OverviewPane({
   sourceTypeInput: string;
   onChangeSourceType: (s: string) => void;
   configs: SourceConfiguration[];
+  diffAccess: ActionAccess;
 }) {
   const linkedId = parser.raw.linked_log_source_id ?? null;
   // NAN-1149: enrichment parsers don't describe a log source_type/transport;
@@ -469,14 +504,17 @@ function OverviewPane({
             to compare and decide whether to merge upstream into your fork or keep your local edits.
           </div>
           {linkedId && (
-            <button
-              type="button"
-              onClick={() => onViewDiff(linkedId)}
-              className="mt-2 h-[24px] px-2 rounded-md border border-destructive/30 bg-destructive/5 text-destructive text-[10.5px] font-mono hover:bg-destructive/10 inline-flex items-center gap-1"
-            >
-              <Eye className="w-[10px] h-[10px]" strokeWidth={1.5} />
-              View diff
-            </button>
+            <PermissionAction access={diffAccess}>
+              <button
+                type="button"
+                onClick={() => onViewDiff(linkedId)}
+                disabled={!diffAccess.allowed}
+                className="mt-2 h-[24px] px-2 rounded-md border border-destructive/30 bg-destructive/5 text-destructive text-[10.5px] font-mono hover:bg-destructive/10 inline-flex items-center gap-1 disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                <Eye className="w-[10px] h-[10px]" strokeWidth={1.5} />
+                View diff
+              </button>
+            </PermissionAction>
           )}
         </div>
       )}

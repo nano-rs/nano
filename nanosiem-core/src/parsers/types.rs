@@ -53,11 +53,6 @@ impl SourceType {
         }
     }
 
-    /// Whether this source type requires cloud credentials
-    pub fn requires_credentials(&self) -> bool {
-        matches!(self, Self::AwsS3 | Self::GcpPubSub | Self::Kafka)
-    }
-
     /// Get the list of all valid source type strings
     pub fn all_types() -> &'static [&'static str] {
         &[
@@ -71,84 +66,6 @@ impl SourceType {
             "gcp_pubsub",
         ]
     }
-}
-
-/// File source configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default, utoipa::ToSchema)]
-pub struct FileSourceConfig {
-    pub include: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exclude: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub read_from: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ignore_older_secs: Option<i64>,
-}
-
-/// Syslog source configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default, utoipa::ToSchema)]
-pub struct SyslogSourceConfig {
-    pub mode: String, // "tcp" or "udp"
-    pub address: String,
-}
-
-/// HTTP source configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default, utoipa::ToSchema)]
-pub struct HttpSourceConfig {
-    pub address: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-}
-
-/// AWS S3 source configuration
-///
-/// IMPORTANT: Vector's aws_s3 source requires an SQS queue configured to receive
-/// S3 bucket notifications. The S3 bucket must be set up to send notifications
-/// (s3:ObjectCreated:*) to an SQS queue. Vector polls the SQS queue, not S3 directly.
-///
-/// Setup steps:
-/// 1. Create an SQS queue in AWS
-/// 2. Configure S3 bucket event notifications to send to the SQS queue
-/// 3. Provide the SQS queue URL here
-#[derive(Debug, Clone, Serialize, Deserialize, Default, utoipa::ToSchema)]
-pub struct S3SourceConfig {
-    /// SQS queue URL that receives S3 bucket notifications
-    /// Format: https://sqs.{region}.amazonaws.com/{account_id}/{queue_name}
-    pub sqs_queue_url: String,
-    /// AWS region (e.g., "us-east-1")
-    pub region: String,
-    /// Compression type: "gzip", "zstd", "none" (auto-detected if not specified)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub compression: Option<String>,
-    /// Custom S3 endpoint for S3-compatible services like MinIO
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
-}
-
-/// GCP Pub/Sub source configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default, utoipa::ToSchema)]
-pub struct GcpPubSubSourceConfig {
-    /// GCP project ID
-    pub project: String,
-    /// Pub/Sub subscription name (not topic - Vector uses pull subscription)
-    pub subscription: String,
-    /// Acknowledgement deadline in seconds (default: 600)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ack_deadline_secs: Option<u32>,
-}
-
-/// Kafka source configuration (with optional auth)
-#[derive(Debug, Clone, Serialize, Deserialize, Default, utoipa::ToSchema)]
-pub struct KafkaSourceConfig {
-    /// Bootstrap servers (comma-separated or array)
-    pub bootstrap_servers: String,
-    /// Topics to consume from
-    pub topics: Vec<String>,
-    /// Consumer group ID
-    pub group_id: String,
-    /// Auto offset reset: "earliest" or "latest" (default: latest)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auto_offset_reset: Option<String>,
 }
 
 /// Cloud provider types
@@ -315,16 +232,11 @@ pub struct Parser {
     pub name: String,
     pub description: Option<String>,
     pub source_type: String,
-    pub source_config: serde_json::Value,
     pub parser_vrl: String,
     pub output_fields: Option<serde_json::Value>,
     #[serde(default, with = "typeid::feed::opt")]
     #[schema(value_type = Option<String>)]
     pub feed_id: Option<Uuid>,
-    /// Reference to cloud credentials (for aws_s3, gcp_pubsub, kafka source types)
-    #[serde(default, with = "typeid::cloud_credential::opt")]
-    #[schema(value_type = Option<String>)]
-    pub credential_id: Option<Uuid>,
     /// NAN-928: dispatch source-configuration whose route this parser should
     /// consume from (set by the parser-import "DISPATCH FROM" picker).
     /// Surfaced here so the Vector config generator can read it without
@@ -400,16 +312,15 @@ pub struct NewParser {
     pub name: String,
     pub description: Option<String>,
     pub source_type: String,
-    pub source_config: serde_json::Value,
     pub parser_vrl: String,
     pub output_fields: Option<serde_json::Value>,
     #[serde(default, with = "typeid::feed::opt")]
     #[schema(value_type = Option<String>)]
     pub feed_id: Option<Uuid>,
-    /// Reference to cloud credentials (required for aws_s3, gcp_pubsub, kafka source types)
-    #[serde(default, with = "typeid::cloud_credential::opt")]
+    /// Source configuration that owns transport connection and credentials.
+    #[serde(default, with = "typeid::source_config::opt")]
     #[schema(value_type = Option<String>)]
-    pub credential_id: Option<Uuid>,
+    pub dispatch_source_config_id: Option<Uuid>,
 }
 
 /// Request to update a parser
@@ -418,16 +329,15 @@ pub struct UpdateParser {
     pub name: Option<String>,
     pub description: Option<String>,
     pub source_type: Option<String>,
-    pub source_config: Option<serde_json::Value>,
     pub parser_vrl: Option<String>,
     pub output_fields: Option<serde_json::Value>,
     #[serde(default, with = "typeid::feed::opt")]
     #[schema(value_type = Option<String>)]
     pub feed_id: Option<Uuid>,
-    /// Reference to cloud credentials (for aws_s3, gcp_pubsub, kafka source types)
-    #[serde(default, with = "typeid::cloud_credential::opt")]
+    /// Source configuration that owns transport connection and credentials.
+    #[serde(default, with = "typeid::source_config::opt")]
     #[schema(value_type = Option<String>)]
-    pub credential_id: Option<Uuid>,
+    pub dispatch_source_config_id: Option<Uuid>,
     pub enabled: Option<bool>,
     /// Sample ratio 0.0-1.0 (e.g., 0.1 = keep 10%). None = no sampling (keep all).
     pub sampling_ratio: Option<f64>,

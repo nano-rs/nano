@@ -122,9 +122,12 @@ impl SearchService {
         scope: &ScopeSet,
     ) -> Result<String, SearchError> {
         // Create job in store
+        // NAN-2096: the execution scope is stamped on the job in the creating
+        // write, so the poll path can re-decide visibility against the caller's
+        // CURRENT scope instead of trusting submission-time authorization.
         let job_id = self
             .job_store
-            .create(request.clone())
+            .create(request.clone(), scope)
             .await
             .ok_or_else(|| {
                 SearchError::SqlValidationError(
@@ -189,10 +192,11 @@ impl SearchService {
         priority: super::admission::QueryPriority,
         scope: &ScopeSet,
     ) -> Result<String, SearchError> {
-        // Create job in Queued state
+        // Create job in Queued state. NAN-2096: stamp the execution scope in the
+        // same write (see `search_async`).
         let job_id = self
             .job_store
-            .create_queued(request.clone(), user_id, priority)
+            .create_queued(request.clone(), user_id, priority, scope)
             .await
             .ok_or_else(|| {
                 SearchError::SqlValidationError(
@@ -657,6 +661,7 @@ impl SearchService {
         let has_prevalence_svc = self.prevalence_service.is_some();
         let has_prevalence_cmds = !prevalence_commands.is_empty();
         let has_enrich = prevalence_commands.iter().any(|cmd| cmd.enrich);
+        let prevalence_scope = crate::auth::ArtifactScope::from_scope(scope);
 
         // Check if there's aggregation (stats, timechart, etc.) before prevalence
         // If so, we can't use JOIN-based prevalence because the result structure is different
@@ -691,6 +696,10 @@ impl SearchService {
             is_clickhouse,
             has_prevalence_svc,
         )
+            // The dictionary-backed JOIN has no source dimension. Restricted
+            // viewers must take the residual path, whose source-attributed
+            // repository query filters contributors before aggregation.
+            && prevalence_scope.is_unrestricted()
             // NAN-1798 P2: the pushdown builds its base scan from the tenant
             // LOGS generator, sync and without the per-request risk config —
             // on a `dataset=risk` request it would scan raw logs instead of
@@ -1349,7 +1358,7 @@ impl SearchService {
         if !prevalence_commands.is_empty() {
             tracing::debug!("Applying {} prevalence commands", prevalence_commands.len());
             results = self
-                .apply_prevalence_processing(results, &prevalence_commands)
+                .apply_prevalence_processing(results, &prevalence_commands, &prevalence_scope)
                 .await?;
             tracing::debug!("After prevalence processing: {} results", results.len());
         }

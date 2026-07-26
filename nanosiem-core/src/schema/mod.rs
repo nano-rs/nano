@@ -86,6 +86,27 @@ pub fn active_logs_table() -> &'static str {
         .unwrap_or("logs")
 }
 
+/// Stable discriminator written into the profile-aware per-source telemetry
+/// rollup. The rollup deliberately stores both UDM and OCSF lanes because an
+/// OCSF Vector deployment writes both raw tables during the transition; every
+/// reader must select exactly the active lane or those events are counted
+/// twice.
+pub fn log_telemetry_profile_for(id: SchemaId) -> &'static str {
+    match id {
+        SchemaId::Ocsf => "ocsf",
+        // Spans, metrics, and risk are per-query datasets rather than tenant log
+        // schemas. Keep this mapping total and aligned with `logs_table_for`.
+        SchemaId::Udm | SchemaId::Spans | SchemaId::Metrics | SchemaId::Risk => "udm",
+    }
+}
+
+/// Env-resolving wrapper for [`log_telemetry_profile_for`].
+pub fn active_log_telemetry_profile() -> &'static str {
+    active_profile_from_env()
+        .map(|p| log_telemetry_profile_for(p.id()))
+        .unwrap_or("udm")
+}
+
 /// The ingested-events table name for a given schema id. Pure (env-free) so it
 /// is unit-testable; `active_logs_table` is the env-resolving wrapper. NAN-1241.
 /// This is the READ table — search/detection/maintenance all target it.
@@ -235,6 +256,12 @@ mod tests {
     fn logs_table_for_dispatches_by_profile() {
         assert_eq!(logs_table_for(SchemaId::Udm), "logs");
         assert_eq!(logs_table_for(SchemaId::Ocsf), "ocsf_logs");
+    }
+
+    #[test]
+    fn log_telemetry_profile_dispatches_by_tenant_schema() {
+        assert_eq!(log_telemetry_profile_for(SchemaId::Udm), "udm");
+        assert_eq!(log_telemetry_profile_for(SchemaId::Ocsf), "ocsf");
     }
 
     // NAN-1266: log-source-repository subtree dispatch. UDM returns the stored
@@ -736,4 +763,3 @@ mod tests {
         );
     }
 }
-

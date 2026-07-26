@@ -11,6 +11,7 @@
 //!   injector --vector http://localhost:8080 --staggered --duration 60
 //!   injector --vector http://localhost:8080 --exfil
 //!   injector --vector http://localhost:8080 --persistence
+//!   injector --vector http://localhost:8080 --drive-by --target WS-FIN-042 --user CORP\\alice
 
 mod scenarios;
 
@@ -21,11 +22,11 @@ use std::sync::Arc;
 use tokio::time::Duration as TokioDuration;
 use tracing::info;
 
-use event_core::entity::WorldState;
+use event_core::entity::{Entity, WorldState};
 use event_core::http::{send_batch_with_retry, Transport};
 use event_core::profiles;
 
-use scenarios::{exfil, lateral, persistence, quick, staggered, AttackScenario};
+use scenarios::{drive_by, exfil, lateral, persistence, quick, staggered, AttackScenario};
 
 #[derive(Parser, Debug)]
 #[command(name = "injector")]
@@ -42,6 +43,18 @@ struct Args {
     /// Target hostname for the attack (random if not specified)
     #[arg(long)]
     target: Option<String>,
+
+    /// Override the target user for --drive-by (for example CORP\\alice)
+    #[arg(long, requires = "drive_by")]
+    user: Option<String>,
+
+    /// SHA-256 of the delivered file in --drive-by (inert telemetry only)
+    #[arg(long, requires = "drive_by", value_parser = parse_sha256)]
+    sha256: Option<String>,
+
+    /// Leaf filename of the delivered sample in --drive-by
+    #[arg(long, requires = "drive_by", value_parser = parse_leaf_filename)]
+    malware_filename: Option<String>,
 
     /// Number of simulated assets (hosts) — must match the blaster's --assets value
     #[arg(long, default_value = "2000")]
@@ -71,6 +84,32 @@ struct Args {
     /// Persistence — scheduled tasks, registry, WMI, startup folder
     #[arg(long)]
     persistence: bool,
+
+    /// Drive-by download — search ad redirect, ZIP delivery, JS execution, and follow-on activity
+    #[arg(long)]
+    drive_by: bool,
+}
+
+fn parse_sha256(value: &str) -> std::result::Result<String, String> {
+    let value = value.trim();
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("SHA-256 must be exactly 64 hexadecimal characters".into());
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn parse_leaf_filename(value: &str) -> std::result::Result<String, String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 255
+        || value.contains('/')
+        || value.contains('\\')
+        || value == "."
+        || value == ".."
+    {
+        return Err("malware filename must be a non-empty leaf filename".into());
+    }
+    Ok(value.to_string())
 }
 
 #[tokio::main]
@@ -91,12 +130,6 @@ async fn main() -> Result<()> {
     // Build world
     let world = Arc::new(parking_lot::RwLock::new(WorldState::new(args.assets)));
 
-    // Pick target
-    let target_hostname = args.target.clone().unwrap_or_else(|| {
-        let w = world.read();
-        w.random_entity().hostname.clone()
-    });
-
     // Select scenario
     let scenario: Box<dyn AttackScenario> = if args.quick {
         Box::new(quick::QuickScenario)
@@ -108,32 +141,61 @@ async fn main() -> Result<()> {
         Box::new(exfil::ExfilScenario)
     } else if args.persistence {
         Box::new(persistence::PersistenceScenario)
+    } else if args.drive_by {
+        Box::new(drive_by::DriveByScenario::new(
+            args.sha256
+                .as_deref()
+                .unwrap_or(drive_by::DEFAULT_SAMPLE_SHA256),
+            args.malware_filename
+                .as_deref()
+                .unwrap_or(drive_by::DEFAULT_SAMPLE_NAME),
+        ))
     } else {
-        eprintln!("Error: specify a scenario flag: --quick, --lateral, --staggered, --exfil, or --persistence");
+        eprintln!("Error: specify a scenario flag: --quick, --lateral, --staggered, --exfil, --persistence, or --drive-by");
         std::process::exit(1);
     };
 
-    info!(
-        "Scenario: {} | Target: {}",
-        scenario.name(),
-        target_hostname
-    );
-
     // Generate attack steps
-    let w = world.read();
-    let target = w.get_entity(&target_hostname).unwrap_or_else(|| {
-        eprintln!(
-            "Target '{}' not found in world state. Available hosts:",
-            target_hostname
-        );
-        for e in w.entities().iter().take(10) {
-            eprintln!("  {}", e.hostname);
-        }
-        std::process::exit(1);
-    });
+    let steps = {
+        let w = world.read();
+        let requested_hostname = args.target.as_deref();
+        let existing_target = requested_hostname
+            .and_then(|hostname| w.get_entity(hostname))
+            .or_else(|| requested_hostname.is_none().then(|| w.random_entity()));
 
-    let steps = scenario.generate(target, w.entities());
-    drop(w);
+        let base_target = existing_target.unwrap_or_else(|| {
+            eprintln!(
+                "Target '{}' not found in world state. Available hosts:",
+                requested_hostname.unwrap_or_default()
+            );
+            for entity in w.entities().iter().take(10) {
+                eprintln!("  {}", entity.hostname);
+            }
+            std::process::exit(1);
+        });
+
+        let custom_target = if args.drive_by && args.user.is_some() {
+            Some(Entity::new(
+                &base_target.hostname,
+                args.user.as_deref().unwrap_or(&base_target.user),
+                &base_target.ip,
+                &base_target.mac,
+                &base_target.domain,
+            ))
+        } else {
+            None
+        };
+        let target = custom_target.as_ref().unwrap_or(base_target);
+
+        info!(
+            "Scenario: {} | Target: {} | User: {}",
+            scenario.name(),
+            target.hostname,
+            target.user
+        );
+
+        scenario.generate(target, w.entities())
+    };
 
     info!("{} attack steps generated", steps.len());
 
@@ -184,4 +246,34 @@ async fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_parser_normalizes_valid_input() {
+        let uppercase = drive_by::DEFAULT_SAMPLE_SHA256.to_ascii_uppercase();
+        assert_eq!(
+            parse_sha256(&format!(" {uppercase} ")).expect("valid SHA-256"),
+            drive_by::DEFAULT_SAMPLE_SHA256
+        );
+        assert!(parse_sha256("abc").is_err());
+        assert!(parse_sha256(&"z".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn sample_filename_must_be_a_leaf_name() {
+        assert_eq!(
+            parse_leaf_filename(" EhDSjenZsx.js ").expect("valid leaf filename"),
+            "EhDSjenZsx.js"
+        );
+        for invalid in ["", ".", "..", "../sample.js", r"folder\sample.js"] {
+            assert!(
+                parse_leaf_filename(invalid).is_err(),
+                "`{invalid}` must be rejected"
+            );
+        }
+    }
 }

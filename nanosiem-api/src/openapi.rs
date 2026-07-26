@@ -254,6 +254,7 @@ pub fn swagger_ui() -> utoipa_swagger_ui::SwaggerUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use utoipa::openapi::path::HttpMethod;
 
     #[test]
     fn verify_openapi_spec_generates() {
@@ -263,6 +264,60 @@ mod tests {
             !spec.paths.paths.is_empty(),
             "OpenAPI spec should have paths"
         );
+    }
+
+    #[test]
+    fn verify_log_source_transport_ownership_contract() {
+        let generated = serde_json::to_value(build_openapi()).expect("serialize generated spec");
+
+        // NAN-2169: read the checked-in spec at RUNTIME, not via include_str!.
+        // The open-core strip drops everything under docs/ except img/
+        // (tools/sync-to-nano-mirror.sh), so a compile-time include makes this
+        // test unbuildable in the mirror tree and fails sync-mirror before it
+        // can push. The generated spec is asserted in both editions; the
+        // checked-in half is additive and only runs where the file survives.
+        let checked_in_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/api/openapi.json");
+        let checked_in: Option<serde_json::Value> = match std::fs::read_to_string(checked_in_path) {
+            Ok(raw) => Some(serde_json::from_str(&raw).expect("parse checked-in spec")),
+            // Only a genuinely absent file means "stripped tree". Any other IO
+            // error (permissions, read fault) must stay loud — silently skipping
+            // would turn this into a half-test that still reports green.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => panic!("read checked-in spec {checked_in_path}: {err}"),
+        };
+
+        let mut specs = vec![("generated", generated)];
+        match checked_in {
+            Some(spec) => specs.push(("checked-in", spec)),
+            None => eprintln!(
+                "skipping checked-in spec assertions: {checked_in_path} absent (open-core stripped tree)"
+            ),
+        }
+
+        for (label, spec) in specs {
+            let schemas = &spec["components"]["schemas"];
+            for schema_name in ["LogSource", "NewLogSource", "UpdateLogSource"] {
+                let properties = schemas[schema_name]["properties"]
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{label} spec missing {schema_name}.properties"));
+                for retired in ["source_config", "credential_id", "parser_only"] {
+                    assert!(
+                        !properties.contains_key(retired),
+                        "{label} {schema_name} retained retired field {retired}"
+                    );
+                }
+            }
+
+            let source_config_properties = schemas["NewSourceConfiguration"]["properties"]
+                .as_object()
+                .unwrap_or_else(|| {
+                    panic!("{label} spec missing NewSourceConfiguration.properties")
+                });
+            assert!(
+                source_config_properties.contains_key("credential_id"),
+                "{label} source-configuration contract lost active credential_id"
+            );
+        }
     }
 
     #[test]
@@ -359,7 +414,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// NAN-1918: the quarantine listing is the only operator-visible surface
     /// for mappings a catalog sync dropped. If it silently falls out of the
     /// spec it also falls out of the generated client.
@@ -372,6 +426,10 @@ mod tests {
         );
     }
 
+    /// A duplicated `#[test]` attribute on the test above had been absorbing
+    /// this one's, so from the day it was written until NAN-2055 this assertion
+    /// never ran and the compiler reported it only as dead code. Restored.
+    #[test]
     fn verify_openapi_has_security_schemes() {
         let spec = build_openapi();
         let components = spec.components.expect("spec should have components");
@@ -383,5 +441,53 @@ mod tests {
             components.security_schemes.contains_key("api_key"),
             "Should have api_key scheme"
         );
+    }
+
+    #[test]
+    fn verify_ingestion_updates_document_optimistic_concurrency() {
+        let spec = build_openapi();
+
+        for path in ["/api/source-configurations/{id}", "/api/log-sources/{id}"] {
+            let operation = spec
+                .paths
+                .get_path_operation(path, HttpMethod::Put)
+                .unwrap_or_else(|| panic!("missing PUT operation for {path}"));
+            assert!(
+                operation.responses.responses.contains_key("409"),
+                "{path} must document stale expected_updated_at as 409 Conflict"
+            );
+        }
+
+        let components = spec.components.expect("spec should have components");
+        for schema_name in ["UpdateSourceConfiguration", "UpdateLogSource"] {
+            let schema = components
+                .schemas
+                .get(schema_name)
+                .unwrap_or_else(|| panic!("missing {schema_name} schema"));
+            let schema = serde_json::to_value(schema).expect("serialize OpenAPI schema");
+            assert!(
+                schema.pointer("/properties/expected_updated_at").is_some(),
+                "{schema_name} must expose expected_updated_at"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_source_config_credential_use_contract() {
+        let spec = serde_json::to_value(build_openapi()).expect("serialize OpenAPI");
+        for (path, method) in [
+            ("/api/source-configurations", "post"),
+            ("/api/source-configurations/{id}", "put"),
+            ("/api/source-configurations/{id}/deploy", "post"),
+            ("/api/source-configurations/deploy-all", "post"),
+        ] {
+            let description = spec["paths"][path][method]["responses"]["403"]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{method} {path} must document its 403 response"));
+            assert!(
+                description.contains("credentials:use"),
+                "{method} {path} must document the credentials:use requirement"
+            );
+        }
     }
 }

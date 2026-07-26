@@ -37,6 +37,7 @@ fn sample_new() -> NewArtifact {
         analysis_secs: None,
         engine: None,
         case_id: None,
+        static_analysis: None,
     }
 }
 

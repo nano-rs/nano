@@ -55,6 +55,10 @@ pub mod feedback;
 pub mod fields;
 pub mod folder_settings;
 pub mod gdpr;
+// NAN-2121: the privilege-grant validator lives in nanosiem-api-lib so the
+// enterprise crate (OIDC group-mapping handler) can enforce the same invariant.
+// Re-exported here so in-crate call sites keep using `crate::handlers::grant_authz`.
+pub use nanosiem_api_lib::grant_authz;
 pub mod groups;
 pub mod health;
 pub mod identity;
@@ -103,6 +107,9 @@ pub mod prevalence;
 pub mod query_library;
 pub mod recent_activity;
 pub mod reports;
+/// Composite target-resource capability policy shared by every
+/// content-repository import/sync/fixup/remove path (NAN-2029).
+pub mod repository_target_authz;
 // Risk analytics handlers — lifted to nanosiem-enterprise in NAN-752 (Phase
 // 2 of the open-core split). Re-exported here so route registrations
 // (`handlers::risk::get_risky_entities`, etc.) continue to resolve.

@@ -331,7 +331,11 @@ export default function SourceConfigurationDetail() {
   // ----- Mutations -----
 
   const updateMutation = useMutation({
-    mutationFn: (request: UpdateSourceConfiguration) => api.updateSourceConfig(id!, request),
+    mutationFn: (request: UpdateSourceConfiguration) =>
+      api.updateSourceConfig(id!, {
+        ...request,
+        expected_updated_at: config?.updated_at,
+      }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['sourceConfig', id] });
       queryClient.invalidateQueries({ queryKey: ['sourceConfigs'] });

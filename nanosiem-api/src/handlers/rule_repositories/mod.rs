@@ -23,6 +23,11 @@ pub use batch::*;
 pub use coverage::*;
 pub use crud::*;
 pub use rules::*;
+// Explicit: glob re-exports skip `pub(crate)` items, and the composite
+// capability tests reach this policy helper from outside the module. Production
+// callers (`coverage::get_coverage`) reach it as a sibling via `super::rules`.
+#[cfg(test)]
+pub(crate) use rules::live_inventory_access;
 pub use sync::*;
 pub use types::*;
 pub use upstream::*;

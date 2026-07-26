@@ -35,6 +35,13 @@ pub enum PlaybookError {
     #[error("Forbidden: {0}")]
     Forbidden(String),
 
+    /// A request the caller is entitled to make but whose payload would leave
+    /// the system in an invalid state — e.g. a per-playbook ACL that no role
+    /// could administer (NAN-2097). Distinct from [`Self::Forbidden`]: the
+    /// caller is authorized, the *content* is rejected.
+    #[error("Validation error: {0}")]
+    Validation(String),
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -49,7 +56,8 @@ impl PlaybookError {
             | PlaybookError::InvalidStatus(_)
             | PlaybookError::InvalidScope(_)
             | PlaybookError::Parse(_)
-            | PlaybookError::Frontmatter(_) => 400,
+            | PlaybookError::Frontmatter(_)
+            | PlaybookError::Validation(_) => 400,
             PlaybookError::Forbidden(_) => 403,
             _ => 500,
         }

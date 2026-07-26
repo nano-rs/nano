@@ -1134,7 +1134,7 @@ pub(super) fn build_add_column_clause(
 ///   - Everything else — the MV-fed aggregate/rollup targets (all `*_prevalence_*`,
 ///     `entity_time_range_agg`, `entity_dimension_day_agg` +
 ///     `ocsf_entity_dimension_day_agg`, `cloud_user_activity_agg`,
-///     `logs_per_source_5m`,
+///     `logs_per_source_5m`, `parser_health_5m`,
 ///     `identity_observations`, `otel_metrics{,_1m,_1h}`, `otel_service_red_1m`)
 ///     and the `synthetic_check_results` sample stream — is written to the LOCAL
 ///     table (by a materialized view or a single-writer scheduler), never through

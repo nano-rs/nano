@@ -335,4 +335,189 @@ mod download_predicate {
         // nothing to protect, so even a restricted requester may download.
         assert!(report_artifact_download_allowed(&deny(&["insider_threat"]), &manifest(&[]), true));
     }
+
+    /// NAN-2155: an ENGINE-written unresolved-provenance manifest is denied to
+    /// every restricted requester even though it is marked complete and does not
+    /// overlap their deny set. This gate is allow-list shaped ("disjoint from the
+    /// deny set"), so an unfamiliar manifest value reads as harmless — the
+    /// sentinel has to be tested for explicitly.
+    #[test]
+    fn unresolved_provenance_manifest_denies_every_restricted_requester() {
+        let unresolved = manifest(&[crate::auth::UNRESOLVED_SOURCE_SENTINEL]);
+        assert!(!report_artifact_download_allowed(
+            &deny(&["insider_threat"]),
+            &unresolved,
+            true,
+        ));
+        // Unrestricted requesters are unaffected — the artifact stays triageable.
+        assert!(report_artifact_download_allowed(&deny(&[]), &unresolved, true));
+    }
+}
+
+// ==========================================================================
+// NAN-2155: reserved-only vs unresolved companion classification
+// ==========================================================================
+
+mod reserved_only_companion {
+    use crate::auth::UNRESOLVED_SOURCE_SENTINEL;
+    use crate::reports::service::companion_provenance;
+    use serde_json::json;
+
+    fn types(rows: &[serde_json::Value]) -> (Vec<String>, bool) {
+        let (set, trustworthy) = companion_provenance(rows);
+        (set.into_iter().collect(), trustworthy)
+    }
+
+    /// A window every one of whose rows is attributed to the reserved marker is
+    /// ATTRIBUTED — to a name we refuse to honour — so the manifest is COMPLETE
+    /// and empty. The forged name cannot be in the restricted registry, so nobody
+    /// is denied it; failing closed would let one crafted event take a scheduled
+    /// report offline for every restricted requester, including its owner.
+    #[test]
+    fn every_row_reserved_is_complete_with_an_empty_manifest() {
+        assert_eq!(
+            types(&[
+                json!({ "source_type": UNRESOLVED_SOURCE_SENTINEL, "count": 3 }),
+                json!({ "source_type": UNRESOLVED_SOURCE_SENTINEL, "count": 1 }),
+            ]),
+            (vec![], true)
+        );
+    }
+
+    /// codex round 6: a forged row must NOT certify an unattributed one. If any
+    /// row lacks a non-empty `source_type` the window's provenance is only
+    /// partly known, so the result is not trustworthy.
+    #[test]
+    fn a_forged_row_cannot_certify_an_unattributed_row() {
+        for unattributed in [
+            json!({ "source_type": "", "count": 1 }),
+            json!({ "source_type": "   ", "count": 1 }),
+            json!({ "source_type": serde_json::Value::Null, "count": 1 }),
+            json!({ "source_type": 7, "count": 1 }),
+            json!({ "count": 1 }),
+        ] {
+            let (_, trustworthy) = types(&[
+                json!({ "source_type": UNRESOLVED_SOURCE_SENTINEL }),
+                unattributed.clone(),
+            ]);
+            assert!(!trustworthy, "must not certify {unattributed}");
+        }
+    }
+
+    /// codex round 7: PARTIAL attribution loses to nothing. A real source next to
+    /// an unattributed group must not certify the result — otherwise a restricted
+    /// requester could download an artifact containing unresolved-provenance data.
+    #[test]
+    fn a_real_source_cannot_certify_a_partially_attributed_window() {
+        let (found, trustworthy) = types(&[
+            json!({ "source_type": "apache", "count": 5 }),
+            json!({ "source_type": "", "count": 2 }),
+        ]);
+        assert!(!trustworthy);
+        // The real source is still reported (the caller unions it into the
+        // manifest) — it is COMPLETENESS that is withheld, not attribution.
+        assert_eq!(found, vec!["apache".to_string()]);
+    }
+
+    /// A fully attributed window reports its normalized sources and is complete;
+    /// a reserved value alongside a real one is dropped, not honoured.
+    #[test]
+    fn fully_attributed_window_is_complete_and_normalized() {
+        assert_eq!(
+            types(&[
+                json!({ "source_type": " Apache " }),
+                json!({ "source_type": "apache" }),
+                json!({ "source_type": UNRESOLVED_SOURCE_SENTINEL }),
+            ]),
+            (vec!["apache".to_string()], true)
+        );
+    }
+
+    /// No rows at all is no attribution, which must not be trustworthy.
+    #[test]
+    fn no_rows_is_not_trustworthy() {
+        assert_eq!(types(&[]), (vec![], false));
+    }
+}
+
+// ==========================================================================
+// NAN-2065: execution authorization must precede every side effect
+// ==========================================================================
+
+#[test]
+fn execution_authorization_precedes_search_artifacts_and_notifications() {
+    let source = include_str!("service.rs");
+    let start = source
+        .find("    async fn run_and_record(")
+        .expect("run_and_record must exist");
+    let end = source[start..]
+        .find("\n    /// Resolve the report owner's per-source deny scope")
+        .map(|offset| start + offset)
+        .expect("run_and_record end marker must exist");
+    let body = &source[start..end];
+
+    let running = body.find(".upsert_run_running(").expect("run row creation");
+    let authorize = body
+        .find("self.authorize_execution(def)")
+        .expect("authoritative execution gate");
+    let scope = body.find("self.owner_scope(def)").expect("source resolution");
+    let requester = body
+        .find("requester_can_search_sql == Some(false)")
+        .expect("manual requester SQL recheck");
+    let produce = body
+        .find("self.produce(def, &scope, &authorization)")
+        .expect("search work from the authorized source snapshot");
+    let success = body.find(".store_run_success(").expect("artifact persistence");
+    let notify = body.find("self.notify_ready(").expect("notification side effect");
+    let failure = body.find(".store_run_failure(").expect("failed-run recording");
+
+    assert!(
+        running < authorize,
+        "scheduled authorization failures must still produce an observable run"
+    );
+    assert!(
+        authorize < requester
+            && authorize < scope
+            && authorize < produce
+            && authorize < success
+            && authorize < notify
+            && authorize < failure,
+        "authorization must precede source resolution, search, artifacts, notifications, and failure handling"
+    );
+}
+
+#[test]
+fn dashboard_execution_uses_the_authorized_snapshot_and_shared_sql_classifier() {
+    let source = include_str!("service.rs");
+    let dashboard_start = source
+        .find("    async fn produce_dashboard(")
+        .expect("produce_dashboard must exist");
+    let panel_start = source[dashboard_start..]
+        .find("\n    /// Execute a single dashboard panel")
+        .map(|offset| dashboard_start + offset)
+        .expect("run_panel marker must exist");
+    let dashboard_body = &source[dashboard_start..panel_start];
+
+    assert!(
+        dashboard_body.contains("dashboard: &Dashboard"),
+        "dashboard production must consume the authorized object snapshot"
+    );
+    assert!(
+        !dashboard_body.contains("DashboardRepository") && !dashboard_body.contains(".find_by_id("),
+        "dashboard production must not reload a post-authorization object"
+    );
+
+    let panel_end = source[panel_start..]
+        .find("\n    async fn notify_ready(")
+        .map(|offset| panel_start + offset)
+        .expect("run_panel end marker must exist");
+    let panel_body = &source[panel_start..panel_end];
+    let classify = panel_body
+        .find("dashboard_panel_executes_search_sql(panel)")
+        .expect("shared SQL classifier");
+    let raw_sql = panel_body.find(".search_sql(").expect("raw SQL execution");
+    assert!(
+        classify < raw_sql,
+        "the capability classifier must select the production raw-SQL path"
+    );
 }

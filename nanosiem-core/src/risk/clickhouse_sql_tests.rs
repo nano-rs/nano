@@ -41,6 +41,7 @@ use super::{
     rule_contributions_query, ClearedBoundaries, EntityScoreSelection, RiskChQuery,
     RiskFindingsSource, RiskSqlBind,
 };
+use crate::auth::{ScopeSet, UNRESOLVED_SOURCE_SENTINEL};
 use crate::risk::types::{RiskDecayConfig, RiskTimeWindow};
 
 // ---------------------------------------------------------------------------
@@ -403,6 +404,186 @@ fn overview_sql_is_token_identical_to_pre_refactor_query() {
         assert!(query.sql.contains(&format!("countIf({dscore} > 70)")));
         assert!(!query.sql.contains("__DSCORE__") && !query.sql.contains("__SCOUNT__"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// NAN-2078: finding-origin source scoping
+// ---------------------------------------------------------------------------
+
+fn restricted_scope(denied: &[&str]) -> ScopeSet {
+    ScopeSet::from_denied(denied.iter().map(|value| value.to_string()).collect())
+}
+
+#[test]
+fn restricted_udm_scope_is_fail_closed_and_binds_after_findings_filters() {
+    let (cleared, _) = one_cleared_entity();
+    let source = RiskFindingsSource::new(false, "logs")
+        .with_source_scope(&restricted_scope(&["  Insider_Threat "]));
+    let query = entity_scores_query(
+        &source,
+        fixed_now(),
+        &decay_config(),
+        &cleared,
+        EntityScoreSelection::MinScores {
+            min_score_24h: 0,
+            min_score_7d: 0,
+            limit: 100,
+        },
+    );
+
+    let origin = "JSONExtract(metadata, 'origin_source_types', 'Array(String)')";
+    assert!(
+        query.sql.contains(&format!("AND notEmpty({origin})")),
+        "missing legacy-empty fail-closed term:\n{}",
+        query.sql
+    );
+    assert!(
+        query.sql.contains(&format!(
+            "arrayMap(origin -> lowerUTF8(trimBoth(origin)), {origin})"
+        )),
+        "missing normalized mixed-origin overlap term:\n{}",
+        query.sql
+    );
+    assert_placeholder_bind_parity(&query);
+    assert_eq!(
+        query.binds[11],
+        RiskSqlBind::StrList(vec![
+            UNRESOLVED_SOURCE_SENTINEL.to_string(),
+            "insider_threat".to_string(),
+        ]),
+        "scope bind follows decay + horizon + clear-boundary binds"
+    );
+}
+
+#[test]
+fn every_restricted_risk_builder_emits_one_origin_guard_and_matching_bind() {
+    let (cleared, _) = one_cleared_entity();
+    let source =
+        RiskFindingsSource::new(false, "logs").with_source_scope(&restricted_scope(&["audit"]));
+    let entities = vec!["alice".to_string()];
+    let selection = EntityScoreSelection::MinScores {
+        min_score_24h: 0,
+        min_score_7d: 0,
+        limit: 100,
+    };
+    let queries = vec![
+        entity_scores_query(&source, fixed_now(), &decay_config(), &cleared, selection),
+        risky_entities_query(
+            &source,
+            fixed_now(),
+            &decay_config(),
+            &cleared,
+            RiskTimeWindow::Last7Days,
+            None,
+            0,
+            100,
+            0,
+        ),
+        risk_for_entities_query(
+            &source,
+            fixed_now(),
+            &decay_config(),
+            &cleared,
+            &entities,
+        ),
+        entity_types_query(&source, fixed_now(), &decay_config(), &cleared),
+        lateral_scores_query(
+            &source,
+            fixed_now(),
+            &decay_config(),
+            &cleared,
+            &entities,
+        ),
+        decayed_overview_query(
+            &source,
+            fixed_now(),
+            &decay_config(),
+            &cleared,
+            RiskTimeWindow::Last7Days,
+        ),
+        rule_contributions_query(&source, fixed_now(), &decay_config(), &entities),
+        risk_dataset_base_query(&source, fixed_now(), &decay_config(), &cleared),
+    ];
+    let expected_scope_bind = RiskSqlBind::StrList(vec![
+        UNRESOLVED_SOURCE_SENTINEL.to_string(),
+        "audit".to_string(),
+    ]);
+
+    for query in queries {
+        assert_placeholder_bind_parity(&query);
+        assert_eq!(
+            query.sql.matches("AND notEmpty(").count(),
+            1,
+            "scope guard must appear exactly once:\n{}",
+            query.sql
+        );
+        assert_eq!(
+            query
+                .binds
+                .iter()
+                .filter(|bind| *bind == &expected_scope_bind)
+                .count(),
+            1,
+            "scope payload must be bound exactly once:\n{:?}",
+            query.binds
+        );
+    }
+}
+
+#[test]
+fn restricted_ocsf_scope_reads_persisted_unmapped_origin_extension() {
+    let (cleared, _) = one_cleared_entity();
+    let source = RiskFindingsSource::new(true, "ocsf_logs_distributed")
+        .with_source_scope(&restricted_scope(&["windows_event"]));
+    let query = risk_dataset_base_query(&source, fixed_now(), &decay_config(), &cleared);
+    let origin =
+        "JSONExtract(toString(unmapped), 'origin_source_types', 'Array(String)')";
+
+    assert!(query.sql.contains(&format!("AND notEmpty({origin})")));
+    assert!(query.sql.contains(&format!(
+        "arrayMap(origin -> lowerUTF8(trimBoth(origin)), {origin})"
+    )));
+    assert!(
+        query
+            .to_inline_sql()
+            .contains("['__nano:unresolved_source__', 'windows_event']"),
+        "dataset=risk must inline the caller's effective deny payload"
+    );
+    assert_placeholder_bind_parity(&query);
+}
+
+#[test]
+fn unrestricted_scope_emits_no_origin_sql_or_bind() {
+    let (cleared, _) = one_cleared_entity();
+    let plain = entity_scores_query(
+        &RiskFindingsSource::new(false, "logs"),
+        fixed_now(),
+        &decay_config(),
+        &cleared,
+        EntityScoreSelection::MinScores {
+            min_score_24h: 0,
+            min_score_7d: 0,
+            limit: 100,
+        },
+    );
+    let explicitly_unrestricted = entity_scores_query(
+        &RiskFindingsSource::new(false, "logs")
+            .with_source_scope(&ScopeSet::unrestricted()),
+        fixed_now(),
+        &decay_config(),
+        &cleared,
+        EntityScoreSelection::MinScores {
+            min_score_24h: 0,
+            min_score_7d: 0,
+            limit: 100,
+        },
+    );
+
+    assert_eq!(
+        explicitly_unrestricted, plain,
+        "unrestricted SQL and binds must remain byte-for-byte unchanged"
+    );
+    assert!(!plain.sql.contains("origin_source_types"));
 }
 
 /// The entity list and the P4 leaderboard are the SAME statement up to the

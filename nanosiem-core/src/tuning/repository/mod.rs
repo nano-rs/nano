@@ -2,10 +2,11 @@
 
 //! Tuning Repository
 //!
-//! Provides database operations for tuning proposals and audit logs, maintaining
-//! a comprehensive audit trail of all auto-tuning activities including proposals,
-//! tests, deployments, and reverts.
+//! Provides source-scoped analytics reads plus database operations for tuning
+//! proposals and audit logs, maintaining a comprehensive audit trail of
+//! auto-tuning activities including proposals, tests, deployments, and reverts.
 
+mod analytics;
 mod application;
 mod logs;
 mod proposals;
@@ -38,9 +39,16 @@ pub struct ProposalHistorySummary {
     pub proposed_query: String,
     pub reviewer_notes: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// NAN-2085: the prior proposal's origin manifest. History is fed into the
+    /// generation prompt, so whatever the model writes next may echo it — the
+    /// new proposal's manifest must be the UNION over the samples AND every
+    /// history entry, and must fail closed if any entry's provenance is not
+    /// complete.
+    pub source_types: Vec<String>,
+    pub source_types_complete: bool,
 }
 
-/// Repository for tuning operations (proposals and logs)
+/// Repository for tuning analytics, proposals, and logs.
 pub struct TuningRepository {
     pub(crate) pool: PgPool,
 }

@@ -11,14 +11,44 @@ use super::LogSourceServiceError;
 use crate::log_sources::types::{ListParams, LogSource, NewLogSource, SourceType, UpdateLogSource};
 use crate::parsers::Parser;
 
-/// Keys whose values are file-written multi-line blobs (PEM certs, GCP
-/// credential JSON) — their content is written to a file and only the generated
-/// path is interpolated into the Vector TOML, so they legitimately contain
-/// newlines and are exempt from the source_config char-safety check (NAN-1371).
-const SOURCE_CONFIG_EXEMPT_KEYS: &[&str] = &["tls_ca_cert", "credentials_json"];
+/// NAN-2158: reject a `match_field` that is not a bare SQL identifier.
+///
+/// `match_field` names the COLUMN the source-health query matches on, and it is
+/// interpolated into generated ClickHouse SQL (`lower({field}) IN (…)`). The
+/// match VALUES are escaped; the identifier is not — a stored
+/// `source_type) = 'audit' --` closes the `lower(` early and comments out the
+/// rest of the line, including the source-scope predicate appended after it.
+///
+/// The read sink validates too (`log_sources::repository::health`), which is
+/// what neutralizes rows already persisted with a hostile value. This is the
+/// other half: stop accepting them, and tell the caller why instead of silently
+/// downgrading the field to `source_type` at query time.
+///
+/// Applied in the SERVICE, not the HTTP handler, so it also covers the
+/// non-HTTP writers — content-repository parser import
+/// (`parser_repository::service`) and the AI log-source wizard — which build a
+/// `NewLogSource` directly.
+///
+/// `None` / empty is allowed: both mean "no explicit match column", and the
+/// sink falls back to `source_type`.
+pub(super) fn validate_match_field(match_field: Option<&str>) -> Result<(), LogSourceServiceError> {
+    let Some(field) = match_field else {
+        return Ok(());
+    };
+    if field.is_empty() {
+        return Ok(());
+    }
+    if !crate::sql_hygiene::is_safe_sql_identifier(field) {
+        return Err(LogSourceServiceError::InvalidMatchField(format!(
+            "'{field}' is not a column name — match_field must contain only \
+             letters, digits, '_' and '.'"
+        )));
+    }
+    Ok(())
+}
 
 impl LogSourceService {
-    /// List all log sources with optional filtering
+    /// List all log sources with optional filtering.
     pub async fn list(
         &self,
         params: Option<ListParams>,
@@ -27,22 +57,22 @@ impl LogSourceService {
         Ok(self.repository().list(&params).await?)
     }
 
-    /// List enabled log sources
+    /// List enabled log sources.
     pub async fn list_enabled(&self) -> Result<Vec<LogSource>, LogSourceServiceError> {
         Ok(self.repository().list_enabled().await?)
     }
 
-    /// List deployed log sources
+    /// List deployed log sources.
     pub async fn list_deployed(&self) -> Result<Vec<LogSource>, LogSourceServiceError> {
         Ok(self.repository().list_deployed().await?)
     }
 
-    /// Get a log source by ID
+    /// Get a log source by ID.
     pub async fn get(&self, id: Uuid) -> Result<LogSource, LogSourceServiceError> {
         Ok(self.repository().find_by_id(id).await?)
     }
 
-    /// Get a log source by name
+    /// Get a log source by name.
     pub async fn get_by_name(&self, name: &str) -> Result<LogSource, LogSourceServiceError> {
         Ok(self.repository().find_by_name(name).await?)
     }
@@ -61,16 +91,8 @@ impl LogSourceService {
         crate::config_safety::validate_config_name(&new.name)
             .map_err(LogSourceServiceError::InvalidSourceConfig)?;
 
-        // Config-injection guard (NAN-1371): source_config is string-interpolated
-        // into the generated Vector TOML, so reject newlines / control chars that
-        // could close a TOML string and inject `[sinks.*]` / `[sources.*]`
-        // sections at deploy time. Mirrors SourceConfigService on the new path.
-        crate::config_safety::validate_safe_config_strings(
-            &new.source_config,
-            "source_config",
-            SOURCE_CONFIG_EXEMPT_KEYS,
-        )
-        .map_err(LogSourceServiceError::InvalidSourceConfig)?;
+        // NAN-2158: `match_field` is a SQL column identifier, not a value.
+        validate_match_field(new.match_field.as_deref())?;
 
         // Create in database
         let log_source = self.repository().create(&new).await?;
@@ -94,11 +116,8 @@ impl LogSourceService {
             .set_validation_status(log_source.id, validation.valid, error_msg.as_deref())
             .await?;
 
-        // Return the updated log source with correct validation status
-        self.repository()
-            .find_by_id(log_source.id)
-            .await
-            .map_err(|e| e.into())
+        // Return the updated log source with correct validation status.
+        Ok(self.repository().find_by_id(log_source.id).await?)
     }
 
     /// Update a log source
@@ -124,8 +143,7 @@ impl LogSourceService {
         // update path historically validated `parser_vrl` only).
         if let Some(ref nvrl) = update.normalize_vrl {
             if !nvrl.trim().is_empty() {
-                if let Err(e) =
-                    crate::parsers::VrlValidator::new().check_normalize_vrl_safety(nvrl)
+                if let Err(e) = crate::parsers::VrlValidator::new().check_normalize_vrl_safety(nvrl)
                 {
                     return Err(LogSourceServiceError::InvalidVrl(format!(
                         "normalize_vrl: {e}"
@@ -140,15 +158,15 @@ impl LogSourceService {
             crate::config_safety::validate_config_name(name)
                 .map_err(LogSourceServiceError::InvalidSourceConfig)?;
         }
-        if let Some(ref source_config) = update.source_config {
-            crate::config_safety::validate_safe_config_strings(
-                source_config,
-                "source_config",
-                SOURCE_CONFIG_EXEMPT_KEYS,
-            )
-            .map_err(LogSourceServiceError::InvalidSourceConfig)?;
-        }
 
+        // NAN-2158: `match_field` is a SQL column identifier, not a value.
+        // `None` means "no change" (the repository UPDATE uses COALESCE) and is
+        // not validated; anything actually being WRITTEN is. Note that the UI
+        // PUTs the whole object, so re-saving a row that already holds a legacy
+        // hostile value is refused with a named error — deliberately, since the
+        // alternative is the read sink silently downgrading it to `source_type`
+        // forever with only a log line to show for it.
+        validate_match_field(update.match_field.as_deref())?;
         let log_source = self.repository().update(id, &update).await?;
 
         // If VRL was updated, validate and set the correct status
@@ -171,8 +189,8 @@ impl LogSourceService {
             log_source.id
         );
 
-        // Return the updated log source with correct validation status
-        self.repository().find_by_id(id).await.map_err(|e| e.into())
+        // Return the updated log source with correct validation status.
+        Ok(self.repository().find_by_id(id).await?)
     }
 
     /// Delete a log source
@@ -203,9 +221,7 @@ impl LogSourceService {
         // Redeploy to update combiner and router (removes references to deleted log source)
         if was_deployed {
             let enabled = self.list_enabled_for_deploy().await?;
-            let with_creds = self.inject_credentials_for_all(&enabled).await?;
-            let mut parsers: Vec<Parser> =
-                with_creds.into_iter().map(log_source_to_parser).collect();
+            let mut parsers: Vec<Parser> = enabled.into_iter().map(log_source_to_parser).collect();
             self.resolve_dispatch_route_names(&mut parsers).await?;
 
             if let Err(e) = self.vector_config.deploy_and_reload(&parsers).await {

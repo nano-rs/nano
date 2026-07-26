@@ -91,6 +91,7 @@ import {
 } from '@/components/rule-editor';
 import { NewRuleAiPanel } from '@/enterprise/components/rule-editor/NewRuleAiPanel';
 import { UpstreamMergeModal } from '@/components/repositories/UpstreamMergeModal';
+import { ruleDiffAccess } from '@/components/repositories/repository-action-policy';
 import type { AiTriageHints, CaseVisibility, GeneratedDetection, TestDetectionResult } from '@/lib/api/types';
 import type { PlaybookSelectorMode } from '@/enterprise/components/detection/editor/RulePlaybookSelector';
 
@@ -102,6 +103,7 @@ export function RuleEditorRedesign() {
   const { user, hasPermission } = useAuth();
 
   const canEdit = hasPermission('detections:edit');
+  const upstreamDiffAccess = ruleDiffAccess(hasPermission);
   const isNewMode = location.pathname.endsWith('/new') || routeId === 'new';
   const id = isNewMode ? undefined : routeId;
 
@@ -1296,6 +1298,7 @@ export function RuleEditorRedesign() {
           detectionRuleId={id}
           open={upstreamMergeOpen}
           onOpenChange={setUpstreamMergeOpen}
+          diffAccess={upstreamDiffAccess}
           onApplyMerge={(mergedQuery) => {
             const merged = serializeDetectionMetadata(metadata, mergedQuery);
             setEditorContent(merged);

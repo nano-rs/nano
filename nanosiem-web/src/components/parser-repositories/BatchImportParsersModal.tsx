@@ -29,6 +29,8 @@ import {
 import { api } from '@/lib/api';
 import type { RepositoryParser, BatchImportParserItem } from '@/lib/api/parser-repositories';
 import { useToast } from '@/hooks/use-toast';
+import { PermissionAction } from '@/components/repositories/PermissionAction';
+import type { ActionAccess } from '@/components/repositories/repository-action-policy';
 
 interface BatchImportParsersModalProps {
   repositoryId: string;
@@ -36,6 +38,7 @@ interface BatchImportParsersModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSuccess: () => void;
+  getImportAccess: (items: BatchImportParserItem[]) => ActionAccess;
 }
 
 interface ParserImportConfig {
@@ -50,6 +53,7 @@ export function BatchImportParsersModal({
   open,
   onOpenChange,
   onSuccess,
+  getImportAccess,
 }: BatchImportParsersModalProps) {
   const { toast } = useToast();
 
@@ -71,7 +75,7 @@ export function BatchImportParsersModal({
     setConfigs(initial);
     setImporting(false);
     setImportProgress({ imported: 0, skipped: 0, failed: 0, total: 0 });
-  }, [open, parsers.length]);
+  }, [open, parsers]);
 
   const selectedCount = useMemo(
     () => Object.values(configs).filter((c) => c.selected).length,
@@ -127,13 +131,9 @@ export function BatchImportParsersModal({
     return parts.length > 1 ? parts.slice(0, -1).join('/') : '';
   };
 
-  const handleImport = async () => {
+  const buildItems = (): BatchImportParserItem[] => {
     const selectedParsers = parsers.filter((p) => configs[p.id]?.selected);
-    if (selectedParsers.length === 0) return;
-
-    setImporting(true);
-
-    const items: BatchImportParserItem[] = selectedParsers.map((parser) => {
+    return selectedParsers.map((parser) => {
       const config = configs[parser.id];
       return {
         path: parser.file_path,
@@ -141,17 +141,26 @@ export function BatchImportParsersModal({
         ingestion_method: config.ingestionMethod,
       };
     });
+  };
 
-    setImportProgress({ imported: 0, skipped: 0, failed: 0, total: items.length });
+  const plannedItems = buildItems();
+  const importAccess = getImportAccess(plannedItems);
+
+  const handleImport = async () => {
+    if (plannedItems.length === 0 || !importAccess.allowed) return;
+
+    setImporting(true);
+
+    setImportProgress({ imported: 0, skipped: 0, failed: 0, total: plannedItems.length });
 
     try {
-      const result = await api.parserRepositories.batchImport(repositoryId, items);
+      const result = await api.parserRepositories.batchImport(repositoryId, plannedItems);
 
       setImportProgress({
         imported: result.imported,
         skipped: result.skipped,
         failed: result.failed.length,
-        total: items.length,
+        total: plannedItems.length,
       });
 
       toast({
@@ -163,8 +172,12 @@ export function BatchImportParsersModal({
       if (result.failed.length === 0) {
         onSuccess();
       }
-    } catch (err: any) {
-      toast({ title: 'Batch import failed', description: err.message, variant: 'destructive' });
+    } catch (err: unknown) {
+      toast({
+        title: 'Batch import failed',
+        description: err instanceof Error ? err.message : 'Failed to import parsers',
+        variant: 'destructive',
+      });
       setImporting(false);
     }
   };
@@ -356,14 +369,20 @@ export function BatchImportParsersModal({
               <Button variant="outline" className="h-8 text-[11.5px]" onClick={() => onOpenChange(false)} disabled={importing}>
                 Cancel
               </Button>
-              <Button className="h-8 text-[11.5px] gap-1.5" onClick={handleImport} disabled={importing || selectedCount === 0}>
-                {importing ? (
-                  <Loader2 className="h-[11px] w-[11px] animate-spin" />
-                ) : (
-                  <Download className="h-[11px] w-[11px]" />
-                )}
-                Import {selectedCount} Parser{selectedCount !== 1 ? 's' : ''}
-              </Button>
+              <PermissionAction access={importAccess}>
+                <Button
+                  className="h-8 text-[11.5px] gap-1.5"
+                  onClick={handleImport}
+                  disabled={importing || selectedCount === 0 || !importAccess.allowed}
+                >
+                  {importing ? (
+                    <Loader2 className="h-[11px] w-[11px] animate-spin" />
+                  ) : (
+                    <Download className="h-[11px] w-[11px]" />
+                  )}
+                  Import {selectedCount} Parser{selectedCount !== 1 ? 's' : ''}
+                </Button>
+              </PermissionAction>
             </>
           )}
         </DialogFooter>

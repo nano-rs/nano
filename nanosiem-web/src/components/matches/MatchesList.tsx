@@ -150,7 +150,7 @@ function MatchRow({ view, selected, onSelect, alertGenerated, now }: MatchRowPro
       ) : (
         <div className="mt-1 flex items-center gap-2 pl-[26px]">
           <span className="font-mono text-[10.5px] text-foreground truncate">
-            {view.topActionName || '—'}
+            {view.topActionName || 'Matched event'}
           </span>
           {view.region && (
             <span className="font-mono text-[10px] text-muted-foreground ml-auto">{view.region}</span>

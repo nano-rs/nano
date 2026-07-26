@@ -12,7 +12,7 @@ use nanosiem_core::tuning::{
     AtomicProposalApplyError, AtomicProposalApplyRequest, PrApprovalProvenance,
     PrDestinationPayload, PrOperationClaim, PrOperationError, PrOperationPhase,
     ProposalRuleMutation, RuleVersion, RuleVersionManager, TuningLogEntry, TuningRepository,
-    TuningStatus, TuningValidationProof, TuningValidationWindow,
+    TuningScope, TuningStatus, TuningValidationProof, TuningValidationWindow,
 };
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -273,6 +273,7 @@ fn apply_request(
         },
         reviewer_notes: None,
         log_trigger_reason: "NAN-1768 integration test".to_string(),
+        scope: TuningScope::system(),
     }
 }
 
@@ -291,7 +292,7 @@ async fn cleanup_rule(pool: &PgPool, rule_id: Uuid) {
 
 async fn scheduler_log_entry(repository: &TuningRepository, proposal_id: Uuid) -> TuningLogEntry {
     let proposal = repository
-        .get_proposal(proposal_id)
+        .get_proposal(proposal_id, &TuningScope::system())
         .await
         .unwrap()
         .expect("proposal exists");
@@ -533,6 +534,7 @@ async fn pr_claim_and_reject_race_has_one_winner_without_reopen() {
 
     let claim_repo = repository.clone();
     let reject_repo = repository.clone();
+    let system_scope = TuningScope::system();
     let (claim, rejected) = tokio::join!(
         claim_repo.claim_pr_operation(proposal_id, target_id, "tuned query"),
         reject_repo.transition_proposal_status(
@@ -540,6 +542,7 @@ async fn pr_claim_and_reject_race_has_one_winner_without_reopen() {
             &[TuningStatus::Proposed, TuningStatus::TestPassed],
             TuningStatus::Rejected,
             Some("race test"),
+            &system_scope,
         ),
     );
 
@@ -587,6 +590,7 @@ async fn expired_pr_lease_reuses_frozen_branch_query_and_completion_is_idempoten
             target_id,
             "analyst modified query",
             approval.clone(),
+            &TuningScope::system(),
         )
         .await
         .unwrap();
@@ -1119,7 +1123,7 @@ async fn expired_silent_pr_is_recoverable_without_a_breach_and_can_be_cancelled(
         .unwrap();
 
     assert!(!repository
-        .cancel_expired_pr_operation(proposal_id, "too early")
+        .cancel_expired_pr_operation(proposal_id, "too early", &TuningScope::system())
         .await
         .unwrap());
     let delete_error = sqlx::query("DELETE FROM detection_code_targets WHERE id = $1")
@@ -1143,7 +1147,14 @@ async fn expired_silent_pr_is_recoverable_without_a_breach_and_can_be_cancelled(
     .await
     .unwrap();
     let recoverable = repository
-        .list_proposals(None, Some(TuningStatus::PrPending), None, 100, 0)
+        .list_proposals(
+            None,
+            Some(TuningStatus::PrPending),
+            None,
+            100,
+            0,
+            &TuningScope::system(),
+        )
         .await
         .unwrap();
     assert!(recoverable.iter().any(|proposal| {
@@ -1156,7 +1167,11 @@ async fn expired_silent_pr_is_recoverable_without_a_breach_and_can_be_cancelled(
         .unwrap()
         .contains(&proposal_id));
     assert!(repository
-        .cancel_expired_pr_operation(proposal_id, "operator cancelled expired retry")
+        .cancel_expired_pr_operation(
+            proposal_id,
+            "operator cancelled expired retry",
+            &TuningScope::system(),
+        )
         .await
         .unwrap());
     sqlx::query("DELETE FROM detection_code_targets WHERE id = $1")
@@ -1396,6 +1411,7 @@ async fn silent_upgrade_cannot_mutate_an_actioned_proposal() {
             &[TuningStatus::Proposed],
             TuningStatus::Rejected,
             Some("analyst rejected"),
+            &TuningScope::system(),
         )
         .await
         .unwrap());
@@ -1406,6 +1422,8 @@ async fn silent_upgrade_cannot_mutate_an_actioned_proposal() {
             "scheduler overwrite",
             0.99,
             &["late tier upgrade".to_string()],
+            &["apache".to_string()],
+            true,
         )
         .await
         .unwrap());

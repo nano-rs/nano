@@ -6,6 +6,7 @@ use super::{ProposalHistorySummary, TuningRepository};
 use crate::detection_code_target::DetectionCodePushService;
 use crate::models::detection_rule::DetectionRule;
 use crate::models::AiTriageHints;
+use crate::tuning::scope::TuningScope;
 use crate::tuning::types::{HintsDiff, ProposalType, TuningProposal, TuningStatus};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -238,6 +239,12 @@ impl TuningRepository {
         let changes_summary_json = serde_json::to_value(&proposal.changes_summary)
             .context("Failed to serialize changes summary")?;
 
+        // NAN-2085 / NAN-2088: normalize the producer's manifest here as well
+        // as at the producer, so a caller that hand-builds a `TuningProposal`
+        // cannot store un-normalized values that would silently fail the
+        // read-side overlap test (i.e. fail OPEN).
+        let source_types = crate::tuning::scope::normalize_source_manifest(&proposal.source_types);
+
         sqlx::query(
             r#"
             INSERT INTO tuning_proposals (
@@ -255,9 +262,11 @@ impl TuningRepository {
                 status,
                 current_hints,
                 proposed_hints,
-                hints_diff
+                hints_diff,
+                source_types,
+                source_types_complete
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             "#,
         )
         .bind(&proposal.id)
@@ -275,6 +284,10 @@ impl TuningRepository {
         .bind(current_hints_json)
         .bind(proposed_hints_json)
         .bind(hints_diff_json)
+        .bind(&source_types)
+        // An empty manifest can never be "complete" — that combination is the
+        // pre-feature default and must keep denying restricted readers.
+        .bind(proposal.source_types_complete && !source_types.is_empty())
         .execute(&self.pool)
         .await
         .context(format!(
@@ -405,18 +418,29 @@ impl TuningRepository {
             target_id,
             query,
             PrApprovalProvenance::automated(),
+            // Automated claim: a background actor with no viewer.
+            &TuningScope::system(),
         )
         .await
     }
 
     /// Claim a manual PR operation while freezing the authorizing actor and any
     /// validation override. Recovery must never infer these from a later retry.
+    ///
+    /// NAN-2085 / NAN-2088: `scope` is the ACTOR's deny scope, re-checked under
+    /// the same row lock that freezes the claim. The returned
+    /// `FrozenPrOperation` carries the proposal's `rationale` /
+    /// `changes_summary` / both queries and ends up in a GitHub PR body, so a
+    /// proposal re-stamped onto a denied source after the handler's preflight
+    /// read must not be claimable. Reported as `ProposalNotFound`, identical to
+    /// a missing proposal.
     pub async fn claim_pr_operation_with_provenance(
         &self,
         proposal_id: Uuid,
         target_id: Uuid,
         query: &str,
         approval_provenance: PrApprovalProvenance,
+        scope: &TuningScope,
     ) -> std::result::Result<PrOperationClaim, PrOperationError> {
         approval_provenance.validate(proposal_id)?;
         let mut tx = self.pool.begin().await?;
@@ -426,6 +450,8 @@ impl TuningRepository {
                 tp.rule_id,
                 COALESCE(tp.proposal_type, 'query_tuning') AS proposal_type,
                 tp.status,
+                tp.source_types,
+                tp.source_types_complete,
                 tp.original_query,
                 tp.rationale,
                 tp.confidence_score,
@@ -460,6 +486,13 @@ impl TuningRepository {
         .ok_or(PrOperationError::ProposalNotFound(proposal_id))?;
 
         let rule_id: Uuid = row.try_get("rule_id")?;
+        // NAN-2085 / NAN-2088: authorize the CURRENT provenance under the lock.
+        let source_types: Vec<String> = row.try_get("source_types")?;
+        let source_types_complete: bool = row.try_get("source_types_complete")?;
+        if !scope.allows(&source_types, source_types_complete) {
+            tx.rollback().await?;
+            return Err(PrOperationError::ProposalNotFound(proposal_id));
+        }
         let proposal_type: String = row.try_get("proposal_type")?;
         let status: String = row.try_get("status")?;
         let original_query: String = row.try_get("original_query")?;
@@ -1297,13 +1330,18 @@ impl TuningRepository {
 
     /// Cancel an expired PR operation. Active attempts must finish, fail, or
     /// expire before cancellation so a user cannot race a live GitHub write.
+    ///
+    /// NAN-2085 / NAN-2088: `scope` is the ACTOR's deny scope, applied inside
+    /// the cancelling UPDATE for the same reason as
+    /// [`Self::transition_proposal_status`] — the preflight read cannot be
+    /// trusted across a concurrent provenance re-stamp.
     pub async fn cancel_expired_pr_operation(
         &self,
         proposal_id: Uuid,
         reason: &str,
+        scope: &TuningScope,
     ) -> std::result::Result<bool, PrOperationError> {
-        let mut tx = self.pool.begin().await?;
-        let cancelled = sqlx::query(
+        let mut sql = String::from(
             r#"
             UPDATE tuning_proposals
             SET status = 'rejected',
@@ -1319,12 +1357,25 @@ impl TuningRepository {
                   OR pr_operation_started_at <= NOW() - ($3 * INTERVAL '1 minute')
               )
             "#,
-        )
-        .bind(reason)
-        .bind(proposal_id)
-        .bind(PR_OPERATION_LEASE_MINUTES)
-        .execute(&mut *tx)
-        .await?;
+        );
+        let scoped = !scope.is_unrestricted();
+        if scoped {
+            sql.push_str(&TuningScope::sql_predicate(
+                "source_types",
+                "source_types_complete",
+                4,
+            ));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let mut update = sqlx::query(&sql)
+            .bind(reason)
+            .bind(proposal_id)
+            .bind(PR_OPERATION_LEASE_MINUTES);
+        if scoped {
+            update = update.bind(scope.deny_bind_values().to_vec());
+        }
+        let cancelled = update.execute(&mut *tx).await?;
         if cancelled.rows_affected() == 0 {
             tx.rollback().await?;
             return Ok(false);
@@ -1365,22 +1416,33 @@ impl TuningRepository {
     /// queued and that it just escalated.
     ///
     /// Returns `false` when another actor actioned the proposal first.
+    ///
+    /// NAN-2088: the upgraded `rationale` / `changes_summary` are re-derived
+    /// from FRESH source telemetry, so the origin manifest is rewritten in the
+    /// same statement. Leaving the old stamp would let a proposal whose text
+    /// now describes a newly-restricted source keep the previous (permissive)
+    /// provenance.
     pub async fn upgrade_silent_proposal(
         &self,
         proposal_id: Uuid,
         rationale: &str,
         confidence_score: f64,
         changes_summary: &[String],
+        source_types: &[String],
+        source_types_complete: bool,
     ) -> Result<bool> {
         let changes_summary_json =
             serde_json::to_value(changes_summary).context("Failed to serialize changes summary")?;
+        let source_types = crate::tuning::scope::normalize_source_manifest(source_types);
 
         let result = sqlx::query(
             r#"
             UPDATE tuning_proposals
             SET rationale = $1,
                 confidence_score = $2,
-                changes_summary = $3
+                changes_summary = $3,
+                source_types = $5,
+                source_types_complete = $6
             WHERE id = $4 AND status IN ('proposed', 'test_passed')
             "#,
         )
@@ -1388,6 +1450,8 @@ impl TuningRepository {
         .bind(confidence_score)
         .bind(changes_summary_json)
         .bind(proposal_id)
+        .bind(&source_types)
+        .bind(source_types_complete && !source_types.is_empty())
         .execute(&self.pool)
         .await
         .context("Failed to upgrade silent proposal")?;
@@ -1403,6 +1467,12 @@ impl TuningRepository {
     /// * `proposal_type` - Optional proposal type filter
     /// * `limit` - Maximum number of proposals to return
     /// * `offset` - Offset for pagination
+    /// * `scope` - the READER's effective per-source deny scope (NAN-2085 /
+    ///   NAN-2088). Proposals whose origin manifest overlaps it — and every
+    ///   proposal whose provenance is not COMPLETE — are excluded in SQL, so a
+    ///   restricted reader never receives derived values from a denied source
+    ///   and a source restricted after generation revokes access on the next
+    ///   read. Background/system callers pass [`TuningScope::system`].
     ///
     /// # Returns
     /// Vector of tuning proposals matching the filters
@@ -1413,6 +1483,7 @@ impl TuningRepository {
         proposal_type: Option<ProposalType>,
         limit: i64,
         offset: i64,
+        scope: &TuningScope,
     ) -> Result<Vec<TuningProposal>> {
         // NAN-963: LEFT JOIN rules so the queue UI can render the rule
         // name without falling back to a truncated UUID. LEFT (not INNER)
@@ -1441,33 +1512,58 @@ impl TuningRepository {
                 tp.hints_diff,
                 tp.pr_url,
                 tp.pr_number,
-                tp.pr_state
+                tp.pr_state,
+                tp.source_types,
+                tp.source_types_complete
             FROM tuning_proposals tp
             LEFT JOIN detection_rules r ON r.id = tp.rule_id
             WHERE 1=1
             "#,
         );
 
-        let mut bindings: Vec<String> = vec![];
+        // Typed filter bindings. `rule_id` MUST bind as a real `Uuid`: binding
+        // it as a String makes Postgres compare `uuid = text` and the whole
+        // query errors out, which is why `?rule_id=` used to 500 (caught by
+        // `tuning_proposal_scope_integration`). `status` / `proposal_type` are
+        // genuinely text columns.
+        enum ListBinding {
+            RuleId(Uuid),
+            Text(String),
+        }
+
+        let mut bindings: Vec<ListBinding> = vec![];
         let mut param_count = 1;
 
         // Column prefixes (`tp.`) required now that `rules` is joined —
         // bare names would be ambiguous.
         if let Some(rid) = rule_id {
             query.push_str(&format!(" AND tp.rule_id = ${}", param_count));
-            bindings.push(rid.to_string());
+            bindings.push(ListBinding::RuleId(rid));
             param_count += 1;
         }
 
         if let Some(s) = status {
             query.push_str(&format!(" AND tp.status = ${}", param_count));
-            bindings.push(s.to_string());
+            bindings.push(ListBinding::Text(s.to_string()));
             param_count += 1;
         }
 
         if let Some(pt) = proposal_type {
             query.push_str(&format!(" AND tp.proposal_type = ${}", param_count));
-            bindings.push(pt.to_string());
+            bindings.push(ListBinding::Text(pt.to_string()));
+            param_count += 1;
+        }
+
+        // NAN-2085 / NAN-2088: filter in SQL, not after the fetch — a
+        // post-filter would still page over denied artifacts and make the page
+        // size an oracle. Nothing is emitted for an unrestricted reader.
+        let scoped = !scope.is_unrestricted();
+        if scoped {
+            query.push_str(&TuningScope::sql_predicate(
+                "tp.source_types",
+                "tp.source_types_complete",
+                param_count,
+            ));
             param_count += 1;
         }
 
@@ -1480,7 +1576,14 @@ impl TuningRepository {
         let mut sqlx_query = sqlx::query(&query);
 
         for binding in bindings {
-            sqlx_query = sqlx_query.bind(binding);
+            sqlx_query = match binding {
+                ListBinding::RuleId(id) => sqlx_query.bind(id),
+                ListBinding::Text(value) => sqlx_query.bind(value),
+            };
+        }
+
+        if scoped {
+            sqlx_query = sqlx_query.bind(scope.deny_bind_values().to_vec());
         }
 
         sqlx_query = sqlx_query.bind(limit).bind(offset);
@@ -1549,6 +1652,8 @@ impl TuningRepository {
                 pr_url: row.try_get("pr_url")?,
                 pr_number: row.try_get("pr_number")?,
                 pr_state: row.try_get("pr_state")?,
+                source_types: row.try_get("source_types")?,
+                source_types_complete: row.try_get("source_types_complete")?,
             });
         }
 
@@ -1559,12 +1664,23 @@ impl TuningRepository {
     ///
     /// # Arguments
     /// * `proposal_id` - The UUID of the proposal
+    /// * `scope` - the READER's effective per-source deny scope (NAN-2085 /
+    ///   NAN-2088). A proposal derived from a denied source, or whose
+    ///   provenance is not COMPLETE, returns `None` — indistinguishable from a
+    ///   nonexistent id, so the route is not an existence oracle. The check is
+    ///   in SQL, so it also gates the MUTATION handlers (approve / reject)
+    ///   that load the proposal first. Background/system callers pass
+    ///   [`TuningScope::system`].
     ///
     /// # Returns
-    /// The tuning proposal if found, None otherwise
-    pub async fn get_proposal(&self, proposal_id: Uuid) -> Result<Option<TuningProposal>> {
+    /// The tuning proposal if found AND visible to `scope`, None otherwise
+    pub async fn get_proposal(
+        &self,
+        proposal_id: Uuid,
+        scope: &TuningScope,
+    ) -> Result<Option<TuningProposal>> {
         // NAN-963: LEFT JOIN rules (see list_proposals for rationale).
-        let row = sqlx::query(
+        let mut sql = String::from(
             r#"
             SELECT
                 tp.id,
@@ -1588,16 +1704,31 @@ impl TuningRepository {
                 tp.hints_diff,
                 tp.pr_url,
                 tp.pr_number,
-                tp.pr_state
+                tp.pr_state,
+                tp.source_types,
+                tp.source_types_complete
             FROM tuning_proposals tp
             LEFT JOIN detection_rules r ON r.id = tp.rule_id
             WHERE tp.id = $1
             "#,
-        )
-        .bind(proposal_id)
-        .fetch_optional(&self.pool)
-        .await
-        .context("Failed to fetch tuning proposal")?;
+        );
+        let scoped = !scope.is_unrestricted();
+        if scoped {
+            sql.push_str(&TuningScope::sql_predicate(
+                "tp.source_types",
+                "tp.source_types_complete",
+                2,
+            ));
+        }
+
+        let mut query = sqlx::query(&sql).bind(proposal_id);
+        if scoped {
+            query = query.bind(scope.deny_bind_values().to_vec());
+        }
+        let row = query
+            .fetch_optional(&self.pool)
+            .await
+            .context("Failed to fetch tuning proposal")?;
 
         if let Some(row) = row {
             let status_str: String = row.try_get("status")?;
@@ -1656,6 +1787,8 @@ impl TuningRepository {
                 pr_url: row.try_get("pr_url")?,
                 pr_number: row.try_get("pr_number")?,
                 pr_state: row.try_get("pr_state")?,
+                source_types: row.try_get("source_types")?,
+                source_types_complete: row.try_get("source_types_complete")?,
             }))
         } else {
             Ok(None)
@@ -1674,7 +1807,7 @@ impl TuningRepository {
         let rows = sqlx::query(
             r#"
             SELECT status, rationale, confidence_score, proposed_query,
-                   reviewer_notes, created_at
+                   reviewer_notes, created_at, source_types, source_types_complete
             FROM tuning_proposals
             WHERE rule_id = $1
             ORDER BY created_at DESC
@@ -1696,6 +1829,8 @@ impl TuningRepository {
                 proposed_query: row.try_get("proposed_query")?,
                 reviewer_notes: row.try_get("reviewer_notes")?,
                 created_at: row.try_get("created_at")?,
+                source_types: row.try_get("source_types")?,
+                source_types_complete: row.try_get("source_types_complete")?,
             });
         }
 

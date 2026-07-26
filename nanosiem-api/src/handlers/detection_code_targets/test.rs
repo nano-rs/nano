@@ -6,9 +6,14 @@ use axum::{
     extract::{Path, State},
     Extension, Json,
 };
-use nanosiem_core::audit::{AuditEvent, AuditSource, ClientContext, DETECTION_CODE_TARGET_TOKEN_SET};
+use nanosiem_core::audit::{
+    AuditEvent, AuditSource, ClientContext, DETECTION_CODE_TARGET_CONNECTION_TESTED,
+    DETECTION_CODE_TARGET_TOKEN_SET,
+};
 use nanosiem_core::auth::permissions;
-use nanosiem_core::detection_code_target::{DetectionCodeTarget, GitHubWriteClient};
+use nanosiem_core::detection_code_target::{
+    DetectionCodeTarget, GitHubWriteClient, GitHubWriteError,
+};
 use uuid::Uuid;
 
 use super::{
@@ -80,26 +85,72 @@ pub async fn set_token(
         (status = 200, description = "Probe result", body = TestConnectionResponse),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
+        (status = 429, description = "Too many connection-test requests"),
     ),
     security(("api_key" = []))
 )]
 pub async fn test_connection(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
+    Extension(client_context): Extension<ClientContext>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<TestConnectionResponse>, ApiError> {
-    ensure_permission(&auth, permissions::DETECTION_CODE_TARGETS_VIEW)?;
+    ensure_test_connection_permission(&auth)?;
 
     let repo = get_target_repo(&state);
-    let target = repo.get(id).await.map_err(map_target_err)?;
-    let token = repo.get_decrypted_token(id).await.map_err(map_target_err)?;
+    let target = match repo.get(id).await {
+        Ok(target) => target,
+        Err(error) => {
+            emit_connection_test_audit(
+                &state,
+                &auth,
+                &client_context,
+                id,
+                None,
+                false,
+                "target_lookup_failed",
+                false,
+                false,
+            );
+            return Err(map_target_err(error));
+        }
+    };
+    let token = match repo.get_decrypted_token(id).await {
+        Ok(token) => token,
+        Err(error) => {
+            emit_connection_test_audit(
+                &state,
+                &auth,
+                &client_context,
+                id,
+                Some(target.name.clone()),
+                false,
+                "credential_unavailable",
+                false,
+                false,
+            );
+            return Err(map_target_err(error));
+        }
+    };
 
     let Some(token) = token else {
+        emit_connection_test_audit(
+            &state,
+            &auth,
+            &client_context,
+            id,
+            Some(target.name.clone()),
+            false,
+            "token_not_configured",
+            false,
+            false,
+        );
         return Ok(Json(TestConnectionResponse {
             success: false,
             can_read: false,
             can_write: false,
             default_branch: None,
+            error_code: Some("token_not_configured".into()),
             message: "No GitHub token configured for this target.".into(),
         }));
     };
@@ -115,20 +166,194 @@ pub async fn test_connection(
             } else {
                 "Token cannot access this repository.".into()
             };
+            emit_connection_test_audit(
+                &state,
+                &auth,
+                &client_context,
+                id,
+                Some(target.name),
+                success,
+                if success {
+                    "connected"
+                } else if access.can_read {
+                    "write_access_missing"
+                } else {
+                    "read_access_missing"
+                },
+                access.can_read,
+                access.can_write,
+            );
             Ok(Json(TestConnectionResponse {
                 success,
                 can_read: access.can_read,
                 can_write: access.can_write,
                 default_branch: access.default_branch,
+                error_code: (!success).then(|| {
+                    if access.can_read {
+                        "write_access_missing".into()
+                    } else {
+                        "read_access_missing".into()
+                    }
+                }),
                 message,
             }))
         }
-        Err(e) => Ok(Json(TestConnectionResponse {
-            success: false,
-            can_read: false,
-            can_write: false,
-            default_branch: None,
-            message: format!("GitHub error: {e}"),
-        })),
+        Err(error) => {
+            let error_code = github_error_code(&error);
+            tracing::warn!(
+                target_id = %id,
+                error = %error,
+                error_code,
+                "Detection-code target connection test failed"
+            );
+            emit_connection_test_audit(
+                &state,
+                &auth,
+                &client_context,
+                id,
+                Some(target.name),
+                false,
+                error_code,
+                false,
+                false,
+            );
+            Ok(Json(TestConnectionResponse {
+                success: false,
+                can_read: false,
+                can_write: false,
+                default_branch: None,
+                error_code: Some(error_code.into()),
+                message: "GitHub connection test failed.".into(),
+            }))
+        }
+    }
+}
+
+fn ensure_test_connection_permission(auth: &AuthContext) -> Result<(), ApiError> {
+    ensure_permission(auth, permissions::DETECTION_CODE_TARGETS_MANAGE)
+}
+
+fn github_error_code(error: &GitHubWriteError) -> &'static str {
+    match error {
+        GitHubWriteError::Request(_) => "github_unavailable",
+        GitHubWriteError::Api {
+            status: 401 | 403, ..
+        } => "authentication_failed",
+        GitHubWriteError::Api { status: 404, .. } => "repository_not_found",
+        GitHubWriteError::Api { status: 429, .. } => "github_rate_limited",
+        GitHubWriteError::Api { .. } => "github_api_error",
+        GitHubWriteError::NotGitHub(_)
+        | GitHubWriteError::InvalidUrl(_)
+        | GitHubWriteError::InvalidRef(_) => "invalid_repository",
+        GitHubWriteError::BlockedEndpoint(_) => "egress_blocked",
+        GitHubWriteError::RemoteConflict(_) => "repository_conflict",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_connection_test_audit(
+    state: &AppState,
+    auth: &AuthContext,
+    client_context: &ClientContext,
+    target_id: Uuid,
+    target_name: Option<String>,
+    success: bool,
+    result: &str,
+    can_read: bool,
+    can_write: bool,
+) {
+    state.emit_audit(
+        AuditEvent::builder(
+            AuditSource::RuleRepo,
+            DETECTION_CODE_TARGET_CONNECTION_TESTED,
+        )
+        .actor(Some(auth.user_id()), None)
+        .api_key(auth.api_key_id, auth.api_key_name.clone())
+        .resource("detection_code_target", Some(target_id), target_name)
+        .client_context(client_context)
+        .success(success)
+        .details(serde_json::json!({
+            "result": result,
+            "can_read": can_read,
+            "can_write": can_write,
+        }))
+        .build(),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nanosiem_core::auth::api_key::ApiKeyInfo;
+    use nanosiem_core::auth::token::{DEFAULT_TOKEN_AUDIENCE, DEFAULT_TOKEN_ISSUER};
+    use nanosiem_core::auth::TokenClaims;
+
+    fn session(permissions: &[&str]) -> AuthContext {
+        AuthContext::from_jwt(TokenClaims {
+            iss: DEFAULT_TOKEN_ISSUER.to_string(),
+            aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
+            sub: Uuid::now_v7(),
+            roles: Vec::new(),
+            permissions: permissions.iter().map(ToString::to_string).collect(),
+            exp: chrono::Utc::now().timestamp() + 60,
+            iat: chrono::Utc::now().timestamp(),
+            jti: Uuid::now_v7(),
+            purpose: "access".to_string(),
+        })
+    }
+
+    fn api_key(permissions: &[&str]) -> AuthContext {
+        AuthContext::from_api_key(&ApiKeyInfo {
+            id: Uuid::now_v7(),
+            name: "connection-probe".to_string(),
+            permissions: permissions.iter().map(ToString::to_string).collect(),
+            user_id: Some(Uuid::now_v7()),
+        })
+    }
+
+    #[test]
+    fn connection_test_requires_manage_for_sessions_and_api_keys() {
+        for auth in [
+            session(&[]),
+            session(&[permissions::DETECTION_CODE_TARGETS_VIEW]),
+            api_key(&[]),
+            api_key(&[permissions::DETECTION_CODE_TARGETS_VIEW]),
+        ] {
+            assert!(matches!(
+                ensure_test_connection_permission(&auth),
+                Err(ApiError::Forbidden(_))
+            ));
+        }
+
+        for auth in [
+            session(&[permissions::DETECTION_CODE_TARGETS_MANAGE]),
+            api_key(&[permissions::DETECTION_CODE_TARGETS_MANAGE]),
+        ] {
+            assert!(ensure_test_connection_permission(&auth).is_ok());
+        }
+    }
+
+    #[test]
+    fn provider_errors_are_reduced_to_stable_non_secret_classes() {
+        assert_eq!(
+            github_error_code(&GitHubWriteError::Api {
+                status: 401,
+                message: "token ghp_secret was rejected".to_string(),
+            }),
+            "authentication_failed"
+        );
+        assert_eq!(
+            github_error_code(&GitHubWriteError::Api {
+                status: 404,
+                message: "private/repository".to_string(),
+            }),
+            "repository_not_found"
+        );
+        assert_eq!(
+            github_error_code(&GitHubWriteError::InvalidUrl(
+                "https://example.invalid/private".to_string(),
+            )),
+            "invalid_repository"
+        );
     }
 }

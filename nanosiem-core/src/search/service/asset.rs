@@ -295,7 +295,12 @@ impl SearchService {
         let mut effective_range: Option<TimeRange> = None;
         if total_count == 0 {
             let (_first_seen, last_seen) = self
-                .query_asset_true_time_range(&identifier_field, &identifier_value, &identities)
+                .query_asset_true_time_range(
+                    &identifier_field,
+                    &identifier_value,
+                    &identities,
+                    scope,
+                )
                 .await
                 .unwrap_or((None, None));
             if let Some(ls) = last_seen.as_deref().and_then(parse_asset_timestamp) {
@@ -628,8 +633,12 @@ impl SearchService {
             None => return Ok((Vec::new(), 0, AssetFacets::default())),
         };
 
-        let (ips, hostnames, users) =
-            Self::collect_asset_identifiers(identities, identifier_field, identifier_value, self.active_profile.as_ref());
+        let (ips, hostnames, users) = Self::collect_asset_identifiers(
+            identities,
+            identifier_field,
+            identifier_value,
+            self.active_profile.as_ref(),
+        );
         let (identity_clause, bind_values) = match Self::build_log_identity_clause_for(
             self.active_profile.as_ref(),
             &ips,
@@ -1188,12 +1197,20 @@ impl SearchService {
         Ok(identities)
     }
 
-    /// Query true first/last seen across all retained data via ClickHouse
+    /// Query true first/last seen across all retained data via ClickHouse.
+    ///
+    /// `entity_time_range_agg` has no source provenance, so only an unrestricted
+    /// caller may use that fast path. A restricted caller is routed to the raw
+    /// logs table, where the same profile-aware asset identity predicate used by
+    /// the event surface can be combined with the canonical source-scope
+    /// predicate. This prevents the aggregate from revealing that a denied-only
+    /// entity exists, or disclosing its global first/last timestamps.
     pub async fn query_asset_true_time_range(
         &self,
         identifier_field: &str,
         identifier_value: &str,
         identities: &[serde_json::Value],
+        scope: &ScopeSet,
     ) -> Result<(Option<String>, Option<String>), SearchError> {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct AssetTimeRange {
@@ -1208,21 +1225,22 @@ impl SearchService {
 
         let (ips, hostnames, users) =
             Self::collect_asset_identifiers(identities, identifier_field, identifier_value, self.active_profile.as_ref());
-        let (identity_clause, identity_binds) =
-            match Self::build_entity_identity_clause(&ips, &hostnames, &users) {
-                Some(pair) => pair,
-                None => return Ok((None, None)),
-            };
-
-        let sql = format!(
-            "SELECT \
-                formatDateTime(min(first_seen), '%Y-%m-%dT%H:%i:%sZ') as first_seen, \
-                formatDateTime(max(last_seen), '%Y-%m-%dT%H:%i:%sZ') as last_seen \
-             FROM {} \
-             WHERE ({})",
-            self.table_names.read("entity_time_range_agg"),
-            identity_clause
-        );
+        let logs_table = self
+            .table_names
+            .read(Self::logs_table_key(self.active_profile.as_ref()));
+        let aggregate_table = self.table_names.read("entity_time_range_agg");
+        let (sql, identity_binds) = match build_asset_true_time_range_query(
+            self.active_profile.as_ref(),
+            &logs_table,
+            &aggregate_table,
+            &ips,
+            &hostnames,
+            &users,
+            scope,
+        ) {
+            Some(query) => query,
+            None => return Ok((None, None)),
+        };
 
         let mut query = clickhouse.query(&sql);
         for val in &identity_binds {
@@ -2494,6 +2512,52 @@ impl SearchService {
     }
 }
 
+/// Build the production query used by [`SearchService::query_asset_true_time_range`].
+///
+/// The unrestricted branch intentionally retains the legacy aggregate SQL
+/// byte-for-byte. Restricted scopes cannot safely read that provenance-free
+/// aggregate and therefore use the raw logs table with both the real
+/// profile-aware asset predicate and the canonical source-scope predicate.
+/// Keeping the routing here (rather than reproducing it in tests) gives the
+/// DB-backed scope regression a direct seam into the query that production
+/// executes.
+fn build_asset_true_time_range_query(
+    profile: &dyn crate::schema::SchemaProfile,
+    logs_table: &str,
+    aggregate_table: &str,
+    ips: &[String],
+    hostnames: &[String],
+    users: &[String],
+    scope: &ScopeSet,
+) -> Option<(String, Vec<String>)> {
+    if !scope.is_restricted() {
+        let (identity_clause, identity_binds) =
+            SearchService::build_entity_identity_clause(ips, hostnames, users)?;
+        let sql = format!(
+            "SELECT \
+                formatDateTime(min(first_seen), '%Y-%m-%dT%H:%i:%sZ') as first_seen, \
+                formatDateTime(max(last_seen), '%Y-%m-%dT%H:%i:%sZ') as last_seen \
+             FROM {} \
+             WHERE ({})",
+            aggregate_table, identity_clause
+        );
+        return Some((sql, identity_binds));
+    }
+
+    let (identity_clause, identity_binds) =
+        SearchService::build_log_identity_clause_for(profile, ips, hostnames, users)?;
+    let scope_predicate = source_scope_sql_predicate("source_type", scope.deny_set())?;
+    let sql = format!(
+        "SELECT \
+            formatDateTime(min(timestamp), '%Y-%m-%dT%H:%i:%sZ') as first_seen, \
+            formatDateTime(max(timestamp), '%Y-%m-%dT%H:%i:%sZ') as last_seen \
+         FROM {} \
+         WHERE ({}) AND {}",
+        logs_table, identity_clause, scope_predicate
+    );
+    Some((sql, identity_binds))
+}
+
 /// The dimension set the `entity_dimension_day_agg` MVs bake in for one
 /// `(entity_type, actor-anchoring)` pair — MUST mirror
 /// `baseline::dimensions_for` + the MV bodies in
@@ -3038,3 +3102,7 @@ mod baseline_predicate_tests {
 #[cfg(test)]
 #[path = "asset_baseline_agg_tests.rs"]
 mod asset_baseline_agg_tests;
+
+#[cfg(test)]
+#[path = "asset_true_time_range_scope_tests.rs"]
+mod asset_true_time_range_scope_tests;

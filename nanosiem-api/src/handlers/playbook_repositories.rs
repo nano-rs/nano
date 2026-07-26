@@ -11,7 +11,7 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
-use nanosiem_core::auth::permissions;
+use nanosiem_core::auth::{permissions, TargetEffect};
 use nanosiem_core::playbook_repository::{
     NewPlaybookRepository, PlaybookImportRequest, PlaybookImportResponse, PlaybookImportType,
     PlaybookRepository, PlaybookRepositoryError, PlaybookRepositoryService, RepositoryPlaybook,
@@ -22,8 +22,16 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
+use crate::handlers::repository_target_authz::{ensure_target_effects, held_target_grants};
 use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
+
+/// Target-resource effects every playbook-import route consumes (NAN-2119).
+///
+/// Import always CREATES (`AlreadyImported` is a 409, never an update), so the
+/// set is a single effect. Declared once so single-import, import-all and
+/// sync-and-import cannot drift apart.
+const PLAYBOOK_IMPORT_EFFECTS: &[TargetEffect] = &[TargetEffect::PlaybookCreate];
 
 // NAN-845: hardcoded URL allowlist for the only repo we sync from. The
 // frontend reshape (drop add/edit dialogs) makes this unreachable via the UI,
@@ -412,7 +420,7 @@ pub async fn list_repository_playbooks(
     request_body = PlaybookImportRequest,
     responses(
         (status = 200, description = "Playbook imported", body = PlaybookImportResponse),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Forbidden — missing playbook_repositories:import, or the playbooks:manage capability the import consumes"),
         (status = 404, description = "Not found"),
         (status = 409, description = "Already imported"),
     ),
@@ -425,9 +433,15 @@ pub async fn import_repository_playbook(
     Json(req): Json<PlaybookImportRequest>,
 ) -> Result<Json<PlaybookImportResponse>, ApiError> {
     ensure_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_IMPORT)?;
+    // NAN-2119: importing materializes a first-class library playbook + its
+    // initial version — the same rows `POST /api/playbooks` creates behind
+    // `playbooks:manage`. Preflight the target capability BEFORE any write, and
+    // hand the grant set to the service so it re-checks at the create branch.
+    ensure_target_effects(&auth, PLAYBOOK_IMPORT_EFFECTS)?;
+    let grants = held_target_grants(&auth);
     let service = get_service(&state);
     let response = service
-        .import_playbook(*id, &path, req, Some(auth.user_id()))
+        .import_playbook(*id, &path, req, Some(auth.user_id()), &grants)
         .await?;
     Ok(Json(response))
 }
@@ -447,7 +461,7 @@ pub async fn import_repository_playbook(
     request_body = ImportAllPlaybooksRequest,
     responses(
         (status = 200, description = "Bulk import completed", body = ImportAllPlaybooksResponse),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Forbidden — missing playbook_repositories:import, or the playbooks:manage capability the import consumes"),
         (status = 404, description = "Not found"),
     ),
     security(("api_key" = []))
@@ -459,6 +473,11 @@ pub async fn import_all_repository_playbooks(
     Json(req): Json<ImportAllPlaybooksRequest>,
 ) -> Result<Json<ImportAllPlaybooksResponse>, ApiError> {
     ensure_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_IMPORT)?;
+    // NAN-2119: bulk import creates up to `max_playbooks_per_repo` library
+    // playbooks. Preflighted here so authorization cannot fail PART-WAY through
+    // and leave a partially-populated library.
+    ensure_target_effects(&auth, PLAYBOOK_IMPORT_EFFECTS)?;
+    let grants = held_target_grants(&auth);
     let service = get_service(&state);
     // Confirm the repo exists (404 if not) before doing any work.
     service.get_repository(*id).await?;
@@ -490,7 +509,7 @@ pub async fn import_all_repository_playbooks(
             owner_team: None,
         };
         match service
-            .import_playbook(*id, &path, import_req, Some(auth.user_id()))
+            .import_playbook(*id, &path, import_req, Some(auth.user_id()), &grants)
             .await
         {
             Ok(_) => imported += 1,
@@ -561,7 +580,7 @@ pub struct SyncAndImportResponse {
     request_body = ImportAllPlaybooksRequest,
     responses(
         (status = 200, description = "Sync + import completed", body = SyncAndImportResponse),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Forbidden — missing playbook_repositories:sync / :import, or the playbooks:manage capability the import consumes"),
         (status = 404, description = "Not found"),
         (status = 409, description = "Sync already in progress"),
     ),
@@ -575,6 +594,10 @@ pub async fn sync_and_import_repository(
 ) -> Result<Json<SyncAndImportResponse>, ApiError> {
     ensure_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_SYNC)?;
     ensure_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_IMPORT)?;
+    // NAN-2119: enforced BEFORE the sync so an under-scoped caller cannot even
+    // trigger the network fetch, let alone reach the library-creating loop.
+    ensure_target_effects(&auth, PLAYBOOK_IMPORT_EFFECTS)?;
+    let grants = held_target_grants(&auth);
     let service = get_service(&state);
     service.get_repository(*id).await?;
 
@@ -601,7 +624,7 @@ pub async fn sync_and_import_repository(
             owner_team: None,
         };
         match service
-            .import_playbook(*id, &path, import_req, Some(auth.user_id()))
+            .import_playbook(*id, &path, import_req, Some(auth.user_id()), &grants)
             .await
         {
             Ok(_) => imported += 1,

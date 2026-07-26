@@ -33,8 +33,8 @@ use nanosiem_core::auth::{
 // dependency. Re-exported here so downstream `use crate::middleware::*`
 // imports continue to resolve.
 pub use nanosiem_api_lib::{
-    check_all_permissions, check_any_permission, check_permission, ensure_permission,
-    require_session_auth, require_session_or_self, AuthContext, AuthErrorResponse,
+    check_all_permissions, check_any_permission, check_permission, ensure_interactive_session,
+    ensure_permission, require_session_auth, require_session_or_self, AuthContext, AuthErrorResponse,
 };
 
 /// Public endpoints that don't require authentication.
@@ -448,10 +448,19 @@ pub async fn auth_middleware(
                 Ok(info) => {
                     let mut auth_context = AuthContext::from_api_key(&info);
                     let claims = auth_context.claims.clone();
-                    // The api-key subject is the key OWNER's user_id, so grants
-                    // resolve the owner's group memberships here (correct).
+                    // NAN-2043: resolve SOURCE-scope grants against the KEY's own
+                    // identity, not the key owner. `claims.sub` is the owner's
+                    // user_id (retained for FK / audit via `user_id()`); resolving
+                    // groups against it would let a key WITHOUT
+                    // `source_scopes:view_all` inherit the owner's group
+                    // source-grants and read restricted sources that the search
+                    // service correctly hides (search resolves against the key id
+                    // → no groups → deny-all-restricted). The key's OWN permissions
+                    // still drive the `source_scopes:view_all` positive bypass
+                    // inside `resolve`. See `AuthContext::source_scope_principal`.
+                    let scope_principal = auth_context.source_scope_principal();
                     let scope =
-                        match resolve_source_scope(&auth_state, claims.sub, &claims.roles, &claims.permissions)
+                        match resolve_source_scope(&auth_state, scope_principal, &claims.roles, &claims.permissions)
                         .await
                     {
                             Ok(scope) => scope,
