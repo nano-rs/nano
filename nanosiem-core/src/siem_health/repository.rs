@@ -6,7 +6,7 @@ use sqlx::{PgPool, Row};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::auth::SourceProvenance;
+use crate::auth::{ArtifactScope, SourceProvenance};
 
 use super::types::{SiemHealthReport, SiemHealthReportSummary};
 
@@ -103,6 +103,53 @@ impl SiemHealthRepository {
         Ok(row.as_ref().map(Self::row_to_report))
     }
 
+    /// Get the most recent report whose complete provenance is visible to
+    /// `scope`.
+    ///
+    /// SIEM-health scores, status, prose, recommendations, dimension details,
+    /// and non-partitioned totals are one persistent derived artifact. They
+    /// cannot be safely omitted from the current DTO or reconstructed by
+    /// string-redacting prose. Restricted readers therefore fail closed on an
+    /// incomplete or overlapping report before `ORDER BY ... LIMIT 1`.
+    pub async fn get_latest_for_scope(
+        &self,
+        scope: &ArtifactScope,
+    ) -> Result<Option<SiemHealthReport>, SiemHealthRepositoryError> {
+        if scope.is_unrestricted() {
+            return self.get_latest().await;
+        }
+
+        let mut sql = String::from(
+            r#"
+            SELECT id, overall_score, overall_status, ingestion_score, parsing_score,
+                   detection_score, enrichment_score, alerting_score,
+                   summary, metrics, recommendations, dimension_details,
+                   triggered_by, created_at, duration_ms,
+                   source_types, source_types_complete
+            FROM siem_health_reports
+            WHERE TRUE
+            "#,
+        );
+        sql.push_str(&ArtifactScope::sql_predicate(
+            "source_types",
+            "source_types_complete",
+            1,
+        ));
+        sql.push_str(
+            r#"
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        );
+
+        let row = sqlx::query(&sql)
+            .bind(scope.deny_bind_values())
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(row.as_ref().map(Self::row_to_report))
+    }
+
     /// Get a report by ID
     pub async fn get_by_id(&self, id: Uuid) -> Result<SiemHealthReport, SiemHealthRepositoryError> {
         let row = sqlx::query(
@@ -120,6 +167,45 @@ impl SiemHealthRepository {
         .fetch_optional(&self.pool)
         .await?
         .ok_or_else(|| SiemHealthRepositoryError::NotFound(id.to_string()))?;
+
+        Ok(Self::row_to_report(&row))
+    }
+
+    /// Get a report by ID only when its complete provenance is visible to
+    /// `scope`. A denied artifact is deliberately indistinguishable from a
+    /// missing one.
+    pub async fn get_by_id_for_scope(
+        &self,
+        id: Uuid,
+        scope: &ArtifactScope,
+    ) -> Result<SiemHealthReport, SiemHealthRepositoryError> {
+        if scope.is_unrestricted() {
+            return self.get_by_id(id).await;
+        }
+
+        let mut sql = String::from(
+            r#"
+            SELECT id, overall_score, overall_status, ingestion_score, parsing_score,
+                   detection_score, enrichment_score, alerting_score,
+                   summary, metrics, recommendations, dimension_details,
+                   triggered_by, created_at, duration_ms,
+                   source_types, source_types_complete
+            FROM siem_health_reports
+            WHERE id = $1
+            "#,
+        );
+        sql.push_str(&ArtifactScope::sql_predicate(
+            "source_types",
+            "source_types_complete",
+            2,
+        ));
+
+        let row = sqlx::query(&sql)
+            .bind(id)
+            .bind(scope.deny_bind_values())
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| SiemHealthRepositoryError::NotFound(id.to_string()))?;
 
         Ok(Self::row_to_report(&row))
     }
@@ -149,8 +235,67 @@ impl SiemHealthRepository {
         .fetch_all(&self.pool)
         .await?;
 
-        let summaries = rows
-            .iter()
+        Ok((Self::rows_to_summaries(&rows), count.0))
+    }
+
+    /// List only whole reports visible to `scope`.
+    ///
+    /// The same provenance predicate is applied to both count and page query,
+    /// before pagination. Post-fetch filtering would make page size and total
+    /// an oracle for denied report activity.
+    pub async fn list_summaries_for_scope(
+        &self,
+        limit: i64,
+        offset: i64,
+        scope: &ArtifactScope,
+    ) -> Result<(Vec<SiemHealthReportSummary>, i64), SiemHealthRepositoryError> {
+        if scope.is_unrestricted() {
+            return self.list_summaries(limit, offset).await;
+        }
+
+        let mut count_sql = String::from("SELECT COUNT(*) FROM siem_health_reports WHERE TRUE");
+        count_sql.push_str(&ArtifactScope::sql_predicate(
+            "source_types",
+            "source_types_complete",
+            1,
+        ));
+        let count = sqlx::query_as::<_, (i64,)>(&count_sql)
+            .bind(scope.deny_bind_values())
+            .fetch_one(&self.pool)
+            .await?;
+
+        let mut list_sql = String::from(
+            r#"
+            SELECT id, overall_score, overall_status, ingestion_score, parsing_score,
+                   detection_score, enrichment_score, alerting_score,
+                   summary, triggered_by, created_at, duration_ms
+            FROM siem_health_reports
+            WHERE TRUE
+            "#,
+        );
+        list_sql.push_str(&ArtifactScope::sql_predicate(
+            "source_types",
+            "source_types_complete",
+            3,
+        ));
+        list_sql.push_str(
+            r#"
+            ORDER BY created_at DESC
+            LIMIT $1 OFFSET $2
+            "#,
+        );
+        let rows = sqlx::query(&list_sql)
+            .bind(limit)
+            .bind(offset)
+            .bind(scope.deny_bind_values())
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok((Self::rows_to_summaries(&rows), count.0))
+    }
+
+    fn rows_to_summaries(rows: &[sqlx::postgres::PgRow]) -> Vec<SiemHealthReportSummary> {
+        rows.iter()
             .map(|r| SiemHealthReportSummary {
                 id: r.get("id"),
                 overall_score: r.get("overall_score"),
@@ -165,9 +310,7 @@ impl SiemHealthRepository {
                 created_at: r.get("created_at"),
                 duration_ms: r.get("duration_ms"),
             })
-            .collect();
-
-        Ok((summaries, count.0))
+            .collect()
     }
 
     fn row_to_report(row: &sqlx::postgres::PgRow) -> SiemHealthReport {

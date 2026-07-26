@@ -1,0 +1,98 @@
+name: migration immutability gate
+
+# NAN-2171 — block edits to already-shipped ClickHouse migrations.
+#
+# The migrator SHA-256s the RAW BYTES of each `clickhouse/NNN_*.sql`
+# (nanosiem-core/src/db/clickhouse_migrate/runner.rs) and compares against the
+# `checksum` row in `nanosiem._migrations`. A mismatch is fail-closed:
+# api/jobs/search all refuse to start with "migration content drift detected",
+# and nginx crash-loops behind them. It does NOT self-heal — the migrator skips
+# already-applied versions, so the stored checksum is never rewritten.
+#
+# Comment-only edits count. This has now bitten twice:
+#   NAN-1898 (2026-07-16) — comment block of 166_baseline_first_seen_agg.sql
+#   NAN-2171 (2026-07-26) — two comment lines in 116_logs_per_source_5m.sql,
+#                           which took the `org` tenant hard down on update
+# Both were pure documentation edits with zero DDL change. A written rule in
+# CLAUDE.md existed for the first and did not prevent the second, hence a
+# mechanical gate: ADDING a new numbered migration is unrestricted, MODIFYING
+# an existing one is blocked.
+#
+# Escape hatch: a maintainer who genuinely must rewrite an applied migration
+# (and will reconcile every deployed `_migrations` row by hand) can apply the
+# `migration-immutability-override` label to the PR.
+
+on:
+  pull_request:
+    # `labeled`/`unlabeled` matter: without them, adding the override label to
+    # an already-red PR does not re-run the gate and the escape hatch appears
+    # not to work. Note this is `pull_request`, NOT `pull_request_target` — the
+    # gate runs on untrusted branch content and must not see secrets.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - 'clickhouse/**.sql'
+      - .github/workflows/migration-immutability-gate.yml
+  workflow_dispatch:
+
+concurrency:
+  group: migration-immutability-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: [self-hosted, X64]
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Need the merge-base to diff against, not just the tip commit.
+          fetch-depth: 0
+
+      - name: Block modifications to applied migrations
+        if: ${{ !contains(github.event.pull_request.labels.*.name, 'migration-immutability-override') }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # Numbered migrations only. `init.sql` is deliberately excluded: it is
+          # only ever executed on a FRESH install (existing boxes are past it),
+          # so body edits there are safe by design.
+          #
+          # Status letters: A=added (fine), M=modified, R=renamed, D=deleted.
+          # R and D are blocked too — renaming changes the parsed version/name
+          # pair and deleting strands the applied row.
+          # THREE-dot: diff from the merge-base, so this reports only what the
+          # PR itself changed. A two-dot diff would compare the two trees
+          # directly, and any migration added to main after the PR branched
+          # would surface as `D` (deleted) — falsely blocking an innocent PR.
+          CHANGED=$(git diff --name-status --find-renames \
+            "$BASE_SHA...$HEAD_SHA" -- 'clickhouse/[0-9]*.sql' || true)
+
+          if [ -z "$CHANGED" ]; then
+            echo "No numbered ClickHouse migrations touched."
+            exit 0
+          fi
+
+          echo "Changed numbered migrations:"
+          echo "$CHANGED"
+          echo
+
+          # Anything not purely added is a violation.
+          VIOLATIONS=$(echo "$CHANGED" | grep -vE '^A' || true)
+
+          if [ -n "$VIOLATIONS" ]; then
+            echo "$VIOLATIONS" | while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              file=$(echo "$line" | cut -f2-)
+              echo "::error file=${file}::This migration has shipped and is frozen. The migrator hashes raw file bytes, so ANY change — including comments — trips the drift guard and blocks boot on every box that already applied it. Put the change in a NEW numbered migration; put documentation in the code that reads the table."
+            done
+            echo
+            echo "Blocked: applied ClickHouse migrations are immutable (NAN-2171)."
+            echo "Adding new clickhouse/NNN_*.sql files is unrestricted."
+            exit 1
+          fi
+
+          echo "OK — only new migrations added."

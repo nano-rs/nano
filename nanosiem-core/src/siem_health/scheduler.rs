@@ -16,7 +16,7 @@ use super::collector;
 use super::repository::SiemHealthRepository;
 use super::suppressions_repository::SuppressionRepository;
 use super::types::HealthStatus;
-use crate::auth::ScopeSet;
+use crate::auth::{ArtifactScope, ScopeSet};
 use crate::extensions::SiemHealthAiAnalyzer;
 
 /// Default interval: 12 hours
@@ -104,8 +104,14 @@ pub async fn run_health_check_with_trigger(
     let metrics_json = serde_json::to_value(&metrics).unwrap_or_default();
 
     // Step 1b: Load active suppressions so the AI can omit classes the tenant
-    // has already marked as not-an-issue (NAN-615).
-    let suppressions = match SuppressionRepository::new(pool.clone()).list_active().await {
+    // has already marked as not-an-issue (NAN-615). Suppression title/reason
+    // rows have no source provenance, so a restricted trigger receives none;
+    // otherwise denied-source prose would enter the prompt before analysis.
+    let artifact_scope = ArtifactScope::from_scope(scope);
+    let suppressions = match SuppressionRepository::new(pool.clone())
+        .list_active_for_scope(&artifact_scope)
+        .await
+    {
         Ok(rows) => rows
             .into_iter()
             .map(|s| SuppressedFinding {

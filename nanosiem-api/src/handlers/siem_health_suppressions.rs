@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::ApiError;
 use crate::middleware::AuthContext;
 use crate::state::AppState;
+use nanosiem_core::auth::ArtifactScope;
 use nanosiem_core::siem_health::finding_signature::signature_for_title;
 use nanosiem_core::siem_health::{FindingSuppression, SuppressionRepository};
 use nanosiem_core::typeid::TypeIdParam;
@@ -52,8 +53,26 @@ pub struct ListSuppressionsParams {
 const REASON_MAX_LEN: usize = 500;
 const TITLE_MAX_LEN: usize = 500;
 
+fn effective_artifact_scope(auth: &AuthContext) -> ArtifactScope {
+    ArtifactScope::from_scope(&auth.effective_viewer_scope())
+}
+
+/// Suppression rows do not yet carry source provenance. A source-scoped
+/// principal cannot safely create or mutate one because the response and
+/// future AI prompt would contain an unattributed finding title/reason.
+fn ensure_suppression_mutation_allowed(auth: &AuthContext) -> Result<(), ApiError> {
+    if effective_artifact_scope(auth).is_unrestricted() {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden(
+            "SIEM health suppressions require unrestricted source visibility".to_string(),
+        ))
+    }
+}
+
 /// Suppress a /health finding so the AI omits the same class on subsequent
-/// report runs.
+/// report runs. Suppression rows have no source provenance, so mutations
+/// require unrestricted source visibility.
 #[utoipa::path(
     post,
     path = "/api/siem-health/findings/suppressions",
@@ -72,6 +91,7 @@ pub async fn create_suppression(
     Json(req): Json<CreateSuppressionRequest>,
 ) -> Result<(StatusCode, Json<FindingSuppression>), ApiError> {
     crate::middleware::ensure_permission(&auth, nanosiem_core::auth::permissions::SETTINGS_SYSTEM)?;
+    ensure_suppression_mutation_allowed(&auth)?;
 
     let title = req.title.trim();
     let reason = req.reason.trim();
@@ -105,7 +125,8 @@ pub async fn create_suppression(
     Ok((StatusCode::CREATED, Json(suppression)))
 }
 
-/// List /health finding suppressions.
+/// List /health finding suppressions. Restricted viewers receive an empty list
+/// because legacy title/reason prose cannot be safely source-filtered.
 #[utoipa::path(
     get,
     path = "/api/siem-health/findings/suppressions",
@@ -128,10 +149,11 @@ pub async fn list_suppressions(
     crate::middleware::ensure_permission(&auth, nanosiem_core::auth::permissions::SETTINGS_SYSTEM)?;
 
     let repo = SuppressionRepository::new(state.pool.clone());
+    let artifact_scope = effective_artifact_scope(&auth);
     let suppressions = if params.include_deactivated {
-        repo.list_all().await
+        repo.list_all_for_scope(&artifact_scope).await
     } else {
-        repo.list_active().await
+        repo.list_active_for_scope(&artifact_scope).await
     }
     .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
 
@@ -139,7 +161,8 @@ pub async fn list_suppressions(
 }
 
 /// Deactivate (undo) a suppression. Findings of this class will surface again
-/// on the next report run.
+/// on the next report run. Suppression mutations require unrestricted source
+/// visibility.
 #[utoipa::path(
     delete,
     path = "/api/siem-health/findings/suppressions/{id}",
@@ -160,6 +183,7 @@ pub async fn deactivate_suppression(
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<FindingSuppression>, ApiError> {
     crate::middleware::ensure_permission(&auth, nanosiem_core::auth::permissions::SETTINGS_SYSTEM)?;
+    ensure_suppression_mutation_allowed(&auth)?;
 
     let repo = SuppressionRepository::new(state.pool.clone());
     let suppression = repo
@@ -185,3 +209,96 @@ pub async fn deactivate_suppression(
     ))
 )]
 pub struct SiemHealthSuppressionsApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use nanosiem_core::auth::api_key::ApiKeyInfo;
+    use nanosiem_core::auth::permissions;
+    use nanosiem_core::auth::token::{DEFAULT_TOKEN_AUDIENCE, DEFAULT_TOKEN_ISSUER};
+    use nanosiem_core::auth::{ScopeSet, TokenClaims};
+    use uuid::Uuid;
+
+    use super::*;
+
+    fn scope(denied: &[&str]) -> ScopeSet {
+        ScopeSet::from_denied(
+            denied
+                .iter()
+                .map(|source_type| source_type.to_string())
+                .collect::<BTreeSet<_>>(),
+        )
+    }
+
+    fn jwt_auth(denied: &[&str], audit_view: bool) -> AuthContext {
+        let mut auth = AuthContext::from_jwt(TokenClaims {
+            iss: DEFAULT_TOKEN_ISSUER.to_string(),
+            aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
+            sub: Uuid::now_v7(),
+            roles: Vec::new(),
+            permissions: [
+                Some(permissions::SETTINGS_SYSTEM.to_string()),
+                audit_view.then(|| permissions::AUDIT_VIEW.to_string()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            exp: i64::MAX,
+            iat: 0,
+            jti: Uuid::now_v7(),
+            purpose: "access".to_string(),
+        });
+        auth.denied_sources = scope(denied);
+        auth
+    }
+
+    fn api_key_auth(denied: &[&str], audit_view: bool) -> AuthContext {
+        let mut auth = AuthContext::from_api_key(&ApiKeyInfo {
+            id: Uuid::now_v7(),
+            name: "NAN-2089 suppression parity".to_string(),
+            permissions: [
+                Some(permissions::SETTINGS_SYSTEM.to_string()),
+                audit_view.then(|| permissions::AUDIT_VIEW.to_string()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            user_id: Some(Uuid::now_v7()),
+        });
+        auth.denied_sources = scope(denied);
+        auth
+    }
+
+    fn forbidden_message(result: Result<(), ApiError>) -> String {
+        match result {
+            Err(ApiError::Forbidden(message)) => message,
+            Err(other) => panic!("expected Forbidden, got {other:?}"),
+            Ok(()) => panic!("expected Forbidden, got Ok"),
+        }
+    }
+
+    #[test]
+    fn suppression_mutations_require_unrestricted_scope_for_both_principals() {
+        for auth in [
+            jwt_auth(&["insider_threat"], true),
+            api_key_auth(&["insider_threat"], true),
+            jwt_auth(&[], false),
+            api_key_auth(&[], false),
+        ] {
+            assert_eq!(
+                forbidden_message(ensure_suppression_mutation_allowed(&auth)),
+                "SIEM health suppressions require unrestricted source visibility"
+            );
+        }
+    }
+
+    #[test]
+    fn unrestricted_jwt_and_api_key_principals_keep_suppression_behavior() {
+        for auth in [jwt_auth(&[], true), api_key_auth(&[], true)] {
+            assert!(effective_artifact_scope(&auth).is_unrestricted());
+            ensure_suppression_mutation_allowed(&auth)
+                .expect("unrestricted suppression mutation remains allowed");
+        }
+    }
+}

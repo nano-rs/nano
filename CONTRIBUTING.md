@@ -75,7 +75,7 @@ OpenAPI / Swagger is at <http://localhost:3000/swagger-ui>.
 # Backend
 cargo test --workspace                       # full suite (open build)
 cargo test --workspace --features enterprise # enterprise build (if you have access)
-cargo test -p nanosiem-api verify_openapi    # OpenAPI spec self-check
+cargo test -p nanosiem-api openapi::tests    # OpenAPI spec + contract self-check
 
 # Frontend
 cd nanosiem-web
@@ -100,7 +100,7 @@ We expect:
 - **Parameterized SQL only.** sqlx with compile-time verification on the
   Rust side; no string-format SQL anywhere.
 - **OpenAPI annotations on every new handler.** See `CLAUDE.md` for the
-  pattern. The `verify_openapi` test enforces path counts.
+  pattern. The `openapi::tests` suite enforces path counts and API contracts.
 
 Before pushing, run `cargo fmt`, `cargo clippy --all-targets --workspace`,
 and `cargo test`. The CI will, but doing it locally is faster than a round

@@ -15,16 +15,22 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::middleware::AuthContext;
 use crate::state::AppState;
-use nanosiem_core::auth::ScopeSet;
+use nanosiem_core::auth::{ArtifactScope, ScopeSet};
 use nanosiem_core::siem_health::types::CollectedMetrics;
 use nanosiem_core::siem_health::{SiemHealthReport, SiemHealthReportSummary, SiemHealthRepository};
 
-/// NAN-1801: post-fetch source-scope filter for precomputed health reports.
+/// NAN-1801 / NAN-2153: typed defense-in-depth for a visible health report.
 ///
 /// Scheduled health reports are generated with an unrestricted SYSTEM scope.
 /// Their typed source partitions are therefore re-filtered against the reader's
 /// current effective scope (per-source RBAC ∪ the `audit` gate) before the
 /// report leaves the API. This also covers grant revocation after generation.
+///
+/// NAN-2089's repository gate runs first and admits a restricted reader only
+/// when the complete report provenance is disjoint from the deny set. That
+/// whole-artifact decision protects prose, recommendations, dimension details,
+/// scores, status, and non-partitioned totals; this function does not attempt
+/// to string-redact or synthesize replacements for them.
 ///
 /// Filtered paths (every `source_type`-keyed vector in `CollectedMetrics`):
 /// - `ingestion.source_volumes`      (`SourceVolumeMetric.source_type`)
@@ -34,9 +40,8 @@ use nanosiem_core::siem_health::{SiemHealthReport, SiemHealthReportSummary, Siem
 /// - `enrichment.per_source_coverage` (`EnrichmentCoverageMetric.source_type`)
 ///
 /// Exact ingestion totals are recomputed from the retained source-volume rows.
-/// Other cluster-wide/global fields (insert-integrity probes, per-column
-/// lowercase violations, rule/alert stats, scores) have no complete persisted
-/// source partition and remain unchanged for NAN-2089's narrative/score policy.
+/// Other cluster-wide/global fields remain byte-identical only because the
+/// repository has already proven the complete enclosing artifact visible.
 ///
 /// An EMPTY deny set returns immediately — the report stays byte-identical
 /// for unrestricted viewers. Comparison is lowercase-on-both-sides, mirroring
@@ -53,6 +58,11 @@ fn filter_report_for_viewer(report: &mut SiemHealthReport, scope: &ScopeSet) {
     };
     metrics.retain_source_partitions(scope);
     report.metrics = serde_json::to_value(metrics).unwrap_or_else(|_| serde_json::json!({}));
+}
+
+/// One canonical conversion for JWT and API-key request paths.
+fn effective_artifact_scope(auth: &AuthContext) -> ArtifactScope {
+    ArtifactScope::from_scope(&auth.effective_viewer_scope())
 }
 
 /// Query parameters for listing health reports
@@ -90,8 +100,9 @@ pub struct TriggerResponse {
 
 /// List SIEM health report summaries (paginated)
 ///
-/// Returns a paginated list of health report summaries, ordered by most recent first.
-/// Summaries omit the full metrics and dimension details for efficiency.
+/// Returns a paginated list of visible health report summaries, ordered by most
+/// recent first. The persistent-artifact policy runs in SQL before count,
+/// pagination, and limit so hidden report activity is not an oracle.
 ///
 /// Requires the `settings:system` permission (NAN-1801 — health reports carry
 /// fleet-wide per-source telemetry).
@@ -117,10 +128,11 @@ pub async fn list_reports(
 
     let limit = params.limit.clamp(1, 100);
     let offset = params.offset.max(0);
+    let artifact_scope = effective_artifact_scope(&auth);
 
     let repo = SiemHealthRepository::new(state.pool.clone());
     let (reports, total) = repo
-        .list_summaries(limit, offset)
+        .list_summaries_for_scope(limit, offset, &artifact_scope)
         .await
         .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
 
@@ -137,8 +149,9 @@ pub async fn list_reports(
 /// Returns the latest full health report including metrics, recommendations,
 /// and dimension details. Returns 404 if no reports exist yet.
 ///
-/// Requires the `settings:system` permission; per-source telemetry inside the
-/// report is filtered to the viewer's source scope (NAN-1801).
+/// Requires the `settings:system` permission. Restricted viewers see the latest
+/// whole report whose complete provenance is disjoint from their current deny
+/// set; legacy, incomplete, denied, and mixed-origin reports fail closed.
 ///
 /// GET /api/siem-health/reports/latest
 #[utoipa::path(
@@ -159,13 +172,15 @@ pub async fn get_latest_report(
     crate::middleware::ensure_permission(&auth, nanosiem_core::auth::permissions::SETTINGS_SYSTEM)?;
 
     let repo = SiemHealthRepository::new(state.pool.clone());
+    let viewer_scope = auth.effective_viewer_scope();
+    let artifact_scope = ArtifactScope::from_scope(&viewer_scope);
     let mut report = repo
-        .get_latest()
+        .get_latest_for_scope(&artifact_scope)
         .await
         .map_err(|e| ApiError::DatabaseError(e.to_string()))?
         .ok_or_else(|| ApiError::NotFound("No health reports exist yet".to_string()))?;
 
-    filter_report_for_viewer(&mut report, &auth.effective_viewer_scope());
+    filter_report_for_viewer(&mut report, &viewer_scope);
 
     Ok(Json(report))
 }
@@ -175,8 +190,8 @@ pub async fn get_latest_report(
 /// Returns the full health report including metrics, recommendations,
 /// and dimension details.
 ///
-/// Requires the `settings:system` permission; per-source telemetry inside the
-/// report is filtered to the viewer's source scope (NAN-1801).
+/// Requires the `settings:system` permission. A restricted viewer receives 404
+/// unless the complete report provenance is disjoint from the current deny set.
 ///
 /// GET /api/siem-health/reports/{id}
 #[utoipa::path(
@@ -201,14 +216,19 @@ pub async fn get_report(
     crate::middleware::ensure_permission(&auth, nanosiem_core::auth::permissions::SETTINGS_SYSTEM)?;
 
     let repo = SiemHealthRepository::new(state.pool.clone());
-    let mut report = repo.get_by_id(id).await.map_err(|e| match e {
-        nanosiem_core::siem_health::SiemHealthRepositoryError::NotFound(msg) => {
-            ApiError::NotFound(msg)
-        }
-        other => ApiError::DatabaseError(other.to_string()),
-    })?;
+    let viewer_scope = auth.effective_viewer_scope();
+    let artifact_scope = ArtifactScope::from_scope(&viewer_scope);
+    let mut report = repo
+        .get_by_id_for_scope(id, &artifact_scope)
+        .await
+        .map_err(|e| match e {
+            nanosiem_core::siem_health::SiemHealthRepositoryError::NotFound(msg) => {
+                ApiError::NotFound(msg)
+            }
+            other => ApiError::DatabaseError(other.to_string()),
+        })?;
 
-    filter_report_for_viewer(&mut report, &auth.effective_viewer_scope());
+    filter_report_for_viewer(&mut report, &viewer_scope);
 
     Ok(Json(report))
 }
@@ -312,6 +332,10 @@ mod tests {
     use std::collections::BTreeSet;
 
     use chrono::Utc;
+    use nanosiem_core::auth::api_key::ApiKeyInfo;
+    use nanosiem_core::auth::permissions;
+    use nanosiem_core::auth::token::{DEFAULT_TOKEN_AUDIENCE, DEFAULT_TOKEN_ISSUER};
+    use nanosiem_core::auth::TokenClaims;
     use nanosiem_core::siem_health::types::InsertIntegrityMetrics;
     use serde_json::{json, Value};
 
@@ -324,6 +348,39 @@ mod tests {
                 .map(|source_type| source_type.to_string())
                 .collect::<BTreeSet<_>>(),
         )
+    }
+
+    fn jwt_auth(denied: &[&str]) -> AuthContext {
+        let mut auth = AuthContext::from_jwt(TokenClaims {
+            iss: DEFAULT_TOKEN_ISSUER.to_string(),
+            aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
+            sub: Uuid::now_v7(),
+            roles: Vec::new(),
+            permissions: vec![
+                permissions::SETTINGS_SYSTEM.to_string(),
+                permissions::AUDIT_VIEW.to_string(),
+            ],
+            exp: i64::MAX,
+            iat: 0,
+            jti: Uuid::now_v7(),
+            purpose: "access".to_string(),
+        });
+        auth.denied_sources = scope(denied);
+        auth
+    }
+
+    fn api_key_auth(denied: &[&str]) -> AuthContext {
+        let mut auth = AuthContext::from_api_key(&ApiKeyInfo {
+            id: Uuid::now_v7(),
+            name: "NAN-2089 parity".to_string(),
+            permissions: vec![
+                permissions::SETTINGS_SYSTEM.to_string(),
+                permissions::AUDIT_VIEW.to_string(),
+            ],
+            user_id: Some(Uuid::now_v7()),
+        });
+        auth.denied_sources = scope(denied);
+        auth
     }
 
     fn metrics_fixture() -> Value {
@@ -526,5 +583,23 @@ mod tests {
         filter_report_for_viewer(&mut report, &ScopeSet::unrestricted());
 
         assert_eq!(report.metrics, legacy);
+    }
+
+    #[test]
+    fn jwt_and_api_key_principals_use_the_same_report_artifact_scope() {
+        for auth in [
+            jwt_auth(&["insider_threat"]),
+            api_key_auth(&["insider_threat"]),
+        ] {
+            let artifact_scope = effective_artifact_scope(&auth);
+            assert!(!artifact_scope.is_unrestricted());
+            assert!(artifact_scope.allows(&["apache".to_string()], true));
+            assert!(!artifact_scope.allows(&["insider_threat".to_string()], true));
+            assert!(!artifact_scope.allows(&["apache".to_string()], false));
+        }
+
+        for auth in [jwt_auth(&[]), api_key_auth(&[])] {
+            assert!(effective_artifact_scope(&auth).is_unrestricted());
+        }
     }
 }

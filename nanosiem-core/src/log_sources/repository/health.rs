@@ -16,6 +16,16 @@ use crate::search::service::source_scope_sql_predicate;
 
 /// The detail page is a live-health surface. Its visible metrics are all 24h
 /// or shorter, so a longer raw-table scan only adds latency and read load.
+///
+/// NAN-2166: detail health reads the most recent 24h of the
+/// `logs_per_source_5m` rollup instead of scanning 90d of raw `logs`. The
+/// rollup's 7-day TTL covers every 24h/1h/7d caller; longer-window callers
+/// (e.g. `get_health_clickhouse` total_events at 90d) still read raw `logs`.
+///
+/// This note lives here rather than in `clickhouse/116_logs_per_source_5m.sql`
+/// because that migration has been applied on deployed boxes and is therefore
+/// frozen — the migrator SHA-256s raw file bytes, so even a comment-only edit
+/// trips its drift guard and blocks boot (NAN-2171, and NAN-1898 before it).
 const DETAIL_HEALTH_WINDOW_HOURS: i64 = 24;
 
 /// NAN-2059: render the caller's deny-set as an `AND`-able predicate over the

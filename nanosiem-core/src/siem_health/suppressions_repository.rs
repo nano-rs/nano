@@ -11,6 +11,8 @@ use sqlx::{PgPool, Row};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::auth::ArtifactScope;
+
 #[derive(Error, Debug)]
 pub enum SuppressionRepositoryError {
     #[error("Database error: {0}")]
@@ -88,9 +90,7 @@ impl SuppressionRepository {
 
     /// All currently-active suppressions, oldest first so the prompt's
     /// "previously suppressed" list reads chronologically.
-    pub async fn list_active(
-        &self,
-    ) -> Result<Vec<FindingSuppression>, SuppressionRepositoryError> {
+    pub async fn list_active(&self) -> Result<Vec<FindingSuppression>, SuppressionRepositoryError> {
         let rows = sqlx::query(
             r#"
             SELECT id, finding_signature, title, reason, created_by, created_at,
@@ -106,11 +106,25 @@ impl SuppressionRepository {
         Ok(rows.iter().map(Self::row_to_suppression).collect())
     }
 
+    /// Active suppressions visible to a persistent-artifact reader.
+    ///
+    /// Suppression rows predate durable source provenance and contain both
+    /// source-derived finding titles and operator rationale. Until their whole
+    /// payload can carry complete attribution, every restricted reader gets an
+    /// empty collection rather than prose redaction or an existence oracle.
+    pub async fn list_active_for_scope(
+        &self,
+        scope: &ArtifactScope,
+    ) -> Result<Vec<FindingSuppression>, SuppressionRepositoryError> {
+        if !scope.is_unrestricted() {
+            return Ok(Vec::new());
+        }
+        self.list_active().await
+    }
+
     /// All suppressions including deactivated ones, newest first. For the
     /// admin "show suppressed" view.
-    pub async fn list_all(
-        &self,
-    ) -> Result<Vec<FindingSuppression>, SuppressionRepositoryError> {
+    pub async fn list_all(&self) -> Result<Vec<FindingSuppression>, SuppressionRepositoryError> {
         let rows = sqlx::query(
             r#"
             SELECT id, finding_signature, title, reason, created_by, created_at,
@@ -123,6 +137,20 @@ impl SuppressionRepository {
         .await?;
 
         Ok(rows.iter().map(Self::row_to_suppression).collect())
+    }
+
+    /// All suppression rows visible to a persistent-artifact reader.
+    ///
+    /// There is no row-level source manifest to evaluate, so the same
+    /// conservative policy as [`Self::list_active_for_scope`] applies.
+    pub async fn list_all_for_scope(
+        &self,
+        scope: &ArtifactScope,
+    ) -> Result<Vec<FindingSuppression>, SuppressionRepositoryError> {
+        if !scope.is_unrestricted() {
+            return Ok(Vec::new());
+        }
+        self.list_all().await
     }
 
     /// Deactivate a suppression so the next report run will surface findings
