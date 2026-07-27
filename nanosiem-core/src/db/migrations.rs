@@ -539,9 +539,101 @@ mod tests {
         );
     }
 
+    /// Drop `--` line comments and `/* … */` block comments so the table
+    /// extractors below only ever see executable SQL.
+    ///
+    /// NAN-2184: without this, English prose in a migration's header comment
+    /// trips the keyword regexes. `270_credentials_use_permission.sql` says
+    /// "…that already references one, only when it holds credentials:use",
+    /// and `\bREFERENCES\s+(\w+)` happily captured `one` as a table name,
+    /// failing the drift guard for a migration that touches nothing but
+    /// `permissions`, `role_permissions` and `roles`.
+    ///
+    /// Single-quoted string literals are stepped over so a `--` or `/*` inside
+    /// a literal is not mistaken for a comment opener. Doubled `''` escapes are
+    /// handled by simply re-entering the literal on the next quote.
+    fn strip_sql_comments(sql: &str) -> String {
+        strip_noise(sql, false)
+    }
+
+    /// [`strip_sql_comments`] plus emptied string literals — the form the
+    /// table-name extractors should see.
+    ///
+    /// NAN-2184: comment stripping alone is not enough, because migrations also
+    /// carry English prose inside `COMMENT ON TABLE … IS '…'`. 271 says
+    /// "…credential references live exclusively in source_configurations", so
+    /// `\bREFERENCES\s+(\w+)` captured `live`. No pattern in `created_tables`
+    /// or `referenced_tables` legitimately matches inside a literal, so the
+    /// safest input is one with literal bodies removed.
+    ///
+    /// `guarded_tables` is the exception — its patterns read table names OUT of
+    /// literals (`relname = 'foo'`) — so it uses [`strip_sql_comments`].
+    ///
+    /// TRADEOFF: DDL hidden in a literal — `EXECUTE 'CREATE TABLE …'`, dynamic
+    /// SQL via `format()` — becomes invisible to the guard. No post-baseline
+    /// core migration does that today (verified when this landed). A future
+    /// migration that needs dynamic DDL must either avoid it or teach this
+    /// function to unwrap the `EXECUTE` payload, or the drift check will
+    /// silently pass on a table the open snapshot lacks.
+    fn executable_sql(sql: &str) -> String {
+        strip_noise(sql, true)
+    }
+
+    /// Byte scanner. Safe on UTF-8 input: every delimiter it looks for (`'`,
+    /// `-`, `/`, `*`, `\n`) is ASCII, and UTF-8 continuation bytes are always
+    /// >= 0x80, so a multi-byte character can never be mistaken for one. Bytes
+    /// are copied through verbatim, so the output is still valid UTF-8.
+    fn strip_noise(sql: &str, blank_literals: bool) -> String {
+        let b = sql.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'\'' => {
+                    out.push(b'\'');
+                    i += 1;
+                    while i < b.len() {
+                        if !blank_literals {
+                            out.push(b[i]);
+                        }
+                        if b[i] == b'\'' {
+                            if blank_literals {
+                                out.push(b'\'');
+                            }
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                b'-' if b.get(i + 1) == Some(&b'-') => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                    // Keep the newline so `\b` boundaries either side survive.
+                    out.push(b'\n');
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                        i += 1;
+                    }
+                    i = (i + 2).min(b.len());
+                    out.push(b' ');
+                }
+                c => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8(out).expect("byte-exact copy of UTF-8 input stays UTF-8")
+    }
+
     /// Bare (schema-stripped, lowercased) table names that a chunk of SQL
     /// CREATEs. Used to model what tables exist on a fresh OPEN database.
     fn created_tables(sql: &str) -> std::collections::HashSet<String> {
+        let sql = &executable_sql(sql);
         let re = regex::Regex::new(
             r"(?i)\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:public\.)?([a-z_][a-z0-9_]*)",
         )
@@ -556,6 +648,7 @@ mod tests {
     /// and INSERT/UPDATE/DELETE targets. Deliberately conservative — anything
     /// matched here must resolve to a table that exists on open.
     fn referenced_tables(sql: &str) -> std::collections::HashSet<String> {
+        let sql = &executable_sql(sql);
         let patterns = [
             r"(?i)\bREFERENCES\s+(?:public\.)?([a-z_][a-z0-9_]*)",
             r"(?i)\bALTER\s+TABLE\s+(?:ONLY\s+)?(?:IF\s+EXISTS\s+)?(?:public\.)?([a-z_][a-z0-9_]*)",
@@ -582,6 +675,7 @@ mod tests {
     /// reference to that table in it — fine for the all-or-nothing guard blocks
     /// these migrations actually use.)
     fn guarded_tables(sql: &str) -> std::collections::HashSet<String> {
+        let sql = &strip_sql_comments(sql);
         let patterns = [
             r"(?i)\brelname\s*=\s*'(?:public\.)?([a-z_][a-z0-9_]*)'",
             r"(?i)\btablename\s*=\s*'(?:public\.)?([a-z_][a-z0-9_]*)'",
@@ -617,6 +711,55 @@ mod tests {
     /// either in the snapshot or created by an earlier post-baseline core
     /// migration. It runs in the normal test suite (no DB needed), so it fails
     /// at PR time instead of on a customer's first boot.
+    /// NAN-2184: the drift guard used to read prose as SQL. Both real cases
+    /// that broke it are pinned here — a `--` comment (migration 270) and a
+    /// `COMMENT ON TABLE … IS '…'` literal (migration 271).
+    #[test]
+    fn table_extractors_ignore_comments_and_string_literals() {
+        // `--` comment: "references one, only when…" is English, not a FK.
+        let line_comment = "-- that already references one, only when it holds x\n\
+             INSERT INTO permissions (id) VALUES ('a') ON CONFLICT DO NOTHING;";
+        let refs = referenced_tables(line_comment);
+        assert!(!refs.contains("one"), "prose in a -- comment read as a table: {refs:?}");
+        assert!(refs.contains("permissions"), "real INSERT target lost: {refs:?}");
+
+        // String literal: "references live exclusively in …" is English too.
+        let in_literal = "COMMENT ON TABLE log_sources IS \
+             'Transport connections and credential references live exclusively here';\n\
+             ALTER TABLE log_sources DROP COLUMN foo;";
+        let refs = referenced_tables(in_literal);
+        assert!(!refs.contains("live"), "prose in a literal read as a table: {refs:?}");
+        assert!(refs.contains("log_sources"), "real ALTER target lost: {refs:?}");
+
+        // Block comments too.
+        let block = "/* REFERENCES nope */ CREATE TABLE real_one (id int);";
+        assert!(!referenced_tables(block).contains("nope"));
+        assert!(created_tables(block).contains("real_one"));
+    }
+
+    /// A `--` inside a string literal is data, not a comment opener; stripping
+    /// from it would swallow the rest of the statement and hide real tables.
+    #[test]
+    fn double_dash_inside_a_literal_does_not_start_a_comment() {
+        let sql = "INSERT INTO settings (v) VALUES ('a -- not a comment');\n\
+             ALTER TABLE alerts ADD COLUMN x int;";
+        let refs = referenced_tables(sql);
+        assert!(refs.contains("settings"), "{refs:?}");
+        assert!(refs.contains("alerts"), "statement after the literal was swallowed: {refs:?}");
+    }
+
+    /// `guarded_tables` must keep reading names OUT of literals — that is how
+    /// existence guards are expressed — so it only strips comments.
+    #[test]
+    fn guarded_tables_still_reads_names_from_literals() {
+        let sql = "-- relname = 'decoy'\n\
+             DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'cases') \
+             THEN NULL; END IF; END $$;";
+        let g = guarded_tables(sql);
+        assert!(g.contains("cases"), "guard name lost: {g:?}");
+        assert!(!g.contains("decoy"), "guard read from a comment: {g:?}");
+    }
+
     #[test]
     fn post_baseline_core_migrations_only_touch_open_tables() {
         let mut available = created_tables(OPEN_INIT_SNAPSHOT);

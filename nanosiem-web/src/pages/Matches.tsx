@@ -32,6 +32,7 @@ import { MatchesDetail } from '@/components/matches/MatchesDetail';
 import { LogicTab } from '@/components/matches/LogicTab';
 import { buildMatchView, buildActivity28, type MatchView } from '@/components/matches/helpers';
 import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
+import { nplQuotedBody } from '@/lib/npl-quote';
 
 type TabId = 'matches' | 'logic';
 
@@ -142,7 +143,7 @@ export function Matches() {
     if (!apiRule) return;
     const raw = (view.entity.raw || view.entity.label || '').trim();
     if (!raw) return;
-    const escaped = raw.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const escaped = nplQuotedBody(raw);
     // Use only the source-filter stage of the rule's pipeline (everything
     // before the first `|`). Appending `| search "..."` after a stats step
     // breaks at compile time because `search` lowers to `WHERE message LIKE …`,

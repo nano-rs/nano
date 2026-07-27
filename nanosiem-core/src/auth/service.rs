@@ -21,6 +21,7 @@ use super::repository::{
     UserRepository, UserRepositoryError,
 };
 use super::token::{TokenError, TokenService};
+use crate::settings::local_auth::LocalAuthSettings;
 use super::types::{
     config_defaults, AuthResponse, LandingPage, LoginResult, QueryMode, TimeRangePreset, TokenPair,
     User, UserInfo,
@@ -42,6 +43,17 @@ pub enum AuthError {
 
     #[error("Account is disabled")]
     AccountDisabled,
+
+    /// Local password sign-in is turned off for this tenant (NAN-2181).
+    ///
+    /// Distinct from `InvalidCredentials` on purpose. This is a statement about
+    /// tenant configuration, which `GET /api/auth/methods` already publishes
+    /// unauthenticated, and it reveals nothing about which accounts exist —
+    /// the check runs before any user lookup, so every request gets the same
+    /// answer. Collapsing it into a generic 401 would strand users watching a
+    /// correct password fail with no way to learn why.
+    #[error("Password sign-in is disabled. Use single sign-on.")]
+    LocalPasswordDisabled,
 
     #[error("Invalid or expired token")]
     InvalidToken,
@@ -165,6 +177,10 @@ pub struct AuthService {
     group_repo: GroupRepository,
     token_service: TokenService,
     config: AuthConfig,
+    /// Tenant toggle for local password sign-in (NAN-2181). Held here rather
+    /// than checked in the handler so every caller of `login()` passes the
+    /// same gate.
+    local_auth_settings: LocalAuthSettings,
 }
 
 impl AuthService {
@@ -175,6 +191,7 @@ impl AuthService {
         group_repo: GroupRepository,
         token_service: TokenService,
         config: AuthConfig,
+        local_auth_settings: LocalAuthSettings,
     ) -> Self {
         Self {
             user_repo,
@@ -182,6 +199,7 @@ impl AuthService {
             group_repo,
             token_service,
             config,
+            local_auth_settings,
         }
     }
 
@@ -199,6 +217,21 @@ impl AuthService {
         ip_address: Option<&str>,
         user_agent: Option<&str>,
     ) -> Result<LoginResult, AuthError> {
+        // NAN-2181: SSO-only tenants reject local password sign-in outright.
+        //
+        // Deliberately the first check, before the user lookup. A gate placed
+        // after the lookup would answer faster for unknown emails than for
+        // known ones, turning an SSO-only tenant into an account oracle. Here
+        // every request costs one settings read and returns the same error.
+        if !self
+            .local_auth_settings
+            .is_local_password_enabled()
+            .await
+            .map_err(|e| AuthError::DatabaseError(e.to_string()))?
+        {
+            return Err(AuthError::LocalPasswordDisabled);
+        }
+
         // Try to find the user by email
         let user = match self.user_repo.get_user_by_email(email).await {
             Ok(user) => user,

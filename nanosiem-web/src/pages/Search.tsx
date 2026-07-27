@@ -89,6 +89,7 @@ import { registerDynamicFields } from '@/components/editor';
 import { SearchDemoHint } from '@/components/DemoHints';
 import { SearchStatsBar } from '@/components/search/SearchStatsBar';
 import { AddToDashboardDialog } from '@/components/dashboard';
+import { nplQuotedBody } from '@/lib/npl-quote';
 
 interface SearchResult {
   id: string;
@@ -2454,14 +2455,14 @@ export function Search() {
     if (isEnrichedField) {
       // For enriched fields, append a | where clause at the end
       const op = exclude ? '!=' : '=';
-      const formattedValue = isNumeric ? value : `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+      const formattedValue = isNumeric ? value : `"${nplQuotedBody(value)}"`;
       const whereClause = `| where ${field} ${op} ${formattedValue}`;
       newQuery = query ? `${query} ${whereClause}` : `* ${whereClause}`;
     } else {
       // For regular fields, add to the search clause BEFORE pipe commands
       const op = exclude ? '!=' : '=';
-      // Escape backslashes and quotes for the query language
-      const escapedValue = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      // NAN-2184: double backslashes and strip `"` — nPL has no `\"` escape.
+      const escapedValue = nplQuotedBody(value);
       const newFilter = `${field}${op}"${escapedValue}"`;
 
       if (!query) {
@@ -2521,8 +2522,8 @@ export function Search() {
       .filter(([field, value]) => value !== null && value !== undefined && !excludeFromDrilldown.has(field))
       .map(([field, value]) => {
         const strValue = typeof value === 'string' ? value : String(value);
-        // Escape backslashes and quotes for the query language
-        const escapedValue = strValue.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+        // NAN-2184: double backslashes and strip `"` — nPL has no `\"` escape.
+        const escapedValue = nplQuotedBody(strValue);
         return `${field}="${escapedValue}"`;
       });
 
@@ -4306,7 +4307,7 @@ export function Search() {
             // which restored the pre-drill query and clobbered the filter.
             // Escape like the field=value drilldown builder — a log-derived
             // artifact with `"`/`\` must not break out of the quoted comparison.
-            const esc = artifact.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+            const esc = nplQuotedBody(artifact);
             const artifactQuery =
               artifactType === 'hash'
                 ? // Search both file_hash and process_hash since different source types use different fields

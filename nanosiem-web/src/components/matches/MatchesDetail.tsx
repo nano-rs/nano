@@ -16,6 +16,7 @@ import { useIdentityUserLookup, useRulePredicates } from '@/hooks/use-api';
 import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
 import { api } from '@/lib/api';
 import type { MatchEntity } from './helpers';
+import { nplQuotedBody } from '@/lib/npl-quote';
 
 // Build a nano-ql query that filters on a specific entity. We pick a UDM
 // field by entity type so we hit the indexed columns (case-insensitive
@@ -24,8 +25,8 @@ import type { MatchEntity } from './helpers';
 function entitySearchQuery(entity: MatchEntity, schema: string | undefined): string | null {
   const raw = (entity.raw || entity.label || '').trim();
   if (!raw) return null;
-  // Escape backslashes first, then double quotes — order matters.
-  const escaped = raw.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  // NAN-2184: double backslashes and strip `"` — nPL has no `\"` escape.
+  const escaped = nplQuotedBody(raw);
   // NAN-1656: emit ONLY the ACTIVE schema profile's real columns. Previously we
   // OR'd the UDM names with their OCSF-dotted equivalents to work under either
   // profile (NAN-1287), but on the inactive profile those extra clauses resolve

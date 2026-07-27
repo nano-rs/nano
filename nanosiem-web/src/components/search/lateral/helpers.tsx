@@ -2,6 +2,7 @@
 
 import type { ReactNode } from 'react';
 import type { LateralBand, LateralMethodGroup, LateralNodeType } from './types';
+import { nplQuotedBody } from '@/lib/npl-quote';
 
 // Band colors lifted verbatim from `design-ref/shadcn/lateral-graph.jsx`.
 export const LATERAL_BAND_COLOR: Record<LateralBand, string> = {
@@ -127,7 +128,7 @@ export const LATERAL_METHODS: {
 // Quote a value for nPL `field="value"` syntax, escaping as needed.
 export function quoteValue(value: string): string {
   if (/^[A-Za-z0-9_.-]+$/.test(value)) return value;
-  const escaped = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const escaped = nplQuotedBody(value);
   return `"${escaped}"`;
 }
 
@@ -146,7 +147,7 @@ export function rewriteLateralSeed(
   field: 'src_host' | 'user' | 'src_ip',
   value: string
 ): string {
-  const escaped = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const escaped = nplQuotedBody(value);
   const filter = /^[A-Za-z0-9_.-]+$/.test(value) ? `${field}=${value}` : `${field}="${escaped}"`;
   // Prior base filters were often entity-filters that conflict with the new
   // seed, so we drop the whole prior search and let the new seed become the

@@ -3252,6 +3252,18 @@ export interface OidcProviderListResponse {
   total: number;
 }
 
+/**
+ * NAN-2181: which authentication methods the tenant accepts.
+ *
+ * `enabledProviderCount` comes back with the setting so the UI can explain why
+ * the toggle is unavailable, and warn before an administrator removes the
+ * provider their tenant is standing on, without a second round trip.
+ */
+export interface AuthMethodsSettings {
+  localPasswordEnabled: boolean;
+  enabledProviderCount: number;
+}
+
 export interface CreateOidcProviderRequest {
   name: string;
   slug: string;

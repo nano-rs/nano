@@ -174,13 +174,30 @@ fn source_config_list_response_carries_no_plaintext_secret() {
 // NAN-2068 — log_sources:view
 // ---------------------------------------------------------------------------
 
-fn log_source_fixture() -> LogSource {
-    let mut ls: LogSource = serde_json::from_value(json!({
+/// NAN-2184: the two tests that used to live here asserted that
+/// `LogSource::redacted()` masked `LogSource.source_config`. Migration 271
+/// (`271_remove_legacy_log_source_transports`) deleted that surface outright —
+/// `LogSource` no longer carries connection config or credentials, and
+/// `redacted()` exists only on `SourceConfiguration` now. The old tests stopped
+/// compiling, and the whole integration target was silently red on main.
+///
+/// Deleting them would quietly drop the NAN-2067/2068 coverage for this type,
+/// so they are replaced by the invariant that made them unnecessary: a
+/// serialized `LogSource` carries no credential-bearing subtree at all. If
+/// anyone re-attaches connection config to this model, this fails and whoever
+/// does it has to bring redaction back with it.
+#[test]
+fn log_source_model_carries_no_credential_surface_at_all() {
+    let ls: LogSource = serde_json::from_value(json!({
         "id": Uuid::new_v4(),
         "name": "s3-cloudtrail",
         "description": null,
         "source_type": "aws_s3",
+        // Deliberately fed in: these keys no longer exist on the model, so
+        // serde drops them. If a field with one of these names is ever added
+        // back, it starts round-tripping and the assertions below catch it.
         "source_config": kitchen_sink_source_config(),
+        "connection_config": kitchen_sink_connection_config(),
         "parser_vrl": ".foo = 1",
         "output_fields": null,
         "category": null,
@@ -206,47 +223,35 @@ fn log_source_fixture() -> LogSource {
         "updated_at": "2026-07-24T00:00:00Z",
     }))
     .expect("LogSource fixture must match the model — update this fixture if fields changed");
-    // Guard against a silently-defaulted fixture: if `source_config` stopped
-    // deserializing, every assertion below would pass vacuously.
-    assert!(
-        ls.source_config.get("_credentials").is_some(),
-        "fixture did not carry _credentials — the test would be vacuous"
+
+    // DORMANT TRIPWIRES, deliberately. As long as the model has no field that
+    // captures the JSON fed above, serde drops it and these two can only pass —
+    // unlike the pre-271 versions, they are not load-bearing today. They arm
+    // themselves the moment such a field exists, which is precisely the
+    // regression worth catching. The live assertion is the key check below.
+    assert_no_secret_in_serialized(&ls, "GET /api/log-sources/{id}");
+    assert_no_secret_in_serialized(
+        &LogSourceWithDraftStatus {
+            log_source: ls.clone(),
+            has_draft_changes: true,
+            active_version_number: Some(3),
+            active_parser_vrl: Some(".foo = 1".to_string()),
+        },
+        "GET /api/log-sources/{id}/draft-status",
     );
-    ls.source_config = kitchen_sink_source_config();
-    ls
-}
 
-#[test]
-fn log_source_response_carries_no_plaintext_credentials() {
-    let redacted = log_source_fixture().redacted();
-    assert_no_secret_in_serialized(&redacted, "GET /api/log-sources/{id}");
-
-    let creds = &redacted.source_config["_credentials"];
-    // The whole `_credentials` subtree is credential material, so even
-    // `access_key_id` — readable at top level — is masked inside it.
-    assert_eq!(creds["sasl_password"], REDACTED_PLACEHOLDER);
-    assert_eq!(creds["credentials_json"], REDACTED_PLACEHOLDER);
-    assert_eq!(creds["access_key_id"], REDACTED_PLACEHOLDER);
-    assert_eq!(redacted.source_config["tls"]["key_content"], REDACTED_PLACEHOLDER);
-
-    // Non-secret ingest configuration survives.
-    assert_eq!(redacted.source_config["region"], "us-west-2");
-    assert_eq!(redacted.source_config["bucket"], "acme-logs");
-}
-
-#[test]
-fn log_source_draft_status_flatten_wrapper_does_not_reopen_the_leak() {
-    // `GET /{id}/draft-status` flattens LogSource — the finding's third path.
-    let wrapped = LogSourceWithDraftStatus {
-        log_source: log_source_fixture(),
-        has_draft_changes: true,
-        active_version_number: Some(3),
-        active_parser_vrl: Some(".foo = 1".to_string()),
+    // Name-level guard: no config/credential subtree may reappear on this model
+    // without someone also re-adding redaction.
+    let v = serde_json::to_value(&ls).expect("serialize");
+    let obj = v.as_object().expect("LogSource serializes to an object");
+    for banned in ["source_config", "connection_config", "_credentials"] {
+        assert!(
+            !obj.contains_key(banned),
+            "`{banned}` is back on LogSource — credentials moved to \
+             source_configurations in migration 271. Re-add redaction \
+             (see SourceConfiguration::redacted) before restoring this field."
+        );
     }
-    .redacted();
-
-    assert_no_secret_in_serialized(&wrapped, "GET /api/log-sources/{id}/draft-status");
-    assert!(is_fully_redacted(&wrapped.log_source.source_config));
 }
 
 // ---------------------------------------------------------------------------

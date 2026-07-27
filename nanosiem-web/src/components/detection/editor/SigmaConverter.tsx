@@ -182,8 +182,15 @@ function mapField(field: string, unmappedFields?: Set<string>): string {
   return converted;
 }
 
+/**
+ * Escape a value for a YAML double-quoted scalar.
+ *
+ * Unlike nPL (see `@/lib/npl-quote`), YAML double-quoted scalars DO treat
+ * backslash as an escape character, so `\\` and `\"` are both correct here.
+ * Order matters: backslashes first, or the backslash introduced by `\"` gets
+ * doubled into a literal backslash followed by a bare quote.
+ */
 function escapeValue(value: string): string {
-  // Escape double quotes and backslashes
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
@@ -422,7 +429,7 @@ function convertSigmaRule(sigmaYaml: string, currentUser?: string): ConversionRe
 
   // Description (quoted)
   if (rule.description) {
-    frontmatter.description = `"${rule.description.replace(/"/g, '\\"')}"`;
+    frontmatter.description = `"${escapeValue(rule.description)}"`;
   }
 
   // Author - use current user, store original for comment

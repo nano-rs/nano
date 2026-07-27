@@ -21,9 +21,25 @@
 /// faithfully. `enforce_source_scope`'s fail-closed structural re-check is the
 /// backstop for anything this leaves.
 ///
+/// Backslashes are doubled (NAN-2184). The parser collapses `\\` → `\` after
+/// taking the literal, so a value carrying CONSECUTIVE backslashes otherwise
+/// loses one on the way back in: `\\fileserver\share` re-parsed as
+/// `\fileserver\share`, and a `rex` pattern matching a literal backslash
+/// (`\\.`) re-parsed as `\.`. A lone backslash is unaffected either way —
+/// which is why Windows paths looked fine and this went unnoticed. Doubling
+/// must happen BEFORE the `"` filter so the two passes cannot interact.
+///
 /// Callers MUST wrap the result in double quotes.
 pub(crate) fn npl_quoted_body(s: &str) -> String {
-    s.chars().filter(|c| !matches!(c, '"' | '\n' | '\r')).collect()
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' | '\n' | '\r' => {}
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Canonical `dataset=` selector string for a cross-dataset subsearch (NAN-1562).

@@ -32,6 +32,7 @@ use nanosiem_enterprise::melod::{
     WizardSessionRepository,
 };
 use nanosiem_core::onboarding::OnboardingRepository;
+use nanosiem_core::settings::local_auth::LocalAuthSettings;
 use nanosiem_core::tuning::{NotificationService, TuningRepository};
 use nanosiem_core::{
     DetectionService, DiskPressureService, DistributedDetectionScheduler, FeedService,
@@ -172,6 +173,10 @@ pub struct AppState {
     // Authentication and RBAC services
     /// Authentication service
     pub auth_service: Arc<AuthService>,
+    /// Tenant toggle for local password sign-in (NAN-2181). Read by the public
+    /// `/api/auth/methods` endpoint and by the admin settings handlers; the
+    /// enforcement copy lives inside `AuthService`.
+    pub local_auth_settings: LocalAuthSettings,
     /// Token service for JWT operations
     pub token_service: Arc<TokenService>,
     /// API key service
@@ -372,6 +377,7 @@ impl AppState {
             group_repo.clone(),
             token_service_for_auth,
             auth_config,
+            LocalAuthSettings::new(pool.clone()),
         ));
 
         // Create API key service
@@ -631,6 +637,10 @@ impl nanosiem_enterprise::handlers::oidc::OidcAppState for AppState {
 
     fn oidc_service(&self) -> Arc<OidcService> {
         self.oidc_service.clone()
+    }
+
+    fn local_auth_settings(&self) -> &LocalAuthSettings {
+        &self.local_auth_settings
     }
 }
 

@@ -118,6 +118,12 @@ impl AppState {
             auth_enabled,
         ) = Self::init_auth_services(pg_pool.clone(), &config);
 
+        // NAN-2181: read handle for the local-password toggle. AuthService holds
+        // its own copy for enforcement; this one serves the public
+        // /api/auth/methods probe and the admin settings handlers.
+        let local_auth_settings =
+            nanosiem_core::settings::local_auth::LocalAuthSettings::new(pg_pool.clone());
+
         // Create OIDC repository and service
         let oidc_repo = OidcRepository::new(pg_pool.clone());
         let oidc_service = Arc::new(OidcService::new(
@@ -403,6 +409,7 @@ impl AppState {
 
             // Auth services
             auth_service,
+            local_auth_settings,
             token_service,
             api_key_service,
             session_service,

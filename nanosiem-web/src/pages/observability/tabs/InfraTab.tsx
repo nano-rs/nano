@@ -37,6 +37,7 @@ import {
 } from '@/components/observability/infra-waffle';
 import type { InfraHost, HostStatus } from '@/lib/api/observability';
 import type { ObservabilityTabProps } from '../types';
+import { nplQuotedBody } from '@/lib/npl-quote';
 
 // One page of hosts pulled per fetch; "Load more" appends the next page.
 const PAGE_SIZE = 100;
@@ -70,7 +71,7 @@ function HostDetail({ host, metric }: { host: InfraHost | null; metric: InfraMet
   // (mirrors ServiceSecuritySignals). The old `host.name="…"` resolved to
   // `ext.host.name` on the logs table, which UDM/OCSF parsers never populate —
   // so "Explore in search" always came back empty.
-  const hq = host.host.replace(/"/g, '\\"');
+  const hq = nplQuotedBody(host.host);
   const hostSearchQuery = `src_host="${hq}" OR dest_host="${hq}" OR hostname="${hq}" OR device.hostname="${hq}"`;
   const fmtCell = (v: number | null, fmt: (n: number) => string) => (v == null ? '–' : fmt(v));
   const stats: Array<{ k: string; v: string; hot: boolean }> = [

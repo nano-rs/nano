@@ -15,8 +15,11 @@
  *   - Email + password submit → `login(email, password)` from AuthContext
  *   - 6-digit TOTP / backup code → `verifyMfa(code)` from AuthContext
  *   - MFA setup-required redirect to `/mfa-setup`
- *   - SSO providers fetched from `/api/auth/oidc/providers` and offered as
- *     clickable affordances in the right inspector.
+ *   - SSO providers fetched from `/api/auth/oidc/providers` and offered in the
+ *     primary column directly under the prompt, plus an `sso` prompt command.
+ *     They deliberately do NOT live in the inspector: that panel is
+ *     `hidden lg:flex`, so SSO was unreachable below the lg breakpoint
+ *     (NAN-2179). Presentation state lives in `login-auth-methods.ts`.
  *
  * What's intentionally NOT exposed:
  *   - Last-login user / IP / "from" location lines from the mockup. Pre-auth
@@ -36,6 +39,17 @@ import { Logo } from '@/components/ui/logo';
 import { useAuth, OidcProvider } from '@/contexts/AuthContext';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { cn } from '@/lib/utils';
+import {
+  SSO_PANEL_CLASS,
+  authMethodsLine,
+  parseSsoCommand,
+  resolveLoginMode,
+  resolveSsoSurface,
+  resolveSsoTarget,
+  showPasswordPrompt,
+  showSsoPanel,
+  type SsoSurface,
+} from './login-auth-methods';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? '';
 
@@ -91,13 +105,19 @@ function CmdEcho({ prompt, cmd }: CmdPayload) {
   );
 }
 
-function HelpCard() {
+function HelpCard({ ssoAvailable }: { ssoAvailable: boolean }) {
   const rows: [string, string][] = [
     ['help · ?', 'show this table'],
     ['back', 'step back one prompt'],
     ['clear', 'clear scrollback'],
     ['^C', 'abort current prompt'],
   ];
+  // Only advertised when the tenant actually has providers — listing a command
+  // that always answers "none configured" is noise on a password-only tenant.
+  if (ssoAvailable) {
+    rows.splice(1, 0, ['sso', 'list single sign-on providers']);
+    rows.splice(2, 0, ['sso <name>', 'continue with that provider']);
+  }
   return (
     <div
       className="my-1.5 ml-[9ch] rounded-md border border-border px-3 py-2.5 max-w-[78ch]"
@@ -397,23 +417,7 @@ function InspectorSection({
   );
 }
 
-function Inspector({
-  step,
-  oidcProviders,
-  loadingProviders,
-  ssoLoading,
-  onSsoClick,
-  stats,
-  ssoEnabled,
-}: {
-  step: Step;
-  oidcProviders: OidcProvider[];
-  loadingProviders: boolean;
-  ssoLoading: string | null;
-  onSsoClick: (slug: string) => void;
-  stats: FakeStats;
-  ssoEnabled: boolean;
-}) {
+function Inspector({ stats, ssoEnabled }: { stats: FakeStats; ssoEnabled: boolean }) {
   const Section = InspectorSection;
 
   return (
@@ -469,45 +473,11 @@ function Inspector({
         </div>
       </Section>
 
-      {ssoEnabled && (
-      <Section title="single sign-on">
-        {loadingProviders ? (
-          <div className="rounded-md border border-border px-3 py-3 flex items-center gap-2 text-[11px] font-mono text-muted-foreground">
-            <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            checking providers…
-          </div>
-        ) : oidcProviders.length === 0 ? (
-          <div className="rounded-md border border-border px-3 py-3 text-[11px] font-mono text-muted-foreground">
-            no SSO providers configured · use email + password
-          </div>
-        ) : (
-          <div className="space-y-1.5">
-            {oidcProviders.map((p) => {
-              const Icon = getSsoIcon(p);
-              const busy = ssoLoading === p.slug;
-              return (
-                <button
-                  key={p.id}
-                  type="button"
-                  onClick={() => onSsoClick(p.slug)}
-                  disabled={ssoLoading !== null || step === 'done'}
-                  className="w-full h-9 rounded-md border border-border bg-card hover:border-[var(--border-2)] hover:bg-[var(--card-2)] flex items-center gap-2 px-2.5 text-[11.5px] text-foreground/85 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                >
-                  <Icon className="w-4 h-4 text-muted-foreground" />
-                  <span className="truncate">Continue with {p.name}</span>
-                  <span className="flex-1" />
-                  {busy ? (
-                    <Loader2 className="w-3 h-3 animate-spin text-muted-foreground" />
-                  ) : (
-                    <ArrowUpRight className="w-3 h-3 text-muted-foreground/60" />
-                  )}
-                </button>
-              );
-            })}
-          </div>
-        )}
-      </Section>
-      )}
+      {/*
+        No SSO section here. Provider actions live in the primary column beside
+        the prompt (NAN-2179) — this panel is `hidden lg:flex`, so anything that
+        only appears here is unreachable below the lg breakpoint.
+      */}
 
       <Section title="keyboard">
         <div className="space-y-1 font-mono text-[10.5px]">
@@ -531,6 +501,7 @@ function Inspector({
         <div className="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 font-mono text-[10.5px]">
           {[
             ['help', 'show help'],
+            ...(ssoEnabled ? [['sso', 'list providers']] : []),
             ['back', 'prev prompt'],
             ['clear', 'clear log'],
           ].map(([k, v]) => (
@@ -601,7 +572,17 @@ export function Login() {
   const [busy, setBusy] = useState(false);
   const [oidcProviders, setOidcProviders] = useState<OidcProvider[]>([]);
   const [loadingProviders, setLoadingProviders] = useState(true);
+  // Distinguishes "endpoint unreachable" from "no providers configured". These
+  // used to collapse into the same empty array, so a broken SSO backend was
+  // presented as a tenant that had simply never enabled SSO.
+  const [providersFailed, setProvidersFailed] = useState(false);
+  const [providersReload, setProvidersReload] = useState(0);
   const [ssoLoading, setSsoLoading] = useState<string | null>(null);
+  // NAN-2181: null until `/api/auth/methods` answers. Deliberately not
+  // defaulted to true — an optimistic default renders a password prompt on
+  // every load of an SSO-only tenant, which is the exact thing the setting
+  // exists to remove.
+  const [localPasswordEnabled, setLocalPasswordEnabled] = useState<boolean | null>(null);
   // Per-session counter for password attempts. Resets when the user goes
   // back to the email step or successfully authenticates. Drives the
   // attempts chip under the password prompt + the escalating hint copy
@@ -616,6 +597,22 @@ export function Login() {
   const terminalShownRef = useRef(false);
 
   const sessionExpired = (location.state as { sessionExpired?: boolean })?.sessionExpired;
+
+  // Single source of truth for every SSO presentation decision on this page.
+  const ssoSurface: SsoSurface = resolveSsoSurface({
+    ssoEnabled,
+    loading: loadingProviders,
+    failed: providersFailed,
+    providers: oidcProviders,
+  });
+  const ssoProviders = ssoSurface.kind === 'providers' ? ssoSurface.providers : [];
+
+  // NAN-2181: whether this tenant offers the password wizard at all.
+  const loginMode = resolveLoginMode({
+    localPassword: localPasswordEnabled,
+    sso: ssoSurface,
+  });
+  const passwordPromptVisible = showPasswordPrompt(loginMode);
 
   const prompt =
     step === 'email'
@@ -641,11 +638,23 @@ export function Login() {
       return;
     }
     let cancelled = false;
+    setLoadingProviders(true);
+    setProvidersFailed(false);
     fetch(`${API_BASE_URL}/api/auth/oidc/providers`)
-      .then(async (res) => (res.ok ? ((await res.json()) as OidcProvider[]) : []))
-      .catch(() => [] as OidcProvider[])
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`providers request failed: ${res.status}`);
+        return (await res.json()) as OidcProvider[];
+      })
       .then((providers) => {
         if (!cancelled) setOidcProviders(providers);
+      })
+      .catch(() => {
+        // Never blocks sign-in: local credentials remain available, and the
+        // panel says so rather than silently pretending SSO isn't configured.
+        if (!cancelled) {
+          setOidcProviders([]);
+          setProvidersFailed(true);
+        }
       })
       .finally(() => {
         if (!cancelled) setLoadingProviders(false);
@@ -653,7 +662,29 @@ export function Login() {
     return () => {
       cancelled = true;
     };
-  }, [ssoEnabled]);
+  }, [ssoEnabled, providersReload]);
+
+  // NAN-2181: which methods this deployment accepts. Public endpoint — the page
+  // has to know before anyone authenticates. A failure falls back to enabled,
+  // because the alternative is a login page offering nothing at all; the server
+  // still rejects the credentials if the tenant really is SSO-only.
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${API_BASE_URL}/api/auth/methods`)
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`auth methods request failed: ${res.status}`);
+        return (await res.json()) as { localPassword: boolean };
+      })
+      .then((methods) => {
+        if (!cancelled) setLocalPasswordEnabled(methods.localPassword);
+      })
+      .catch(() => {
+        if (!cancelled) setLocalPasswordEnabled(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [providersReload]);
 
   // When the AuthContext flips MFA-pending, jump our wizard to the mfa step.
   useEffect(() => {
@@ -721,7 +752,10 @@ export function Login() {
     }
     setEmail(val);
     setAttempts(0); // Fresh identity → fresh attempt budget.
-    pushLines(makeLine('sys', '→ provider resolved: local-password'));
+    // States the tenant's configured methods. The previous line claimed
+    // `provider resolved: local-password`, which read as per-account provider
+    // discovery even though no lookup happens here (NAN-2179).
+    pushLines(makeLine('sys', authMethodsLine(ssoSurface)));
     setStep('password');
   };
 
@@ -757,7 +791,9 @@ export function Login() {
         followups.push(
           makeLine(
             'hint',
-            'check caps lock and confirm the email is correct · or use SSO from the inspector →',
+            ssoProviders.length > 0
+              ? 'check caps lock and confirm the email is correct · or continue with single sign-on below'
+              : 'check caps lock and confirm the email is correct',
           ),
         );
       } else if (next >= 3) {
@@ -798,6 +834,17 @@ export function Login() {
     }
   };
 
+  const handleSsoClick = async (slug: string) => {
+    setSsoLoading(slug);
+    clearError();
+    pushLines(makeLine('sys', `→ launching SSO handoff · ${slug}`));
+    try {
+      await loginWithOidc(slug, location.pathname);
+    } catch {
+      setSsoLoading(null);
+    }
+  };
+
   // Global commands available at every prompt.
   const handleGlobalCommand = (lower: string, raw: string): boolean => {
     if (lower === 'help' || lower === '?') {
@@ -806,6 +853,55 @@ export function Login() {
     }
     if (lower === 'clear' || lower === 'cls') {
       setHistory([]);
+      return true;
+    }
+    // `sso` / `sso <slug|index>` — keeps the SSO route reachable without
+    // leaving the prompt, for keyboard-only use.
+    const ssoCommand = parseSsoCommand(raw);
+    if (ssoCommand) {
+      pushLines(makeLine('cmd', { prompt, cmd: raw }));
+      // Gated on the same steps as the panel. Without this the command could
+      // hand off to an IdP mid-MFA and abandon a live challenge — exactly what
+      // withholding the panel at that step is meant to prevent.
+      if (!showSsoPanel(step)) {
+        pushLines(
+          makeLine('warn', 'single sign-on is unavailable at this prompt · press ^C to start over'),
+        );
+        return true;
+      }
+      if (ssoSurface.kind === 'loading') {
+        pushLines(makeLine('sys', '→ still checking configured providers · try again shortly'));
+        return true;
+      }
+      if (ssoProviders.length === 0) {
+        pushLines(
+          makeLine(
+            'warn',
+            ssoSurface.kind === 'error'
+              ? 'sso providers could not be loaded · continue with email + password'
+              : 'no sso providers configured · continue with email + password',
+          ),
+        );
+        return true;
+      }
+      if (ssoCommand.kind === 'list') {
+        pushLines(
+          makeLine('sys', '→ configured providers · run `sso <name>` to continue'),
+          ...ssoProviders.map((p, i) =>
+            makeLine('sys', `  [${i + 1}] ${p.slug} · ${p.name}`),
+          ),
+        );
+        return true;
+      }
+      const target = resolveSsoTarget(ssoCommand.target, ssoProviders);
+      if (!target) {
+        pushLines(
+          makeLine('err', `× unknown provider: ${ssoCommand.target}`),
+          makeLine('hint', 'run `sso` to list configured providers'),
+        );
+        return true;
+      }
+      void handleSsoClick(target.slug);
       return true;
     }
     if (lower === 'back') {
@@ -875,23 +971,12 @@ export function Login() {
     }
   };
 
-  const handleSsoClick = async (slug: string) => {
-    setSsoLoading(slug);
-    clearError();
-    pushLines(makeLine('sys', `→ launching SSO handoff · ${slug}`));
-    try {
-      await loginWithOidc(slug, location.pathname);
-    } catch {
-      setSsoLoading(null);
-    }
-  };
-
   const renderLine = (line: Line) => {
     if (line.kind === 'cmd' && line.text && typeof line.text === 'object') {
       return <CmdEcho key={line.id} {...(line.text as CmdPayload)} />;
     }
     if (line.kind === 'help') {
-      return <HelpCard key={line.id} />;
+      return <HelpCard key={line.id} ssoAvailable={ssoProviders.length > 0} />;
     }
     return (
       <TermGroup key={line.id}>
@@ -983,7 +1068,7 @@ export function Login() {
                 {bootLines.current.map((l) => renderLine(l))}
                 {history.map((l) => renderLine(l))}
 
-                {step !== 'done' && (
+                {step !== 'done' && passwordPromptVisible && (
                   <div className="pt-1">
                     {/*
                       Anchored prompt — design_handoff_login_terminal/README.md
@@ -1084,11 +1169,6 @@ export function Login() {
                       <TermGroup>
                         <div className="text-muted-foreground/60 text-[10.5px] mt-0.5">
                           your work email · type <span className="text-muted-foreground">help</span> for commands
-                          {ssoEnabled && oidcProviders.length > 0 && (
-                            <>
-                              {' '}· or use SSO from the inspector
-                            </>
-                          )}
                         </div>
                       </TermGroup>
                     )}
@@ -1118,6 +1198,210 @@ export function Login() {
                         </div>
                       </TermGroup>
                     )}
+
+                    {/*
+                      Single sign-on, in the primary column directly under the
+                      prompt. Previously this lived only in the `hidden lg:flex`
+                      inspector, which made SSO both visually secondary and
+                      entirely unreachable below the lg breakpoint (NAN-2179).
+                    */}
+                    {showSsoPanel(step) && ssoSurface.kind !== 'hidden' && (
+                      <div className={SSO_PANEL_CLASS}>
+                        <div className="flex items-center gap-2 mb-1.5">
+                          <span className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-muted-foreground/70 shrink-0">
+                            or single sign-on
+                          </span>
+                          <span className="flex-1 h-px bg-border" />
+                        </div>
+
+                        {ssoSurface.kind === 'loading' && (
+                          <div className="flex items-center gap-2 h-9 px-2.5 rounded-md border border-border bg-card font-mono text-[11px] text-muted-foreground">
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            checking configured providers…
+                          </div>
+                        )}
+
+                        {ssoSurface.kind === 'error' && (
+                          <div
+                            className="flex items-center gap-2 h-9 px-2.5 rounded-md border font-mono text-[11px]"
+                            style={{
+                              borderColor: 'color-mix(in srgb, var(--warning) 40%, var(--border))',
+                              background: 'color-mix(in srgb, var(--warning) 8%, transparent)',
+                            }}
+                          >
+                            <span className="text-[var(--warning)] truncate">
+                              sso unavailable · email + password still works
+                            </span>
+                            <span className="flex-1" />
+                            <button
+                              type="button"
+                              onClick={() => setProvidersReload((n) => n + 1)}
+                              className="inline-flex items-center gap-1 h-[20px] px-1.5 rounded-sm border border-border text-muted-foreground hover:text-foreground hover:border-[var(--border-2)] text-[10px] shrink-0 transition-colors"
+                            >
+                              <RefreshCw className="w-3 h-3" />
+                              retry
+                            </button>
+                          </div>
+                        )}
+
+                        {ssoSurface.kind === 'providers' && (
+                          <>
+                            <div
+                              role="group"
+                              aria-label="Single sign-on providers"
+                              className="space-y-1.5"
+                            >
+                              {ssoSurface.providers.map((p, i) => {
+                                const Icon = getSsoIcon(p);
+                                const launching = ssoLoading === p.slug;
+                                return (
+                                  <button
+                                    // Keyed by slug, not id: the public
+                                    // providers endpoint returns only
+                                    // {slug, name}, so every `p.id` was
+                                    // undefined. Slug is unique per tenant.
+                                    key={p.slug}
+                                    type="button"
+                                    onClick={() => handleSsoClick(p.slug)}
+                                    disabled={ssoLoading !== null || busy}
+                                    aria-label={`Continue with ${p.name}`}
+                                    aria-busy={launching}
+                                    className="w-full h-9 rounded-md border border-border bg-card hover:border-[var(--border-2)] hover:bg-[var(--card-2)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--primary)] flex items-center gap-2 px-2.5 text-[11.5px] text-foreground/85 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                                  >
+                                    <span
+                                      aria-hidden="true"
+                                      className="font-mono text-[10px] text-muted-foreground/60 tabular-nums shrink-0"
+                                    >
+                                      [{i + 1}]
+                                    </span>
+                                    <Icon className="w-4 h-4 text-muted-foreground shrink-0" />
+                                    <span className="truncate">Continue with {p.name}</span>
+                                    <span className="flex-1" />
+                                    {launching ? (
+                                      <Loader2 className="w-3 h-3 animate-spin text-muted-foreground shrink-0" />
+                                    ) : (
+                                      <ArrowUpRight className="w-3 h-3 text-muted-foreground/60 shrink-0" />
+                                    )}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                            <div className="text-muted-foreground/60 text-[10.5px] mt-1">
+                              or type{' '}
+                              <span className="text-muted-foreground">
+                                sso {ssoSurface.providers[0].slug}
+                              </span>{' '}
+                              at the prompt
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/*
+                  NAN-2181 — SSO-only tenants. The password wizard is not
+                  rendered at all: soliciting credentials the server will refuse
+                  is worse than not offering them. Providers become the primary
+                  action, in the same primary column at every viewport width.
+                */}
+                {step !== 'done' && loginMode.kind === 'loading' && (
+                  <div className="pt-1 flex items-center gap-2 text-[11.5px] font-mono text-muted-foreground">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    resolving sign-in methods…
+                  </div>
+                )}
+
+                {step !== 'done' && loginMode.kind === 'ssoOnlyLoading' && (
+                  <div className="pt-1 flex items-center gap-2 text-[11.5px] font-mono text-muted-foreground">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    password sign-in is disabled · loading providers…
+                  </div>
+                )}
+
+                {step !== 'done' && loginMode.kind === 'ssoOnly' && (
+                  <div className="pt-1">
+                    <TermGroup>
+                      <div className="text-[11.5px] text-muted-foreground mb-2">
+                        this organization requires single sign-on · password
+                        sign-in is disabled
+                      </div>
+                    </TermGroup>
+                    <div className={SSO_PANEL_CLASS}>
+                      <div
+                        role="group"
+                        aria-label="Single sign-on providers"
+                        className="space-y-1.5"
+                      >
+                        {loginMode.providers.map((p, i) => {
+                          const Icon = getSsoIcon(p);
+                          const launching = ssoLoading === p.slug;
+                          return (
+                            <button
+                              key={p.slug}
+                              type="button"
+                              onClick={() => handleSsoClick(p.slug)}
+                              disabled={ssoLoading !== null}
+                              aria-label={`Continue with ${p.name}`}
+                              aria-busy={launching}
+                              className="w-full h-10 rounded-md border bg-card hover:bg-[var(--card-2)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--primary)] flex items-center gap-2 px-2.5 text-[12.5px] text-foreground disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                              style={{
+                                borderColor:
+                                  'color-mix(in srgb, var(--primary) 45%, var(--border))',
+                              }}
+                            >
+                              <span
+                                aria-hidden="true"
+                                className="font-mono text-[10px] text-muted-foreground/60 tabular-nums shrink-0"
+                              >
+                                [{i + 1}]
+                              </span>
+                              <Icon className="w-4 h-4 text-muted-foreground shrink-0" />
+                              <span className="truncate">Continue with {p.name}</span>
+                              <span className="flex-1" />
+                              {launching ? (
+                                <Loader2 className="w-3.5 h-3.5 animate-spin text-muted-foreground shrink-0" />
+                              ) : (
+                                <ArrowUpRight className="w-3.5 h-3.5 text-muted-foreground/60 shrink-0" />
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {step !== 'done' && loginMode.kind === 'ssoOnlyUnavailable' && (
+                  <div className="pt-1">
+                    <TermGroup>
+                      <div
+                        className="rounded-md border px-3.5 py-3 max-w-[72ch]"
+                        style={{
+                          borderColor: 'color-mix(in srgb, var(--destructive) 40%, transparent)',
+                          background: 'color-mix(in srgb, var(--destructive) 8%, transparent)',
+                        }}
+                      >
+                        <div className="text-[12.5px] text-foreground font-medium mb-1">
+                          No sign-in method is available
+                        </div>
+                        <div className="text-[11.5px] text-muted-foreground">
+                          {loginMode.reason === 'error'
+                            ? 'Password sign-in is disabled and the SSO providers could not be loaded.'
+                            : 'Password sign-in is disabled and no SSO provider is enabled.'}{' '}
+                          Contact an administrator.
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setProvidersReload((n) => n + 1)}
+                          className="mt-2 inline-flex items-center gap-1 h-[22px] px-2 rounded-sm border border-border text-muted-foreground hover:text-foreground hover:border-[var(--border-2)] text-[11px] transition-colors"
+                        >
+                          <RefreshCw className="w-3 h-3" />
+                          retry
+                        </button>
+                      </div>
+                    </TermGroup>
                   </div>
                 )}
 
@@ -1153,15 +1437,7 @@ export function Login() {
               </div>
             </div>
           </div>
-          <Inspector
-            step={step}
-            oidcProviders={oidcProviders}
-            loadingProviders={loadingProviders}
-            ssoLoading={ssoLoading}
-            onSsoClick={handleSsoClick}
-            stats={stats}
-            ssoEnabled={ssoEnabled}
-          />
+          <Inspector stats={stats} ssoEnabled={ssoEnabled} />
         </div>
         <StatusBar
           step={step}

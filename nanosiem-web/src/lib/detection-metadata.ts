@@ -102,6 +102,22 @@ export function parseDetectionMetadata(text: string): ParsedDetection {
 }
 
 /**
+ * Escape a value for a YAML double-quoted scalar (NAN-2184).
+ *
+ * YAML double-quoted scalars treat backslash as an escape character, so a value
+ * ending in `\` previously escaped its own closing quote and produced a
+ * frontmatter block that would not round-trip. Backslashes must be doubled
+ * BEFORE quotes are escaped, or the backslash `\"` introduces gets doubled in
+ * turn.
+ *
+ * This is deliberately NOT the nPL rule (`@/lib/npl-quote`), where backslash is
+ * not an escape at all and an embedded quote has to be stripped instead.
+ */
+function escapeYamlDoubleQuoted(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+/**
  * Serialize detection metadata and query into YAML frontmatter format
  */
 export function serializeDetectionMetadata(metadata: DetectionMetadata, query: string): string {
@@ -135,14 +151,20 @@ export function serializeDetectionMetadata(metadata: DetectionMetadata, query: s
     if (alwaysInclude.includes(key) || (value !== undefined && value !== null && value !== '')) {
       // Quote strings that contain special characters or spaces
       const stringValue = String(value || '');
+      // NAN-2184: `"` and `\` were missing here. A value carrying either was
+      // emitted as an unquoted plain scalar, which either fails to parse (a
+      // leading `"` opens a quoted scalar that never closes) or silently loses
+      // the backslash on the way back in.
       const needsQuotes = stringValue.includes(':') ||
                          stringValue.includes('#') ||
                          stringValue.includes(',') ||
                          stringValue.includes('\n') ||
+                         stringValue.includes('"') ||
+                         stringValue.includes('\\') ||
                          (key === 'description' && stringValue.length > 0);
       
       if (needsQuotes) {
-        lines.push(`${key}: "${stringValue.replace(/"/g, '\\"')}"`);
+        lines.push(`${key}: "${escapeYamlDoubleQuoted(stringValue)}"`);
       } else {
         lines.push(`${key}: ${stringValue}`);
       }

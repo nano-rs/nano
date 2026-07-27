@@ -28,6 +28,8 @@
  *    keep their exact spacing (load-bearing in command-line hunts).
  */
 
+import { nplQuoted } from '@/lib/npl-quote';
+
 interface Segment {
   text: string;
   quoted: boolean;
@@ -69,9 +71,11 @@ function tokenize(query: string): Segment[] {
 }
 
 // Wrap an equality/keyword value in double quotes, stripping any embedded
-// double-quote (nPL has no backslash escaping, so we cannot escape it).
+// double-quote (nPL has no `\"` mechanism, so we cannot escape it) and
+// doubling backslashes so the parser's `\\` → `\` collapse round-trips.
+// NAN-2184: shared with every other nPL call site.
 function quoteEqualityValue(value: string): string {
-  return `"${value.replace(/"/g, '')}"`;
+  return nplQuoted(value);
 }
 
 // Relational comparisons (`>`, `<`, `>=`, `<=`) are numeric — drop anything that

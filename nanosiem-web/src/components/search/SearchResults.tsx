@@ -143,6 +143,7 @@ interface SearchResult {
 }
 
 import type { DisplayType } from '@/lib/api/types';
+import { nplQuotedBody } from '@/lib/npl-quote';
 
 function formatCacheAge(timestamp: number): string {
   const seconds = Math.floor((Date.now() - timestamp) / 1000);
@@ -429,8 +430,8 @@ export function FieldValueMenu({
     typeof value === 'string' &&
     value.trim().length > 0;
 
-  // Escape value for query (handle quotes and special chars)
-  const escapeValue = (v: string) => v.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  // NAN-2184: double backslashes and strip `"` — nPL has no `\"` escape.
+  const escapeValue = (v: string) => nplQuotedBody(v);
 
   // Build prevalence query: base search + field filter + prevalence command
   const buildPrevalenceQuery = (field: string, val: string) => {
@@ -1318,7 +1319,7 @@ export function SearchResults({
               config={(results[0]?.fields?._tree_config as TreeConfig) || { parent_field: '', child_field: '', label_field: '' }}
               onFilter={(field, value) => {
                 // Tree clicks: keep base search, add filter, drop pipe commands
-                const escapedValue = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+                const escapedValue = nplQuotedBody(value);
                 const newFilter = `${field}="${escapedValue}"`;
                 // Extract base search (before pipes) from current query
                 const baseSearch = query ? getBaseSearch(query) : '';

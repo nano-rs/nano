@@ -127,8 +127,8 @@ fn test_pretty_print_sort_desc() {
     let query = Query::Piped {
         source: Box::new(Query::Search(SearchExpr::Keyword("error".to_string()))),
         command: Command::Sort {
-            field: "timestamp".to_string(),
-            descending: true,
+            fields: vec![SortField { field: "timestamp".to_string(), descending: true }],
+            limit: None,
         },
     };
     assert_eq!(query.pretty_print(), "error | sort -timestamp");
@@ -139,11 +139,13 @@ fn test_pretty_print_sort_asc() {
     let query = Query::Piped {
         source: Box::new(Query::Search(SearchExpr::Keyword("error".to_string()))),
         command: Command::Sort {
-            field: "timestamp".to_string(),
-            descending: false,
+            fields: vec![SortField { field: "timestamp".to_string(), descending: false }],
+            limit: None,
         },
     };
-    assert_eq!(query.pretty_print(), "error | sort timestamp");
+    // The printer emits an explicit `+` for ascending so the direction
+    // survives a round trip unambiguously.
+    assert_eq!(query.pretty_print(), "error | sort +timestamp");
 }
 
 #[test]
@@ -281,8 +283,8 @@ fn test_pretty_print_multiple_pipes() {
                 },
             }),
             command: Command::Sort {
-                field: "count".to_string(),
-                descending: true,
+                fields: vec![SortField { field: "count".to_string(), descending: true }],
+                limit: None,
             },
         }),
         command: Command::Head { count: 10 },
@@ -491,8 +493,89 @@ fn test_pretty_print_risk_dynamic_score() {
             weight: None,
         },
     };
+    // The printer emits the expression unparenthesized. Verified round-trip
+    // safe: `score=count * 10 entity=src_ip` and `score=(count * 10) …` parse
+    // to the identical AST, so the parser knows where the score expression
+    // ends without the parens.
     assert_eq!(
         query.pretty_print(),
-        "* | risk score=(count * 10) entity=src_ip"
+        "* | risk score=count * 10 entity=src_ip"
     );
+}
+
+// ---------------------------------------------------------------------------
+// NAN-2184: `npl_quoted_body` doubles backslashes so `parse(pretty_print(x))`
+// preserves values carrying CONSECUTIVE backslashes. The parser collapses
+// `\\` → `\` after taking the literal (values.rs::double_quoted_string), so
+// emitting them raw silently dropped one — invisible for lone backslashes
+// (Windows paths), lossy for UNC paths and regexes matching a literal `\`.
+// ---------------------------------------------------------------------------
+
+/// Round-trip a filter value through pretty_print → parse and hand back what
+/// the parser actually reconstructed.
+fn round_trip_value(raw: &str) -> String {
+    use crate::query::parse_query;
+    let q = Query::Search(SearchExpr::FieldFilter {
+        field: "file_path".to_string(),
+        op: Comparator::Eq,
+        value: Value::String(raw.to_string()),
+    });
+    let printed = q.pretty_print();
+    let reparsed = parse_query(&printed)
+        .unwrap_or_else(|e| panic!("pretty_print produced unparseable nPL {printed:?}: {e:?}"));
+    match reparsed {
+        Query::Search(SearchExpr::FieldFilter { value: Value::String(s), .. }) => s,
+        other => panic!("round trip changed structure for {raw:?}: {other:?}"),
+    }
+}
+
+#[test]
+fn unc_path_survives_round_trip() {
+    // Before NAN-2184 this came back as `\fileserver\share` — one backslash lost.
+    assert_eq!(round_trip_value(r"\\fileserver\share"), r"\\fileserver\share");
+}
+
+#[test]
+fn lone_backslash_path_still_round_trips() {
+    // Regression guard: the case that always worked must keep working.
+    assert_eq!(round_trip_value(r"C:\Windows\System32"), r"C:\Windows\System32");
+    assert_eq!(round_trip_value(r"C:\Windows\System32\"), r"C:\Windows\System32\");
+}
+
+#[test]
+fn regex_escapes_survive_round_trip() {
+    assert_eq!(round_trip_value(r"a\.b\d\w"), r"a\.b\d\w");
+    // A pattern matching a LITERAL backslash — previously collapsed to `\.`.
+    assert_eq!(round_trip_value(r"\\."), r"\\.");
+}
+
+#[test]
+fn embedded_quote_is_still_stripped_not_escaped() {
+    // NAN-2006: `"` is the lone breakout character and must not survive.
+    assert_eq!(round_trip_value(r#"a" OR src_ip=10.0.0.9"#), "a OR src_ip=10.0.0.9");
+}
+
+#[test]
+fn quote_after_backslash_cannot_reopen_the_literal() {
+    // The doubling pass must run BEFORE the quote filter, or the stripped quote
+    // could leave a dangling escape.
+    assert_eq!(round_trip_value(r#"trail\"next"#), r"trail\next");
+}
+
+#[test]
+fn newlines_are_stripped_so_the_query_stays_one_line() {
+    let printed = Query::Search(SearchExpr::FieldFilter {
+        field: "message".to_string(),
+        op: Comparator::Eq,
+        value: Value::String("evil\n| head 1".to_string()),
+    })
+    .pretty_print();
+    assert!(!printed.contains('\n'), "pretty_print leaked a newline: {printed:?}");
+    assert_eq!(round_trip_value("evil\n| head 1"), "evil| head 1");
+}
+
+#[test]
+fn inert_characters_are_preserved() {
+    assert_eq!(round_trip_value("cmd|powershell"), "cmd|powershell");
+    assert_eq!(round_trip_value("(foo|bar)[1]"), "(foo|bar)[1]");
 }

@@ -19,6 +19,7 @@ import { TopActions } from './TopActions';
 import { TopResources } from './TopResources';
 import { ErrorRate } from './ErrorRate';
 import { Stream } from './Stream';
+import { nplQuotedBody } from '@/lib/npl-quote';
 
 interface CloudPrincipalDossierProps {
   principal: string;
@@ -179,7 +180,7 @@ export function CloudPrincipalDossier({
           const kept = args.replace(/\bprincipal\s*=\s*("([^"\\]|\\.)*"|\S+)/i, '').trim();
           const prefix = kept ? `| cloud ${kept}` : '| cloud';
           const needsQuote = !/^[A-Za-z0-9_]+$/.test(id);
-          const escaped = id.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+          const escaped = nplQuotedBody(id);
           return `${prefix} principal=${needsQuote ? `"${escaped}"` : escaped}`;
         }
       );
@@ -200,7 +201,7 @@ export function CloudPrincipalDossier({
     if (!field || !value) return;
     if (query && onSetQuery) {
       const withoutCloud = query.replace(/\s*\|\s*cloud\b[^|]*/i, '').trim();
-      const escaped = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      const escaped = nplQuotedBody(value);
       const filter = `${field}="${escaped}"`;
       const rewritten = withoutCloud ? `${withoutCloud} ${filter}` : filter;
       onSetQuery(rewritten);

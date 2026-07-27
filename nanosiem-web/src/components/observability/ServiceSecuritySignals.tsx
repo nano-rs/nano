@@ -24,6 +24,7 @@ import { cn } from '@/lib/utils';
 import { parseUTCTimestamp } from '@/lib/date-utils';
 import type { ServiceSecuritySignalsResponse, ServiceSecuritySignal } from '@/lib/api/observability';
 import type { TimeRange } from '@/lib/api/types';
+import { nplQuotedBody } from '@/lib/npl-quote';
 
 // How many of the sampled signals to render inline. The backend already caps
 // the sample; this keeps the strip from growing tall on a noisy host.
@@ -52,10 +53,10 @@ function sevTone(sev: string | null): SevTone {
 function searchHref(s: ServiceSecuritySignal): string {
   let q: string | null = null;
   if (s.src_ip) {
-    const ip = s.src_ip.replace(/"/g, '\\"');
+    const ip = nplQuotedBody(s.src_ip);
     q = `src_ip="${ip}" OR dest_ip="${ip}" OR src_endpoint.ip="${ip}" OR dst_endpoint.ip="${ip}"`;
   } else if (s.src_host) {
-    const h = s.src_host.replace(/"/g, '\\"');
+    const h = nplQuotedBody(s.src_host);
     q = `src_host="${h}" OR dest_host="${h}" OR hostname="${h}" OR device.hostname="${h}"`;
   }
   return q ? `/search?q=${encodeURIComponent(q)}` : '/alerts';

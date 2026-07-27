@@ -9,7 +9,7 @@ mod command;
 mod expressions;
 mod helpers;
 mod search_expr;
-#[cfg(any())]
+#[cfg(test)]
 mod tests;
 
 use super::ast::*;

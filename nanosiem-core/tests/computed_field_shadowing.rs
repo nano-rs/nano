@@ -140,29 +140,47 @@ fn downstream_sort_references_shadowed_output_column() {
 /// `by_field_sql` (dedup / eventstats partitioning).
 #[test]
 fn by_field_sql_commands_shadow_rex_capture() {
-    // (q, the by-clause that must reference the capture)
-    for (q, clause, schema_clause) in [
+    // (q, marker identifying the by-clause line, expected capture reference)
+    //
+    // NAN-2184: eventstats used to lower to a window function, so this asserted
+    // `PARTITION BY method`. It now lowers to a map built in a `WITH … AS
+    // __nano_es` CTE and looked up per row, so the assertion is anchored to the
+    // line carrying the by-key instead of to a SQL shape. The property under
+    // test is unchanged: the by-key must be the rex capture `method`, never the
+    // schema column (`http_method` / `"http_request.http_method"`).
+    //
+    // Anchoring to the by-clause LINE matters — under OCSF the stage_0 SELECT
+    // promotes `"http_request.http_method"` as a column, so a whole-SQL
+    // "must not contain http_method" assertion would always fire.
+    for (q, line_marker, expect) in [
         (
             r#"* | rex "(?P<method>GET|POST)" | dedup method"#,
+            "LIMIT 1 BY",
             "LIMIT 1 BY method",
-            "LIMIT 1 BY http",
         ),
         (
             r#"* | rex "(?P<method>GET|POST)" | eventstats count by method"#,
-            "PARTITION BY method",
-            "PARTITION BY http",
+            "__nano_es",
+            "toString(method)",
         ),
     ] {
         for (profile, sql) in [("udm", udm(q)), ("ocsf", ocsf(q))] {
+            let by_lines: Vec<&str> =
+                sql.lines().filter(|l| l.contains(line_marker)).collect();
             assert!(
-                sql.contains(clause),
-                "{profile} `{q}`: by-field must reference the capture (`{clause}`).\nSQL:\n{sql}"
+                !by_lines.is_empty(),
+                "{profile} `{q}`: no by-clause line matching `{line_marker}`.\nSQL:\n{sql}"
             );
-            // Neither `... BY http_method` nor `... BY "http_request.http_method"`.
             assert!(
-                !sql.contains(schema_clause),
-                "{profile} `{q}`: by-field must not reference the schema column.\nSQL:\n{sql}"
+                by_lines.iter().any(|l| l.contains(expect)),
+                "{profile} `{q}`: by-field must reference the capture (`{expect}`).\nSQL:\n{sql}"
             );
+            for l in &by_lines {
+                assert!(
+                    !l.contains("http_method"),
+                    "{profile} `{q}`: by-field references the schema column.\nline: {l}"
+                );
+            }
         }
     }
 }

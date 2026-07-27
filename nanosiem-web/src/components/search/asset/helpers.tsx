@@ -2,6 +2,7 @@
 
 import { cn } from '@/lib/utils';
 import type { ReactNode } from 'react';
+import { nplQuotedBody } from '@/lib/npl-quote';
 
 // ---------------------------------------------------------------------------
 // Risk tone / severity tone
@@ -244,7 +245,7 @@ interface AssetIdentityRecordLike {
   user?: string | null;
 }
 
-const escDQ = (s: string) => s.replace(/"/g, '\\"');
+const escDQ = (s: string) => nplQuotedBody(s);
 
 export function buildIdentityClause(
   identities: AssetIdentityRecordLike[] | undefined,

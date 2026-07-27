@@ -15,6 +15,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import { nplQuotedBody } from '@/lib/npl-quote';
 
 // NAN-1450: module-level so the object identity is stable across renders. Passed
 // inline, it gave `useSchemaEntityMap` a fresh `fallback` every render, which
@@ -1209,10 +1210,10 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
     }
 
     for (const ip of uniqueIps) {
-      identityClauses.push(`src_ip="${ip.replace(/"/g, '\\"')}"`);
+      identityClauses.push(`src_ip="${nplQuotedBody(ip)}"`);
     }
     for (const hostname of uniqueHostnames) {
-      identityClauses.push(`src_host="${hostname.replace(/"/g, '\\"')}"`);
+      identityClauses.push(`src_host="${nplQuotedBody(hostname)}"`);
     }
 
     const modifiedFilters: Record<string, unknown> = {};

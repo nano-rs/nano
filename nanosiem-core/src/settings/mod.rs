@@ -10,6 +10,7 @@
 
 mod developer_repository;
 pub mod disk_pressure;
+pub mod local_auth;
 mod organizational_context;
 mod retention;
 pub mod search_admission;
@@ -20,6 +21,7 @@ mod tiering;
 
 pub use developer_repository::*;
 pub use disk_pressure::*;
+pub use local_auth::*;
 pub use organizational_context::*;
 pub use retention::*;
 pub use search_admission::*;

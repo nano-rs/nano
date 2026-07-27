@@ -28,6 +28,7 @@ import type {
   OidcGroupMappingsResponse,
   UpdateOidcGroupMappingsRequest,
   OidcTokenGroupsResponse,
+  AuthMethodsSettings,
 } from './types';
 
 export class AccessControlApi {
@@ -214,6 +215,24 @@ export class AccessControlApi {
   // OIDC Provider Management
   async listOidcProviders(): Promise<OidcProviderListResponse> {
     return this.request('/api/settings/oidc');
+  }
+
+  /** NAN-2181: tenant authentication-method configuration (admin view). */
+  async getAuthMethodsSettings(): Promise<AuthMethodsSettings> {
+    return this.request('/api/settings/auth-methods');
+  }
+
+  /**
+   * NAN-2181: turn local password sign-in on or off.
+   *
+   * Rejected with 409 when disabling without an enabled OIDC provider — the
+   * server owns that guard; the UI disabling the control is a convenience.
+   */
+  async updateAuthMethodsSettings(localPasswordEnabled: boolean): Promise<AuthMethodsSettings> {
+    return this.request('/api/settings/auth-methods', {
+      method: 'PUT',
+      body: JSON.stringify({ localPasswordEnabled }),
+    });
   }
 
   async getOidcProvider(id: string): Promise<OidcProviderSummary> {

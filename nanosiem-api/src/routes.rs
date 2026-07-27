@@ -336,6 +336,12 @@ pub fn create_router(state: AppState) -> Router {
         .merge(login_route)
         .route("/api/auth/logout", post(handlers::auth::logout))
         .route("/api/auth/refresh", post(handlers::auth::refresh_token))
+        // NAN-2181: public — the login page needs this before anyone has
+        // authenticated, to know whether to offer a password field at all.
+        // Listed in PUBLIC_ENDPOINTS; registered here beside the other auth
+        // routes rather than in the rate-limited group, since it is a cheap
+        // read of one boolean and gates nothing.
+        .route("/api/auth/methods", get(handlers::auth::get_auth_methods))
         .merge(password_reset_routes)
         .route("/api/auth/password", put(handlers::auth::change_password))
         .route("/api/auth/me", get(handlers::auth::get_current_user))
@@ -1187,6 +1193,18 @@ pub fn create_router(state: AppState) -> Router {
             .route(
                 "/api/settings/oidc/{id}/token-groups",
                 get(handlers::oidc::get_token_groups::<AppState>),
+            )
+            // NAN-2181: the SSO-only toggle. Registered alongside the OIDC
+            // admin routes because both halves of its lockout guard need
+            // provider state — and because it is meaningless without SSO, so
+            // it should not exist as a surface in an open-core build.
+            .route(
+                "/api/settings/auth-methods",
+                get(handlers::oidc::get_auth_methods_settings::<AppState>),
+            )
+            .route(
+                "/api/settings/auth-methods",
+                put(handlers::oidc::update_auth_methods_settings::<AppState>),
             );
     }
 

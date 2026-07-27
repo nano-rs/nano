@@ -19,6 +19,7 @@ use nanosiem_core::auth::repository::{GroupRepository, SessionRepository, UserRe
 use nanosiem_core::auth::{
     hash_password, AuthConfig, AuthError, AuthService, TokenConfig, TokenService,
 };
+use nanosiem_core::settings::local_auth::LocalAuthSettings;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -49,6 +50,9 @@ fn auth_service(pool: PgPool) -> AuthService {
         GroupRepository::new(pool.clone()),
         token_service,
         AuthConfig::default(),
+        // NAN-2181 added this parameter; these tests exercise the password
+        // path, which the default (local sign-in enabled) leaves reachable.
+        LocalAuthSettings::new(pool.clone()),
     )
 }
 

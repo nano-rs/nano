@@ -133,8 +133,11 @@ function tokenizeYaml(stream: StringStream, _state: DetectionState): string | nu
   // YAML keywords (mode values, severity, etc.)
   // Check longest first to match 'auto-detect' before 'auto'
   for (const keyword of YAML_KEYWORDS) {
-    // Escape special regex chars (like hyphen) and use word boundary or end-of-string
-    const escaped = keyword.replace(/[-]/g, '\\-');
+    // Escape every regex metacharacter, not just the hyphen (NAN-2184). The
+    // keyword list is internal so nothing here is attacker-controlled, but a
+    // keyword containing `.`, `+`, `(`, … would otherwise compile to a pattern
+    // that silently matches the wrong tokens.
+    const escaped = keyword.replace(/[.*+?^${}()|[\]\\-]/g, '\\$&');
     if (stream.match(new RegExp(`^${escaped}(?=[\\s,]|$)`))) {
       return 'atom';
     }

@@ -24,6 +24,7 @@ import { DnsCard } from './sections/DnsCard';
 import { AssetPrevalenceCard } from './AssetPrevalenceCard';
 import { AssetStream } from './AssetStream';
 import { computeBucketWindow, formatTimestampHMS, withAssetIdentity } from './helpers';
+import { nplQuotedBody } from '@/lib/npl-quote';
 
 // nPL `| where` snippets used by more than one drilldown. Keep these as
 // module-level consts so future edits land in one place.
@@ -241,7 +242,7 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
     (artifact: string, artifactType: 'hash' | 'domain') => {
       // Escape like the field=value drilldown builder — a log-derived artifact
       // with `"`/`\` must not break out of the quoted comparison.
-      const esc = artifact.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      const esc = nplQuotedBody(artifact);
       const rawClause =
         artifactType === 'hash'
           ? `(file_hash="${esc}" OR process_hash="${esc}")`

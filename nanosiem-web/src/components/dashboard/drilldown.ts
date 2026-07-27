@@ -10,6 +10,7 @@
  */
 
 import type { TimeRangeValue } from '@/hooks/use-api';
+import { nplQuotedBody } from '@/lib/npl-quote';
 
 // Drilldown filter interface - represents a single field filter
 export interface DrilldownFilter {
@@ -120,19 +121,22 @@ export function buildDrilldownContext(
 /**
  * Sanitize a value for inclusion in a double-quoted nPL string literal.
  *
- * nPL has NO backslash escaping (NAN-1157): a backslash is a literal character
- * and there is no `\"` or `''` mechanism. Because drilldown wraps values in
- * double quotes, the only character that can break the literal is an embedded
- * double quote — so we strip it rather than backslash-escape it (which would
- * make the query search for a literal backslash and match nothing). Backslashes
- * pass through unchanged so Windows paths (`C:\Windows\cmd.exe`) and
- * command-lines match (DSH28).
+ * Delegates to the shared {@link nplQuotedBody} (NAN-2184) so every nPL call
+ * site in the app shares one implementation. The reasoning DSH28 recorded here
+ * still holds: nPL has no `\"` mechanism (NAN-1157), so an embedded double
+ * quote is stripped rather than backslash-escaped.
+ *
+ * The one behavioural change is that consecutive backslashes are now doubled
+ * on emit, because the parser collapses `\\` → `\`. Windows paths still match
+ * (`C:\Windows\cmd.exe` round-trips identically — a lone backslash is
+ * unaffected); UNC paths like `\\fileserver\share` stop silently losing a
+ * backslash.
  *
  * @param value - The value to sanitize
  * @returns Value safe to place inside `"..."` in an nPL query
  */
 export function escapeFilterValue(value: string): string {
-  return value.replace(/"/g, '');
+  return nplQuotedBody(value);
 }
 
 /**

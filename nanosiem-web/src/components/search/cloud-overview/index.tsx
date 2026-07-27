@@ -21,6 +21,7 @@ import { CrossAccountTimeline } from './CrossAccountTimeline';
 import { AnomalyFeed } from './AnomalyFeed';
 import { ServiceHealth } from './ServiceHealth';
 import { TopChanges } from './TopChanges';
+import { nplQuotedBody } from '@/lib/npl-quote';
 
 interface CloudOverviewViewProps {
   /** The time window the initial `| cloud` query was evaluated over */
@@ -163,7 +164,7 @@ export function CloudOverviewView({
       return;
     }
     const withoutCloud = (query ?? '').replace(/\s*\|\s*cloud\b[^|]*/i, '').trim();
-    const escaped = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const escaped = nplQuotedBody(value);
     const filter = `${field}="${escaped}"`;
     const rewritten = withoutCloud ? `${withoutCloud} ${filter}` : filter;
     onSetQuery(rewritten);
@@ -284,7 +285,7 @@ export function appendCloudArg(
     // `by=service` and `show_mfa=true` readable while making quoting
     // unambiguous for ids with `.`, `@`, `-`, etc.
     const simple = /^[A-Za-z0-9_]+$/.test(v);
-    const escaped = v.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const escaped = nplQuotedBody(v);
     parts.push(`${k}=${simple ? escaped : `"${escaped}"`}`);
   }
   const rewritten = parts.join(' ');

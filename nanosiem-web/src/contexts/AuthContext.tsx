@@ -46,8 +46,15 @@ export interface User {
   isApiKey?: boolean;
 }
 
+/**
+ * Public provider shape from `GET /api/auth/oidc/providers`.
+ *
+ * Mirrors `OidcProviderInfo` in nanosiem-core: slug and name only. It carried a
+ * phantom `id` that the endpoint has never returned, so consumers keying on it
+ * were keying on `undefined` (NAN-2179). Pre-auth, the slug is the identifier —
+ * it is what `/authorize` takes and what the callback path is built from.
+ */
 export interface OidcProvider {
-  id: string;
   name: string;
   slug: string;
 }

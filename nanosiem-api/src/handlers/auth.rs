@@ -77,6 +77,16 @@ impl AuthApiError {
                 "invalid_credentials",
                 "Invalid email or password",
             ),
+            // NAN-2181: NOT folded into the generic 401 above. Those variants
+            // are normalized because they differ per account; this one is
+            // identical for every request and is decided before any user
+            // lookup, so it leaks no account state. Telling the user which
+            // method to use is the entire point.
+            AuthError::LocalPasswordDisabled => (
+                StatusCode::FORBIDDEN,
+                "local_password_disabled",
+                "Password sign-in is disabled for this organization. Sign in with single sign-on.",
+            ),
             AuthError::InvalidToken => (
                 StatusCode::UNAUTHORIZED,
                 "invalid_token",
@@ -239,7 +249,14 @@ pub async fn login(
                     .client_context(&client_ctx)
                     .success(false)
                     .details(serde_json::json!({
-                        "error": e.to_string()
+                        "error": e.to_string(),
+                        // NAN-2181: separates "wrong password" from "password
+                        // sign-in is switched off for this tenant", so an
+                        // SSO-only org can alert on clients still presenting
+                        // local credentials — a stale bookmark, an unmigrated
+                        // script, or someone probing.
+                        "blocked_reason": matches!(e, AuthError::LocalPasswordDisabled)
+                            .then_some("local_password_disabled"),
                     }))
                     .build(),
             );
@@ -857,6 +874,56 @@ pub async fn validate_token(
     })
 }
 
+/// Which authentication methods this deployment currently accepts.
+///
+/// Public by necessity: the login page has to know whether to offer a password
+/// field before anyone has authenticated. The only thing disclosed is tenant
+/// configuration the sign-in screen would reveal anyway — no account data, no
+/// provider secrets, nothing per-user.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthMethodsResponse {
+    /// Whether `POST /api/auth/login` accepts local email/password credentials.
+    ///
+    /// Always true in open-core builds: there is no SSO surface to fall back
+    /// to, so there is nothing to switch off.
+    pub local_password: bool,
+}
+
+/// Get the authentication methods available on this deployment.
+///
+/// GET /api/auth/methods
+#[utoipa::path(
+    get,
+    path = "/api/auth/methods",
+    tag = "auth",
+    responses(
+        (status = 200, description = "Available authentication methods", body = AuthMethodsResponse),
+        (status = 500, description = "Internal server error", body = AuthApiError),
+    ),
+    security(())
+)]
+pub async fn get_auth_methods(
+    State(state): State<AppState>,
+) -> Result<Json<AuthMethodsResponse>, (StatusCode, Json<AuthApiError>)> {
+    let local_password = state
+        .local_auth_settings
+        .is_local_password_enabled()
+        .await
+        .map_err(|e| {
+            tracing::error!("failed to read local auth setting: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(AuthApiError {
+                    error: "internal_error".to_string(),
+                    message: "Failed to read authentication settings".to_string(),
+                }),
+            )
+        })?;
+
+    Ok(Json(AuthMethodsResponse { local_password }))
+}
+
 /// OpenAPI documentation for auth endpoints
 #[derive(utoipa::OpenApi)]
 #[openapi(
@@ -868,7 +935,8 @@ pub async fn validate_token(
         reset_password,
         change_password,
         get_current_user,
-        validate_token
+        validate_token,
+        get_auth_methods
     ),
     components(schemas(
         AuthApiError,
@@ -879,7 +947,8 @@ pub async fn validate_token(
         ChangePasswordRequest,
         ChangePasswordResponse,
         CurrentUserResponse,
-        TokenValidationResponse
+        TokenValidationResponse,
+        AuthMethodsResponse
     ))
 )]
 pub struct AuthApiDoc;

@@ -1786,6 +1786,16 @@ class ApiClient {
   }
 
   // Access Control - OIDC Providers
+  async getAuthMethodsSettings(): Promise<import('./types').AuthMethodsSettings> {
+    return this._accessControl.getAuthMethodsSettings();
+  }
+
+  async updateAuthMethodsSettings(
+    localPasswordEnabled: boolean,
+  ): Promise<import('./types').AuthMethodsSettings> {
+    return this._accessControl.updateAuthMethodsSettings(localPasswordEnabled);
+  }
+
   async listOidcProviders(): Promise<import('./types').OidcProviderListResponse> {
     return this._accessControl.listOidcProviders();
   }

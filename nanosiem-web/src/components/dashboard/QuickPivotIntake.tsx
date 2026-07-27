@@ -13,6 +13,7 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Search as SearchIcon, ArrowRight } from 'lucide-react';
+import { nplQuoted } from '@/lib/npl-quote';
 
 type IocKind = 'ipv4' | 'ipv6' | 'sha256' | 'sha1' | 'md5' | 'email' | 'url' | 'domain' | 'text';
 
@@ -53,7 +54,7 @@ const KIND_LABEL: Record<IocKind, string> = {
 
 function buildQuery(kind: IocKind, raw: string): string {
   const v = raw.trim();
-  const q = (s: string) => `"${s.replace(/"/g, '\\"')}"`;
+  const q = (s: string) => nplQuoted(s);
   switch (kind) {
     case 'ipv4':
     case 'ipv6':

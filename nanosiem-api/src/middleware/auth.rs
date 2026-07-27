@@ -53,6 +53,12 @@ const PUBLIC_ENDPOINTS: &[&str] = &[
     "/api/auth/password/reset-request",
     "/api/auth/password/reset",
     "/api/auth/oidc/providers",
+    // NAN-2181: the login page reads this pre-auth to decide whether to render
+    // a password field. Requiring auth would 401 the boot fetch and leave the
+    // page guessing — the failure mode being a password prompt on an SSO-only
+    // tenant, which is exactly what the setting exists to remove. Discloses one
+    // boolean of tenant config and nothing per-account.
+    "/api/auth/methods",
     "/api/setup/status",
     "/api/setup/initialize",
     // The SPA fetches /api/capabilities pre-auth to decide which edition
