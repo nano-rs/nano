@@ -11,9 +11,15 @@
 //!   This is the SYSTEM-caller / back-compat default (`Default` == unrestricted).
 //! - A non-empty denied set lists `source_type` values the caller must never
 //!   see; the query injector excludes them at every base-table scan.
-//! - This type carries SOURCE-scope ONLY. The `audit` source gate is unioned
-//!   into the deny set by the handler (based on the `audit:view` permission),
-//!   not here.
+//! - The value carries TWO deny sets (NAN-2219): the ROW-FILTER set
+//!   ([`ScopeSet::deny_set`]) that governs live log rows, and the
+//!   DERIVED-ARTIFACT set ([`ScopeSet::artifact_deny_set`]) that governs
+//!   persisted provenance-stamped artifacts. They are identical unless a
+//!   composer explicitly marks a deny as row-filter-only via
+//!   [`ScopeSet::with_row_filter_only`] — see [`compose_viewer_scope`].
+//! - Source-scope RESOLUTION still produces SOURCE-scope only. The `audit`
+//!   source gate is composed on top from the `audit:view` permission, and it is
+//!   row-filter-only.
 
 use std::collections::BTreeSet;
 
@@ -172,11 +178,29 @@ pub fn deny_bind_values(denied: &BTreeSet<String>) -> Vec<String> {
 
 /// Set of `source_type` values denied to a caller.
 ///
-/// Empty denied set = unrestricted = SYSTEM caller. Carries SOURCE-scope only;
-/// the audit gate is unioned in by the handler, not by this type.
+/// Empty denied set = unrestricted = SYSTEM caller.
+///
+/// # Two scopes, one value (NAN-2219)
+///
+/// A caller has TWO deny sets that are usually — but not always — the same:
+///
+/// * the ROW-FILTER set ([`Self::deny_set`]) — what the caller may not see in
+///   LIVE data: log rows, `/api/source-types`, alerts, search;
+/// * the DERIVED-ARTIFACT set ([`Self::artifact_deny_set`]) — what the caller
+///   may not see in PERSISTED, provenance-stamped artifacts: prevalence
+///   aggregates, tuning proposals/baselines, SIEM health reports.
+///
+/// [`Self::from_denied`] makes them identical, which is the fail-closed default
+/// and keeps every pre-existing construction byte-identical. Only
+/// [`Self::with_row_filter_only`] separates them, and only for denies that a
+/// composer has explicitly classified as live-data-only. The one such deny
+/// today is the `audit` gate: see [`compose_viewer_scope`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScopeSet {
     denied: BTreeSet<String>,
+    /// Always a SUBSET of `denied`. Equal to it unless built by
+    /// [`ScopeSet::with_row_filter_only`].
+    artifact_denied: BTreeSet<String>,
 }
 
 impl ScopeSet {
@@ -187,19 +211,108 @@ impl ScopeSet {
     }
 
     /// Build a scope from an explicit denied set of `source_type` values.
+    ///
+    /// The deny applies to BOTH live rows and derived artifacts — the
+    /// fail-closed reading, and the only correct one for a source-scope
+    /// resolution (a source denied by per-source RBAC is denied everywhere).
     pub fn from_denied(denied: BTreeSet<String>) -> Self {
-        Self { denied }
+        Self {
+            artifact_denied: denied.clone(),
+            denied,
+        }
     }
 
-    /// The `source_type` values this caller must never see.
+    /// Build a scope whose `row_filter_only` denies apply to LIVE DATA ONLY
+    /// (NAN-2219).
+    ///
+    /// `artifact_denied` is the authoritative per-source RBAC deny set — it
+    /// governs both live rows and derived artifacts. `row_filter_only` is
+    /// unioned on top for live rows and dropped for artifacts. A value present
+    /// in both stays denied everywhere, so a composer can pass the audit gate
+    /// unconditionally without weakening a tenant that genuinely restricts
+    /// `audit` through the registry.
+    pub fn with_row_filter_only(
+        artifact_denied: BTreeSet<String>,
+        row_filter_only: BTreeSet<String>,
+    ) -> Self {
+        let mut denied = artifact_denied.clone();
+        denied.extend(row_filter_only);
+        Self {
+            denied,
+            artifact_denied,
+        }
+    }
+
+    /// The `source_type` values this caller must never see in LIVE data.
     pub fn deny_set(&self) -> &BTreeSet<String> {
         &self.denied
     }
 
-    /// True when at least one source is denied. `false` means unrestricted.
+    /// The `source_type` values this caller must never see in a PERSISTED,
+    /// provenance-stamped DERIVED ARTIFACT (NAN-2219).
+    ///
+    /// A subset of [`Self::deny_set`]; equal to it for every scope that was not
+    /// built by [`Self::with_row_filter_only`].
+    pub fn artifact_deny_set(&self) -> &BTreeSet<String> {
+        &self.artifact_denied
+    }
+
+    /// True when at least one source is denied in LIVE data. `false` means
+    /// unrestricted.
     pub fn is_restricted(&self) -> bool {
         !self.denied.is_empty()
     }
+
+    /// True when at least one source is denied in DERIVED ARTIFACTS.
+    ///
+    /// Weaker than [`Self::is_restricted`]: an ordinary analyst with no
+    /// per-source grants restricting them is row-filter-restricted (the audit
+    /// gate) but NOT artifact-restricted.
+    pub fn is_artifact_restricted(&self) -> bool {
+        !self.artifact_denied.is_empty()
+    }
+}
+
+/// Compose a request principal's effective [`ScopeSet`] from its resolved
+/// per-source RBAC scope plus the `audit:view` gate (NAN-1801 / NAN-2219).
+///
+/// This is the ONE definition of the composition. `nanosiem-api` and
+/// `nanosiem-search` each carry their own `AuthContext`, and both delegate here
+/// so the two request surfaces cannot drift.
+///
+/// # Why the audit gate is row-filter-only
+///
+/// Unioning `audit` into the deny set is correct for LIVE data: without
+/// `audit:view` a caller must not read audit event rows, and
+/// `/api/source-types` once returned audit event counts because a handler
+/// forgot exactly this union (NAN-1801 / NAN-2055).
+///
+/// It is NOT correct for DERIVED ARTIFACTS. `audit:view` is an Admin-only
+/// permission, so unioning it made `is_restricted()` true for every Editor,
+/// ReadOnly, custom role and API key — including on tenants with an EMPTY
+/// `restricted_source_types` registry, which have no per-source boundary at
+/// all. NAN-2053 / NAN-2137's fail-closed artifact gates then required
+/// `source_types_complete = TRUE`, a column shipped `DEFAULT FALSE` with
+/// backfills declined, so those callers read unbackfilled tables and got
+/// inverted or blank analytics: every hash/domain/IP looked first-seen and rare
+/// (`PrevalenceData::empty`), and tuning analytics returned nothing.
+///
+/// The artifact half therefore carries per-source RBAC only. ACCEPTED
+/// DISCLOSURE (signed off, NAN-2219): a caller without `audit:view` sees
+/// aggregate-level audit-derived facts inside those artifacts — a prevalence
+/// host-count that includes audit observations, a health score computed over
+/// audit volume. It does NOT gain audit event rows, audit field values, or
+/// per-source audit counts; those all stay on the row-filter half.
+///
+/// A tenant that genuinely wants `audit` restricted registers it in
+/// `restricted_source_types`, which puts it in `source_scope` and therefore in
+/// BOTH halves.
+pub fn compose_viewer_scope(source_scope: &ScopeSet, has_audit_view: bool) -> ScopeSet {
+    let mut row_filter_only = BTreeSet::new();
+    if !has_audit_view {
+        row_filter_only.insert("audit".to_string());
+    }
+    ScopeSet::with_row_filter_only(source_scope.deny_set().clone(), row_filter_only)
 }
 
 #[cfg(test)]
@@ -231,6 +344,96 @@ mod tests {
         let scope = ScopeSet::from_denied(set(&["insider_threat", "audit"]));
         assert!(scope.is_restricted());
         assert_eq!(scope.deny_set(), &set(&["audit", "insider_threat"]));
+        // `from_denied` is the fail-closed constructor: the deny applies to
+        // derived artifacts as well as to live rows.
+        assert!(scope.is_artifact_restricted());
+        assert_eq!(scope.artifact_deny_set(), scope.deny_set());
+    }
+
+    // ---- NAN-2219: the row-filter / derived-artifact split -----------------
+
+    #[test]
+    fn with_row_filter_only_splits_the_two_halves() {
+        let scope = ScopeSet::with_row_filter_only(set(&["insider_threat"]), set(&["audit"]));
+        assert_eq!(scope.deny_set(), &set(&["audit", "insider_threat"]));
+        assert_eq!(scope.artifact_deny_set(), &set(&["insider_threat"]));
+        assert!(scope.is_restricted() && scope.is_artifact_restricted());
+    }
+
+    #[test]
+    fn a_row_filter_only_deny_does_not_make_a_scope_artifact_restricted() {
+        let scope = ScopeSet::with_row_filter_only(BTreeSet::new(), set(&["audit"]));
+        assert!(scope.is_restricted(), "audit rows are still denied");
+        assert!(
+            !scope.is_artifact_restricted(),
+            "an audit-gate-only deny is not a per-source boundary (NAN-2219)"
+        );
+        assert!(scope.artifact_deny_set().is_empty());
+    }
+
+    #[test]
+    fn a_value_in_both_halves_stays_denied_in_both() {
+        // The composer passes the audit gate unconditionally; a tenant that has
+        // registered `audit` in `restricted_source_types` must keep it denied
+        // for artifacts too.
+        let scope = ScopeSet::with_row_filter_only(set(&["audit"]), set(&["audit"]));
+        assert_eq!(scope.deny_set(), &set(&["audit"]));
+        assert_eq!(scope.artifact_deny_set(), &set(&["audit"]));
+    }
+
+    #[test]
+    fn compose_viewer_scope_matches_the_documented_composition() {
+        let unscoped = ScopeSet::unrestricted();
+        let scoped = ScopeSet::from_denied(set(&["insider_threat"]));
+        let audit_scoped = ScopeSet::from_denied(set(&["audit", "insider_threat"]));
+
+        // No audit:view, no per-source grants restricting them: row-restricted,
+        // artifact-unrestricted. This is the NAN-2219 case.
+        let s = compose_viewer_scope(&unscoped, false);
+        assert_eq!(s.deny_set(), &set(&["audit"]));
+        assert!(s.artifact_deny_set().is_empty());
+
+        // audit:view + no per-source grants: fully unrestricted, byte-identical
+        // SQL on every path.
+        let s = compose_viewer_scope(&unscoped, true);
+        assert_eq!(s, ScopeSet::unrestricted());
+
+        // Genuinely source-scoped: real denies survive in BOTH halves.
+        let s = compose_viewer_scope(&scoped, false);
+        assert_eq!(s.deny_set(), &set(&["audit", "insider_threat"]));
+        assert_eq!(s.artifact_deny_set(), &set(&["insider_threat"]));
+
+        // Registry-restricted audit: denied in both halves regardless of the
+        // permission.
+        for has_audit_view in [false, true] {
+            let s = compose_viewer_scope(&audit_scoped, has_audit_view);
+            assert_eq!(s.deny_set(), &set(&["audit", "insider_threat"]));
+            assert_eq!(s.artifact_deny_set(), &set(&["audit", "insider_threat"]));
+        }
+    }
+
+    #[test]
+    fn composed_row_filter_half_is_byte_identical_to_the_legacy_union() {
+        // Every live-data caller reads `deny_set()`; NAN-2219 must not move it.
+        for (rbac, has_audit_view) in [
+            (set(&[]), false),
+            (set(&[]), true),
+            (set(&["insider_threat"]), false),
+            (set(&["insider_threat"]), true),
+            (set(&["audit"]), false),
+            (set(&["audit", "zeek"]), true),
+        ] {
+            let legacy = {
+                let mut deny = rbac.clone();
+                if !has_audit_view {
+                    deny.insert("audit".to_string());
+                }
+                deny
+            };
+            let composed = compose_viewer_scope(&ScopeSet::from_denied(rbac), has_audit_view);
+            assert_eq!(composed.deny_set(), &legacy);
+            assert_eq!(composed.is_restricted(), !legacy.is_empty());
+        }
     }
 
     #[test]

@@ -123,8 +123,20 @@ impl ArtifactScope {
     }
 
     /// Build from the canonical source-scope value carried by request paths.
+    ///
+    /// NAN-2219: this reads the scope's DERIVED-ARTIFACT half
+    /// ([`ScopeSet::artifact_deny_set`]), not its row-filter half. The two
+    /// differ only by denies a composer explicitly classified as live-data-only
+    /// — today just the `audit:view` gate, which must not make an otherwise
+    /// unscoped analyst "restricted" against artifact provenance gates whose
+    /// backing columns were never backfilled. See
+    /// [`compose_viewer_scope`](crate::auth::compose_viewer_scope).
+    ///
+    /// Use [`Self::from_denied`] with `scope.deny_set()` at any site that is
+    /// really doing per-source ROW filtering and merely borrows this type's
+    /// classifier (e.g. retaining per-source partitions inside a report).
     pub fn from_scope(scope: &ScopeSet) -> Self {
-        Self::from_denied(scope.deny_set())
+        Self::from_denied(scope.artifact_deny_set())
     }
 
     /// Build from an already-composed effective deny set.
@@ -250,6 +262,32 @@ mod tests {
         assert!(restricted.allows_provenance(&allowed));
         assert!(!restricted.allows_provenance(&denied));
         assert!(!restricted.allows_provenance(&mixed));
+    }
+
+    /// NAN-2219: `from_scope` reads the scope's DERIVED-ARTIFACT half, while a
+    /// site doing real per-source ROW filtering opts into the row-filter half
+    /// explicitly via `from_denied(scope.deny_set())`. Both directions are
+    /// pinned here so a future edit cannot quietly swap them.
+    #[test]
+    fn from_scope_reads_the_artifact_half_and_from_denied_the_row_half() {
+        let scope = crate::auth::compose_viewer_scope(
+            &ScopeSet::from_denied(deny(&["insider_threat"])),
+            /* has_audit_view = */ false,
+        );
+
+        let artifact = ArtifactScope::from_scope(&scope);
+        assert!(artifact.allows(&["audit".to_string()], true));
+        assert!(!artifact.allows(&["insider_threat".to_string()], true));
+
+        let row = ArtifactScope::from_denied(scope.deny_set());
+        assert!(!row.allows(&["audit".to_string()], true));
+        assert!(!row.allows(&["insider_threat".to_string()], true));
+
+        // A caller with no per-source boundary at all is artifact-unrestricted,
+        // which is what keeps the provenance gates off the byte-identical path.
+        let unscoped = crate::auth::compose_viewer_scope(&ScopeSet::unrestricted(), false);
+        assert!(ArtifactScope::from_scope(&unscoped).is_unrestricted());
+        assert!(!ArtifactScope::from_denied(unscoped.deny_set()).is_unrestricted());
     }
 
     #[test]

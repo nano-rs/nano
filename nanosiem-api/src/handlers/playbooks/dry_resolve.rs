@@ -188,13 +188,7 @@ pub async fn dry_resolve(
         // not use dry-resolve to read matched events of an alert derived from
         // sources denied to them (per-source RBAC + the audit gate). Mirrors
         // the handlers/alerts.rs composition.
-        let scope = {
-            let mut deny = auth.denied_sources.deny_set().clone();
-            if !auth.has_permission(permissions::AUDIT_VIEW) {
-                deny.insert("audit".to_string());
-            }
-            nanosiem_core::auth::ScopeSet::from_denied(deny)
-        };
+        let scope = auth.effective_viewer_scope();
         let alert = state
             .detection_service
             .get_alert(alert_uuid, scope.deny_set())

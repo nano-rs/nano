@@ -156,7 +156,15 @@ pub(crate) fn analyze_required_fields(
                         "dest_host",
                         "dest_ip",
                         "user",
-                        "action",
+                        // NAN-2230: the CANONICAL name. `table_view` goes through
+                        // the explicit-fields projection branch, which emits each
+                        // required field under its own name with no rewrite — so
+                        // listing the physical `action` here put it in every
+                        // default search row, and the inspector (which merges the
+                        // row with the full-log fetch, correctly keyed
+                        // `event_type`) showed both. `event_type` is an ALIAS on
+                        // `logs`/`logs_distributed`, so it projects directly.
+                        "event_type",
                         "status",
                         "severity",
                         "process_name",
@@ -1321,7 +1329,7 @@ mod table_view_profile_tests {
             "src_ip",
             "dest_ip",
             "user",
-            "action",
+            "event_type",
             "status",
             "severity",
             "enriched_src_country",

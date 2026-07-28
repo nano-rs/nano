@@ -193,6 +193,9 @@ impl SearchService {
         )
             // Restricted execution cannot use source-less prevalence
             // dictionaries; keep Inspect SQL on the same residual path.
+            // NAN-2219: the ARTIFACT half, byte-for-byte the same term the
+            // execute path evaluates in `core_search` — the two must never
+            // disagree or "Inspect SQL" renders a shape that does not run.
             && crate::auth::ArtifactScope::from_scope(scope).is_unrestricted()
             // NAN-1798 P2: mirror the execute path — risk-touching queries do
             // not take the prevalence pushdown (see core_search).

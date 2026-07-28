@@ -47,8 +47,48 @@ use nanosiem_core::siem_health::{SiemHealthReport, SiemHealthReportSummary, Siem
 /// unrestricted viewers. Comparison is lowercase-on-both-sides. A restricted
 /// viewer gets no metrics if the stored JSON cannot be deserialized into the
 /// typed partition contract.
+///
+/// NAN-2219: this takes the scope's ROW-FILTER half, explicitly — NOT
+/// `ArtifactScope::from_scope`, which reads the derived-artifact half. Both
+/// halves of what this reduction touches are per-source data: the pruned
+/// partitions carry each source's exact event volume and coverage, and the
+/// withheld narrative is free prose that can name any contributing source. A
+/// reader without `audit:view` must get neither for `audit`, so the audit gate
+/// has to be in the deny set here. See [`report_reduction_scope`].
 fn filter_report_for_viewer(report: &mut SiemHealthReport, scope: &ScopeSet) {
-    report.apply_artifact_scope(&ArtifactScope::from_scope(scope));
+    report.apply_artifact_scope(&report_reduction_scope(scope));
+}
+
+/// The scope that decides what a reader may see INSIDE a health report
+/// (NAN-2222 reduction) — the caller's ROW-FILTER deny set (NAN-2219).
+///
+/// # Why the row half, when this builds an `ArtifactScope`
+///
+/// NAN-2219 split [`ScopeSet`] because NAN-2053/NAN-2137's fail-closed
+/// whole-artifact gates were denying every non-Admin outright, on tenants with
+/// no source scoping at all, over a `source_types_complete` column that ships
+/// `DEFAULT FALSE` and was never backfilled. For SIEM health that symptom is
+/// gone for a different and better reason: NAN-2222 deleted the row-existence
+/// gate entirely, so no report is withheld from anyone. What survives is a
+/// per-part REDUCTION of a report that is always delivered.
+///
+/// That reduction is per-source data end to end, so it belongs on the row half:
+///
+/// * the pruned partitions are keyed by `source_type` and carry that source's
+///   exact 24h volume, field coverage and enrichment coverage — the shape
+///   NAN-1801 closed on `/api/source-types`;
+/// * the withheld narrative is unattributed free prose that can name a denied
+///   source and quote its figures. NAN-2219's accepted disclosure covers
+///   AGGREGATE audit-derived facts (a score computed over audit volume) and
+///   explicitly does NOT extend to per-source audit counts — which is exactly
+///   what a sentence like "audit ingestion fell 40%" would be.
+///
+/// So `audit` stays denied here for a caller without `audit:view`, and the
+/// NAN-2219 split contributes nothing to this surface: it is
+/// [`super::siem_health_suppressions`] — whose rows carry no source provenance
+/// at all — where the split actually changes the answer.
+fn report_reduction_scope(scope: &ScopeSet) -> ArtifactScope {
+    ArtifactScope::from_denied(scope.deny_set())
 }
 
 /// List-view counterpart of [`filter_report_for_viewer`], for the same
@@ -61,8 +101,14 @@ fn filter_summaries_for_viewer(summaries: &mut [SiemHealthReportSummary], scope:
 }
 
 /// One canonical conversion for JWT and API-key request paths.
+///
+/// Drives the LIST view, whose only scope-dependent decision is whether a
+/// summary row keeps its narrative (NAN-2222 — rows are never dropped, so page
+/// size and `total` cannot become an oracle). Same policy, same input, as the
+/// detail path: [`report_reduction_scope`], i.e. the ROW-FILTER half. A summary
+/// narrative can name a denied source exactly as the detail narrative can.
 fn effective_artifact_scope(auth: &AuthContext) -> ArtifactScope {
-    ArtifactScope::from_scope(&auth.effective_viewer_scope())
+    report_reduction_scope(&auth.effective_viewer_scope())
 }
 
 /// Query parameters for listing health reports
@@ -821,6 +867,121 @@ mod tests {
 
         for auth in [jwt_auth(&[]), api_key_auth(&[])] {
             assert!(effective_artifact_scope(&auth).is_unrestricted());
+        }
+    }
+
+    /// NAN-2219: a principal with `settings:system` but no `audit:view` and no
+    /// per-source grants restricting them — the archetypal monitoring
+    /// credential from NAN-2222, and the population NAN-2219 is about.
+    fn jwt_auth_without_audit_view(denied: &[&str]) -> AuthContext {
+        let mut auth = AuthContext::from_jwt(TokenClaims {
+            iss: DEFAULT_TOKEN_ISSUER.to_string(),
+            aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
+            sub: Uuid::now_v7(),
+            roles: Vec::new(),
+            permissions: vec![permissions::SETTINGS_SYSTEM.to_string()],
+            exp: i64::MAX,
+            iat: 0,
+            jti: Uuid::now_v7(),
+            purpose: "access".to_string(),
+        });
+        auth.denied_sources = scope(denied);
+        auth
+    }
+
+    /// NAN-2219 x NAN-2222: the report REDUCTION runs on the scope's
+    /// ROW-FILTER half, so a reader without `audit:view` still loses every
+    /// `audit` partition.
+    ///
+    /// NAN-2219 split `ScopeSet` so that `ArtifactScope::from_scope` reads the
+    /// derived-artifact half (per-source RBAC only), which for this principal
+    /// is EMPTY. `apply_artifact_scope` short-circuits on an unrestricted
+    /// scope, so building this scope with `from_scope` would hand them the
+    /// `audit` source's exact 24h volume and the unattributed narrative that
+    /// can name it. `report_reduction_scope` therefore uses `from_denied(
+    /// scope.deny_set())` — this test is what fails if someone "simplifies" it
+    /// back to `from_scope`.
+    ///
+    /// The other half of NAN-2219's symptom on this surface — the report being
+    /// withheld ENTIRELY from this caller — is fixed by NAN-2222 deleting the
+    /// unsatisfiable row-existence gate, and is pinned by
+    /// `settings_system_without_audit_view_still_receives_the_report` above.
+    #[test]
+    fn the_report_reduction_runs_on_the_row_filter_half_not_the_artifact_half() {
+        let auth = jwt_auth_without_audit_view(&[]);
+        let viewer_scope = auth.effective_viewer_scope();
+
+        // The two halves genuinely disagree for this principal — otherwise
+        // this test would pass for the wrong reason.
+        assert!(viewer_scope.deny_set().contains("audit"));
+        assert!(viewer_scope.artifact_deny_set().is_empty());
+        assert!(
+            ArtifactScope::from_scope(&viewer_scope).is_unrestricted(),
+            "precondition: the artifact half alone would not restrict anything"
+        );
+
+        // The reduction scope — and the list-view scope built from it — must
+        // still deny `audit`.
+        assert!(!report_reduction_scope(&viewer_scope).is_unrestricted());
+        assert!(!effective_artifact_scope(&auth).is_unrestricted());
+
+        let mut metrics = metrics_fixture();
+        metrics["ingestion"]["source_volumes"]
+            .as_array_mut()
+            .expect("source volumes")
+            .push(json!({
+                "source_type": "audit",
+                "count_24h": 500,
+                "count_prior_24h": 400,
+                "change_pct": 25.0
+            }));
+        metrics["ingestion"]["total_events_24h"] = json!(612);
+        let mut report = report(metrics);
+
+        filter_report_for_viewer(&mut report, &viewer_scope);
+
+        let volumes = report.metrics["ingestion"]["source_volumes"]
+            .as_array()
+            .expect("typed source volumes");
+        assert!(
+            !volumes
+                .iter()
+                .any(|entry| entry["source_type"] == json!("audit")),
+            "a caller without audit:view must not see the audit source's event volume"
+        );
+        // apache survives; insider_threat is not denied for this principal;
+        // the blank-source row fails closed.
+        assert_eq!(volumes.len(), 2);
+        assert_eq!(report.metrics["ingestion"]["total_events_24h"], 13);
+
+        // The unattributed narrative can name a denied source, so it is
+        // withheld for exactly the same reason.
+        assert_eq!(
+            report.summary,
+            nanosiem_core::siem_health::types::WITHHELD_NARRATIVE_NOTICE
+        );
+    }
+
+    /// A registry-configured `audit` restriction is a real per-source boundary
+    /// and is denied in BOTH halves, so it survives regardless of which half a
+    /// future edit picks here.
+    #[test]
+    fn registry_restricted_audit_is_denied_in_both_halves() {
+        for auth in [
+            jwt_auth(&["audit"]),
+            jwt_auth_without_audit_view(&["audit"]),
+        ] {
+            let viewer_scope = auth.effective_viewer_scope();
+            assert!(viewer_scope.deny_set().contains("audit"));
+            assert!(viewer_scope.artifact_deny_set().contains("audit"));
+
+            for artifact_scope in [
+                effective_artifact_scope(&auth),
+                ArtifactScope::from_scope(&viewer_scope),
+            ] {
+                assert!(!artifact_scope.is_unrestricted());
+                assert!(!artifact_scope.allows(&["audit".to_string()], true));
+            }
         }
     }
 }

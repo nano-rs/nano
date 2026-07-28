@@ -321,19 +321,35 @@ impl SearchResultCache {
     /// regardless of component count, `{"ab"}` vs `{"a","b"}` stay distinct,
     /// and an empty deny-set folds an empty component — deterministic and
     /// identical across all unrestricted callers.
+    ///
+    /// NAN-2219: BOTH halves of the scope are folded, as two separate final
+    /// components. The artifact half selects a different prevalence read path
+    /// (source-attributed aggregates vs. the source-less dictionaries), so two
+    /// callers can now share a row-filter deny-set yet execute different SQL:
+    /// an ordinary analyst (`{audit}` row-filter, `{}` artifact) and a genuinely
+    /// audit-restricted `audit:view` holder (`{audit}` row-filter, `{audit}`
+    /// artifact) collide on the row-filter half alone, and the second would be
+    /// served the first's unrestricted prevalence numbers. Folding both makes
+    /// the key match result identity again; the added component rotates every
+    /// existing key once on deploy (a cold cache, not a correctness event).
     pub fn companion_key(prefix: &str, components: &[&[u8]], scope: &ScopeSet) -> String {
+        fn fold(hasher: &mut Sha256, denied: &std::collections::BTreeSet<String>) {
+            let mut bytes: Vec<u8> = Vec::new();
+            for value in denied {
+                bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+                bytes.extend_from_slice(value.as_bytes());
+            }
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(&bytes);
+        }
+
         let mut hasher = Sha256::new();
         for c in components {
             hasher.update((c.len() as u64).to_le_bytes());
             hasher.update(c);
         }
-        let mut deny_bytes: Vec<u8> = Vec::new();
-        for denied in scope.deny_set() {
-            deny_bytes.extend_from_slice(&(denied.len() as u64).to_le_bytes());
-            deny_bytes.extend_from_slice(denied.as_bytes());
-        }
-        hasher.update((deny_bytes.len() as u64).to_le_bytes());
-        hasher.update(&deny_bytes);
+        fold(&mut hasher, scope.deny_set());
+        fold(&mut hasher, scope.artifact_deny_set());
         format!("{}:{}", prefix, hex::encode(hasher.finalize()))
     }
 
@@ -742,6 +758,59 @@ mod tests {
         assert_ne!(
             SearchResultCache::companion_key("x", &[b"q"], &scope_of(&["ab"])),
             SearchResultCache::companion_key("x", &[b"q"], &scope_of(&["a", "b"])),
+        );
+    }
+
+    /// NAN-2219: two callers can now share a ROW-FILTER deny-set while
+    /// differing in the artifact half, and the artifact half selects a
+    /// different prevalence read path. They must not share a cache entry.
+    ///
+    /// * an ordinary analyst — no per-source grants restricting them, no
+    ///   `audit:view` → row `{audit}`, artifact `{}`;
+    /// * a principal whose tenant registered `audit` in
+    ///   `restricted_source_types` and who holds `audit:view` → row `{audit}`,
+    ///   artifact `{audit}`.
+    #[test]
+    fn cache_key_distinguishes_scopes_that_share_only_the_row_filter_half() {
+        let start = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let request = SearchRequest {
+            query: "* | prevalence enrich=true".into(),
+            time_range: TimeRangeInput {
+                start,
+                end: start + chrono::Duration::hours(1),
+            },
+            limit: Some(100),
+            offset: None,
+            include_sql: None,
+            skip_histogram: false,
+            skip_field_stats: false,
+            use_cache: false,
+            table_view: false,
+            request_id: None,
+            async_mode: false,
+            priority: None,
+            dataset: None,
+        };
+
+        let analyst = nanosiem_core::auth::compose_viewer_scope(&ScopeSet::unrestricted(), false);
+        let audit_restricted =
+            nanosiem_core::auth::compose_viewer_scope(&scope_of(&["audit"]), true);
+
+        // Precondition: the row-filter halves really do collide.
+        assert_eq!(analyst.deny_set(), audit_restricted.deny_set());
+        assert_ne!(
+            analyst.artifact_deny_set(),
+            audit_restricted.artifact_deny_set()
+        );
+
+        assert_ne!(
+            SearchResultCache::cache_key(&request, &analyst),
+            SearchResultCache::cache_key(&request, &audit_restricted),
+        );
+        let comps: &[&[u8]] = &[b"error"];
+        assert_ne!(
+            SearchResultCache::companion_key("fstats", comps, &analyst),
+            SearchResultCache::companion_key("fstats", comps, &audit_restricted),
         );
     }
 }

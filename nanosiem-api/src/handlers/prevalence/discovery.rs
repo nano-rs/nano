@@ -383,7 +383,7 @@ pub async fn get_artifact_detail(
     // leak) that bypass the nPL scope injector. Pass the caller's effective
     // source scope (per-source RBAC ∪ audit unless `audit:view`) so denied
     // sources contribute nothing. Empty scope is byte-identical.
-    let scope = nanosiem_core::auth::ScopeSet::from_denied(auth.effective_source_deny_set());
+    let scope = auth.effective_viewer_scope();
 
     match prevalence_service
         .get_artifact_detail(

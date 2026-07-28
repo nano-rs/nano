@@ -82,12 +82,19 @@ pub(crate) async fn reserve_query_owner(
 /// instead of pre-mangling `request.query`. The same composed scope MUST be
 /// folded into every cache key (see `cache.rs`) — the scope changes the
 /// executed SQL, so it is part of result identity.
+///
+/// NAN-2219: delegates to `nanosiem_core::auth::compose_viewer_scope`, the ONE
+/// definition, shared with `nanosiem-api`'s
+/// `AuthContext::effective_viewer_scope` so the two request surfaces cannot
+/// drift. The returned scope carries BOTH halves: `deny_set()` (live rows,
+/// audit gate included — byte-identical to the previous inline composition) and
+/// `artifact_deny_set()` (per-source RBAC only), which is what the prevalence
+/// provenance gates behind `| prevalence` read.
 pub(crate) fn effective_scope(auth: &crate::AuthContext) -> nanosiem_core::auth::ScopeSet {
-    let mut deny = auth.denied_sources.deny_set().clone();
-    if !auth.claims.has_permission(permissions::AUDIT_VIEW) {
-        deny.insert("audit".to_string());
-    }
-    nanosiem_core::auth::ScopeSet::from_denied(deny)
+    nanosiem_core::auth::compose_viewer_scope(
+        &auth.denied_sources,
+        auth.claims.has_permission(permissions::AUDIT_VIEW),
+    )
 }
 
 /// Execute a piped query
@@ -920,5 +927,125 @@ mod field_values_endpoint_tests {
             !body.contains("field_access_expr"),
             "the endpoint must not grow its own schema-resolution path"
         );
+    }
+}
+
+/// NAN-2219: `nanosiem-search` carries its OWN `AuthContext` and composes its
+/// own scope, so the row-filter / derived-artifact split has to be pinned HERE
+/// as well as at `nanosiem-api`'s `AuthContext::effective_viewer_scope`. Both
+/// delegate to `nanosiem_core::auth::compose_viewer_scope`; these assertions are
+/// what catches this crate re-inlining the composition and losing the split —
+/// which would silently restore the inverted `| prevalence` numbers this issue
+/// fixed, on the primary search surface.
+#[cfg(test)]
+mod effective_scope_split_tests {
+    use nanosiem_core::auth::{types::TokenClaims, ApiKeyInfo, ArtifactScope, ScopeSet};
+    use std::collections::BTreeSet;
+    use uuid::Uuid;
+
+    // The permission IDS, not the `permissions::*` constants. `authz_guard`'s
+    // `every_handler_is_authorization_accounted_for` splits this file on the
+    // literal `pub async fn ` — which also occurs inside a string in
+    // `field_values_endpoint_tests` — and runs the resulting phantom region to
+    // EOF. Naming `SEARCH_EXECUTE` here would land inside that region and
+    // silently satisfy the guard for it, muting part of a pre-existing
+    // (unrelated) failure. Matches how the sibling scope tests in
+    // `nanosiem-api-lib::auth_context` spell these.
+    const SEARCH_EXECUTE_ID: &str = "search:execute";
+    const AUDIT_VIEW_ID: &str = "audit:view";
+
+    fn jwt_auth(permissions: &[&str]) -> crate::AuthContext {
+        crate::AuthContext::from_jwt(TokenClaims {
+            iss: "test".to_string(),
+            aud: "test".to_string(),
+            sub: Uuid::now_v7(),
+            roles: vec![],
+            permissions: permissions.iter().map(|item| item.to_string()).collect(),
+            exp: i64::MAX,
+            iat: 0,
+            jti: Uuid::now_v7(),
+            purpose: "access".to_string(),
+        })
+    }
+
+    fn api_key_auth(permissions: &[&str]) -> crate::AuthContext {
+        crate::AuthContext::from_api_key(&ApiKeyInfo {
+            id: Uuid::now_v7(),
+            name: "effective-scope-split-test".to_string(),
+            permissions: permissions.iter().map(|item| item.to_string()).collect(),
+            user_id: Some(Uuid::now_v7()),
+        })
+    }
+
+    fn set(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    /// The NAN-2219 case: an ordinary analyst on a tenant whose
+    /// `restricted_source_types` registry is empty. `audit:view` is Admin-only,
+    /// so its absence must NOT be read as a per-source boundary.
+    #[test]
+    fn unscoped_caller_without_audit_view_is_row_restricted_but_not_artifact_restricted() {
+        for auth in [jwt_auth(&[SEARCH_EXECUTE_ID]), api_key_auth(&[SEARCH_EXECUTE_ID])] {
+            let scope = super::effective_scope(&auth);
+
+            // Row filter: audit event rows stay denied (NAN-1801 unchanged).
+            assert_eq!(scope.deny_set(), &set(&["audit"]));
+            assert!(scope.is_restricted());
+
+            // Artifacts: no per-source boundary exists, so none is invented —
+            // `| prevalence` keeps the source-less dictionary fast path instead
+            // of the aggregates migration 170 never backfilled.
+            assert!(scope.artifact_deny_set().is_empty());
+            assert!(ArtifactScope::from_scope(&scope).is_unrestricted());
+        }
+    }
+
+    /// A GENUINELY source-scoped caller keeps its real per-source denies in
+    /// BOTH halves; only the `audit:view` gate is split off.
+    #[test]
+    fn a_source_scoped_caller_keeps_its_real_denies_in_both_halves() {
+        for mut auth in [jwt_auth(&[SEARCH_EXECUTE_ID]), api_key_auth(&[SEARCH_EXECUTE_ID])] {
+            auth.denied_sources = ScopeSet::from_denied(set(&["insider_threat"]));
+            let scope = super::effective_scope(&auth);
+
+            assert_eq!(scope.deny_set(), &set(&["audit", "insider_threat"]));
+            assert_eq!(scope.artifact_deny_set(), &set(&["insider_threat"]));
+            assert!(!ArtifactScope::from_scope(&scope).is_unrestricted());
+        }
+    }
+
+    /// A tenant that registers `audit` in `restricted_source_types` has a REAL
+    /// per-source boundary on it, so it is denied in BOTH halves regardless of
+    /// the permission. The split must not launder a registry deny into
+    /// artifact visibility.
+    #[test]
+    fn registry_restricted_audit_survives_in_both_halves() {
+        for mut auth in [
+            jwt_auth(&[SEARCH_EXECUTE_ID]),
+            jwt_auth(&[SEARCH_EXECUTE_ID, AUDIT_VIEW_ID]),
+            api_key_auth(&[SEARCH_EXECUTE_ID]),
+            api_key_auth(&[SEARCH_EXECUTE_ID, AUDIT_VIEW_ID]),
+        ] {
+            auth.denied_sources = ScopeSet::from_denied(set(&["audit"]));
+            let scope = super::effective_scope(&auth);
+
+            assert_eq!(scope.deny_set(), &set(&["audit"]));
+            assert_eq!(scope.artifact_deny_set(), &set(&["audit"]));
+            assert!(!ArtifactScope::from_scope(&scope).is_unrestricted());
+        }
+    }
+
+    /// An unrestricted `audit:view` holder still yields the fully EMPTY scope
+    /// both halves — the contract that keeps downstream SQL byte-identical to
+    /// the pre-scoping form.
+    #[test]
+    fn an_unrestricted_audit_viewer_yields_an_empty_scope() {
+        for auth in [
+            jwt_auth(&[SEARCH_EXECUTE_ID, AUDIT_VIEW_ID]),
+            api_key_auth(&[SEARCH_EXECUTE_ID, AUDIT_VIEW_ID]),
+        ] {
+            assert_eq!(super::effective_scope(&auth), ScopeSet::unrestricted());
+        }
     }
 }

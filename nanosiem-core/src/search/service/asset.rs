@@ -1660,134 +1660,11 @@ impl SearchService {
     /// Classify an event into a type category.
     /// Ordering and logic mirrors the SQL CASE WHEN in the facet/filter queries
     /// and the frontend getEventType() to ensure consistent classification.
+    /// See [`detect_event_kind`] — a free function so the classification
+    /// heuristic is unit-testable without constructing a `SearchService`
+    /// (NAN-2230, same pattern as `build_fetch_log_sql`/`build_lateral_columns`).
     fn detect_event_kind(&self, event: &serde_json::Value) -> String {
-        // The paginated events query computes `event_kind` server-side via the
-        // profile-aware classifier (`classification::event_kind_sql`), so under
-        // OCSF — where the UDM key reads below would all be absent (those columns
-        // aren't projected) — we trust the SQL classification. Falls through to the
-        // UDM JSON-key heuristic only when the column is missing (e.g. callers that
-        // pass raw rows without the computed column). This keeps UDM byte-identical
-        // (the classifier and the heuristic agree on the UDM mapping) while making
-        // OCSF correct (NAN-1241).
-        if let Some(server_type) = event
-            .get("event_kind")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            return server_type.to_string();
-        }
-
-        let source_type = event
-            .get("source_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_lowercase();
-
-        let action = event
-            .get("action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_lowercase();
-
-        // Helper: check if a field exists AND is a non-empty string
-        let has_non_empty = |field: &str| -> bool {
-            event
-                .get(field)
-                .and_then(|v| v.as_str())
-                .map_or(false, |s| !s.is_empty())
-        };
-
-        // Alert/Signal events
-        if source_type == "signal" || source_type.contains("alert") {
-            return "ALERT".to_string();
-        }
-
-        // DHCP / network info events (before auth/process to avoid misclassification
-        // when ClickHouse returns empty strings for auth_result/process_name)
-        if source_type.contains("dhcp")
-            || action.contains("dhcp")
-            || action == "network_info"
-            || action == "networkinfo"
-            || action.contains("network_adapter")
-        {
-            return "DHCP".to_string();
-        }
-
-        // DNS events
-        let src_port = event.get("src_port").and_then(|v| v.as_u64()).unwrap_or(0);
-        let dest_port = event.get("dest_port").and_then(|v| v.as_u64()).unwrap_or(0);
-        if (source_type.contains("dns")
-            || has_non_empty("query")
-            || src_port == 53
-            || dest_port == 53)
-            && !source_type.contains("dhcp")
-        {
-            return "DNS".to_string();
-        }
-
-        // Authentication events - require non-empty auth_result or auth-related source/action
-        if has_non_empty("auth_result")
-            || source_type.contains("auth")
-            || action.contains("login")
-            || action.contains("logon")
-        {
-            let auth_result = event
-                .get("auth_result")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_lowercase();
-            if auth_result.contains("fail") || action.contains("fail") {
-                return "AUTH_FAILURE".to_string();
-            }
-            return "AUTH_SUCCESS".to_string();
-        }
-
-        // Image load events (DLL loads)
-        if action == "image_load" || action == "imageload" {
-            return "IMAGE_LOAD".to_string();
-        }
-
-        // Registry events
-        let category = event
-            .get("category")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_lowercase();
-        if action.contains("registry") || category == "registry" {
-            return "REGISTRY".to_string();
-        }
-
-        // Pipe events (named pipe create/connect)
-        if action.contains("pipe") || category == "pipe" {
-            return "PIPE".to_string();
-        }
-
-        // Network events (action-based) — check BEFORE process so EDR events with
-        // both process_name and dest_ip (e.g. "chrome.exe connected to ...") classify
-        // as NETWORK when the action indicates a connection.
-        if action.contains("connection")
-            || source_type.contains("firewall")
-            || source_type.contains("proxy")
-        {
-            return "NETWORK".to_string();
-        }
-
-        // Process events - require non-empty process_name
-        if has_non_empty("process_name") || action.contains("process") || action.contains("exec") {
-            return "PROCESS".to_string();
-        }
-
-        // File events - require non-empty file_action
-        if has_non_empty("file_action") || action.contains("file") {
-            return "FILE".to_string();
-        }
-
-        // Network events (fallback) - dest_ip present but no connection keyword
-        if has_non_empty("dest_ip") {
-            return "NETWORK".to_string();
-        }
-
-        "EVENT".to_string()
+        detect_event_kind(event)
     }
 
     /// Build a human-readable summary for an event based on its type.
@@ -1800,60 +1677,9 @@ impl SearchService {
     /// columns (`dst_endpoint.hostname`, …). Empty values are skipped so the
     /// fallback chain reaches a populated field (e.g. a NETWORK event with no
     /// hostname falls through to the IP instead of rendering `:port`).
+    /// See [`build_event_summary`] — free function for the same reason.
     fn build_event_summary(&self, event: &serde_json::Value, event_kind: &str) -> String {
-        let profile = self.active_profile.as_ref();
-        // Resolve a UDM-semantic concept → the native key the row carries, then
-        // read it as a non-empty string / number.
-        let s = |concept: &str| -> Option<&str> {
-            let key = profile.display_field_name(concept)?;
-            event
-                .get(key.as_str())
-                .and_then(|v| v.as_str())
-                .filter(|x| !x.is_empty())
-        };
-        let n = |concept: &str| -> Option<u64> {
-            let key = profile.display_field_name(concept)?;
-            event.get(key.as_str()).and_then(|v| v.as_u64())
-        };
-        match event_kind {
-            "PROCESS" => {
-                let proc_name = s("process_name")
-                    .or_else(|| s("command_line"))
-                    .unwrap_or("Unknown process");
-                match n("process_id") {
-                    Some(p) => format!("{} ({})", proc_name, p),
-                    None => proc_name.to_string(),
-                }
-            }
-            "FILE" => s("file_name")
-                .or_else(|| s("file_path"))
-                .unwrap_or("Unknown file")
-                .to_string(),
-            "NETWORK" => {
-                let dest = s("dest_host").or_else(|| s("dest_ip")).unwrap_or("Unknown");
-                match n("dest_port") {
-                    Some(p) => format!("{}:{}", dest, p),
-                    None => dest.to_string(),
-                }
-            }
-            "DNS" => s("query")
-                .or_else(|| s("dest_host"))
-                .or_else(|| s("dest_ip"))
-                .unwrap_or("Unknown query")
-                .to_string(),
-            "ALERT" => s("rule_name")
-                .or_else(|| s("message"))
-                .unwrap_or("Alert triggered")
-                .to_string(),
-            "AUTH_SUCCESS" | "AUTH_FAILURE" => {
-                let user = s("user").unwrap_or("Unknown");
-                match s("auth_type") {
-                    Some(t) => format!("{} via {}", user, t),
-                    None => user.to_string(),
-                }
-            }
-            _ => s("message").or_else(|| s("action")).unwrap_or("Event").to_string(),
-        }
+        build_event_summary(self.active_profile.as_ref(), event, event_kind)
     }
 
     /// Hourly activity for one entity from `entity_time_range_agg` (NAN-1864).
@@ -3113,3 +2939,262 @@ mod asset_baseline_agg_tests;
 #[cfg(test)]
 #[path = "asset_true_time_range_scope_tests.rs"]
 mod asset_true_time_range_scope_tests;
+
+/// Classify an event into a kind bucket (`PROCESS`, `AUTH_FAILURE`, …).
+///
+/// Free function (NAN-2230) so the heuristic is unit-testable without a
+/// `SearchService`; `SearchService::detect_event_kind` delegates here.
+pub(crate) fn detect_event_kind(event: &serde_json::Value) -> String {
+    // The paginated events query computes `event_kind` server-side via the
+    // profile-aware classifier (`classification::event_kind_sql`), so under
+    // OCSF — where the UDM key reads below would all be absent (those columns
+    // aren't projected) — we trust the SQL classification. Falls through to the
+    // UDM JSON-key heuristic only when the column is missing (e.g. callers that
+    // pass raw rows without the computed column). This keeps UDM byte-identical
+    // (the classifier and the heuristic agree on the UDM mapping) while making
+    // OCSF correct (NAN-1241).
+    if let Some(server_type) = event
+        .get("event_kind")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return server_type.to_string();
+    }
+
+    let source_type = event
+        .get("source_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // NAN-2230: the timeline projection aliases the physical `action` column
+    // to the canonical `event_type` (NAN-2211), so the row is keyed
+    // `event_type`. Reading `action` here silently matched nothing.
+    let action = event
+        .get("event_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // Helper: check if a field exists AND is a non-empty string
+    let has_non_empty = |field: &str| -> bool {
+        event
+            .get(field)
+            .and_then(|v| v.as_str())
+            .map_or(false, |s| !s.is_empty())
+    };
+
+    // Alert/Signal events
+    if source_type == "signal" || source_type.contains("alert") {
+        return "ALERT".to_string();
+    }
+
+    // DHCP / network info events (before auth/process to avoid misclassification
+    // when ClickHouse returns empty strings for auth_result/process_name)
+    if source_type.contains("dhcp")
+        || action.contains("dhcp")
+        || action == "network_info"
+        || action == "networkinfo"
+        || action.contains("network_adapter")
+    {
+        return "DHCP".to_string();
+    }
+
+    // DNS events
+    let src_port = event.get("src_port").and_then(|v| v.as_u64()).unwrap_or(0);
+    let dest_port = event.get("dest_port").and_then(|v| v.as_u64()).unwrap_or(0);
+    if (source_type.contains("dns")
+        || has_non_empty("query")
+        || src_port == 53
+        || dest_port == 53)
+        && !source_type.contains("dhcp")
+    {
+        return "DNS".to_string();
+    }
+
+    // Authentication events - require non-empty auth_result or auth-related source/action
+    if has_non_empty("auth_result")
+        || source_type.contains("auth")
+        || action.contains("login")
+        || action.contains("logon")
+    {
+        let auth_result = event
+            .get("auth_result")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if auth_result.contains("fail") || action.contains("fail") {
+            return "AUTH_FAILURE".to_string();
+        }
+        return "AUTH_SUCCESS".to_string();
+    }
+
+    // Image load events (DLL loads)
+    if action == "image_load" || action == "imageload" {
+        return "IMAGE_LOAD".to_string();
+    }
+
+    // Registry events
+    let category = event
+        .get("category")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if action.contains("registry") || category == "registry" {
+        return "REGISTRY".to_string();
+    }
+
+    // Pipe events (named pipe create/connect)
+    if action.contains("pipe") || category == "pipe" {
+        return "PIPE".to_string();
+    }
+
+    // Network events (action-based) — check BEFORE process so EDR events with
+    // both process_name and dest_ip (e.g. "chrome.exe connected to ...") classify
+    // as NETWORK when the action indicates a connection.
+    if action.contains("connection")
+        || source_type.contains("firewall")
+        || source_type.contains("proxy")
+    {
+        return "NETWORK".to_string();
+    }
+
+    // Process events - require non-empty process_name
+    if has_non_empty("process_name") || action.contains("process") || action.contains("exec") {
+        return "PROCESS".to_string();
+    }
+
+    // File events - require non-empty file_action
+    if has_non_empty("file_action") || action.contains("file") {
+        return "FILE".to_string();
+    }
+
+    // Network events (fallback) - dest_ip present but no connection keyword
+    if has_non_empty("dest_ip") {
+        return "NETWORK".to_string();
+    }
+
+    "EVENT".to_string()
+}
+
+/// Human-readable one-line summary for an asset-timeline event.
+///
+/// Free function (NAN-2230) so the field-fallback chains are unit-testable
+/// without constructing a `SearchService` — the same reason `build_fetch_log_sql`
+/// and `build_lateral_columns` are free functions. `SearchService::build_event_summary`
+/// delegates here with its active profile.
+pub(crate) fn build_event_summary(
+    profile: &dyn crate::schema::SchemaProfile,
+    event: &serde_json::Value,
+    event_kind: &str,
+) -> String {
+    // Resolve a UDM-semantic concept → the native key the row carries, then
+    // read it as a non-empty string / number.
+    let s = |concept: &str| -> Option<&str> {
+        let key = profile.display_field_name(concept)?;
+        event
+            .get(key.as_str())
+            .and_then(|v| v.as_str())
+            .filter(|x| !x.is_empty())
+    };
+    let n = |concept: &str| -> Option<u64> {
+        let key = profile.display_field_name(concept)?;
+        event.get(key.as_str()).and_then(|v| v.as_u64())
+    };
+    match event_kind {
+        "PROCESS" => {
+            let proc_name = s("process_name")
+                .or_else(|| s("command_line"))
+                .unwrap_or("Unknown process");
+            match n("process_id") {
+                Some(p) => format!("{} ({})", proc_name, p),
+                None => proc_name.to_string(),
+            }
+        }
+        "FILE" => s("file_name")
+            .or_else(|| s("file_path"))
+            .unwrap_or("Unknown file")
+            .to_string(),
+        "NETWORK" => {
+            let dest = s("dest_host").or_else(|| s("dest_ip")).unwrap_or("Unknown");
+            match n("dest_port") {
+                Some(p) => format!("{}:{}", dest, p),
+                None => dest.to_string(),
+            }
+        }
+        "DNS" => s("query")
+            .or_else(|| s("dest_host"))
+            .or_else(|| s("dest_ip"))
+            .unwrap_or("Unknown query")
+            .to_string(),
+        "ALERT" => s("rule_name")
+            .or_else(|| s("message"))
+            .unwrap_or("Alert triggered")
+            .to_string(),
+        "AUTH_SUCCESS" | "AUTH_FAILURE" => {
+            let user = s("user").unwrap_or("Unknown");
+            match s("auth_type") {
+                Some(t) => format!("{} via {}", user, t),
+                None => user.to_string(),
+            }
+        }
+        // NAN-2230: `event_type`, not the physical `action` — the row is keyed
+        // by the canonical name since NAN-2211, so this leg missed and every
+        // message-less EVENT row rendered the literal string "Event".
+        _ => s("message")
+            .or_else(|| s("event_type"))
+            .unwrap_or("Event")
+            .to_string(),
+    }
+}
+
+#[cfg(test)]
+mod nan2230_asset_reader_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn udm() -> crate::schema::UdmProfile {
+        crate::schema::UdmProfile::new()
+    }
+
+    /// NAN-2230 regression (introduced by NAN-2211): the asset timeline aliases
+    /// the physical `action` column to the canonical `event_type`, so the row is
+    /// keyed `event_type`. `build_event_summary`'s EVENT-lane fallback still read
+    /// `action`, so a row with no `message` lost its text and rendered the bare
+    /// literal "Event".
+    #[test]
+    fn event_lane_summary_falls_back_to_event_type() {
+        let event = json!({ "event_type": "process_access", "source_type": "windows_sysmon" });
+        assert_eq!(build_event_summary(&udm(), &event, "EVENT"), "process_access");
+    }
+
+    /// `message` still wins when present — the fallback is second, not first.
+    #[test]
+    fn event_lane_summary_prefers_message() {
+        let event = json!({ "message": "a real message", "event_type": "process_access" });
+        assert_eq!(build_event_summary(&udm(), &event, "EVENT"), "a real message");
+    }
+
+    /// With neither, the literal placeholder is still correct.
+    #[test]
+    fn event_lane_summary_placeholder_when_nothing_to_show() {
+        assert_eq!(build_event_summary(&udm(), &json!({}), "EVENT"), "Event");
+    }
+
+    /// The server-computed classification wins outright — this is why the stale
+    /// `action` read in the heuristic was silently dead rather than visibly wrong.
+    #[test]
+    fn detect_event_kind_trusts_the_server_computed_column() {
+        let event = json!({ "event_kind": "IMAGE_LOAD", "event_type": "process_access" });
+        assert_eq!(detect_event_kind(&event), "IMAGE_LOAD");
+    }
+
+    /// NAN-2230: with no server column the UDM heuristic must read the row's
+    /// canonical key. Before the fix this read `action`, found nothing, and fell
+    /// through to the generic bucket.
+    #[test]
+    fn detect_event_kind_heuristic_reads_canonical_event_type() {
+        let event = json!({ "event_type": "image_load", "source_type": "windows_sysmon" });
+        assert_eq!(detect_event_kind(&event), "IMAGE_LOAD");
+    }
+}

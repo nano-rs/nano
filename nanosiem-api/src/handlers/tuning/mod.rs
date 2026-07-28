@@ -32,9 +32,8 @@ pub use versions::*;
 // =============================================================================
 
 /// NAN-2085 / NAN-2088: the reader's effective per-source deny scope for AI
-/// tuning artifacts — the per-source RBAC deny set unioned with `audit` unless
-/// the caller holds `audit:view`, from the canonical
-/// `AuthContext::effective_source_deny_set()`.
+/// tuning artifacts, from the canonical
+/// `AuthContext::effective_viewer_scope()`.
 ///
 /// Every route that can surface source-derived tuning data resolves the scope
 /// through this single helper: metrics, baselines, breach history, proposal
@@ -43,10 +42,17 @@ pub use versions::*;
 /// Background/system callers — the orchestrator, PR recovery, and scheduler —
 /// instead use `TuningScope::system()`; their execution scope is never a
 /// viewer's authorization.
+///
+/// NAN-2219: `TuningScope` IS `ArtifactScope`, and tuning proposals/baselines/
+/// breaches are gated on `source_types_complete`. `from_scope` therefore reads
+/// the scope's per-source RBAC half only. Folding the `audit:view` gate in here
+/// made every non-Admin "restricted" and blanked `/api/tuning/*` on tenants
+/// with no source scoping configured, because that column ships `DEFAULT FALSE`
+/// and was never backfilled.
 pub(crate) fn effective_tuning_scope(
     auth: &crate::middleware::AuthContext,
 ) -> nanosiem_core::tuning::scope::TuningScope {
-    nanosiem_core::tuning::scope::TuningScope::from_denied(&auth.effective_source_deny_set())
+    nanosiem_core::tuning::scope::TuningScope::from_scope(&auth.effective_viewer_scope())
 }
 
 // =============================================================================

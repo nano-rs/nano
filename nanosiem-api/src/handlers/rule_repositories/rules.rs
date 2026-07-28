@@ -175,7 +175,7 @@ pub async fn preview_import(
     // catalog half only, and with it the inventory is still filtered by the
     // caller's effective deny set (per-source RBAC ∪ implicit `audit` without
     // `audit:view`).
-    let scope = nanosiem_core::auth::ScopeSet::from_denied(auth.effective_source_deny_set());
+    let scope = auth.effective_viewer_scope();
     let access = live_inventory_access(&auth, &scope);
 
     let service = get_rule_repo_service(&state)?;
@@ -332,8 +332,7 @@ pub async fn import_rule(
                     start: chrono::Utc::now() - chrono::Duration::days(7),
                     end: chrono::Utc::now(),
                 };
-                let scope =
-                    nanosiem_core::auth::ScopeSet::from_denied(auth.effective_source_deny_set());
+                let scope = auth.effective_viewer_scope();
                 melod_service
                     .data_access()
                     .get_source_types(&time_range, &scope)

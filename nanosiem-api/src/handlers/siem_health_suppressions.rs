@@ -53,6 +53,11 @@ pub struct ListSuppressionsParams {
 const REASON_MAX_LEN: usize = 500;
 const TITLE_MAX_LEN: usize = 500;
 
+/// NAN-2219: the scope's per-source RBAC half. Suppression rows carry no source
+/// provenance, so the question this gate asks is "does this principal have a
+/// per-source boundary at all?" — the `audit:view` gate does not create one, and
+/// folding it in made every non-Admin unable to read or manage suppressions on
+/// tenants with no source scoping configured.
 fn effective_artifact_scope(auth: &AuthContext) -> ArtifactScope {
     ArtifactScope::from_scope(&auth.effective_viewer_scope())
 }
@@ -283,8 +288,10 @@ mod tests {
         for auth in [
             jwt_auth(&["insider_threat"], true),
             api_key_auth(&["insider_threat"], true),
-            jwt_auth(&[], false),
-            api_key_auth(&[], false),
+            // A registry-restricted `audit` is a real per-source boundary and
+            // still blocks the mutation, with or without `audit:view`.
+            jwt_auth(&["audit"], true),
+            api_key_auth(&["audit"], false),
         ] {
             assert_eq!(
                 forbidden_message(ensure_suppression_mutation_allowed(&auth)),
@@ -299,6 +306,22 @@ mod tests {
             assert!(effective_artifact_scope(&auth).is_unrestricted());
             ensure_suppression_mutation_allowed(&auth)
                 .expect("unrestricted suppression mutation remains allowed");
+        }
+    }
+
+    /// NAN-2219: lacking `audit:view` is not a per-source boundary. A caller
+    /// with `settings:system` and no source grants restricting them must not be
+    /// treated as source-restricted here — that blocked suppression management
+    /// outright on every tenant with an empty `restricted_source_types`
+    /// registry.
+    #[test]
+    fn missing_audit_view_alone_no_longer_blocks_suppression_mutations() {
+        for auth in [jwt_auth(&[], false), api_key_auth(&[], false)] {
+            assert!(effective_artifact_scope(&auth).is_unrestricted());
+            ensure_suppression_mutation_allowed(&auth)
+                .expect("an unscoped principal may manage suppressions (NAN-2219)");
+            // The row-filter half still denies audit event rows everywhere else.
+            assert!(auth.effective_viewer_scope().deny_set().contains("audit"));
         }
     }
 }

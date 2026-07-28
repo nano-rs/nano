@@ -116,6 +116,12 @@ pub async fn run_health_check_with_trigger(
     // regardless of who pressed the button; who may READ suppression prose is a
     // separate decision that `list_active_for_scope` still makes on the API
     // path (`handlers/siem_health_suppressions.rs`), unchanged.
+    //
+    // NAN-2219 reached the same defect from the scope side and narrowed it to
+    // triggers with a REAL per-source boundary. NAN-2222 supersedes that:
+    // there is no viewer scope here to narrow, because generation is not a
+    // viewer operation. `scope` below still governs metric COLLECTION, which
+    // is per-source log data and stays on the row-filter half.
     let suppressions = match SuppressionRepository::new(pool.clone()).list_active().await {
         Ok(rows) => rows
             .into_iter()

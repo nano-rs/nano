@@ -4061,3 +4061,99 @@
             "quoted display alias must survive, got:\n{sql2}"
         );
     }
+
+/// NAN-2230: `table_view` is the default results grid and goes through the
+/// explicit-fields projection branch, which emits each required field under its
+/// own name with no canonical rewrite. Listing the physical `action` in the
+/// summary set therefore put it in EVERY search row; the row-expand inspector
+/// merges that row with the full-log fetch (correctly keyed `event_type`), so
+/// the analyst saw the same column twice under two names.
+#[cfg(test)]
+mod nan2230_table_view_canonical_name {
+    use super::*;
+
+    fn table_view_projection(npl: &str) -> String {
+        let gen = ClickHouseSqlGenerator::new();
+        let query = parse_query(npl).unwrap();
+        let options = QueryOptions {
+            table_view: true,
+            ..Default::default()
+        };
+        let sql = gen
+            .generate_with_options(&query, &time_range(), &options)
+            .unwrap();
+        let head = sql.split(" FROM ").next().unwrap_or("");
+        // Strip the leading `SELECT `/CTE preamble so a FIRST-POSITION column
+        // still matches an exact `== "action"` comparison — without this the
+        // first column reads `SELECT action` and silently passes every check.
+        head.rsplit("SELECT ").next().unwrap_or(head).to_string()
+    }
+
+    /// A bare search must project the canonical name and never the physical one.
+    #[test]
+    fn bare_search_projects_event_type_not_action() {
+        let proj = table_view_projection("error");
+        assert!(
+            proj.contains("event_type"),
+            "table_view summary must carry the canonical name: {proj}"
+        );
+        assert!(
+            !proj.split(", ").any(|c| c.trim() == "action"),
+            "physical `action` must not be projected: {proj}"
+        );
+    }
+
+    /// The exact shape the user reported: filtering on `event_type` must not
+    /// yield BOTH names in the row.
+    #[test]
+    fn filtering_on_event_type_does_not_project_both_names() {
+        let proj = table_view_projection("event_type=process_access");
+        assert!(
+            !proj.split(", ").any(|c| c.trim() == "action"),
+            "must not project `action` alongside `event_type`: {proj}"
+        );
+        assert_eq!(
+            proj.matches("event_type").count(),
+            1,
+            "the canonical name must appear exactly once: {proj}"
+        );
+    }
+
+    /// Bounded, deliberate exception: a query that literally types `action=`
+    /// still projects it, because `field_analysis` adds it so a downstream
+    /// `| where action=…` can bind. Forcing an alias here is how NAN-876 broke
+    /// every piped query. Pinned so the exception stays intentional.
+    #[test]
+    fn explicit_action_reference_is_still_projected_by_design() {
+        let proj = table_view_projection("action=process_access");
+        assert!(
+            proj.split(", ").any(|c| c.trim() == "action"),
+            "an explicit `action=` reference must stay bindable downstream: {proj}"
+        );
+    }
+}
+
+/// NAN-2230 / NAN-876 guard: a downstream stage filtering on the canonical name
+/// must bind to what stage_0 projected. The table_view summary swap changes what
+/// stage_0 emits, so this pins the projection and the predicate agreeing.
+#[cfg(test)]
+mod nan2230_cte_binding {
+    use super::*;
+
+    #[test]
+    fn where_on_event_type_binds_to_the_projected_column() {
+        let gen = ClickHouseSqlGenerator::new();
+        let query = parse_query("source_type=windows_sysmon | where event_type=\"process_access\"").unwrap();
+        let options = QueryOptions { table_view: true, ..Default::default() };
+        let sql = gen.generate_with_options(&query, &time_range(), &options).unwrap();
+        let stage_0 = sql.split("stage_1").next().expect("stage_0");
+        assert!(
+            stage_0.contains("event_type"),
+            "stage_0 must project the column the downstream WHERE binds: {sql}"
+        );
+        assert!(
+            sql.contains("event_type"),
+            "the predicate must reference the projected name: {sql}"
+        );
+    }
+}

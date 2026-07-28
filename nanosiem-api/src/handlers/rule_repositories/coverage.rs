@@ -65,7 +65,7 @@ pub async fn get_coverage(
     // source types back through `most_missing_fields[].source_types_with_field`.
     // Same two gates as the import preview — live-data capability, then the
     // requester's effective per-source deny set.
-    let scope = nanosiem_core::auth::ScopeSet::from_denied(auth.effective_source_deny_set());
+    let scope = auth.effective_viewer_scope();
     let access = super::rules::live_inventory_access(&auth, &scope);
     let analysis = service.get_coverage_analysis(filter, &access).await?;
 

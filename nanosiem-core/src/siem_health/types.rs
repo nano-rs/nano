@@ -260,6 +260,21 @@ impl CollectedMetrics {
     /// published the denied sources' exact 24h event volume as the difference
     /// of two returned fields — the precise datum this pruning exists to hide,
     /// recoverable with one subtraction.
+    ///
+    /// # Feed this the ROW-FILTER half of the caller's scope (NAN-2219)
+    ///
+    /// NAN-2219 split [`ScopeSet`](crate::auth::ScopeSet) into a row-filter
+    /// deny set (per-source RBAC ∪ the `audit:view` gate) and a derived-artifact
+    /// deny set (per-source RBAC only), and `ArtifactScope::from_scope` reads
+    /// the ARTIFACT half. Every partition pruned here is keyed by `source_type`
+    /// and carries that source's exact event volume, field coverage and
+    /// enrichment coverage — per-source log data, the shape `/api/source-types`
+    /// leaked in NAN-1801 — so it must be driven by the ROW half. Callers build
+    /// that with `ArtifactScope::from_denied(scope.deny_set())`; passing
+    /// `from_scope` here would hand a viewer without `audit:view` the `audit`
+    /// partitions. This function is not one of the `source_types_complete`
+    /// provenance gates and has no unbackfilled-column failure mode; it merely
+    /// borrows `ArtifactScope`'s normalizing classifier.
     pub fn retain_source_partitions(&mut self, scope: &ArtifactScope) {
         if scope.is_unrestricted() {
             return;

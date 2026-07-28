@@ -63,13 +63,11 @@ pub async fn panel_query(
     // The raw-SQL arm must NOT use it (it would fail closed for every non-audit
     // caller); the SQL arm builds a source-only scope + an explicit
     // RawSqlAuditAccess below, and the ClickHouse row policy hides audit rows.
-    let scope = {
-        let mut deny = auth.denied_sources.deny_set().clone();
-        if !auth.has_permission(permissions::AUDIT_VIEW) {
-            deny.insert("audit".to_string());
-        }
-        nanosiem_core::auth::ScopeSet::from_denied(deny)
-    };
+    // NAN-2219: use the canonical composer rather than re-inlining it — a
+    // hand-built `ScopeSet::from_denied(..)` loses the row-filter/artifact
+    // split, which silently re-restricts a `| prevalence` panel for every
+    // caller without `audit:view`.
+    let scope = auth.effective_viewer_scope();
 
     // Execute based on query mode. Each arm yields
     // `(response, cached, cache_age_secs)` so the caller can report cache

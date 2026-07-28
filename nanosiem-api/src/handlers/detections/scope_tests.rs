@@ -88,11 +88,53 @@ fn missing_audit_view_implicitly_denies_the_audit_source() {
     // NAN-2155: every restricted bind also carries the unresolved-provenance
     // sentinel; filter it out to assert the audit composition itself.
     assert_eq!(caller_denied(&scope), vec!["audit".to_string()]);
+}
 
-    // Same composition drives the tuning-artifact gate.
+/// NAN-2219: the two gates DIVERGE for a caller whose only "restriction" is the
+/// absence of `audit:view`.
+///
+/// `MatchScope` filters `detection_matches` ROWS, so the audit deny stays — an
+/// analyst without `audit:view` must not see a match derived from audit events.
+///
+/// `TuningScope` is `ArtifactScope`: it gates persisted proposals/baselines on
+/// `source_types_complete`, a column shipped `DEFAULT FALSE` and never
+/// backfilled. Treating "no `audit:view`" (an Admin-only permission) as a
+/// per-source restriction denied every Editor / ReadOnly / API key every tuning
+/// artifact, on tenants with no source scoping configured at all. Accepted
+/// disclosure: those callers now see tuning artifacts whose inputs may include
+/// audit-derived events.
+#[test]
+fn missing_audit_view_alone_gates_match_rows_but_not_tuning_artifacts() {
+    let auth = session(&[permissions::DETECTIONS_VIEW], &[]);
+
+    // Row filter: unchanged.
+    assert!(!effective_match_scope(&auth).is_unrestricted());
+
+    // Artifact gate: no per-source boundary, so none is invented.
     let tuning = effective_tuning_scope(&auth);
-    assert!(!tuning.allows(&["audit".to_string()], true));
+    assert!(tuning.is_unrestricted());
+    assert!(tuning.allows(&["audit".to_string()], true));
     assert!(tuning.allows(&["apache".to_string()], true));
+    // …and legacy unstamped artifacts stop failing closed for them, which is
+    // the blank-analytics half of the bug.
+    assert!(tuning.allows(&[], false));
+}
+
+/// A tenant that genuinely registers `audit` in `restricted_source_types` puts
+/// it in the caller's per-source RBAC scope, so the tuning artifact gate still
+/// denies it — with or without `audit:view`.
+#[test]
+fn registry_restricted_audit_still_denies_tuning_artifacts() {
+    for perms in [
+        vec![permissions::DETECTIONS_VIEW],
+        vec![permissions::DETECTIONS_VIEW, permissions::AUDIT_VIEW],
+    ] {
+        let auth = session(&perms, &["audit"]);
+        let tuning = effective_tuning_scope(&auth);
+        assert!(!tuning.is_unrestricted());
+        assert!(!tuning.allows(&["audit".to_string()], true));
+        assert!(tuning.allows(&["apache".to_string()], true));
+    }
 }
 
 #[test]

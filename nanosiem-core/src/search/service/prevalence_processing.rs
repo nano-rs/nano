@@ -926,6 +926,11 @@ impl SearchService {
         scope: &crate::auth::ScopeSet,
     ) -> Result<crate::prevalence::PrevalenceScatterData, SearchError> {
         use crate::prevalence::{PrevalenceScatterData, TimeWindow};
+        // NAN-2219: the artifact half. The DISTINCT artifact extraction below
+        // still runs under the full row-filter deny set via
+        // `enforce_source_scope`, so a caller cannot enumerate artifacts out of
+        // denied (or audit) LOG ROWS; only the prevalence numbers looked up for
+        // the artifacts they legitimately extracted come from the artifact half.
         let artifact_scope = crate::auth::ArtifactScope::from_scope(scope);
 
         // Need ClickHouse for this operation

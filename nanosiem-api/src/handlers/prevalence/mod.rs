@@ -26,9 +26,19 @@ pub use types::*;
 
 use nanosiem_core::prevalence::{ArtifactType, TimeWindow};
 
-/// One composition seam for every prevalence read. `AuthContext` is populated
-/// identically by JWT and API-key middleware; `effective_viewer_scope` also
-/// folds in the implicit audit deny when the principal lacks `audit:view`.
+/// One composition seam for every prevalence ARTIFACT read. `AuthContext` is
+/// populated identically by JWT and API-key middleware.
+///
+/// NAN-2219: `ArtifactScope::from_scope` reads the scope's per-source RBAC half
+/// and deliberately NOT the `audit:view` gate. The gate belongs to live rows —
+/// the raw-logs drilldowns in `discovery.rs` still use
+/// `effective_viewer_scope()` / `effective_source_deny_set()` for exactly that
+/// reason. Folding it in here made every non-Admin `is_restricted()`, which
+/// routed them onto the `*_prevalence_source_agg` tables that migration 170
+/// shipped without a backfill; a miss there returns `PrevalenceData::empty`, so
+/// every hash, domain and IP read back as `host_count: 0, is_rare: true,
+/// first_seen: now` — prevalence inverted for every non-Admin, including on
+/// tenants with no source scoping at all.
 fn effective_artifact_scope(
     auth: &crate::middleware::AuthContext,
 ) -> nanosiem_core::auth::ArtifactScope {
@@ -172,8 +182,18 @@ mod scope_tests {
             .iter()
             .map(String::as_str)
             .collect();
+        // A genuinely source-scoped caller keeps its real per-source boundary
+        // in the artifact scope.
         assert!(values.contains("secret_source"));
-        assert!(values.contains("audit"));
+        // NAN-2219: the `audit:view` gate is NOT folded into the artifact
+        // scope. It stays on the row-filter half, which the raw-logs
+        // drilldowns in `discovery.rs` use.
+        assert!(!values.contains("audit"));
+        assert!(auth_row_filter_denies_audit(&jwt));
+    }
+
+    fn auth_row_filter_denies_audit(auth: &AuthContext) -> bool {
+        auth.effective_viewer_scope().deny_set().contains("audit")
     }
 
     #[test]
@@ -183,5 +203,45 @@ mod scope_tests {
             &[],
         );
         assert!(effective_artifact_scope(&auth).is_unrestricted());
+    }
+
+    /// NAN-2219 (the bug): an ordinary analyst on a tenant with an EMPTY
+    /// `restricted_source_types` registry has no per-source boundary at all.
+    /// They must NOT be artifact-restricted — that is what routed them onto the
+    /// unbackfilled `*_prevalence_source_agg` tables and made every artifact
+    /// read back as first-seen and rare.
+    #[test]
+    fn unscoped_analyst_without_audit_view_is_not_artifact_restricted() {
+        for auth in [
+            session(&[permissions::PREVALENCE_VIEW], &[]),
+            api_key(&[permissions::PREVALENCE_VIEW], &[]),
+        ] {
+            assert!(
+                effective_artifact_scope(&auth).is_unrestricted(),
+                "an unscoped caller lacking audit:view must keep the unrestricted \
+                 prevalence fast path (NAN-2219)"
+            );
+            // …while still being denied audit ROWS on the live-data paths.
+            assert!(auth_row_filter_denies_audit(&auth));
+        }
+    }
+
+    /// A tenant that genuinely restricts `audit` through the registry puts it in
+    /// the caller's per-source RBAC scope, so it is denied in BOTH halves —
+    /// NAN-2219 must not weaken that.
+    #[test]
+    fn registry_restricted_audit_is_denied_in_the_artifact_scope_too() {
+        let auth = session(
+            &[permissions::PREVALENCE_VIEW, permissions::AUDIT_VIEW],
+            &["audit"],
+        );
+        let artifact_scope = effective_artifact_scope(&auth);
+        let values: BTreeSet<_> = artifact_scope
+            .deny_bind_values()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert!(values.contains("audit"));
+        assert!(auth_row_filter_denies_audit(&auth));
     }
 }

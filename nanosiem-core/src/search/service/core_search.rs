@@ -661,6 +661,15 @@ impl SearchService {
         let has_prevalence_svc = self.prevalence_service.is_some();
         let has_prevalence_cmds = !prevalence_commands.is_empty();
         let has_enrich = prevalence_commands.iter().any(|cmd| cmd.enrich);
+        // NAN-2219: prevalence rows are DERIVED ARTIFACTS, so this reads the
+        // scope's per-source RBAC half, not its row-filter half. The log rows
+        // this query returns are still filtered by the full row-filter deny set
+        // (injected into the query TEXT above), audit gate included — only the
+        // `_prevalence` host-counts attached to them come from the artifact
+        // half. Reading the row-filter half here made every caller without
+        // `audit:view` take the source-attributed residual path over tables
+        // migration 170 never backfilled, so `| prevalence` reported every
+        // artifact as rare and first-seen-now.
         let prevalence_scope = crate::auth::ArtifactScope::from_scope(scope);
 
         // Check if there's aggregation (stats, timechart, etc.) before prevalence

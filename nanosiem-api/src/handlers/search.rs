@@ -310,9 +310,18 @@ pub async fn get_query_explanation(
 /// visibility share cache entries (shared-URL explanations keep working), while
 /// a differently-scoped caller gets a distinct key and its own scope-correct
 /// entry. The empty (unrestricted) deny-set yields `""`.
+///
+/// NAN-2219: BOTH halves of the effective scope are encoded. The cached
+/// `generated_sql` is scope-specific, and the artifact half now selects a
+/// different prevalence shape (dictionary pushdown vs. the source-attributed
+/// residual path), so two callers sharing only the row-filter half must not
+/// share an entry. The halves are separated by a length-prefixed marker so the
+/// concatenation stays injective across the boundary.
 fn explanation_scope_fingerprint(auth: &AuthContext) -> String {
-    let deny = auth.effective_source_deny_set();
-    encode_scope_fingerprint(deny.iter().map(String::as_str))
+    let scope = auth.effective_viewer_scope();
+    let row = encode_scope_fingerprint(scope.deny_set().iter().map(String::as_str));
+    let artifact = encode_scope_fingerprint(scope.artifact_deny_set().iter().map(String::as_str));
+    format!("{}:{}{}", row.len(), row, artifact)
 }
 
 /// Canonical, injective encoding of a set of source-type names (NAN-2049).
@@ -396,6 +405,7 @@ pub struct SearchApiDoc;
 #[cfg(test)]
 mod tests {
     use super::encode_scope_fingerprint;
+    use crate::middleware::AuthContext;
 
     #[test]
     fn scope_fingerprint_is_injective_across_delimiter_boundaries() {
@@ -426,6 +436,61 @@ mod tests {
         assert_eq!(
             encode_scope_fingerprint(["sysmon", "wineventlog"].into_iter()),
             encode_scope_fingerprint(["sysmon", "wineventlog"].into_iter()),
+        );
+    }
+
+    /// NAN-2219: the cached `generated_sql` now also depends on the ARTIFACT
+    /// half of the scope (dictionary prevalence pushdown vs. the
+    /// source-attributed residual path), so two principals that share only the
+    /// row-filter half must get distinct fingerprints.
+    #[test]
+    fn explanation_fingerprint_separates_the_row_filter_and_artifact_halves() {
+        use nanosiem_core::auth::token::{DEFAULT_TOKEN_AUDIENCE, DEFAULT_TOKEN_ISSUER};
+        use nanosiem_core::auth::{permissions, ScopeSet, TokenClaims};
+        use std::collections::BTreeSet;
+
+        fn auth_with(denied: &[&str], audit_view: bool) -> AuthContext {
+            let mut auth = AuthContext::from_jwt(TokenClaims {
+                iss: DEFAULT_TOKEN_ISSUER.to_string(),
+                aud: DEFAULT_TOKEN_AUDIENCE.to_string(),
+                sub: uuid::Uuid::now_v7(),
+                roles: Vec::new(),
+                permissions: audit_view
+                    .then(|| vec![permissions::AUDIT_VIEW.to_string()])
+                    .unwrap_or_default(),
+                exp: i64::MAX,
+                iat: 0,
+                jti: uuid::Uuid::now_v7(),
+                purpose: "access".to_string(),
+            });
+            auth.denied_sources = ScopeSet::from_denied(
+                denied
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<BTreeSet<_>>(),
+            );
+            auth
+        }
+
+        // Ordinary analyst: row {audit}, artifact {}.
+        let analyst = auth_with(&[], false);
+        // Registry-restricted audit + audit:view: row {audit}, artifact {audit}.
+        let audit_restricted = auth_with(&["audit"], true);
+
+        assert_eq!(
+            analyst.effective_viewer_scope().deny_set(),
+            audit_restricted.effective_viewer_scope().deny_set(),
+            "precondition: the row-filter halves collide"
+        );
+        assert_ne!(
+            super::explanation_scope_fingerprint(&analyst),
+            super::explanation_scope_fingerprint(&audit_restricted),
+        );
+
+        // A fully unrestricted admin still fingerprints as the empty scope.
+        assert_eq!(
+            super::explanation_scope_fingerprint(&auth_with(&[], true)),
+            "0:"
         );
     }
 }

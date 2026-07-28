@@ -55,6 +55,12 @@ pub struct AuthContext {
     /// `audit:view` permission when composing the effective deny set they pass
     /// to the search/detection services.
     ///
+    /// NAN-2219: because this is per-source RBAC only, it is exactly the
+    /// DERIVED-ARTIFACT deny set. `effective_viewer_scope()` carries it through
+    /// as the scope's artifact half; read it from there rather than reaching
+    /// into this field, so a caller cannot accidentally bypass the row-filter
+    /// half at a live-data site.
+    ///
     /// Defaults to unrestricted (empty deny set) in the constructors below; the
     /// middleware overwrites it with the resolved scope. An unrestricted scope
     /// means "sees everything", so callers built outside the middleware (tests,
@@ -106,9 +112,9 @@ impl AuthContext {
         self.claims.has_permission(permission)
     }
 
-    /// NAN-1801: compose the caller's EFFECTIVE per-source deny set — the
-    /// per-source RBAC deny set (NAN-1799, `denied_sources`) unioned with the
-    /// `audit` source unless the caller holds `audit:view`. This is the same
+    /// NAN-1801: compose the caller's EFFECTIVE per-source ROW-FILTER deny set
+    /// — the per-source RBAC deny set (NAN-1799, `denied_sources`) unioned with
+    /// the `audit` source unless the caller holds `audit:view`. This is the same
     /// composition the gated handlers perform inline (alerts, fields,
     /// dashboard panel queries, detection stats, dry-resolve); side-door
     /// callers use this method so the audit gate cannot be forgotten.
@@ -121,29 +127,41 @@ impl AuthContext {
     /// already arrives with an empty `denied_sources`. The `audit` gate here is
     /// intentionally SEPARATE: it stays keyed on `audit:view` (which the Admin
     /// role also holds), so it is not weakened by the source-scope bypass.
+    ///
+    /// NAN-2219: this is the LIVE-DATA deny set. It is the right input for log
+    /// rows, `/api/source-types`, alerts, search and any hand-built scan over
+    /// event data. It is the WRONG input for a derived-artifact provenance
+    /// gate — use [`effective_viewer_scope`](Self::effective_viewer_scope) and
+    /// let `ArtifactScope::from_scope` pick the artifact half.
     pub fn effective_source_deny_set(&self) -> std::collections::BTreeSet<String> {
-        let mut deny = self.denied_sources.deny_set().clone();
-        if !self.has_permission(nanosiem_core::auth::permissions::AUDIT_VIEW) {
-            deny.insert("audit".to_string());
-        }
-        deny
+        self.effective_viewer_scope().deny_set().clone()
     }
 
-    /// The same composition as [`effective_source_deny_set`](Self::effective_source_deny_set),
-    /// wrapped in the [`ScopeSet`](nanosiem_core::auth::ScopeSet) that the
-    /// search / detection / log-source services take.
+    /// The caller's effective source scope, carrying BOTH halves of the
+    /// composition (NAN-2219) in the [`ScopeSet`](nanosiem_core::auth::ScopeSet)
+    /// that the search / detection / log-source services take:
+    ///
+    /// * `deny_set()` — per-source RBAC ∪ the `audit` gate. Governs LIVE data.
+    ///   Byte-identical to the pre-NAN-2219 composition.
+    /// * `artifact_deny_set()` — per-source RBAC only. Governs persisted
+    ///   provenance-stamped artifacts (prevalence, tuning, SIEM health).
     ///
     /// NAN-2055: this was hand-inlined identically in a growing number of
     /// handlers (alerts, detection testing, fields, log-source telemetry). One
     /// definition means a new log-reading surface cannot silently ship with the
     /// `audit` half of the composition forgotten — the failure mode that made
     /// `/api/source-types` return `audit` event counts to a caller without
-    /// `audit:view`.
+    /// `audit:view`. Prefer this over rebuilding a `ScopeSet` from
+    /// [`effective_source_deny_set`](Self::effective_source_deny_set): a
+    /// rebuilt one loses the split and silently re-restricts the artifact half.
     ///
     /// An unrestricted caller holding `audit:view` yields an EMPTY deny set, so
     /// downstream SQL stays byte-identical to the pre-scoping form.
     pub fn effective_viewer_scope(&self) -> nanosiem_core::auth::ScopeSet {
-        nanosiem_core::auth::ScopeSet::from_denied(self.effective_source_deny_set())
+        nanosiem_core::auth::compose_viewer_scope(
+            &self.denied_sources,
+            self.has_permission(nanosiem_core::auth::permissions::AUDIT_VIEW),
+        )
     }
 
     /// Check if the context has any of the specified permissions
@@ -606,15 +624,90 @@ mod tests {
 
     #[test]
     fn effective_viewer_scope_is_empty_only_for_an_unrestricted_audit_viewer() {
-        // An EMPTY deny set is the contract every caller relies on to keep its
-        // SQL byte-identical to the pre-scoping form. It must require BOTH an
-        // unrestricted source scope and `audit:view` — a caller missing
-        // `audit:view` is restricted even with no per-source denials.
+        // An EMPTY ROW-FILTER deny set is the contract every live-data caller
+        // relies on to keep its SQL byte-identical to the pre-scoping form. It
+        // must require BOTH an unrestricted source scope and `audit:view` — a
+        // caller missing `audit:view` is row-filter-restricted even with no
+        // per-source denials.
         let unrestricted = jwt_auth(vec!["audit:view".to_string()]);
         assert!(!unrestricted.effective_viewer_scope().is_restricted());
 
         let no_audit_view = jwt_auth(vec![]);
         assert!(no_audit_view.effective_viewer_scope().is_restricted());
+
+        // NAN-2219 — the deliberate change to this test. The ARTIFACT half of
+        // the same scope tells the opposite story, and that is the whole fix:
+        // `audit:view` is Admin-only, so treating its absence as "source
+        // restricted" classified every Editor / ReadOnly / custom role / API
+        // key as scoped — including on tenants whose `restricted_source_types`
+        // registry is empty and which therefore have no per-source boundary at
+        // all. NAN-2053 / NAN-2137's fail-closed provenance gates then denied
+        // them every artifact whose `source_types_complete` was still the
+        // shipped `DEFAULT FALSE`, inverting prevalence and blanking tuning
+        // analytics.
+        assert!(!no_audit_view.effective_viewer_scope().is_artifact_restricted());
+        assert!(!unrestricted
+            .effective_viewer_scope()
+            .is_artifact_restricted());
+    }
+
+    /// NAN-2219: the two halves must stay split in the right direction for a
+    /// caller with NO per-source grants restricting them.
+    #[test]
+    fn unscoped_caller_without_audit_view_is_row_restricted_but_not_artifact_restricted() {
+        let auth = jwt_auth(vec!["search:execute".to_string()]);
+        let scope = auth.effective_viewer_scope();
+
+        // Row filter: audit rows stay denied (NAN-1801 unchanged).
+        assert!(scope.deny_set().contains("audit"));
+        assert!(scope.is_restricted());
+
+        // Artifacts: no per-source boundary exists, so none is invented.
+        assert!(scope.artifact_deny_set().is_empty());
+        assert!(!scope.is_artifact_restricted());
+        assert!(
+            nanosiem_core::auth::ArtifactScope::from_scope(&scope).is_unrestricted(),
+            "the artifact-provenance gates must see an unrestricted scope"
+        );
+    }
+
+    /// A GENUINELY source-scoped caller keeps its real per-source denies in
+    /// BOTH halves; only the audit gate is split off.
+    #[test]
+    fn a_source_scoped_caller_keeps_its_real_denies_in_both_halves() {
+        let mut auth = jwt_auth(vec!["search:execute".to_string()]);
+        auth.denied_sources = nanosiem_core::auth::ScopeSet::from_denied(
+            ["insider_threat".to_string()].into_iter().collect(),
+        );
+        let scope = auth.effective_viewer_scope();
+
+        assert!(scope.deny_set().contains("insider_threat"));
+        assert!(scope.deny_set().contains("audit"));
+        assert!(scope.artifact_deny_set().contains("insider_threat"));
+        assert!(!scope.artifact_deny_set().contains("audit"));
+        assert!(scope.is_restricted() && scope.is_artifact_restricted());
+    }
+
+    /// A tenant that explicitly registers `audit` in `restricted_source_types`
+    /// gets it in the per-source RBAC scope, so it is denied in BOTH halves —
+    /// the split must not launder a real registry deny into visibility.
+    #[test]
+    fn registry_restricted_audit_survives_in_the_artifact_half() {
+        for perms in [
+            vec!["search:execute".to_string()],
+            vec!["search:execute".to_string(), "audit:view".to_string()],
+        ] {
+            let mut auth = jwt_auth(perms);
+            auth.denied_sources = nanosiem_core::auth::ScopeSet::from_denied(
+                ["audit".to_string()].into_iter().collect(),
+            );
+            let scope = auth.effective_viewer_scope();
+            assert!(scope.deny_set().contains("audit"));
+            assert!(
+                scope.artifact_deny_set().contains("audit"),
+                "a registry-configured audit restriction must survive in the artifact half"
+            );
+        }
     }
 
     /// The `ScopeSet` form and the raw `BTreeSet` form must never disagree —

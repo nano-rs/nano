@@ -126,7 +126,7 @@ pub async fn get_service_security_signals(
     let time_range = TimeRange::new(begin, end);
 
     // NAN-1801: restricted-source signals must not surface here either.
-    let scope = nanosiem_core::auth::ScopeSet::from_denied(auth.effective_source_deny_set());
+    let scope = auth.effective_viewer_scope();
     let (host_count, signal_count, signal_total, signals) = state
         .search_service
         .observability_service_security_signals(&service, &time_range, params.limit, &scope)
