@@ -469,6 +469,56 @@ pub struct LogSourceHealth {
     /// Runtime parse success ratio over the last 24 hours. `None` means no
     /// production events were available; static VRL validation is not counted.
     pub parse_success_rate_24h: Option<f64>,
+
+    // Collector errors (NAN-2196)
+    //
+    // Distinct from `parse_errors_24h` above, and the distinction is the whole
+    // point. Parse errors mean data ARRIVED and we failed to understand it.
+    // These mean data never arrived at all — the collector could not reach the
+    // queue, assume the role, or authenticate. Before this, those two states
+    // were indistinguishable from the outside: both looked like silence.
+    /// Most recent collector failures attributed to this source, newest first.
+    /// Empty when the collector is healthy — or when it has never reported,
+    /// which is the same thing from here.
+    #[serde(default)]
+    pub collector_errors: Vec<CollectorError>,
+    /// Count over the last 24 hours. Separate from `collector_errors.len()`,
+    /// which is capped for display — a source failing every 15 seconds should
+    /// read as thousands of failures, not as the handful we chose to show.
+    #[serde(default)]
+    pub collector_errors_24h: i64,
+    /// A specific likely cause, when the error and the source's configuration
+    /// together point at one. `None` means we will not guess: the raw error is
+    /// in `collector_errors` and inventing a confident diagnosis on top of a
+    /// generic message like `dispatch failure` would be worse than silence.
+    #[serde(default)]
+    pub collector_error_hint: Option<String>,
+}
+
+/// One collector failure, as reported by the collector itself.
+///
+/// Deliberately a near-verbatim record of what Vector said rather than a nano
+/// abstraction over it. The value here is ground truth from the process that
+/// actually failed; normalising it into our own taxonomy would discard the
+/// detail that makes it diagnostic.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CollectorError {
+    pub timestamp: DateTime<Utc>,
+    /// `WARN` or `ERROR`. The collector filters anything lower before it
+    /// reaches storage.
+    pub level: String,
+    /// Human-readable text, e.g. `Failed to fetch SQS events.`
+    pub message: String,
+    /// Stable machine-readable code, e.g. `failed_fetching_sqs_events`. Empty
+    /// when the collector did not classify the failure.
+    pub error_code: String,
+    /// e.g. `request_failed`.
+    pub error_type: String,
+    /// Which end of the pipeline broke — `receiving`, `processing`, `sending`.
+    pub stage: String,
+    /// The collector driver — `aws_s3`, `kafka`, `gcp_pubsub`, … Distinguishes
+    /// "this transport is broken everywhere" from "this one source is broken".
+    pub component_type: String,
 }
 
 /// Health status of a log source

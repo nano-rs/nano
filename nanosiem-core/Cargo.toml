@@ -72,10 +72,7 @@ ed25519-dalek = { version = "2", features = ["pkcs8"] }
 tar = "0.4"
 
 [features]
-# Enterprise-only modules that are stripped from the open edition. Enabled
-# transitively by nanosiem-api's `enterprise` feature. NAN-1193: gates the
-# license / phone-home machinery out of open-edition builds entirely.
-enterprise = []
+default = []
 
 [dev-dependencies]
 proptest.workspace = true
@@ -95,3 +92,6 @@ path = "src/bin/parse_udm_csv.rs"
 [[bin]]
 name = "generate_udm_json"
 path = "src/bin/generate_udm_json.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("enterprise"))'] }

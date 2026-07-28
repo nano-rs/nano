@@ -90,6 +90,9 @@ import { SearchDemoHint } from '@/components/DemoHints';
 import { SearchStatsBar } from '@/components/search/SearchStatsBar';
 import { AddToDashboardDialog } from '@/components/dashboard';
 import { nplQuotedBody } from '@/lib/npl-quote';
+// NAN-2209: shared with SearchResults so both group-by entry points and the
+// query-rewrite paths split the pipeline identically (regex-aware).
+import { getBaseSearch, getPipeCommands, buildGroupByQuery } from '@/lib/npl-pipeline';
 
 interface SearchResult {
   id: string;
@@ -178,73 +181,6 @@ const checkIfAggregateQuery = (q: string) => {
   }
   
   return false;
-};
-
-// Find the position of the first pipe command separator (outside regex patterns and quotes)
-// Returns -1 if no pipe found
-const findFirstPipePosition = (q: string): number => {
-  let inRegex = false;
-  let inQuote = false;
-  let escapeNext = false;
-
-  for (let i = 0; i < q.length; i++) {
-    const c = q[i];
-
-    if (escapeNext) {
-      escapeNext = false;
-      continue;
-    }
-
-    if (c === '\\') {
-      escapeNext = true;
-      continue;
-    }
-
-    if (c === '"' && !inRegex) {
-      inQuote = !inQuote;
-      continue;
-    }
-
-    if (c === '/' && !inQuote) {
-      if (!inRegex) {
-        // Check if this is a regex delimiter (preceded by = or !=)
-        const before = q.substring(0, i).trimEnd();
-        if (before.endsWith('=') || before.endsWith('!=')) {
-          inRegex = true;
-        }
-      } else {
-        // End of regex
-        inRegex = false;
-      }
-      continue;
-    }
-
-    if (c === '|' && !inRegex && !inQuote) {
-      // Found a pipe outside of regex and quotes - this is a command separator
-      return i;
-    }
-  }
-
-  // No pipe found
-  return -1;
-};
-
-// Extract base query (before pipe commands), being careful not to split on | inside regex patterns or quotes
-const getBaseSearch = (q: string) => {
-  const pipePos = findFirstPipePosition(q);
-  if (pipePos === -1) {
-    return q.trim();
-  }
-  return q.substring(0, pipePos).trim();
-};
-
-// Extract pipe commands (from first | to end), being careful not to split on | inside regex patterns or quotes
-const getPipeCommands = (q: string) => {
-  const pipePos = findFirstPipePosition(q);
-  if (pipePos === -1) {
-    return '';
-  }
-  return q.substring(pipePos).trim();
 };
 
 // --- Client-side search result cache for back-navigation ---
@@ -2441,6 +2377,15 @@ export function Search() {
     }
   }, [saveSearchName, saveSearchShared, query, queryMode, timeRange, createSavedSearch, refetchSaved]);
 
+  // NAN-2209: one-click group-by from the field index. Keeps the analyst's
+  // base filters, drops whatever pipeline followed them, and runs immediately —
+  // the same shape FieldValueMenu emits, so both entry points stay consistent.
+  const groupByField = useCallback((field: string) => {
+    const newQuery = buildGroupByQuery(query, field);
+    setQuery(newQuery);
+    handleSearch(1, false, newQuery, queryMode, timeRange);
+  }, [query, queryMode, timeRange, handleSearch]);
+
   // Add filter to query
   const addToQuery = useCallback((field: string, value: string, exclude: boolean = false) => {
     // Check if this is an enriched field (starts with _)
@@ -4390,6 +4335,7 @@ export function Search() {
                       expandedFields={expandedFields}
                       onToggleField={toggleField}
                       onAddToQuery={addToQuery}
+                      onGroupBy={groupByField}
                       isExpanded={fieldsPanelExpanded}
                       onToggleExpanded={() => { userToggledFieldsPanel.current = true; setFieldsPanelExpanded(!fieldsPanelExpanded); }}
                       isLoading={fieldStatsLoading && fieldStats.length === 0}
@@ -4487,6 +4433,7 @@ export function Search() {
             expandedFields={expandedFields}
             onToggleField={toggleField}
             onAddToQuery={(field, value, exclude) => { addToQuery(field, value, exclude); setMobileFieldsOpen(false); }}
+            onGroupBy={(field) => { groupByField(field); setMobileFieldsOpen(false); }}
             isExpanded={true}
             onToggleExpanded={() => setMobileFieldsOpen(false)}
             isLoading={fieldStatsLoading && fieldStats.length === 0}

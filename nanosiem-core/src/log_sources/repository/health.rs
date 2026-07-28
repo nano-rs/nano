@@ -6,8 +6,8 @@ use clickhouse::Client as ClickHouseClient;
 use uuid::Uuid;
 
 use super::super::types::{
-    HealthStatus, HistoryPoint, IngestionHistoryPoint, IngestionTrend, ListParams, LogSource,
-    LogSourceHealth, LogSourceHealthSummary,
+    CollectorError, HealthStatus, HistoryPoint, IngestionHistoryPoint, IngestionTrend, ListParams,
+    LogSource, LogSourceHealth, LogSourceHealthSummary,
 };
 use super::helpers::parse_json_i64;
 use super::{LogSourceRepository, LogSourceRepositoryError};
@@ -62,6 +62,140 @@ fn parse_health_rates(attempts: i64, parse_errors_24h: i64) -> (f64, Option<f64>
     };
     let success_rate = (attempts > 0).then_some(1.0 - error_rate);
     (error_rate, success_rate)
+}
+
+/// How many recent collector errors the detail page renders (NAN-2196).
+///
+/// A failing source reports continuously — the NAN-2186 case emitted one every
+/// few seconds — so this is a display cap, not a measurement. The 24h count is
+/// carried separately and is the honest total.
+const COLLECTOR_ERROR_DISPLAY_LIMIT: usize = 20;
+
+/// Vector error codes that mean "could not read from the cloud queue/bucket"
+/// (NAN-2196).
+///
+/// Used only to decide whether a configuration-specific hint applies. Anything
+/// not listed still surfaces its raw error — the list gates the *diagnosis*,
+/// never the reporting.
+const AWS_FETCH_ERROR_CODES: &[&str] = &[
+    "failed_fetching_sqs_events",
+    "failed_processing_sqs_message",
+    "failed_fetching_s3_object",
+];
+
+/// May this caller see the ingest telemetry for a source of this type?
+///
+/// NAN-2059 draws the line the rest of this file already respects:
+/// `log_sources:view` authorizes reading a source's CONFIG, not the DATA it
+/// ingested, and a denied source must render as a zeroed record indistinguishable
+/// from an allowed-but-idle one.
+///
+/// Collector errors are that same telemetry — arguably more revealing, since the
+/// messages carry queue URLs, bucket names, regions and role ARNs. They are keyed
+/// by `component_id` rather than `source_type`, so the deny-set predicate the
+/// event counts fold into their SQL does not reach them; without this gate a
+/// denied caller would read a source's failures, its 24h error count and its
+/// diagnosis while its event counts correctly showed zero.
+///
+/// Compared against the normalized form because deny sets are stored
+/// `trim().to_lowercase()`.
+fn scope_allows_source_telemetry(scope: &ScopeSet, source_type: &str) -> bool {
+    !scope
+        .deny_set()
+        .contains(&source_type.trim().to_lowercase())
+}
+
+/// Turn `JSONEachRow` output into `(recent errors, 24h total)` (NAN-2196).
+///
+/// Split out from the query so it is testable without a ClickHouse instance.
+/// The 24h total rides along on every row via `count() OVER ()`, so it is read
+/// from the first row rather than costing a second query; zero rows means zero
+/// errors, which is the healthy case.
+fn parse_collector_error_rows(body: &str) -> (Vec<CollectorError>, i64) {
+    let mut errors = Vec::new();
+    let mut total_24h = 0i64;
+
+    for line in body.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if total_24h == 0 {
+            total_24h = parse_json_i64(&json, "total_24h");
+        }
+
+        let str_field = |k: &str| {
+            json.get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        // ClickHouse renders DateTime64 as `YYYY-MM-DD HH:MM:SS.sss`. A row we
+        // cannot place in time is not useful in a "what happened recently"
+        // list, so it is dropped rather than shown at the epoch.
+        let Some(timestamp) = json
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").ok())
+            .map(|dt| dt.and_utc())
+        else {
+            continue;
+        };
+
+        errors.push(CollectorError {
+            timestamp,
+            level: str_field("level"),
+            message: str_field("message"),
+            error_code: str_field("error_code"),
+            error_type: str_field("error_type"),
+            stage: str_field("stage"),
+            component_type: str_field("component_type"),
+        });
+    }
+
+    (errors, total_24h)
+}
+
+/// A likely cause, when the error signature points at a well-understood one
+/// (NAN-2196).
+///
+/// **Keyed on the collector's own error, not on the source's credential.**
+/// NAN-2196 originally specified correlating this with a role-only AWS
+/// credential, since that was the real NAN-2186 failure. That check is not
+/// worth its cost: `assume_role_arn` lives inside `credentials_encrypted`, so
+/// reading it means decrypting a credential on a health-read path — putting
+/// secret handling into an endpoint that otherwise never touches it, and
+/// coupling this repository to credential decryption, all to refine one
+/// sentence.
+///
+/// So the hint enumerates the plausible causes instead of asserting one. That
+/// is also more honest: `dispatch failure` — the message in the real case —
+/// covers credentials, networking, DNS and endpoint problems alike, and a
+/// confident diagnosis built on it would be wrong often enough to erode trust
+/// in every hint we ever show. Vector's own text is always quoted alongside,
+/// so the reader can see what was actually said rather than only our reading
+/// of it.
+fn collector_error_hint(errors: &[CollectorError]) -> Option<String> {
+    let fetch_failure = errors
+        .iter()
+        .find(|e| AWS_FETCH_ERROR_CODES.contains(&e.error_code.as_str()))?;
+
+    Some(format!(
+        "The collector could not read from AWS, so no data is arriving — this is not a \
+         parsing problem. It reported: \"{message}\"{code}. The most common cause is \
+         authentication: if this source assumes an IAM role and has no static access keys, \
+         the collector needs an ambient AWS identity to assume *from* — an EC2 instance \
+         profile, EKS IRSA, or an ECS task role. Running the collector somewhere without \
+         one (a local Docker host, for example) fails the assume-role call before any data \
+         is read. Otherwise check that the queue URL and region are correct and that the \
+         credential can reach both the queue and the bucket.",
+        message = fetch_failure.message.trim_end_matches('.'),
+        code = if fetch_failure.error_code.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", fetch_failure.error_code)
+        }
+    ))
 }
 
 /// Is `s` usable as a bare ClickHouse column identifier in generated SQL?
@@ -310,6 +444,12 @@ impl LogSourceRepository {
             parse_errors_24h: 0,
             parse_attempts_24h: 0,
             parse_success_rate_24h: None,
+            // No ClickHouse client, so no collector error history to read.
+            // Empty is honest here — it means "unknown", and the surrounding
+            // metrics are all zeroed for the same reason.
+            collector_errors: Vec::new(),
+            collector_errors_24h: 0,
+            collector_error_hint: None,
         })
     }
 
@@ -455,6 +595,36 @@ impl LogSourceRepository {
         let (error_rate_24h, parse_success_rate_24h) =
             parse_health_rates(parse_attempts_24h, parse_errors_24h);
 
+        // NAN-2196. A source that cannot reach its queue and a source with no
+        // traffic both report zero events; only this distinguishes them.
+        //
+        // Deliberately non-fatal: the collector error channel is a diagnostic
+        // side channel, and losing it must never take down the health page that
+        // is otherwise fine. On a deployment predating migration 171 the table
+        // does not exist, which is a normal state, not an error.
+        //
+        // Scope-gated the same way the event counts are (NAN-2059): a caller
+        // denied this source's data gets the zeroed record, not its failures.
+        // The counts fold the deny-set into their SQL; collector errors are
+        // keyed by component_id, which that predicate does not reach, so the
+        // gate is applied here instead.
+        let (collector_errors, collector_errors_24h) =
+            if scope_allows_source_telemetry(scope, &log_source.source_type) {
+                self.get_collector_errors_clickhouse(ch_client, log_source)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::debug!(
+                            log_source = %log_source.name,
+                            error = %e,
+                            "collector error history unavailable; reporting health without it"
+                        );
+                        (Vec::new(), 0)
+                    })
+            } else {
+                (Vec::new(), 0)
+            };
+        let collector_error_hint = collector_error_hint(&collector_errors);
+
         Ok(LogSourceHealth {
             log_source_id: log_source.id,
             log_source_name: log_source.name.clone(),
@@ -473,7 +643,83 @@ impl LogSourceRepository {
             parse_errors_24h,
             parse_attempts_24h,
             parse_success_rate_24h,
+            collector_errors,
+            collector_errors_24h,
+            collector_error_hint,
         })
+    }
+
+    /// Recent collector failures attributed to this log source.
+    ///
+    /// Returns `(most recent N, count over 24h)`. The two are separate on
+    /// purpose: a source failing every 15 seconds should report thousands of
+    /// failures even though only a handful are worth rendering.
+    ///
+    /// Attribution is by `component_id`, which the source-config generator
+    /// writes as `<safe_name>_source` — see [`crate::vector_naming`], which
+    /// exists precisely so this derivation cannot drift from that one.
+    async fn get_collector_errors_clickhouse(
+        &self,
+        ch_client: &ClickHouseClient,
+        log_source: &LogSource,
+    ) -> Result<(Vec<CollectorError>, i64), LogSourceRepositoryError> {
+        let component_id = crate::vector_naming::source_component_id(&log_source.name);
+        let table = self.table_names.read_bare("collector_errors");
+        let sql = Self::build_collector_error_query(&table, &component_id);
+
+        let mut cursor = ch_client
+            .query(&sql)
+            .fetch_bytes("JSONEachRow")
+            .map_err(|e| LogSourceRepositoryError::ClickHouseError(e.to_string()))?;
+
+        let mut bytes = Vec::new();
+        while let Ok(Some(chunk)) = cursor.next().await {
+            bytes.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8(bytes)
+            .map_err(|e| LogSourceRepositoryError::ClickHouseError(format!("Invalid UTF-8: {e}")))?;
+        // (query construction lives in `build_collector_error_query` so it can
+        // be asserted without a ClickHouse instance)
+
+        Ok(parse_collector_error_rows(&body))
+    }
+
+    /// Build the recent-collector-errors query (NAN-2196).
+    ///
+    /// `component_id` is the ORDER BY prefix of `collector_errors`, so this is a
+    /// primary-key seek plus a daily partition prune, not a scan. Single WHERE,
+    /// no explicit PREWHERE (NAN-1412).
+    ///
+    /// `timestamp` is selected BARE, and that is load-bearing. The
+    /// obvious-looking `toString(timestamp) AS timestamp` is a bug: the alias
+    /// shadows the column inside WHERE, so the time bound compares String to
+    /// DateTime and ClickHouse rejects the entire query with NO_COMMON_TYPE. It
+    /// is also unnecessary — JSONEachRow already renders DateTime64 as
+    /// `YYYY-MM-DD HH:MM:SS.sss`, exactly what the parser reads. Pinned by
+    /// `collector_error_query_does_not_shadow_the_timestamp_column`, because a
+    /// unit test of the row parser cannot catch a malformed query.
+    fn build_collector_error_query(table: &str, component_id: &str) -> String {
+        format!(
+            "SELECT
+                 timestamp,
+                 level,
+                 message,
+                 error_code,
+                 error_type,
+                 stage,
+                 component_type,
+                 count() OVER () AS total_24h
+             FROM {table}
+             WHERE timestamp >= now() - INTERVAL 24 HOUR
+               AND component_id = '{component_id}'
+             ORDER BY timestamp DESC
+             LIMIT {COLLECTOR_ERROR_DISPLAY_LIMIT}",
+            table = table,
+            // `safe_name` has already collapsed every non-alphanumeric to `_`,
+            // so no quote can reach this literal. Asserted by
+            // `component_id_cannot_break_out_of_sql_literal`.
+            component_id = component_id,
+        )
     }
 
     /// Build the bounded event-health query used by the detail page.
@@ -1345,5 +1591,209 @@ mod tests {
         assert!((error_rate - 0.04).abs() < f64::EPSILON);
         assert_eq!(success_rate, Some(0.96));
         assert_eq!(parse_health_rates(0, 0), (0.0, None));
+    }
+
+    // ---------------------------------------------------------------------
+    // Collector error channel (NAN-2196)
+    // ---------------------------------------------------------------------
+
+    /// The exact row ClickHouse returns for the real NAN-2186 failure, as
+    /// captured from Vector 0.56.0 rather than hand-written from the docs.
+    fn nan2186_row() -> String {
+        // `total_24h` is an unquoted NUMBER because that is what ClickHouse
+        // actually emits for `count() OVER ()` in JSONEachRow — verified
+        // against a live instance, not copied from the docs. An earlier
+        // version of this fixture quoted it and would have passed while
+        // misrepresenting the contract.
+        r#"{"timestamp":"2026-07-27 14:03:11.482","level":"ERROR","message":"Failed to fetch SQS events.","error_code":"failed_fetching_sqs_events","error_type":"request_failed","stage":"receiving","component_type":"aws_s3","total_24h":1447}"#.to_string()
+    }
+
+    /// The row parser cannot catch a malformed query, so the query gets its own
+    /// assertion.
+    ///
+    /// `toString(timestamp) AS timestamp` reads as harmless and is not: the
+    /// alias shadows the column in WHERE, the time bound then compares String
+    /// to DateTime, and ClickHouse rejects the whole query (NO_COMMON_TYPE).
+    /// Caught by running the generated SQL against a real instance; pinned here
+    /// so it cannot come back.
+    #[test]
+    fn collector_error_query_does_not_shadow_the_timestamp_column() {
+        let sql = LogSourceRepository::build_collector_error_query(
+            "nanosiem.collector_errors",
+            "aws_alb_source",
+        );
+        assert!(
+            !sql.contains("AS timestamp"),
+            "aliasing to `timestamp` shadows the column in WHERE:\n{sql}"
+        );
+        assert!(
+            !sql.contains("toString(timestamp)"),
+            "JSONEachRow already renders DateTime64 as a string:\n{sql}"
+        );
+        // The time bound must survive, and be the only WHERE.
+        assert!(sql.contains("WHERE timestamp >= now() - INTERVAL 24 HOUR"));
+        assert_eq!(sql.matches("WHERE").count(), 1, "single WHERE (NAN-1412)");
+        assert!(!sql.contains("PREWHERE"), "no explicit PREWHERE (NAN-1412)");
+        // component_id leads the ORDER BY, so this must filter on it.
+        assert!(sql.contains("component_id = 'aws_alb_source'"));
+        assert!(sql.contains(&format!("LIMIT {COLLECTOR_ERROR_DISPLAY_LIMIT}")));
+    }
+
+    /// NAN-2059's invariant, extended to the collector error channel.
+    ///
+    /// A caller denied a source's DATA must not read its collector failures —
+    /// those messages carry queue URLs, bucket names, regions and role ARNs.
+    /// The event counts fold the deny-set into their SQL; collector errors are
+    /// keyed by `component_id`, which that predicate never touches, so the gate
+    /// is a separate check and therefore a separate test.
+    #[test]
+    fn denied_source_telemetry_is_gated() {
+        let restricted = deny(&["aws_alb"]);
+        assert!(
+            !scope_allows_source_telemetry(&restricted, "aws_alb"),
+            "a denied source must not expose collector errors"
+        );
+        assert!(
+            scope_allows_source_telemetry(&restricted, "windows_security"),
+            "an allowed source must still expose them"
+        );
+    }
+
+    #[test]
+    fn telemetry_gate_matches_the_deny_sets_normalization() {
+        // Deny sets are stored `trim().to_lowercase()`, so a source_type that
+        // differs only in case or padding must still be denied — otherwise the
+        // gate is trivially bypassed by how the source happens to be named.
+        let restricted = deny(&["aws_alb"]);
+        for variant in ["AWS_ALB", "  aws_alb  ", "Aws_Alb"] {
+            assert!(
+                !scope_allows_source_telemetry(&restricted, variant),
+                "{variant:?} must be denied — it normalizes to a denied source_type"
+            );
+        }
+    }
+
+    #[test]
+    fn unrestricted_caller_sees_all_source_telemetry() {
+        let open = ScopeSet::unrestricted();
+        assert!(scope_allows_source_telemetry(&open, "aws_alb"));
+        assert!(scope_allows_source_telemetry(&open, "anything"));
+    }
+
+    #[test]
+    fn collector_error_query_reads_the_resolved_table_name() {
+        // Cluster deploys read the `_distributed` wrapper; the caller resolves
+        // it and this must not hardcode past it.
+        let sql = LogSourceRepository::build_collector_error_query(
+            "nanosiem.collector_errors_distributed",
+            "x_source",
+        );
+        assert!(sql.contains("FROM nanosiem.collector_errors_distributed"));
+    }
+
+    #[test]
+    fn parses_a_collector_error_row_and_the_24h_total() {
+        let (errors, total) = parse_collector_error_rows(&nan2186_row());
+        assert_eq!(total, 1447, "24h count rides along on every row");
+        assert_eq!(errors.len(), 1);
+        let e = &errors[0];
+        assert_eq!(e.level, "ERROR");
+        assert_eq!(e.message, "Failed to fetch SQS events.");
+        assert_eq!(e.error_code, "failed_fetching_sqs_events");
+        assert_eq!(e.stage, "receiving");
+        assert_eq!(e.component_type, "aws_s3");
+        assert_eq!(e.timestamp.to_rfc3339(), "2026-07-27T14:03:11.482+00:00");
+    }
+
+    #[test]
+    fn no_rows_means_no_errors_not_an_error() {
+        // The healthy case. Must not be confused with a failure to read.
+        let (errors, total) = parse_collector_error_rows("");
+        assert!(errors.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn skips_rows_that_cannot_be_placed_in_time() {
+        // A row with no usable timestamp is useless in a "what happened
+        // recently" list; showing it at the epoch would be worse than dropping
+        // it. The valid row alongside must still survive.
+        let body = format!(
+            "{}\n{}",
+            r#"{"timestamp":"not-a-timestamp","level":"ERROR","message":"x","total_24h":"2"}"#,
+            nan2186_row()
+        );
+        let (errors, total) = parse_collector_error_rows(&body);
+        assert_eq!(errors.len(), 1, "only the parseable row survives");
+        assert_eq!(
+            total, 2,
+            "the total is read from the first row even when that row is dropped"
+        );
+    }
+
+    #[test]
+    fn tolerates_missing_optional_fields() {
+        // Not every internal event carries error_code/error_type/stage.
+        // Missing ones must degrade to empty, never drop the whole error.
+        let body = r#"{"timestamp":"2026-07-27 14:03:11.000","level":"WARN","message":"partial","total_24h":"1"}"#;
+        let (errors, _) = parse_collector_error_rows(body);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].message, "partial");
+        assert_eq!(errors[0].error_code, "");
+        assert_eq!(errors[0].stage, "");
+    }
+
+    #[test]
+    fn hint_fires_on_an_aws_fetch_failure_and_quotes_the_collector() {
+        let (errors, _) = parse_collector_error_rows(&nan2186_row());
+        let hint = collector_error_hint(&errors).expect("aws fetch failure should hint");
+        // The collector's own words must appear — the reader needs to see what
+        // was actually said, not only our interpretation of it.
+        assert!(hint.contains("Failed to fetch SQS events"));
+        assert!(hint.contains("failed_fetching_sqs_events"));
+        // And the insight that took hours to find the first time.
+        assert!(hint.contains("instance profile") || hint.contains("IRSA"));
+        // It must not claim to know this source is role-only; we deliberately
+        // do not read the credential here.
+        assert!(hint.contains("if this source assumes an IAM role"));
+    }
+
+    #[test]
+    fn no_hint_without_a_recognised_error_code() {
+        // A generic collector failure gets no diagnosis — the raw error is
+        // still surfaced, but we do not invent a cause for it.
+        let body = r#"{"timestamp":"2026-07-27 14:03:11.000","level":"ERROR","message":"Something else broke.","error_code":"some_other_failure","total_24h":"1"}"#;
+        let (errors, _) = parse_collector_error_rows(body);
+        assert!(collector_error_hint(&errors).is_none());
+    }
+
+    #[test]
+    fn no_hint_when_there_are_no_errors() {
+        assert!(collector_error_hint(&[]).is_none());
+    }
+
+    /// `component_id` is interpolated into a SQL string literal, so it must not
+    /// be able to carry a quote. `safe_name` collapses every non-alphanumeric
+    /// to `_`, which makes that structurally impossible — this pins it, because
+    /// the guarantee lives in a different module than the query does.
+    #[test]
+    fn component_id_cannot_break_out_of_sql_literal() {
+        for hostile in [
+            "'; DROP TABLE nanosiem.logs; --",
+            "a' OR '1'='1",
+            "quote\"inside",
+            "back\\slash",
+            "new\nline",
+        ] {
+            let id = crate::vector_naming::source_component_id(hostile);
+            assert!(
+                !id.contains('\'') && !id.contains('"') && !id.contains('\\'),
+                "component id {id:?} from {hostile:?} must carry no quoting characters"
+            );
+            assert!(
+                id.chars().all(|c| c.is_alphanumeric() || c == '_'),
+                "component id {id:?} must be alphanumeric or underscore only"
+            );
+        }
     }
 }

@@ -1202,7 +1202,7 @@ impl SearchService {
                     // for UDM (`logs`) / OCSF (`ocsf_logs`).
                     let logs_table = crate::schema::logs_table_for(query_profile.id());
                     let columns =
-                        ch_executor.get_table_columns(logs_table, query_profile.materialized_columns()).await.unwrap_or_else(|e| {
+                        ch_executor.get_table_columns(logs_table, query_profile.materialized_columns(), query_profile.default_view_renames()).await.unwrap_or_else(|e| {
                         // NAN-1559: dataset-correct fallback — a UDM list here over an
                         // `otel_spans`/`otel_metrics` base would re-trigger CH 47.
                         warn!("Failed to get table columns, using dataset defaults: {}", e);

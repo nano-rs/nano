@@ -53,7 +53,7 @@ interface AssetEvent {
   id: string;
   timestamp: string;
   source_type: string;
-  event_type: string;
+  event_kind: string;
   summary: string;
   details: Record<string, unknown>;
 }
@@ -338,7 +338,7 @@ const ALERT_COLOR = 'text-red-600 dark:text-red-400';
 const AUTH_FAIL_COLOR = 'text-orange-600 dark:text-orange-400';
 const MUTED_COLOR = 'text-muted-foreground';
 
-// Pre-built lookup for server-computed event_type → color/icon (avoids per-call allocation)
+// Pre-built lookup for server-computed event_kind → color/icon (avoids per-call allocation)
 const EVENT_TYPE_STYLE: Record<string, { color: string; icon: React.ReactNode }> = {
   'ALERT': { color: ALERT_COLOR, icon: <AlertTriangle className="w-3 h-3" /> },
   'AUTH_SUCCESS': { color: DEFAULT_COLOR, icon: <Shield className="w-3 h-3" /> },
@@ -357,17 +357,17 @@ const EVENT_TYPE_STYLE: Record<string, { color: string; icon: React.ReactNode }>
 // Returns type label and simple text color (no badge backgrounds)
 // Color scheme: blue for most events, green for network, red for alerts
 function getEventType(fields: Record<string, unknown>): { type: string; color: string; icon: React.ReactNode } {
-  // Use server-computed event_type when available (matches facet classification)
-  const precomputed = fields.event_type as string | undefined;
+  // Use server-computed event_kind when available (matches facet classification)
+  const precomputed = fields.event_kind as string | undefined;
   if (precomputed) {
     const mapped = EVENT_TYPE_STYLE[precomputed];
     if (mapped) return { type: precomputed, ...mapped };
     return { type: precomputed, color: MUTED_COLOR, icon: <Eye className="w-3 h-3" /> };
   }
 
-  // Fallback: heuristic classification when event_type not pre-computed
+  // Fallback: heuristic classification when event_kind not pre-computed
   const sourceType = String(fields.source_type || '').toLowerCase();
-  const action = String(fields.action || '').toLowerCase();
+  const eventType = String(fields.event_type || '').toLowerCase();
   const fileAction = fields.file_action as string | undefined;
   const authResult = fields.auth_result as string | undefined;
 
@@ -377,8 +377,8 @@ function getEventType(fields: Record<string, unknown>): { type: string; color: s
   }
 
   // Authentication events - blue (orange for failures)
-  if (sourceType.includes('auth') || action.includes('login') || action.includes('logon') || authResult) {
-    const isFailed = authResult?.toLowerCase().includes('fail') || action.includes('fail');
+  if (sourceType.includes('auth') || eventType.includes('login') || eventType.includes('logon') || authResult) {
+    const isFailed = authResult?.toLowerCase().includes('fail') || eventType.includes('fail');
     return {
       type: isFailed ? 'AUTH_FAILURE' : 'AUTH_SUCCESS',
       color: isFailed ? AUTH_FAIL_COLOR : DEFAULT_COLOR,
@@ -387,9 +387,9 @@ function getEventType(fields: Record<string, unknown>): { type: string; color: s
   }
 
   // Network connection events - green
-  if (action.includes('connection') || action.includes('network_connection') ||
+  if (eventType.includes('connection') || eventType.includes('network_connection') ||
       sourceType.includes('firewall') || sourceType.includes('proxy') ||
-      ((fields.dest_ip || (fields.dest_port && fields.dest_port !== 0 && fields.dest_port !== '0')) && !action.includes('process') && !action.includes('exec'))) {
+      ((fields.dest_ip || (fields.dest_port && fields.dest_port !== 0 && fields.dest_port !== '0')) && !eventType.includes('process') && !eventType.includes('exec'))) {
     return { type: 'NETWORK', color: NETWORK_COLOR, icon: <Network className="w-3 h-3" /> };
   }
 
@@ -401,33 +401,33 @@ function getEventType(fields: Record<string, unknown>): { type: string; color: s
   }
 
   // Network info / inventory events (DHCP, adapter info) - green
-  if (sourceType.includes('dhcp') || action.includes('dhcp') ||
-      action === 'network_info' || action === 'networkinfo' || action.includes('network_adapter')) {
+  if (sourceType.includes('dhcp') || eventType.includes('dhcp') ||
+      eventType === 'network_info' || eventType === 'networkinfo' || eventType.includes('network_adapter')) {
     return { type: 'DHCP', color: NETWORK_COLOR, icon: <Network className="w-3 h-3" /> };
   }
 
   // Image load events (DLL loads) - muted (noisy, default filtered)
-  if (action === 'image_load' || action === 'imageload') {
+  if (eventType === 'image_load' || eventType === 'imageload') {
     return { type: 'IMAGE_LOAD', color: MUTED_COLOR, icon: <Package className="w-3 h-3" /> };
   }
 
   // Registry events
-  if (action.includes('registry') || String(fields.category || '').toLowerCase() === 'registry') {
+  if (eventType.includes('registry') || String(fields.category || '').toLowerCase() === 'registry') {
     return { type: 'REGISTRY', color: DEFAULT_COLOR, icon: <Database className="w-3 h-3" /> };
   }
 
   // Pipe events (named pipe create/connect)
-  if (action.includes('pipe') || String(fields.category || '').toLowerCase() === 'pipe') {
+  if (eventType.includes('pipe') || String(fields.category || '').toLowerCase() === 'pipe') {
     return { type: 'PIPE', color: MUTED_COLOR, icon: <Plug className="w-3 h-3" /> };
   }
 
   // Process events - blue
-  if (action.includes('process') || action.includes('exec') || action.includes('spawn') || action.includes('start')) {
+  if (eventType.includes('process') || eventType.includes('exec') || eventType.includes('spawn') || eventType.includes('start')) {
     return { type: 'PROCESS', color: DEFAULT_COLOR, icon: <Terminal className="w-3 h-3" /> };
   }
 
   // File events - blue
-  if (fileAction || action.includes('file') || action.includes('write') || action.includes('read') || action.includes('create') || action.includes('delete')) {
+  if (fileAction || eventType.includes('file') || eventType.includes('write') || eventType.includes('read') || eventType.includes('create') || eventType.includes('delete')) {
     return { type: 'FILE', color: DEFAULT_COLOR, icon: <FileText className="w-3 h-3" /> };
   }
 
@@ -466,7 +466,7 @@ function getInlineFields(fields: Record<string, unknown>, eventType: string): Ar
 
     case 'FILE':
       addField('file', fv('file_name') || fv('file_path'));
-      addField('action', fields.file_action || fields.action);
+      addField('event_type', fields.file_action || fields.event_type);
       addField('process', fv('process_name'));
       addField('user', fv('user'));
       addField('hash', fv('file_hash'));
@@ -528,7 +528,7 @@ function getInlineFields(fields: Record<string, unknown>, eventType: string): Ar
       break;
 
     default:
-      addField('action', fields.action);
+      addField('event_type', fields.event_type);
       addField('message', fields.message);
       break;
   }
@@ -553,18 +553,18 @@ function EventTypeLabel({ type, color, icon }: { type: string; color: string; ic
 // columns that would 500. Under UDM every name resolves, so the output stays
 // byte-identical (NAN-1241).
 const TABLE_COLUMNS: Record<string, string> = {
-  PROCESS: 'timestamp, source_type, action, user, src_host, process_name, process, process_path, parent_process, process_hash',
-  FILE: 'timestamp, source_type, action, user, src_host, file_path, file_name, file_hash, file_action, process_name',
-  NETWORK: 'timestamp, source_type, action, user, src_ip, dest_ip, dest_port, dest_host, url, protocol, bytes_in, bytes_out',
-  DNS: 'timestamp, source_type, action, user, src_ip, query, query_type, answer, dest_ip',
-  AUTH_SUCCESS: 'timestamp, source_type, action, user, src_ip, src_host, auth_type, auth_result, session_id',
-  AUTH_FAILURE: 'timestamp, source_type, action, user, src_ip, src_host, auth_type, auth_result, status',
-  DHCP: 'timestamp, source_type, action, src_ip, src_mac, src_host, user',
+  PROCESS: 'timestamp, source_type, event_type, user, src_host, process_name, process, process_path, parent_process, process_hash',
+  FILE: 'timestamp, source_type, event_type, user, src_host, file_path, file_name, file_hash, file_action, process_name',
+  NETWORK: 'timestamp, source_type, event_type, user, src_ip, dest_ip, dest_port, dest_host, url, protocol, bytes_in, bytes_out',
+  DNS: 'timestamp, source_type, event_type, user, src_ip, query, query_type, answer, dest_ip',
+  AUTH_SUCCESS: 'timestamp, source_type, event_type, user, src_ip, src_host, auth_type, auth_result, session_id',
+  AUTH_FAILURE: 'timestamp, source_type, event_type, user, src_ip, src_host, auth_type, auth_result, status',
+  DHCP: 'timestamp, source_type, event_type, src_ip, src_mac, src_host, user',
   ALERT: 'timestamp, source_type, rule_name, severity, user, src_ip, dest_ip, mitre_tactic, mitre_technique',
   IMAGE_LOAD: 'timestamp, source_type, user, src_host, process_name, process_hash, signature',
-  REGISTRY: 'timestamp, source_type, action, user, src_host, process_name, registry_path, registry_value_data',
-  PIPE: 'timestamp, source_type, action, user, src_host, process_name',
-  EVENT: 'timestamp, source_type, action, user, src_ip, src_host, dest_ip, dest_host, message',
+  REGISTRY: 'timestamp, source_type, event_type, user, src_host, process_name, registry_path, registry_value_data',
+  PIPE: 'timestamp, source_type, event_type, user, src_host, process_name',
+  EVENT: 'timestamp, source_type, event_type, user, src_ip, src_host, dest_ip, dest_host, message',
 };
 
 // Always-safe columns kept even when intersection with the active schema would
@@ -636,7 +636,7 @@ function TimelineEvent({ event, onDrilldown, onAddToQuery, onFetchLog, isHighlig
     // Fields to always exclude
     const exclude = new Set([
       'id', 'timestamp', '_display_type', '_asset_profile', '_asset_events',
-      '_asset_histogram', '_asset_sections', '_asset_pagination', 'details', 'event_type', 'summary'
+      '_asset_histogram', '_asset_sections', '_asset_pagination', 'details', 'event_kind', 'summary'
     ]);
 
     // Priority fields by event type (shown first in expanded view)
@@ -1024,7 +1024,7 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
   // Store initial facets so filter buttons don't disappear when filtering
   const [initialFacets, setInitialFacets] = React.useState<{
     source_type: [string, number][];
-    event_type: [string, number][];
+    event_kind: [string, number][];
     user: [string, number][];
   } | null>(null);
 
@@ -1125,10 +1125,10 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
         // Save initial facets so filter buttons persist when filtering
         // Also set default filter to exclude DHCP (noise events)
         if (pag.facets && !initialFacets) {
-          const eventTypes = pag.facets.event_type || [];
+          const eventTypes = pag.facets.event_kind || [];
           setInitialFacets({
             source_type: pag.facets.source_type || [],
-            event_type: eventTypes,
+            event_kind: eventTypes,
             user: pag.facets.user || [],
           });
           // Default focus mode: exclude noisy event types
@@ -1136,7 +1136,7 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
             .map(([type]) => type)
             .filter(type => !NOISY_EVENT_TYPES.has(type));
           if (quietTypes.length < eventTypes.length && quietTypes.length > 0) {
-            setServerFilters(prev => prev.event_types ? prev : { ...prev, event_types: quietTypes });
+            setServerFilters(prev => prev.event_kinds ? prev : { ...prev, event_kinds: quietTypes });
           }
         }
       }
@@ -1148,7 +1148,7 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
           id: e.id || `event-${i}`,
           timestamp: parseAsUTC(e.timestamp),
           source: e.source_type,
-          fields: { ...e.details, timestamp: e.timestamp, source_type: e.source_type, event_type: e.event_type }
+          fields: { ...e.details, timestamp: e.timestamp, source_type: e.source_type, event_kind: e.event_kind }
         }));
         setEvents(converted);
       }
@@ -1247,17 +1247,17 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
 
       const response = await api.getAssetEvents(request);
 
-      // Convert events and append (compute event_type so filters match facets)
+      // Convert events and append (compute event_kind so filters match facets)
       const newEvents = response.events.map((e: Record<string, unknown>, i: number) => {
         const details = (e.details as Record<string, unknown>) || e;
         const fields = { ...details, timestamp: e.timestamp || details.timestamp, source_type: e.source_type || details.source_type };
-        // Compute event_type using the same classifier as initial load so TYPE filter stays consistent
+        // Compute event_kind using the same classifier as initial load so TYPE filter stays consistent
         const { type: eventType } = getEventType(fields);
         return {
           id: (e.id as string) || `event-${events.length + i}`,
           timestamp: parseAsUTC((e.timestamp as string) || (details.timestamp as string) || ''),
           source: (e.source_type as string) || (details.source_type as string) || 'unknown',
-          fields: { ...fields, event_type: eventType },
+          fields: { ...fields, event_kind: eventType },
         };
       });
 
@@ -1317,16 +1317,16 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
 
   const eventTypeCounts = React.useMemo<[string, { count: number; color: string }][]>(() => {
     // Use initial facets for the list of options
-    if (initialFacets?.event_type?.length) {
-      const currentCounts = new Map(pagination?.facets?.event_type || []);
-      return initialFacets.event_type.map(([type, initialCount]) => {
-        const { color } = getEventType({ event_type: type });
+    if (initialFacets?.event_kind?.length) {
+      const currentCounts = new Map(pagination?.facets?.event_kind || []);
+      return initialFacets.event_kind.map(([type, initialCount]) => {
+        const { color } = getEventType({ event_kind: type });
         return [type, { count: currentCounts.get(type) ?? initialCount, color }];
       });
     }
-    if (pagination?.facets?.event_type?.length) {
-      return pagination.facets.event_type.map(([type, count]) => {
-        const { color } = getEventType({ event_type: type });
+    if (pagination?.facets?.event_kind?.length) {
+      return pagination.facets.event_kind.map(([type, count]) => {
+        const { color } = getEventType({ event_kind: type });
         return [type, { count, color }];
       });
     }
@@ -1342,7 +1342,7 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
       }
     }
     return Array.from(counts.entries()).sort((a, b) => b[1].count - a[1].count);
-  }, [initialFacets?.event_type, pagination?.facets?.event_type, events]);
+  }, [initialFacets?.event_kind, pagination?.facets?.event_kind, events]);
 
   const userCounts = React.useMemo<[string, number][]>(() => {
     // Use initial facets for the list of options
@@ -1420,8 +1420,8 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
 
   const toggleEventTypeFilter = (eventType: string) => {
     setServerFilters(prev => {
-      const allTypes = (initialFacets?.event_type?.length ? initialFacets.event_type : eventTypeCounts).map(([t]) => t);
-      const current = prev.event_types;
+      const allTypes = (initialFacets?.event_kind?.length ? initialFacets.event_kind : eventTypeCounts).map(([t]) => t);
+      const current = prev.event_kinds;
 
       let newTypes: string[];
       if (!current || current.length === 0) {
@@ -1436,7 +1436,7 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
         newTypes = [];
       }
 
-      return { ...prev, event_types: newTypes.length > 0 ? newTypes : undefined };
+      return { ...prev, event_kinds: newTypes.length > 0 ? newTypes : undefined };
     });
   };
 
@@ -1446,14 +1446,14 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
       const next = !prev;
       if (next) {
         // Re-apply noisy type exclusions
-        const allTypes = (initialFacets?.event_type?.length ? initialFacets.event_type : eventTypeCounts).map(([t]) => t);
+        const allTypes = (initialFacets?.event_kind?.length ? initialFacets.event_kind : eventTypeCounts).map(([t]) => t);
         const quietTypes = allTypes.filter(t => !NOISY_EVENT_TYPES.has(t));
         if (quietTypes.length < allTypes.length && quietTypes.length > 0) {
-          setServerFilters(f => ({ ...f, event_types: quietTypes }));
+          setServerFilters(f => ({ ...f, event_kinds: quietTypes }));
         }
       } else {
-        // Show all — clear event_types filter
-        setServerFilters(f => ({ ...f, event_types: undefined }));
+        // Show all — clear event_kinds filter
+        setServerFilters(f => ({ ...f, event_kinds: undefined }));
       }
       return next;
     });
@@ -1472,9 +1472,9 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
       });
     }
 
-    // Filter by event_type (using getEventType for consistency with display)
-    if (serverFilters.event_types && serverFilters.event_types.length > 0) {
-      const allowed = new Set(serverFilters.event_types);
+    // Filter by event_kind (using getEventType for consistency with display)
+    if (serverFilters.event_kinds && serverFilters.event_kinds.length > 0) {
+      const allowed = new Set(serverFilters.event_kinds);
       filtered = filtered.filter(e => {
         const { type } = getEventType(e.fields || {});
         return allowed.has(type);
@@ -1497,7 +1497,7 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
         const f = e.fields || {};
         return (
           String(f.message || '').toLowerCase().includes(needle) ||
-          String(f.action || '').toLowerCase().includes(needle) ||
+          String(f.event_type || '').toLowerCase().includes(needle) ||
           String(f.user || '').toLowerCase().includes(needle) ||
           String(f.process_name || '').toLowerCase().includes(needle) ||
           String(f.src_ip || '').toLowerCase().includes(needle) ||
@@ -1522,7 +1522,7 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
     }
 
     return filtered;
-  }, [events, serverFilters.source_types, serverFilters.event_types, serverFilters.users, searchText, interestingOnly]);
+  }, [events, serverFilters.source_types, serverFilters.event_kinds, serverFilters.users, searchText, interestingOnly]);
 
   // Dedup: collapse consecutive similar events into groups
   const groupedEvents = React.useMemo<EventGroup[]>(() => {
@@ -1535,9 +1535,9 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
     const dedupKey = (e: SearchResult) => {
       const f = e.fields || {};
       const { type } = getEventType(f);
-      const action = String(f.action || '');
+      const eventType = String(f.event_type || '');
       const processName = String(f.process_name || '');
-      return `${type}|${action}|${processName}`;
+      return `${type}|${eventType}|${processName}`;
     };
 
     const isHighSeverity = (e: SearchResult) => {
@@ -1658,7 +1658,7 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
   const totalCount = pagination?.total_count ?? events.length;
   const loadedCount = events.length;
   const filteredCount = filteredEvents.length;
-  const hasActiveFilters = !!(serverFilters.source_types || serverFilters.event_types || serverFilters.users || searchText.trim() || interestingOnly);
+  const hasActiveFilters = !!(serverFilters.source_types || serverFilters.event_kinds || serverFilters.users || searchText.trim() || interestingOnly);
 
   if (!results.length) {
     return (
@@ -1854,7 +1854,7 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
             <div className="flex flex-wrap items-center gap-1.5">
               <span className="text-[10px] text-muted-foreground uppercase tracking-wide mr-1">Type</span>
               {eventTypeCounts.map(([eventType, { count, color }]) => {
-                const isEnabled = !serverFilters.event_types || serverFilters.event_types.includes(eventType);
+                const isEnabled = !serverFilters.event_kinds || serverFilters.event_kinds.includes(eventType);
                 return (
                   <button
                     key={eventType}

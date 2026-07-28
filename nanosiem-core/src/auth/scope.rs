@@ -100,35 +100,49 @@ pub fn is_unresolved_provenance(source_types: &[String]) -> bool {
     source_types.iter().any(|s| is_reserved_source_type(s))
 }
 
-/// Origins whose evidence must never leave write-time redaction boundaries,
-/// independent of the configurable restricted-source registry.
+/// Origins whose evidence must never reach FINDING STORAGE, independent of the
+/// configurable restricted-source registry.
 ///
 /// `audit` is deliberately not seeded into `restricted_source_types`: doing so
 /// would source-scope every non-bypass principal on otherwise unscoped
-/// deployments. It is nevertheless always restricted for findings and webhook
-/// egress because those channels can re-embed raw audit event content under a
-/// different outer `source_type`.
+/// deployments. It is nevertheless always restricted for findings, because a
+/// finding re-embeds raw audit event content under a different outer
+/// `source_type` and then feeds risk scores every analyst reads.
+///
+/// NAN-2207: this is a FINDINGS-ONLY policy. Webhook egress deliberately does
+/// NOT consult it — see [`is_always_restricted_origin`] for why the two
+/// write-time boundaries diverged.
 pub const ALWAYS_RESTRICTED_ORIGINS: &[&str] = &["audit"];
 
 /// Does a source manifest contain an always-restricted origin?
 ///
-/// This is the shared write-time predicate for finding storage and webhook
-/// egress. Keep it separate from per-user source visibility: an unrestricted
-/// UI principal may inspect audit data, but external/re-injected evidence still
-/// requires unconditional redaction.
+/// The write-time predicate for FINDING STORAGE
+/// (`FindingLogger::origin_restricted`). Keep it separate from per-user source
+/// visibility: an unrestricted UI principal may inspect audit data, but a
+/// finding that re-embeds it is a different, longer-lived artifact.
+///
+/// # Not for webhook egress (NAN-2207)
+///
+/// NAN-2155 applied this to webhook payloads too. That silently broke every
+/// existing SOAR integration built on an audit-sourced detection rule: the
+/// payload kept `matched_event_count` but dropped `matched_events` + `entity`,
+/// with no error and no delivery-log signal, on deployments that had never
+/// configured source scoping at all. On such a deployment there is no RBAC
+/// boundary for the redaction to protect — every analyst can already read audit
+/// events in search — so the strip removed evidence from the receiver without
+/// hiding it from anyone.
+///
+/// Webhook egress now redacts an audit origin only when an admin has explicitly
+/// registered `audit` in `restricted_source_types`, which is the deployment's
+/// own statement that audit is sensitive. Unresolved provenance
+/// ([`is_unresolved_provenance`]) still redacts unconditionally on BOTH
+/// boundaries: "we could not tell where this came from" is not a policy choice
+/// an admin can make in advance.
 pub fn is_always_restricted_origin(source_types: &[String]) -> bool {
     source_types.iter().any(|source_type| {
         let normalized = source_type.trim().to_lowercase();
         ALWAYS_RESTRICTED_ORIGINS.contains(&normalized.as_str())
     })
-}
-
-/// Must this origin be redacted without consulting the configurable registry?
-///
-/// Centralizes the two engine/write-time sentinels so completeness branches
-/// cannot accidentally skip one of them.
-pub fn requires_unconditional_origin_redaction(source_types: &[String]) -> bool {
-    is_unresolved_provenance(source_types) || is_always_restricted_origin(source_types)
 }
 
 /// Normalize a caller's effective deny set into the values to BIND as the
@@ -279,9 +293,21 @@ mod tests {
         assert!(is_always_restricted_origin(&[" Audit ".to_string()]));
         assert!(!is_always_restricted_origin(&["auditbeat".to_string()]));
         assert!(!is_always_restricted_origin(&[]));
-        assert!(requires_unconditional_origin_redaction(&[
+    }
+
+    #[test]
+    fn unresolved_provenance_is_independent_of_the_always_restricted_set() {
+        // NAN-2207 split the two write-time policies: findings consult BOTH
+        // predicates, webhook egress consults only this one. They must therefore
+        // stay independently true — an `audit` origin is not "unresolved", and a
+        // sentinel origin does not need `audit` to redact.
+        assert!(is_unresolved_provenance(&[
             "syslog".to_string(),
             UNRESOLVED_SOURCE_SENTINEL.to_string(),
+        ]));
+        assert!(!is_unresolved_provenance(&["audit".to_string()]));
+        assert!(!is_always_restricted_origin(&[
+            UNRESOLVED_SOURCE_SENTINEL.to_string()
         ]));
     }
 }

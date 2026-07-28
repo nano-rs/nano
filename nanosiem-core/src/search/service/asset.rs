@@ -21,14 +21,14 @@ impl SearchService {
     /// Canonical (UDM-semantic) timeline field names, in projection order.
     ///
     /// Slim column list for asset timeline queries — covers everything
-    /// `detect_event_type`, `build_event_summary`, and the frontend
+    /// `detect_event_kind`, `build_event_summary`, and the frontend
     /// `getInlineFields` need, avoiding the full 130+ column `SELECT *` to reduce
     /// payload size by ~80-90%.
     ///
     /// These are UDM-semantic names. The actual SELECT projection is built per
     /// the active schema profile by [`Self::asset_timeline_columns`], which
     /// resolves each name to its physical column and aliases it back to the
-    /// canonical name so downstream JSON consumers (`detect_event_type`,
+    /// canonical name so downstream JSON consumers (`detect_event_kind`,
     /// `build_event_summary`) see a stable key set regardless of schema (NAN-1241).
     /// Fields the active schema does not map are skipped.
     const ASSET_TIMELINE_FIELDS: &'static [&'static str] = &[
@@ -142,6 +142,13 @@ impl SearchService {
                     let key = profile
                         .display_field_name(field)
                         .unwrap_or_else(|| field.to_string());
+                    // NAN-2211: then apply the profile's canonical rename, so UDM's
+                    // `action` is keyed `event_type` like every other read path since
+                    // NAN-2208. Safe to do here only because the classifier this
+                    // SELECT also projects is now `event_kind` — the two used to
+                    // collide on `event_type`. Identity for every other field and
+                    // for OCSF (no renames).
+                    let key = profile.canonical_field_name(&key).to_string();
                     let key_sql = crate::query::escape_identifier(&key);
                     // ASN under OCSF maps to the numeric `autonomous_system.number`
                     // (UInt32) whereas UDM stores a String. Wrap the OCSF projection
@@ -159,7 +166,7 @@ impl SearchService {
     }
 
     // Event classification is profile-aware (NAN-1241): each call site uses
-    // `crate::search::classification::event_type_sql(self.active_profile.as_ref())`
+    // `crate::search::classification::event_kind_sql(self.active_profile.as_ref())`
     // so UDM (`action`/`category`-based) and OCSF (`class_uid`/`category_uid`-based)
     // each get their correct CASE expression. See [`crate::search::classification`].
 
@@ -230,7 +237,7 @@ impl SearchService {
                     "has_more": false,
                     "facets": {
                         "source_type": [],
-                        "event_type": [],
+                        "event_kind": [],
                         "user": []
                     }
                 }
@@ -365,17 +372,17 @@ impl SearchService {
                     .unwrap_or("unknown")
                     .to_string();
 
-                // Determine event_type based on fields present
-                let event_type = self.detect_event_type(event);
+                // Determine event_kind based on fields present
+                let event_kind = self.detect_event_kind(event);
 
                 // Build summary from event fields
-                let summary = self.build_event_summary(event, &event_type);
+                let summary = self.build_event_summary(event, &event_kind);
 
                 json!({
                     "id": id,
                     "timestamp": timestamp,
                     "source_type": source_type,
-                    "event_type": event_type,
+                    "event_kind": event_kind,
                     "summary": summary,
                     "details": event,
                 })
@@ -602,7 +609,7 @@ impl SearchService {
     /// This method returns:
     /// - A page of events (limited by offset/limit)
     /// - Total count of matching events
-    /// - Facet counts for source_type, event_type, and user
+    /// - Facet counts for source_type, event_kind, and user
     ///
     /// `scope` (NAN-1797/NAN-1799): the caller's source-scope deny-set. Every
     /// scan below is a fresh hand-built query that does not inherit the main
@@ -679,15 +686,15 @@ impl SearchService {
                 }
             }
             // Event type filter using CASE WHEN (same logic as facet query)
-            if let Some(ref event_types) = f.event_types {
-                if !event_types.is_empty() {
-                    let placeholders: Vec<&str> = event_types.iter().map(|_| "?").collect();
+            if let Some(ref event_kinds) = f.event_kinds {
+                if !event_kinds.is_empty() {
+                    let placeholders: Vec<&str> = event_kinds.iter().map(|_| "?").collect();
                     filter_conditions.push(format!(
                         "{} IN ({})",
-                        crate::search::classification::event_type_sql(self.active_profile.as_ref()),
+                        crate::search::classification::event_kind_sql(self.active_profile.as_ref()),
                         placeholders.join(",")
                     ));
-                    for s in event_types {
+                    for s in event_kinds {
                         filter_binds.push(s.to_uppercase());
                     }
                 }
@@ -716,7 +723,7 @@ impl SearchService {
 
         // NAN-1797: render the caller's deny-set ONCE; ANDed into every logs
         // scan below — the events page, the filtered count, the combined
-        // source_type/event_type facet (which otherwise enumerated exactly the
+        // source_type/event_kind facet (which otherwise enumerated exactly the
         // caller's hidden sources), the user facet, and the unfiltered count.
         // `None` (unrestricted) leaves every SQL string byte-identical to the
         // pre-scoping form.
@@ -745,7 +752,7 @@ impl SearchService {
         }
 
         // Events query with pagination (slim columns for timeline view). We also
-        // compute `event_type` server-side via the shared classifier so the
+        // compute `event_kind` server-side via the shared classifier so the
         // redesigned asset stream doesn't have to re-classify client-side —
         // same source of truth as the facet aggregation a few queries below.
         let logs_table = self
@@ -753,14 +760,14 @@ impl SearchService {
             .read(Self::logs_table_key(self.active_profile.as_ref()));
         let timeline_columns = self.asset_timeline_columns();
         let events_sql = format!(
-            r#"SELECT {cols}, {event_type} AS event_type
+            r#"SELECT {cols}, {event_kind} AS event_kind
             FROM {logs_table}
             PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})
             {where_clause}
             ORDER BY timestamp DESC
             LIMIT {limit} OFFSET {offset}"#,
             cols = timeline_columns,
-            event_type = crate::search::classification::event_type_sql(self.active_profile.as_ref()),
+            event_kind = crate::search::classification::event_kind_sql(self.active_profile.as_ref()),
             start = start_str,
             end = end_str,
             ident = identity_clause,
@@ -843,7 +850,7 @@ impl SearchService {
         } else {
             // Initial load: run full facet aggregation + reliable count (4 queries)
             let combined_facet_sql = build_asset_combined_facet_sql(
-                crate::search::classification::event_type_sql(self.active_profile.as_ref()),
+                crate::search::classification::event_kind_sql(self.active_profile.as_ref()),
                 &logs_table,
                 &start_str,
                 &end_str,
@@ -934,19 +941,19 @@ impl SearchService {
             let reliable_count = reliable_count?;
             let events = events?;
 
-            // Aggregate combined facet rows into facet_total, source_type_facets, event_type_facets
+            // Aggregate combined facet rows into facet_total, source_type_facets, event_kind_facets
             let mut facet_total: u64 = 0;
             let mut source_type_map: std::collections::HashMap<String, u64> =
                 std::collections::HashMap::new();
-            let mut event_type_map: std::collections::HashMap<String, u64> =
+            let mut event_kind_map: std::collections::HashMap<String, u64> =
                 std::collections::HashMap::new();
-            for (source_type, event_type, cnt) in &combined_facet_rows {
+            for (source_type, event_kind, cnt) in &combined_facet_rows {
                 facet_total += cnt;
                 if !source_type.is_empty() {
                     *source_type_map.entry(source_type.clone()).or_insert(0) += cnt;
                 }
-                if !event_type.is_empty() {
-                    *event_type_map.entry(event_type.clone()).or_insert(0) += cnt;
+                if !event_kind.is_empty() {
+                    *event_kind_map.entry(event_kind.clone()).or_insert(0) += cnt;
                 }
             }
 
@@ -961,12 +968,12 @@ impl SearchService {
             source_type_facets.sort_by(|a, b| b.1.cmp(&a.1));
             source_type_facets.truncate(50);
 
-            let mut event_type_facets: Vec<(String, u64)> = event_type_map.into_iter().collect();
-            event_type_facets.sort_by(|a, b| b.1.cmp(&a.1));
+            let mut event_kind_facets: Vec<(String, u64)> = event_kind_map.into_iter().collect();
+            event_kind_facets.sort_by(|a, b| b.1.cmp(&a.1));
 
             let facets = AssetFacets {
                 source_type: source_type_facets,
-                event_type: event_type_facets,
+                event_kind: event_kind_facets,
                 user: user_facets,
             };
 
@@ -1653,9 +1660,9 @@ impl SearchService {
     /// Classify an event into a type category.
     /// Ordering and logic mirrors the SQL CASE WHEN in the facet/filter queries
     /// and the frontend getEventType() to ensure consistent classification.
-    fn detect_event_type(&self, event: &serde_json::Value) -> String {
-        // The paginated events query computes `event_type` server-side via the
-        // profile-aware classifier (`classification::event_type_sql`), so under
+    fn detect_event_kind(&self, event: &serde_json::Value) -> String {
+        // The paginated events query computes `event_kind` server-side via the
+        // profile-aware classifier (`classification::event_kind_sql`), so under
         // OCSF — where the UDM key reads below would all be absent (those columns
         // aren't projected) — we trust the SQL classification. Falls through to the
         // UDM JSON-key heuristic only when the column is missing (e.g. callers that
@@ -1663,7 +1670,7 @@ impl SearchService {
         // (the classifier and the heuristic agree on the UDM mapping) while making
         // OCSF correct (NAN-1241).
         if let Some(server_type) = event
-            .get("event_type")
+            .get("event_kind")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
         {
@@ -1793,7 +1800,7 @@ impl SearchService {
     /// columns (`dst_endpoint.hostname`, …). Empty values are skipped so the
     /// fallback chain reaches a populated field (e.g. a NETWORK event with no
     /// hostname falls through to the IP instead of rendering `:port`).
-    fn build_event_summary(&self, event: &serde_json::Value, event_type: &str) -> String {
+    fn build_event_summary(&self, event: &serde_json::Value, event_kind: &str) -> String {
         let profile = self.active_profile.as_ref();
         // Resolve a UDM-semantic concept → the native key the row carries, then
         // read it as a non-empty string / number.
@@ -1808,7 +1815,7 @@ impl SearchService {
             let key = profile.display_field_name(concept)?;
             event.get(key.as_str()).and_then(|v| v.as_u64())
         };
-        match event_type {
+        match event_kind {
             "PROCESS" => {
                 let proc_name = s("process_name")
                     .or_else(|| s("command_line"))
@@ -2764,13 +2771,13 @@ fn build_asset_events_where(
     }
 }
 
-/// Build the combined `GROUP BY source_type, event_type` facet scan
+/// Build the combined `GROUP BY source_type, event_kind` facet scan
 /// (NAN-1797): without the scope gate this facet enumerated EXACTLY the
 /// denied sources — name and event count — for a scoped caller. With
 /// `scope_predicate = None` the output is byte-identical to the pre-scoping
 /// inline `format!`.
 fn build_asset_combined_facet_sql(
-    event_type_sql: &str,
+    event_kind_sql: &str,
     logs_table: &str,
     start: &str,
     end: &str,
@@ -2781,12 +2788,12 @@ fn build_asset_combined_facet_sql(
         .map(|pred| format!(" AND {pred}"))
         .unwrap_or_default();
     format!(
-        "SELECT source_type, {} as event_type, count() as cnt \
+        "SELECT source_type, {} as event_kind, count() as cnt \
          FROM {} \
          PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({}){} \
-         GROUP BY source_type, event_type \
+         GROUP BY source_type, event_kind \
          ORDER BY cnt DESC",
-        event_type_sql, logs_table, start, end, identity_clause, scope_and
+        event_kind_sql, logs_table, start, end, identity_clause, scope_and
     )
 }
 
@@ -2909,10 +2916,10 @@ mod source_scope_tests {
 
         assert_eq!(
             build_asset_combined_facet_sql("ET", "logs", "S", "E", "id", None),
-            "SELECT source_type, ET as event_type, count() as cnt \
+            "SELECT source_type, ET as event_kind, count() as cnt \
              FROM logs \
              PREWHERE timestamp BETWEEN 'S' AND 'E' AND (id) \
-             GROUP BY source_type, event_type \
+             GROUP BY source_type, event_kind \
              ORDER BY cnt DESC"
         );
 

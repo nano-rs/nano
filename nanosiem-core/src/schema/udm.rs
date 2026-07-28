@@ -114,6 +114,44 @@ const UDM_ENTITY_EXTRACTION_ORDER: &[(EntityRole, &str)] = &[
 /// Default-view column rewrites for UDM: drop `action` from `SELECT *` and
 /// re-project it as `action AS event_type` (NAN-659/671/876). Single source of
 /// the byte-identical rewrite the SQL generator emits.
+///
+/// # This rewrite is permanent — do NOT "finish" it with a physical rename
+///
+/// `clickhouse/113_event_type_alias.sql` says a Phase 2 migration will
+/// `RENAME COLUMN action TO event_type` and add `action` as the reverse alias
+/// "once the parser fleet has migrated". **That plan is cancelled (NAN-2213).**
+/// The comment cannot be edited — ClickHouse migrations are checksummed, so
+/// changing an applied file fails boot everywhere — so the decision lives here.
+///
+/// Two independent reasons, both measured against a live ClickHouse:
+///
+/// 1. **Renaming existing deployments hard-fails ingest.** ALIAS columns are
+///    read-only: `INSERT INTO t (action)` where `action` is an ALIAS returns
+///    `Code: 16 … NO_SUCH_COLUMN_IN_TABLE`. After the rename `action` IS the
+///    alias, so any deployment still running a Vector config that writes
+///    `action` has *every* insert rejected — ingest down, not degraded. Tenant
+///    updates are operator-selected and manual, so there is always a population
+///    on older configs, and there is no way to flip the column and the writer
+///    atomically.
+///
+/// 2. **Giving only fresh deploys the flipped shape corrupts the result set.**
+///    With `event_type` physical and `action` the alias,
+///    `SELECT * EXCEPT (action), action AS event_type` projects the column
+///    TWICE — `EXCEPT (action)` removes nothing because aliases are not in
+///    `SELECT *`, so the alias expression duplicates what the wildcard already
+///    returned. ClickHouse does not drop one; it disambiguates by qualifying
+///    the wildcard's copy with the table name, so every row comes back as
+///    `{"logs.event_type": …, "event_type": …}`. That phantom key is in no
+///    schema, no field inventory, and no frontend field list, yet it rides
+///    along on every bare search. Making it safe would require this constant to
+///    become a per-deployment value probed at boot: permanent dual-shape
+///    complexity for zero user-visible gain.
+///
+/// Nothing is lost by stopping here. Since NAN-2208/2211 every analyst-facing
+/// read path emits `event_type`, every write path targets the physical
+/// `action`, and queries accept BOTH names (the alias resolves bidirectionally,
+/// so saved searches and detection rules written against either keep working).
+/// The physical column name is now purely an implementation detail.
 const UDM_DEFAULT_VIEW_RENAMES: &[(&str, &str)] = &[("action", "event_type")];
 
 /// Aliases `normalize_field_name` maps that the profile must NOT claim as known
@@ -430,5 +468,53 @@ impl SchemaProfile for UdmProfile {
 
     fn timestamp_expr(&self) -> &str {
         UDM_TIMESTAMP_EXPR
+    }
+}
+
+#[cfg(test)]
+mod phase2_rename_guard_tests {
+    use super::*;
+    use crate::schema::SchemaProfile;
+
+    /// NAN-2213: pins the rewrite DIRECTION. `action` is the physical column and
+    /// `event_type` is its read alias — never the reverse.
+    ///
+    /// Flipping this pair is the first edit anyone attempting the cancelled
+    /// Phase 2 rename (`clickhouse/113_event_type_alias.sql:11-12`) would make.
+    /// It must not happen: ALIAS columns are read-only, so once `action` becomes
+    /// the alias every deployment still writing that column name has its inserts
+    /// rejected with `Code: 16 NO_SUCH_COLUMN_IN_TABLE` — ingest down, not
+    /// degraded — and tenant updates are manual, so such deployments always
+    /// exist. See the `UDM_DEFAULT_VIEW_RENAMES` doc comment for the full
+    /// reasoning and the measurements behind it.
+    #[test]
+    fn udm_rename_direction_is_physical_action_to_canonical_event_type() {
+        assert_eq!(
+            UDM_DEFAULT_VIEW_RENAMES,
+            &[("action", "event_type")],
+            "the rewrite must stay (physical `action` -> canonical `event_type`). \
+             Flipping it implies the cancelled NAN-659 Phase 2 physical rename, \
+             which hard-fails ingest fleet-wide (NAN-2213)."
+        );
+    }
+
+    /// The profile must actually expose that pair — a profile that silently
+    /// returned `[]` would make every read path emit the legacy `action` again,
+    /// undoing NAN-2208/2211 without any test noticing.
+    #[test]
+    fn udm_profile_exposes_the_rename() {
+        let udm = UdmProfile::new();
+        assert_eq!(udm.default_view_renames(), &[("action", "event_type")]);
+        assert_eq!(udm.canonical_field_name("action"), "event_type");
+        assert_eq!(udm.canonical_field_name("src_ip"), "src_ip");
+    }
+
+    /// OCSF has no `action` column, so it must never acquire the UDM rewrite —
+    /// applying it there references a nonexistent column and fails every search.
+    #[test]
+    fn ocsf_declares_no_renames() {
+        let ocsf = crate::schema::OcsfProfile::new();
+        assert!(ocsf.default_view_renames().is_empty());
+        assert_eq!(ocsf.canonical_field_name("action"), "action");
     }
 }

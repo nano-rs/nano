@@ -1186,8 +1186,9 @@ pub struct AssetPagination {
 pub struct AssetFacets {
     /// Source type facet: [(value, count), ...]
     pub source_type: Vec<(String, u64)>,
-    /// Event type facet: [(value, count), ...]
-    pub event_type: Vec<(String, u64)>,
+    /// Event-kind facet — the classifier label (`PROCESS`, `AUTH_FAILURE`, …),
+    /// NOT the UDM `event_type` field value (NAN-2211).
+    pub event_kind: Vec<(String, u64)>,
     /// User facet: [(value, count), ...]
     pub user: Vec<(String, u64)>,
 }
@@ -1198,9 +1199,10 @@ pub struct AssetEventFilters {
     /// Filter by source types (OR)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_types: Option<Vec<String>>,
-    /// Filter by event types (OR)
+    /// Filter by event kinds (OR) — classifier labels, not UDM `event_type`
+    /// field values (NAN-2211).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub event_types: Option<Vec<String>>,
+    pub event_kinds: Option<Vec<String>>,
     /// Filter by users (OR)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub users: Option<Vec<String>>,
@@ -1356,7 +1358,7 @@ mod asset_pagination_tests {
             has_more: true,
             facets: AssetFacets {
                 source_type: vec![("edr".to_string(), 45000), ("proxy".to_string(), 30000)],
-                event_type: vec![
+                event_kind: vec![
                     ("PROCESS".to_string(), 35000),
                     ("NETWORK".to_string(), 28000),
                 ],
@@ -1373,7 +1375,7 @@ mod asset_pagination_tests {
     fn test_asset_event_filters_default() {
         let filters = AssetEventFilters::default();
         assert!(filters.source_types.is_none());
-        assert!(filters.event_types.is_none());
+        assert!(filters.event_kinds.is_none());
         assert!(filters.users.is_none());
         assert!(filters.search_text.is_none());
     }

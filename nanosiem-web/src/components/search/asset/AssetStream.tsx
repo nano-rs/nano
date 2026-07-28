@@ -36,7 +36,7 @@ interface StreamEvent {
   id: string;
   timestamp: string;
   source_type: string;
-  event_type: string;
+  event_kind: string;
   user?: string;
   summary: Record<string, unknown>;
   details: Record<string, unknown>;
@@ -121,10 +121,10 @@ export function AssetStream({
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase();
     return events.filter((e) => {
-      if (activeTypes.size > 0 && !activeTypes.has(e.event_type)) return false;
+      if (activeTypes.size > 0 && !activeTypes.has(e.event_kind)) return false;
       if (activeSources.size > 0 && !activeSources.has(e.source_type)) return false;
       if (activeUsers.size > 0 && e.user && !activeUsers.has(e.user)) return false;
-      if (interestingOnly && e.event_type !== 'AUTH_FAILURE' && e.event_type !== 'PROCESS') {
+      if (interestingOnly && e.event_kind !== 'AUTH_FAILURE' && e.event_kind !== 'PROCESS') {
         // crude proxy for "interesting" — backend doesn't flag them today
         return false;
       }
@@ -136,7 +136,7 @@ export function AssetStream({
     });
   }, [events, activeTypes, activeSources, activeUsers, interestingOnly, filter]);
 
-  const typeCounts = useMemo(() => countBy(events, (e) => e.event_type), [events]);
+  const typeCounts = useMemo(() => countBy(events, (e) => e.event_kind), [events]);
   const sourceCounts = useMemo(() => countBy(events, (e) => e.source_type), [events]);
   const userCounts = useMemo(
     () => countBy(events.filter((e) => e.user), (e) => e.user ?? ''),
@@ -270,7 +270,7 @@ export function AssetStream({
                 <span className="text-[11px] font-mono tabular-nums text-muted-foreground/70 w-[70px] shrink-0 mt-0.5">
                   {formatTime(e.timestamp)}
                 </span>
-                <TypeBadge type={e.event_type} />
+                <TypeBadge type={e.event_kind} />
                 <span className="text-muted-foreground/70 text-[11px] font-mono shrink-0 mt-0.5">
                   |
                 </span>
@@ -461,7 +461,7 @@ function EventDetail({
     // meaningful in the stream. See lib/prevalence-sentinels.
     if (isPrevalenceSentinelField(k, v)) return false;
     // Hide internal/marker fields the slim payload sometimes carries.
-    if (k === 'event_type' || k === 'summary') return false;
+    if (k === 'event_kind' || k === 'summary') return false;
     // NAN-1324: the OCSF full log (SELECT *) carries the entire raw source as a
     // single `event` JSON blob plus the `time_dt` timestamp alias — both OCSF-only
     // and redundant with the promoted columns already shown (the blob dwarfs the
@@ -520,12 +520,12 @@ function normalizeEvent(raw: Record<string, unknown>): StreamEvent {
     typeof raw.summary === 'object' && raw.summary !== null
       ? (raw.summary as Record<string, unknown>)
       : {};
-  // Prefer the server-computed event_type (asset-events now attaches it via the
+  // Prefer the server-computed event_kind (asset-events now attaches it via the
   // shared classifier). Older payloads and non-asset callers fall through to
   // the local heuristic as a safety net.
-  const eventType =
-    (raw.event_type as string) ||
-    (details.event_type as string) ||
+  const eventKind =
+    (raw.event_kind as string) ||
+    (details.event_kind as string) ||
     classifyEventType(details) ||
     'EVENT';
   return {
@@ -533,7 +533,7 @@ function normalizeEvent(raw: Record<string, unknown>): StreamEvent {
     timestamp: (raw.timestamp as string) ?? (details.timestamp as string) ?? '',
     source_type:
       (raw.source_type as string) ?? (details.source_type as string) ?? 'unknown',
-    event_type: eventType,
+    event_kind: eventKind,
     // The user that drives the USER facet/filter. UDM keys this `user`; OCSF
     // keys the row by its native column (`user.name`, or `actor.user.name` on
     // actor-class events), so check those too (NAN-1303 — asset stream is
@@ -550,14 +550,14 @@ function normalizeEvent(raw: Record<string, unknown>): StreamEvent {
 /**
  * Fallback event-type classifier.
  *
- * The server-side classifier in `search::classification::EVENT_TYPE_SQL` is the
- * source of truth and is attached to asset-events responses as `event_type`.
+ * The server-side classifier in `search::classification::EVENT_KIND_SQL` is the
+ * source of truth and is attached to asset-events responses as `event_kind`.
  * This function only runs when that column is absent — e.g. legacy payloads or
  * manual callers. Keep the predicate shape aligned with the server rules.
  */
 function classifyEventType(fields: Record<string, unknown>): string {
   const sourceType = String(fields.source_type ?? '').toLowerCase();
-  const action = String(fields.action ?? '').toLowerCase();
+  const eventType = String(fields.event_type ?? '').toLowerCase();
   const authResult = String(fields.auth_result ?? '').toLowerCase();
   const fileAction = String(fields.file_action ?? '').toLowerCase();
   const category = String(fields.category ?? '').toLowerCase();
@@ -571,10 +571,10 @@ function classifyEventType(fields: Record<string, unknown>): string {
 
   if (
     sourceType.includes('dhcp') ||
-    action.includes('dhcp') ||
-    action === 'network_info' ||
-    action === 'networkinfo' ||
-    action.includes('network_adapter')
+    eventType.includes('dhcp') ||
+    eventType === 'network_info' ||
+    eventType === 'networkinfo' ||
+    eventType.includes('network_adapter')
   ) {
     return 'DHCP';
   }
@@ -594,20 +594,20 @@ function classifyEventType(fields: Record<string, unknown>): string {
   if (
     authResult ||
     sourceType.includes('auth') ||
-    action.includes('login') ||
-    action.includes('logon') ||
+    eventType.includes('login') ||
+    eventType.includes('logon') ||
     isAuthCategory
   ) {
-    if (authResult.includes('fail') || action.includes('fail')) return 'AUTH_FAILURE';
+    if (authResult.includes('fail') || eventType.includes('fail')) return 'AUTH_FAILURE';
     return 'AUTH_SUCCESS';
   }
 
-  if (action === 'image_load' || action === 'imageload') return 'IMAGE_LOAD';
-  if (action.includes('registry') || category === 'registry') return 'REGISTRY';
-  if (action.includes('pipe') || category === 'pipe') return 'PIPE';
+  if (eventType === 'image_load' || eventType === 'imageload') return 'IMAGE_LOAD';
+  if (eventType.includes('registry') || category === 'registry') return 'REGISTRY';
+  if (eventType.includes('pipe') || category === 'pipe') return 'PIPE';
 
   if (
-    action.includes('connection') ||
+    eventType.includes('connection') ||
     sourceType.includes('firewall') ||
     sourceType.includes('proxy') ||
     category === 'network' ||
@@ -616,8 +616,8 @@ function classifyEventType(fields: Record<string, unknown>): string {
     return 'NETWORK';
   }
 
-  if (processName || action.includes('process') || action.includes('exec')) return 'PROCESS';
-  if (fileAction || action.includes('file') || category === 'file_access' || category === 'object_access') return 'FILE';
+  if (processName || eventType.includes('process') || eventType.includes('exec')) return 'PROCESS';
+  if (fileAction || eventType.includes('file') || category === 'file_access' || category === 'object_access') return 'FILE';
   if (destIp) return 'NETWORK';
   return 'EVENT';
 }
@@ -638,7 +638,7 @@ function summarize(e: StreamEvent): string {
   // UDM — byte-identical) and stays consistent with the native-keyed detail. It also
   // treats `"-"` as empty, so a Sysmon `dst_endpoint.hostname = "-"` falls through to
   // the IP instead of rendering `dest_host=-`. The key list + order are unchanged.
-  // `event_type`/`message` are operational columns present verbatim in both schemas.
+  // `event_kind`/`message` are operational columns present verbatim in both schemas.
   const d = e.details;
   const keys = [
     'dest_host',
@@ -647,11 +647,11 @@ function summarize(e: StreamEvent): string {
     'command_line',
     'file_path',
     'query',
-    'event_type',
+    'event_kind',
     'message',
   ];
   for (const k of keys) {
-    if (k === 'event_type' || k === 'message') {
+    if (k === 'event_kind' || k === 'message') {
       const v = d[k];
       if (v !== null && v !== undefined && v !== '') {
         return `${k}=${String(v).slice(0, 120)}`;

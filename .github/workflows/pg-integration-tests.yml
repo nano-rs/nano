@@ -120,6 +120,7 @@ jobs:
               cargo test -p nanosiem-enterprise --test case_route_authz_guard
               cargo test -p nanosiem-core --test api_key_rate_limit_integration -- --ignored
               cargo test -p nanosiem-core --test source_scope_integration -- --ignored
+              cargo test -p nanosiem-core --test webhook_delivery_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-enterprise --test notebook_tab_revocation_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-enterprise --test settings_integration -- --ignored
               cargo test -p nanosiem-enterprise --test playbook_acl_integration -- --ignored --test-threads=1

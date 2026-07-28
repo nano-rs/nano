@@ -28,6 +28,7 @@ import {
   PanelRight,
   Rows3,
   ExternalLink,
+  Group as GroupIcon,
 } from 'lucide-react';
 import { PivtIcon } from '@/enterprise/icons/PivtIcon';
 import { cn } from '@/lib/utils';
@@ -98,41 +99,6 @@ function getDetailViewMode(): DetailViewMode {
 // can't drift (the inline copy previously never expanded the OCSF `unmapped`
 // spill — that's exactly what sharing prevents).
 
-// ============================================================================
-// Query Parsing Utilities
-// ============================================================================
-
-// Extract base query (before pipe commands), being careful not to split on | inside quotes
-const getBaseSearch = (q: string): string => {
-  let inQuote = false;
-  let escapeNext = false;
-
-  for (let i = 0; i < q.length; i++) {
-    const c = q[i];
-
-    if (escapeNext) {
-      escapeNext = false;
-      continue;
-    }
-
-    if (c === '\\') {
-      escapeNext = true;
-      continue;
-    }
-
-    if (c === '"') {
-      inQuote = !inQuote;
-      continue;
-    }
-
-    if (c === '|' && !inQuote) {
-      return q.substring(0, i).trim();
-    }
-  }
-
-  return q.trim();
-};
-
 import { extractKeywordsFromQuery, highlightText } from './keyword-highlight';
 
 interface SearchResult {
@@ -144,6 +110,9 @@ interface SearchResult {
 
 import type { DisplayType } from '@/lib/api/types';
 import { nplQuotedBody } from '@/lib/npl-quote';
+// NAN-2209: the single regex-aware base-search extractor. SearchResults
+// previously carried a quote-only copy that split inside `field=/re|gex/`.
+import { getBaseSearch, buildGroupByQuery } from '@/lib/npl-pipeline';
 
 function formatCacheAge(timestamp: number): string {
   const seconds = Math.floor((Date.now() - timestamp) / 1000);
@@ -683,6 +652,20 @@ export function FieldValueMenu({
           <span>Exclude</span>
           <DropdownMenuShortcut className="text-[10.5px]">⇧⏎</DropdownMenuShortcut>
         </DropdownMenuItem>
+        {/* NAN-2209: grouping by a single field is the most common triage move
+            and previously required hand-writing the pipeline. Field-scoped, not
+            value-scoped — it keeps the base filters and ignores the clicked
+            value. Hidden without `onSetQuery` (the stats-cell embedding in
+            StatsView has no query to rewrite). */}
+        {onSetQuery && (
+          <DropdownMenuItem
+            onClick={() => onSetQuery(buildGroupByQuery(query, fieldName))}
+            className="gap-1.5 px-2 py-1 text-[12px]"
+          >
+            <GroupIcon className="w-[13px] h-[13px]" />
+            <span>Group by {fieldName}</span>
+          </DropdownMenuItem>
+        )}
         <DropdownMenuItem
           onClick={() => navigator.clipboard.writeText(stringValue)}
           className="gap-1.5 px-2 py-1 text-[12px]"

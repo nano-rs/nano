@@ -14,6 +14,7 @@
     "test:mitre-readiness": "node --test src/components/mitre/types.test.ts",
     "test:log-source-transports": "node --test src/lib/log-source-transports.test.ts",
     "test:npl-quote": "node --test src/lib/npl-quote.test.ts",
+    "test:npl-pipeline": "node --test src/lib/npl-pipeline.test.ts",
     "test:theme-tokens": "node --test src/lib/theme-tokens.test.ts",
     "test:notification-permissions": "node --test src/components/notification-query-policy.test.ts",
     "test:repository-permissions": "node --test src/components/repositories/repository-action-policy.test.ts",

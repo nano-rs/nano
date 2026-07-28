@@ -142,11 +142,18 @@ const RESPONSE_READ_CAP: usize = 8 * 1024;
 pub struct WebhookService {
     repo: WebhookRepository,
     /// Redacts restricted-source alert content at the webhook egress choke
-    /// point (NAN-1800). `None` means the construction site has not been wired
-    /// with a resolver yet — redaction is skipped (status-quo behavior, not a
-    /// new leak). `WebhookRepository` does not expose its `PgPool`, so the
-    /// service cannot self-build one; inject the shared resolver via
-    /// [`with_scope_resolver`](Self::with_scope_resolver).
+    /// point (NAN-1800).
+    ///
+    /// ALWAYS `Some` in production: [`new`](Self::new) self-builds a resolver
+    /// from the repository's pool, so redaction is live at every construction
+    /// site. `None` is reachable only by constructing the struct directly in a
+    /// test, and means "skip redaction entirely".
+    ///
+    /// NAN-2207: this doc previously claimed the service *could not* self-build
+    /// a resolver and that egress redaction was therefore inert until a call
+    /// site chained [`with_scope_resolver`](Self::with_scope_resolver). That was
+    /// false — and load-bearing, because the only way to conclude "the
+    /// redaction branch is dead code" is to believe it. Keep it accurate.
     scope_resolver: Option<SourceScopeResolver>,
     /// Gates actual in-flight HTTP requests.
     semaphore: Arc<Semaphore>,
@@ -174,10 +181,14 @@ impl WebhookService {
         }
     }
 
-    /// Wire the shared [`SourceScopeResolver`] so `fire_alert` redacts
-    /// restricted-source content before fanout (NAN-1800). Additive builder —
-    /// existing `new(repo)` call sites keep compiling; each must be migrated to
-    /// chain this so redaction is active there.
+    /// Override the self-built [`SourceScopeResolver`] with a shared one
+    /// (NAN-1800).
+    ///
+    /// Redaction is already active without this — [`new`](Self::new) builds a
+    /// resolver from the repo's pool. Chaining this only swaps in an instance
+    /// whose caches are shared with other consumers, which converges scope
+    /// changes marginally faster than the NAN-1807 cross-process version poll.
+    /// It has no production call site today.
     pub fn with_scope_resolver(mut self, resolver: SourceScopeResolver) -> Self {
         self.scope_resolver = Some(resolver);
         self
@@ -359,17 +370,26 @@ impl WebhookService {
     ///   origin cannot be proven unrestricted, so FAIL CLOSED whenever any
     ///   restriction exists — redact if the registry is non-empty, and also
     ///   when the registry is unavailable. An empty registry (pre-feature)
-    ///   never redacts unless an unconditional marker was still recovered.
+    ///   never redacts unless the unresolved sentinel was still recovered.
+    ///
+    /// NAN-2207: an `audit` origin is NOT unconditionally redacted here (it
+    /// still is for finding storage). NAN-2155 hard-wired it, which broke every
+    /// SOAR integration built on an audit-sourced detection rule — the payload
+    /// silently lost `matched_events` + `entity` while keeping
+    /// `matched_event_count`, on deployments with no source scoping configured
+    /// and therefore no RBAC boundary to protect. Audit evidence is redacted
+    /// here iff an admin registered `audit` in `restricted_source_types`, via
+    /// the ordinary registry branches below.
     async fn origin_restricted(&self, matched_events: &serde_json::Value) -> bool {
         let Some(resolver) = &self.scope_resolver else {
             return false;
         };
         let (source_types, fully_attributed) = origin_source_types(matched_events);
-        // Unconditional markers win before the completeness split. Otherwise a
-        // mixed batch containing audit/unresolved evidence plus one malformed
-        // row would take the incomplete fallback and could egress when the
+        // The unresolved sentinel wins before the completeness split. Otherwise
+        // a mixed batch containing unresolved evidence plus one malformed row
+        // would take the incomplete fallback and could egress when the
         // configurable registry is empty.
-        if crate::auth::requires_unconditional_origin_redaction(&source_types) {
+        if crate::auth::is_unresolved_provenance(&source_types) {
             return true;
         }
         if fully_attributed {

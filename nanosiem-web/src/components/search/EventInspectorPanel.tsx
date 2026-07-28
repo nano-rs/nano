@@ -419,7 +419,15 @@ export function EventInspectorPanel({
       <div className="px-3 py-2 sticky top-[45px] z-10" style={{ background: 'var(--card)' }}>
         <div className="flex flex-wrap gap-1 font-mono text-[10.5px]">
           {keyChipSpecs.map(({ label: displayField, field, accent }) => {
-            const value = displayFields?.[field];
+            // NAN-2208: `event_type` is UDM's canonical name for the physical
+            // `action` column. Both read paths now emit `event_type`, but a row
+            // cached from before the fix (or a hand-built payload) may still
+            // carry only `action` — mirror SearchResults' fallback rather than
+            // rendering a blank chip. Harmless under OCSF, which has neither.
+            const value =
+              field === 'event_type'
+                ? (displayFields?.event_type ?? displayFields?.action)
+                : displayFields?.[field];
             if (!value || isClickHouseDefault(value, field)) return null;
             return (
               <span

@@ -75,7 +75,7 @@ import { ParserTestLab } from '@/components/parser/ParserTestLab';
 import { Markdown } from '@/components/ui/markdown';
 import { useMelodJob } from '@/enterprise/hooks/use-melod-job';
 import { useMelodStatus } from '@/hooks/use-api';
-import type { MelodEditParserResponse } from '@/lib/api';
+import type { CollectorError, MelodEditParserResponse } from '@/lib/api';
 import { Send } from 'lucide-react';
 import { PivtIcon } from '@/enterprise/icons/PivtIcon';
 
@@ -1161,6 +1161,9 @@ function OverviewTab({
         events_last_24h?: number;
         events_last_hour?: number;
         last_event_at?: string | null;
+        collector_errors?: CollectorError[];
+        collector_errors_24h?: number;
+        collector_error_hint?: string | null;
       }
     | null
     | undefined;
@@ -1170,6 +1173,19 @@ function OverviewTab({
   const parseErrors = health?.parse_errors_24h ?? 0;
   const parseAttempts = health?.parse_attempts_24h ?? 0;
   const parseSuccessRate = health?.parse_success_rate_24h;
+  // NAN-2196. A failing collector produces no events, so every volume-derived
+  // status reads it as "quiet" — the state this outranks below.
+  const collectorErrors = health?.collector_errors ?? [];
+  // Errors cover a 24h window, so their mere presence does NOT mean the
+  // collector is failing *now*: a source that broke this morning and recovered
+  // would otherwise be labelled broken while actively ingesting. Data arriving
+  // after the most recent error is the evidence of recovery.
+  const newestErrorAt = collectorErrors[0]?.timestamp;
+  const collectorRecovered =
+    Boolean(newestErrorAt) &&
+    Boolean(health?.last_event_at) &&
+    new Date(health!.last_event_at!).getTime() > new Date(newestErrorAt!).getTime();
+  const collectorFailing = collectorErrors.length > 0 && !collectorRecovered;
   return (
     <div className="p-4 space-y-4">
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -1216,7 +1232,19 @@ function OverviewTab({
           }
         >
           <LSRow label="Status">
-            {health?.health_status === 'error' ? (
+            {/*
+              NAN-2196: collector failure outranks everything below it. The
+              statuses that follow are all derived from event volume, and a
+              collector that cannot reach its queue produces no volume — so
+              without this branch a hard failure renders as "No data yet" or
+              "Stale", which is exactly how the original bug stayed invisible.
+            */}
+            {collectorFailing ? (
+              <span className="inline-flex items-center gap-1.5 text-red-500">
+                <XCircle className="w-3.5 h-3.5" />
+                <span className="text-[12px]">Collector failing — not receiving data</span>
+              </span>
+            ) : health?.health_status === 'error' ? (
               <span className="inline-flex items-center gap-1.5 text-red-500">
                 <XCircle className="w-3.5 h-3.5" />
                 <span className="text-[12px]">Errors detected</span>
@@ -1292,6 +1320,90 @@ function OverviewTab({
           </div>
         </LSCard>
       </div>
+
+      {/*
+        NAN-2196. Rendered only when the collector has actually reported a
+        failure, so a healthy source gains no empty panel. Placed above the
+        sparkline: when a source is broken, "why" outranks "how much".
+      */}
+      {collectorErrors.length > 0 && (
+        <LSCard
+          eyebrow="Collector"
+          title="Recent collector errors"
+          action={
+            <span
+              className={cn(
+                'text-[10px] font-mono',
+                collectorFailing ? 'text-red-500' : 'text-muted-foreground',
+              )}
+            >
+              {fmtCount(health?.collector_errors_24h ?? collectorErrors.length)} in 24h
+            </span>
+          }
+        >
+          <div className="px-4 py-3 text-[11.5px] leading-relaxed text-foreground/80 border-b border-border">
+            {collectorRecovered ? (
+              <>
+                The collector reported these errors, then resumed — data has arrived since the
+                most recent one. Shown because a recovered feed may still have a gap.
+              </>
+            ) : (
+              <>
+                These are reported by the collector itself, not by the parser. They mean data is
+                not arriving — distinct from data arriving and failing to parse.
+              </>
+            )}
+          </div>
+
+          {/* A diagnosis for a feed that has since recovered would misdirect. */}
+          {collectorFailing && health?.collector_error_hint && (
+            <div className="px-4 py-3 text-[11.5px] leading-relaxed text-amber-600 dark:text-amber-500 border-b border-border">
+              {health.collector_error_hint}
+            </div>
+          )}
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-[11.5px]">
+              <thead>
+                <tr className="text-[10px] font-mono uppercase tracking-wide text-muted-foreground">
+                  <th className="text-left font-medium px-4 py-1.5">Time</th>
+                  <th className="text-left font-medium px-4 py-1.5">Level</th>
+                  <th className="text-left font-medium px-4 py-1.5">Message</th>
+                  <th className="text-left font-medium px-4 py-1.5">Code</th>
+                </tr>
+              </thead>
+              <tbody>
+                {collectorErrors.map((e, i) => (
+                  <tr key={`${e.timestamp}-${i}`} className="border-t border-border align-top">
+                    <td className="px-4 py-1.5 font-mono text-[10.5px] text-foreground/70 whitespace-nowrap">
+                      {formatUTCCompact(e.timestamp)}
+                    </td>
+                    <td className="px-4 py-1.5 font-mono text-[10.5px] whitespace-nowrap">
+                      <span className={e.level === 'ERROR' ? 'text-red-500' : 'text-amber-500'}>
+                        {e.level || '—'}
+                      </span>
+                    </td>
+                    <td className="px-4 py-1.5 text-foreground/90">{e.message || '—'}</td>
+                    <td className="px-4 py-1.5 font-mono text-[10.5px] text-muted-foreground whitespace-nowrap">
+                      {e.error_code || '—'}
+                      {e.stage && (
+                        <div className="mt-0.5 text-foreground/50">{e.stage}</div>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {(health?.collector_errors_24h ?? 0) > collectorErrors.length && (
+            <div className="px-4 py-2 text-[10.5px] text-muted-foreground border-t border-border">
+              Showing the {collectorErrors.length} most recent of{' '}
+              {fmtCount(health?.collector_errors_24h)} in the last 24 hours.
+            </div>
+          )}
+        </LSCard>
+      )}
 
       <Sparkline points={sparklinePoints} isLive={isLive} sourceDeployed={source.deployed} />
     </div>

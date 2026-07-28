@@ -685,8 +685,9 @@ export interface FieldValuesResponse {
 export interface AssetFacets {
   /** Source type facet: [value, count][] */
   source_type: [string, number][];
-  /** Event type facet: [value, count][] */
-  event_type: [string, number][];
+  /** Event-kind facet: [value, count][] — the classifier label (PROCESS,
+   *  AUTH_FAILURE, …), NOT the UDM `event_type` field value (NAN-2211). */
+  event_kind: [string, number][];
   /** User facet: [value, count][] */
   user: [string, number][];
 }
@@ -709,8 +710,8 @@ export interface AssetPagination {
 export interface AssetEventFilters {
   /** Filter by source types (OR) */
   source_types?: string[];
-  /** Filter by event types (OR) - note: computed from fields, not stored */
-  event_types?: string[];
+  /** Filter by event kinds (OR) — classifier labels, computed not stored (NAN-2211) */
+  event_kinds?: string[];
   /** Filter by users (OR) */
   users?: string[];
   /** Text search across message, process, file_path, etc. */
@@ -5158,6 +5159,33 @@ export interface LogSourceHealth {
   parse_errors_24h: number;
   parse_attempts_24h: number;
   parse_success_rate_24h: number | null;
+  /**
+   * Recent collector failures, newest first (NAN-2196).
+   *
+   * Distinct from `parse_errors_24h`: parse errors mean data arrived and we
+   * could not read it; these mean it never arrived. Without them a broken
+   * source and a quiet one look identical.
+   */
+  collector_errors: CollectorError[];
+  /** 24h total. `collector_errors` is capped for display, so this is larger. */
+  collector_errors_24h: number;
+  /** A likely cause, when the error signature points at one. Often null. */
+  collector_error_hint: string | null;
+}
+
+/** One collector failure, as reported by the collector itself (NAN-2196). */
+export interface CollectorError {
+  timestamp: string;
+  /** `WARN` or `ERROR`. */
+  level: string;
+  message: string;
+  /** Stable code, e.g. `failed_fetching_sqs_events`. May be empty. */
+  error_code: string;
+  error_type: string;
+  /** `receiving` | `processing` | `sending`. */
+  stage: string;
+  /** Collector driver — `aws_s3`, `kafka`, `gcp_pubsub`, … */
+  component_type: string;
 }
 
 export interface IngestionHistoryPoint {

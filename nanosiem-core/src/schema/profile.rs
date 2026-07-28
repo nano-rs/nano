@@ -100,8 +100,33 @@ pub trait SchemaProfile: Send + Sync {
     /// UDM rewrite would reference a nonexistent column and fail every bare/filter
     /// search. The default here is `[]` so an unrelated profile is never
     /// accidentally given a UDM-specific rewrite.
+    ///
+    /// This rewrite is the PERMANENT contract, not a migration step. The Phase 2
+    /// physical `RENAME COLUMN action TO event_type` promised by
+    /// `clickhouse/113_event_type_alias.sql` is cancelled — it would hard-fail
+    /// ingest on every deployment still writing the old column name. See
+    /// `udm::UDM_DEFAULT_VIEW_RENAMES` for the full reasoning (NAN-2213).
     fn default_view_renames(&self) -> &[(&str, &str)] {
         &[]
+    }
+
+    /// The analyst-facing name for a canonical field, applying
+    /// [`default_view_renames`](Self::default_view_renames) (NAN-2211).
+    ///
+    /// Hand-built projections that alias a resolved column back to its canonical
+    /// name (`{col} AS {field}`) must emit the *renamed* name, or that view
+    /// re-exposes the legacy one NAN-2208 removed from the main search paths.
+    /// UDM maps `action` → `event_type`; every other field, and every profile
+    /// with no renames, is identity.
+    ///
+    /// Only for SELECT aliases. WHERE predicates reference the physical column
+    /// and must NOT be routed through this.
+    fn canonical_field_name<'a>(&'a self, field: &'a str) -> &'a str {
+        self.default_view_renames()
+            .iter()
+            .find(|(col, _)| *col == field)
+            .map(|(_, alias)| *alias)
+            .unwrap_or(field)
     }
 
     /// The JSON "tail"/overflow column holding the un-promoted record body —

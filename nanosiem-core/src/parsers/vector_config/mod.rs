@@ -121,12 +121,13 @@ impl VectorConfigManager {
         &self.config_dir
     }
 
-    /// Convert parser name to a safe identifier for Vector
+    /// Convert parser name to a safe identifier for Vector.
+    ///
+    /// Delegates to [`crate::vector_naming::safe_name`] — see there for why the
+    /// transformation is centralised rather than copied per subsystem
+    /// (NAN-2196).
     pub(crate) fn safe_name(name: &str) -> String {
-        name.chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '_' })
-            .collect::<String>()
-            .to_lowercase()
+        crate::vector_naming::safe_name(name)
     }
 
     /// Path on disk for a parser-side credential or cert file. Lives directly

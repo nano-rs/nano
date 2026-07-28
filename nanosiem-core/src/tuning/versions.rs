@@ -1314,21 +1314,12 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn revert_migration_persists_results_and_runtime_reconciliation() {
-        // Revert idempotency touches the enterprise-only tuning_logs table, so it
-        // lives in the enterprise overlay (9000031); the runtime-sync-jobs table
-        // it reconciles against is created by core migration 225.
-        let revert = include_str!(
-            "../../../migrations/postgres-enterprise/9000031_tuning_revert_idempotency.sql"
-        );
-        assert!(revert.contains("reverted_result_version_id"));
-        assert!(revert.contains("unambiguous_applied_versions"));
-        assert!(revert.contains("proposal_status"));
-        let runtime =
-            include_str!("../../../migrations/postgres/225_atomic_rule_version_invariants.sql");
-        assert!(runtime.contains("detection_rule_runtime_sync_jobs"));
-        assert!(runtime.contains("desired_version_id"));
-        assert!(runtime.contains("claimed_by"));
-    }
+    // `revert_migration_persists_results_and_runtime_reconciliation` used to live
+    // here. It `include_str!`s an ENTERPRISE migration (9000031), and the open-core
+    // mirror strips `migrations/postgres-enterprise/` — so in the mirror this file
+    // still compiled under `cargo check` but its test target did not, which took
+    // down every unit test in `nanosiem-core` for anyone cloning the public repo.
+    // Moved to `tests/tuning_revert_integration.rs`, which the strip drops whole.
+    // Nothing enterprise-only may be `include_str!`d from `src/` — not even under
+    // `#[cfg(test)]`. See NAN-2205.
 }

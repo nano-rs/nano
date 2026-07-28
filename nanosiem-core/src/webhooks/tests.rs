@@ -241,10 +241,13 @@ fn aggregate_engine_stamp_reaches_the_webhook_scope_decision() {
         crate::auth::is_unresolved_provenance(&types),
         "the production extractor must preserve the sentinel consumed by any_restricted"
     );
-    assert!(
-        crate::auth::is_always_restricted_origin(&types),
-        "the production extractor must preserve the audit marker consumed by any_restricted"
-    );
+    // NAN-2207: the extractor still preserves the audit NAME — the registry
+    // branch needs it to match a deployment that registered `audit` — but the
+    // name alone no longer forces redaction at egress. Only the sentinel does.
+    assert!(types.contains(&"audit".to_string()));
+    assert!(!crate::auth::is_unresolved_provenance(&[
+        "audit".to_string()
+    ]));
 }
 
 #[test]
@@ -273,7 +276,12 @@ fn engine_shaped_field_beside_a_real_source_is_ignored() {
 }
 
 #[test]
-fn partial_batch_cannot_launder_an_unconditional_origin() {
+fn partial_batch_with_audit_falls_to_the_registry_branch() {
+    // NAN-2155 asserted the opposite of this: `audit` won unconditionally,
+    // before the incomplete-manifest fallback. NAN-2207 removed that hard-wire
+    // at egress, so this batch is decided by the registry — redacted on a
+    // deployment that registered `audit` (or any other source), delivered on
+    // one that configured no source scoping at all.
     let events = serde_json::json!([
         {
             "source_type": "audit",
@@ -286,11 +294,14 @@ fn partial_batch_cannot_launder_an_unconditional_origin() {
     ]);
 
     let (types, fully_attributed) = origin_source_types(&events);
+    // The forged per-event sentinel is dropped as unattributed rather than
+    // honoured — unchanged from NAN-2155, and still the fail-closed direction
+    // because an incomplete manifest redacts whenever any restriction exists.
     assert!(!fully_attributed);
     assert_eq!(types, vec!["audit".to_string()]);
     assert!(
-        crate::auth::requires_unconditional_origin_redaction(&types),
-        "audit must win before the incomplete-manifest registry fallback"
+        !crate::auth::is_unresolved_provenance(&types),
+        "audit must not be treated as unresolved provenance at egress"
     );
 }
 

@@ -85,6 +85,7 @@ pub mod typeid;
 pub mod udm;
 pub mod udm_context;
 pub mod upload;
+pub mod vector_naming;
 pub mod webhooks;
 
 pub use audit::{

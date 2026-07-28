@@ -138,6 +138,18 @@ impl ClickHouseExecutor {
         default_kind != "MATERIALIZED" || cte_visible_materialized.contains(&name)
     }
 
+    /// Map a physical column name to the profile's canonical analyst-facing name
+    /// (NAN-2208). UDM's `[("action", "event_type")]` turns the inventory entry
+    /// `action` into `event_type`; every other name, and every profile with no
+    /// renames, passes through untouched.
+    pub fn canonical_column_name(name: &str, default_view_renames: &[(&str, &str)]) -> String {
+        default_view_renames
+            .iter()
+            .find(|(col, _)| *col == name)
+            .map(|(_, alias)| (*alias).to_string())
+            .unwrap_or_else(|| name.to_string())
+    }
+
     /// Get list of queryable columns from the active schema's logs table.
     /// Excludes arrays, maps, and internal columns (starting with _).
     ///
@@ -157,10 +169,22 @@ impl ClickHouseExecutor {
     /// (e.g. `src_endpoint.ip.search`); it sits alongside the existing `%_search`
     /// exclusion that drops UDM's snake_case companions (`message_search`, …).
     /// Both are harmless no-ops against the other schema.
+    /// `default_view_renames` is the active profile's `(column, alias)` rewrite
+    /// list (NAN-2208). ALIAS columns are excluded in SQL (they vanish from
+    /// `SELECT *`, so aggregating one in a wrapped CTE would fail), but that
+    /// also hid UDM's canonical `event_type` and left the field index showing
+    /// only the legacy physical `action` — while the event list, autocomplete
+    /// and search rows all said `event_type`. Rewriting the inventory entry to
+    /// the canonical alias fixes the split without un-excluding aliases
+    /// generally: a renamed column is explicitly re-projected as
+    /// `col AS alias` by `build_select_clause`, so the alias name *is*
+    /// resolvable in every scope the stats query runs in. OCSF has no renames,
+    /// so its inventory is unchanged.
     pub async fn get_table_columns(
         &self,
         table: &str,
         cte_visible_materialized: &[&str],
+        default_view_renames: &[(&str, &str)],
     ) -> Result<Vec<String>, SearchError> {
         // Escape single quotes in the table name to avoid injection in the
         // string literal (table names are internal/registry-derived, but keep
@@ -237,7 +261,7 @@ impl ClickHouseExecutor {
                 let name = v.get("name")?.as_str()?;
                 let default_kind = v.get("default_kind").and_then(|k| k.as_str()).unwrap_or("");
                 Self::is_companion_safe_column(name, default_kind, cte_visible_materialized)
-                    .then(|| name.to_string())
+                    .then(|| Self::canonical_column_name(name, default_view_renames))
             })
             .collect();
 
@@ -774,6 +798,42 @@ impl ClickHouseExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NAN-2208: `system.columns` cannot report UDM's canonical `event_type`
+    /// (it is an ALIAS, and aliases are excluded — they vanish from `SELECT *`).
+    /// The inventory must therefore rewrite the physical `action` to the
+    /// canonical name, or the field index shows the legacy name while the event
+    /// list, autocomplete and search rows all say `event_type`.
+    #[test]
+    fn canonical_column_name_rewrites_udm_action_to_event_type() {
+        const UDM: &[(&str, &str)] = &[("action", "event_type")];
+        assert_eq!(
+            ClickHouseExecutor::canonical_column_name("action", UDM),
+            "event_type"
+        );
+    }
+
+    /// Every other column passes through untouched — the rewrite is exact-match
+    /// on the rename source, not a substring or prefix rule.
+    #[test]
+    fn canonical_column_name_leaves_unrelated_columns_alone() {
+        const UDM: &[(&str, &str)] = &[("action", "event_type")];
+        for name in ["src_ip", "auth_result", "file_action", "action_type"] {
+            assert_eq!(
+                ClickHouseExecutor::canonical_column_name(name, UDM),
+                name,
+                "{name} must not be rewritten"
+            );
+        }
+    }
+
+    /// OCSF declares no renames, so its inventory is byte-identical to before.
+    #[test]
+    fn canonical_column_name_without_renames_is_identity() {
+        for name in ["action", "activity", "src_endpoint.ip"] {
+            assert_eq!(ClickHouseExecutor::canonical_column_name(name, &[]), name);
+        }
+    }
 
     #[test]
     fn ext_field_names_sql_is_bounded_and_native() {

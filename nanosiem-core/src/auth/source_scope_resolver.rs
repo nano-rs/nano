@@ -286,15 +286,32 @@ impl SourceScopeResolver {
     /// is unavailable (never loaded and PostgreSQL is unreachable) this returns
     /// `true` (treat as restricted) so redaction errs toward hiding.
     ///
-    /// NAN-2155: an UNRESOLVED or always-restricted origin
+    /// NAN-2155: an UNRESOLVED origin
     /// ([`UNRESOLVED_SOURCE_SENTINEL`](super::scope::UNRESOLVED_SOURCE_SENTINEL))
-    /// is restricted unconditionally, checked BEFORE any registry access. Both
-    /// the sentinel and `audit` are deliberately not registry members, so a
-    /// plain membership test would report them as unrestricted. Without this,
-    /// a "fully attributed" engine stamp could EGRESS the matched-event sample,
-    /// which is strictly worse than the unstamped behaviour it replaced.
+    /// is restricted unconditionally, checked BEFORE any registry access. The
+    /// sentinel is deliberately not a registry member, so a plain membership
+    /// test would report it as unrestricted. Without this, a "fully attributed"
+    /// engine stamp could EGRESS the matched-event sample, which is strictly
+    /// worse than the unstamped behaviour it replaced.
+    ///
+    /// NAN-2207: the `audit` origin is NOT checked here. This predicate is
+    /// shared by finding storage and webhook egress, and those two boundaries
+    /// no longer agree about audit:
+    ///
+    /// * Finding storage keeps the hard-wire, applied by its OWN short-circuit
+    ///   in [`FindingLogger::origin_restricted`](crate::detection::FindingLogger)
+    ///   before it ever calls this method — so moving the check out of here
+    ///   leaves finding redaction byte-identical.
+    /// * Webhook egress deliberately dropped it (see
+    ///   [`is_always_restricted_origin`](super::scope::is_always_restricted_origin)):
+    ///   an audit-sourced alert now egresses its evidence unless an admin has
+    ///   registered `audit` as restricted, which the registry branch below
+    ///   handles like any other source.
+    ///
+    /// Keeping the audit test inside a SHARED predicate is what made NAN-2155
+    /// change both boundaries at once; each caller now states its own policy.
     pub async fn any_restricted(&self, source_types: &[String]) -> bool {
-        if super::scope::requires_unconditional_origin_redaction(source_types) {
+        if super::scope::is_unresolved_provenance(source_types) {
             return true;
         }
         match self.restricted_snapshot().await {
@@ -649,7 +666,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_side_sentinels_short_circuit_without_postgres() {
+    async fn unresolved_sentinel_short_circuits_without_postgres() {
+        // The sentinel must redact with NO PostgreSQL access at all: it is not a
+        // registry member, so if this fell through to the registry branch it
+        // would depend on the snapshot being loadable — exactly the dependency
+        // NAN-2155 removed.
         let resolver = SourceScopeResolver::new(unreachable_pool());
 
         assert!(
@@ -657,6 +678,23 @@ mod tests {
                 .any_restricted(&[crate::auth::UNRESOLVED_SOURCE_SENTINEL.to_string()])
                 .await
         );
-        assert!(resolver.any_restricted(&[" Audit ".to_string()]).await);
+    }
+
+    #[tokio::test]
+    async fn audit_origin_no_longer_short_circuits() {
+        // NAN-2207: `audit` is no longer hard-wired into this predicate — it is
+        // an ordinary registry lookup now. This pool can never connect, so the
+        // registry branch fails CLOSED and the result is still `true`; the point
+        // of the test is the ROUTE, not the verdict. Proven by the pure
+        // predicate: nothing in `any_restricted`'s short-circuit matches audit.
+        assert!(!crate::auth::is_unresolved_provenance(&[
+            "audit".to_string()
+        ]));
+
+        let resolver = SourceScopeResolver::new(unreachable_pool());
+        assert!(
+            resolver.any_restricted(&[" Audit ".to_string()]).await,
+            "registry unavailable must still fail closed for any source"
+        );
     }
 }

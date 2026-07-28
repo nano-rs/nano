@@ -32,11 +32,35 @@ type = "internal_logs"
 # =============================================================================
 # Log Level Filter
 # =============================================================================
-# Only expose warnings and errors to avoid noise
+# Only expose warnings and errors to avoid noise.
+#
+# The `component_id` clause is NOT belt-and-suspenders — it breaks a real
+# feedback loop (NAN-2196). `clickhouse_internal_logs` below consumes this
+# transform, so when THAT sink fails it emits internal log events of its own,
+# which match the level filter, which feed the failing sink, which emits more.
+# The amplification kicks in exactly when the system is already broken.
+#
+# Vector logs the sink's failures at WARN (not ERROR), so an ERROR-only reading
+# of this makes the loop invisible. Measured over 75s against a dead endpoint,
+# with a source failing continuously to seed it:
+#
+#   without the clause   166 events forwarded, 22 self-referential
+#   with the clause      144 events forwarded,  0 self-referential
+#
+# Both forward the same 144 real source errors — the clause removes only the
+# self-referential traffic. Vector's own flood suppression dampens the loop but
+# does not eliminate it.
+#
+# `.vector.component_id` is null on events not attributed to a component (early
+# startup logs), and `null != "…"` is true, so those still pass on level alone.
+# Do not "improve" this into `string!(.vector.component_id ?? "")` — VRL rejects
+# it as E651: a path lookup cannot fail, so the coalesce is invalid and the
+# assertion then chokes on the null. That mistake is a config error at boot,
+# meaning no collector at all.
 [transforms.filter_internal_logs]
 type = "filter"
 inputs = ["internal_logs"]
-condition = '.metadata.level == "WARN" || .metadata.level == "ERROR"'
+condition = '(.metadata.level == "WARN" || .metadata.level == "ERROR") && .vector.component_id != "clickhouse_internal_logs"'
 
 # =============================================================================
 # Prometheus Metrics Sink
@@ -54,8 +78,57 @@ default_namespace = "nanosiem"
 # =============================================================================
 # Internal Logs Sink (Console for Docker logs)
 # =============================================================================
-# Outputs important internal logs to stdout for Docker logging
+# Outputs important internal logs to stdout for Docker logging.
+# Kept alongside the ClickHouse sink below: when ClickHouse is the thing that is
+# broken, stdout is the only place the reason can still be read.
 [sinks.internal_logs_console]
 type = "console"
 inputs = ["filter_internal_logs"]
 encoding.codec = "json"
+
+# =============================================================================
+# Internal Logs Sink (ClickHouse — the collector error channel)
+# =============================================================================
+# NAN-2196. Without this, a broken collector and a quiet one are the same object
+# in the API: `LogSourceHealth` was entirely volume-based, so diagnosing "why is
+# ingest broken" meant reading container logs by hand — impossible for a
+# customer, and unavailable in a managed deployment.
+#
+# The event keys Vector emits (`message`, `error_code`, `error_type`, `stage`,
+# `host`, plus flattened `metadata.level` / `vector.component_*`) line up with
+# the columns in `clickhouse/171_collector_errors.sql`, so the sink's implicit
+# no-column-list INSERT populates the table directly. No staging table or
+# materialized view — unlike the OTLP lanes there is nothing to derive.
+#
+# `component_id` is the join back to a log source: generated sources are named
+# `<safe_name(name)>_source`.
+[sinks.clickhouse_internal_logs]
+type = "clickhouse"
+inputs = ["filter_internal_logs"]
+
+endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
+database = "${CLICKHOUSE_DATABASE:-nanosiem}"
+table = "${CLICKHOUSE_COLLECTOR_ERRORS_TABLE:-collector_errors}"
+
+auth.strategy = "basic"
+auth.user = "${CLICKHOUSE_USER:-nanosiem}"
+auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
+
+compression = "gzip"
+date_time_best_effort = true
+# Vector emits per-error-type extras we deliberately do not model; without this
+# a novel key would fail the whole batch and we would lose the error we were
+# trying to record.
+skip_unknown_fields = true
+
+# Diagnostics must never apply backpressure to ingest. If this sink cannot
+# keep up or ClickHouse is down, drop the diagnostics rather than stall the
+# pipeline they describe — the console sink above still has them.
+buffer.type = "memory"
+buffer.max_events = 1000
+buffer.when_full = "drop_newest"
+
+# The healthcheck runs at boot. Failing it would take the whole collector down
+# over an error-reporting side channel, so a missing table must degrade to
+# "no error history", never to "no ingest".
+healthcheck.enabled = false

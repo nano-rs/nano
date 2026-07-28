@@ -31,7 +31,8 @@ use nanosiem_core::audit::{
 };
 use nanosiem_core::log_sources::{
     DeploymentResult, IngestionHistoryPoint, LiveTestResult, LogSource, LogSourceDeployment,
-    LogSourceHealth, LogSourceVersion, LogSourceWithDraftStatus, NewLogSource, ParserTestResult,
+    CollectorError, LogSourceHealth, LogSourceVersion, LogSourceWithDraftStatus, NewLogSource,
+    ParserTestResult,
     UpdateLogSource, VrlDiagnostic, VrlValidationResult,
 };
 use nanosiem_core::typeid::TypeIdParam;
@@ -973,6 +974,13 @@ pub async fn get_log_source_draft_status(
         VrlValidationResult,
         VrlDiagnostic,
         ParserTestResult,
+        // NAN-2196: the health response and its nested collector-error record.
+        // Registered explicitly per the repo's OpenAPI convention rather than
+        // left to utoipa's transitive collection, so a future refactor that
+        // stops referencing them from a `body =` annotation cannot silently
+        // drop them from the published spec.
+        LogSourceHealth,
+        CollectorError,
     ))
 )]
 pub struct LogSourcesApiDoc;

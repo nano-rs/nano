@@ -3,17 +3,24 @@
 //! Shared UDM event classification — single source of truth used by both the
 //! asset search paths and the dossier endpoint.
 //!
-//! Two consumers today:
-//! - [`EVENT_TYPE_SQL`] — returns a string label (`'AUTH_SUCCESS'`, `'NETWORK'`, …)
+//! Two consumers today — the SAME taxonomy in two representations:
+//! - [`EVENT_KIND_SQL`] — returns a string label (`'AUTH_SUCCESS'`, `'NETWORK'`, …)
 //!   consumed by the per-event facet aggregation in `service/asset.rs` and by
-//!   the paginated asset-events endpoint (via `detect_event_type` in Rust).
+//!   the paginated asset-events endpoint (via `detect_event_kind` in Rust).
 //! - [`LANE_SQL`] — returns an integer lane index (0-4) consumed by the 5-lane
 //!   heatmap timeline in `service/asset_dossier.rs`.
+//!
+//! NAN-2211: this classifier was called `event_type` until the UDM field of that
+//! name (the `action` column's canonical alias, NAN-659/2208) started being
+//! projected alongside it on the asset timeline — two different things under one
+//! name in a single row. It is now `event_kind` everywhere: the *kind* of
+//! activity (`PROCESS`), as distinct from the UDM `event_type` field value
+//! (`image_load`). Do not reintroduce `event_type` for this concept.
 //!
 //! Both expressions must agree on what "kind of event this is" — if you change
 //! one, change the other to match. The mapping is:
 //!
-//! | Lane idx | String types            |
+//! | Lane idx | Event kinds             |
 //! |---------:|-------------------------|
 //! |        0 | AUTH_SUCCESS, AUTH_FAILURE |
 //! |        1 | PROCESS, IMAGE_LOAD     |
@@ -119,7 +126,7 @@ macro_rules! p_network_fallback {
 // Predicate exports
 //
 // The macros above produce literal `&'static str` so `concat!` can splice them
-// into `EVENT_TYPE_SQL` / `LANE_SQL`. They're also useful to non-classifier
+// into `EVENT_KIND_SQL` / `LANE_SQL`. They're also useful to non-classifier
 // callers that need to filter on "is this an auth event?" — the dossier
 // service in particular (NAN-1049) used to embed its own near-copies of these
 // predicates and drifted when NAN-1047 added the `category` axis here.
@@ -145,8 +152,8 @@ macro_rules! p_network_fallback {
 // match the UDM mapping exactly so both classifiers stay interchangeable.
 // ---------------------------------------------------------------------------
 
-/// OCSF analog of [`EVENT_TYPE_SQL`].
-pub const OCSF_EVENT_TYPE_SQL: &str = concat!(
+/// OCSF analog of [`EVENT_KIND_SQL`].
+pub const OCSF_EVENT_KIND_SQL: &str = concat!(
     "CASE",
     " WHEN category_uid = 2 THEN 'ALERT'",
     " WHEN class_uid = 4004 THEN 'DHCP'",
@@ -178,15 +185,15 @@ pub const OCSF_AUTH_PREDICATE: &str = "(category_uid = 3)";
 /// OCSF analog of [`FILE_PREDICATE`] — File System Activity class.
 pub const OCSF_FILE_PREDICATE: &str = "(class_uid = 1001)";
 
-/// Event-type CASE expression for the active schema profile (NAN-1241). UDM
-/// returns [`EVENT_TYPE_SQL`] byte-identical; OCSF returns [`OCSF_EVENT_TYPE_SQL`].
-pub fn event_type_sql(profile: &dyn crate::schema::SchemaProfile) -> &'static str {
+/// Event-kind CASE expression for the active schema profile (NAN-1241). UDM
+/// returns [`EVENT_KIND_SQL`] byte-identical; OCSF returns [`OCSF_EVENT_KIND_SQL`].
+pub fn event_kind_sql(profile: &dyn crate::schema::SchemaProfile) -> &'static str {
     match profile.id() {
-        crate::schema::SchemaId::Ocsf => OCSF_EVENT_TYPE_SQL,
+        crate::schema::SchemaId::Ocsf => OCSF_EVENT_KIND_SQL,
         crate::schema::SchemaId::Udm
         | crate::schema::SchemaId::Spans
         | crate::schema::SchemaId::Metrics
-        | crate::schema::SchemaId::Risk => EVENT_TYPE_SQL,
+        | crate::schema::SchemaId::Risk => EVENT_KIND_SQL,
     }
 }
 
@@ -241,7 +248,7 @@ pub const FILE_PREDICATE: &str = p_file!();
 /// `IMAGE_LOAD`, `REGISTRY`, `PIPE`, `NETWORK`, `PROCESS`, `FILE`, `EVENT`.
 /// Used by the facet aggregation and filter-condition queries in the asset
 /// service.
-pub const EVENT_TYPE_SQL: &str = concat!(
+pub const EVENT_KIND_SQL: &str = concat!(
     "CASE",
     " WHEN ", p_alert!(), " THEN 'ALERT'",
     " WHEN ", p_dhcp!(), " THEN 'DHCP'",
@@ -283,12 +290,12 @@ mod tests {
     /// Sanity check: both classifiers should compile to valid-looking SQL
     /// (balanced `CASE`/`END`, non-empty, starts with the keyword).
     #[test]
-    fn event_type_sql_is_well_formed() {
-        assert!(EVENT_TYPE_SQL.starts_with("CASE"));
-        assert!(EVENT_TYPE_SQL.ends_with("END"));
-        let cases = EVENT_TYPE_SQL.matches("CASE").count();
-        let ends = EVENT_TYPE_SQL.matches("END").count();
-        assert_eq!(cases, ends, "CASE / END count mismatch: {EVENT_TYPE_SQL}");
+    fn event_kind_sql_is_well_formed() {
+        assert!(EVENT_KIND_SQL.starts_with("CASE"));
+        assert!(EVENT_KIND_SQL.ends_with("END"));
+        let cases = EVENT_KIND_SQL.matches("CASE").count();
+        let ends = EVENT_KIND_SQL.matches("END").count();
+        assert_eq!(cases, ends, "CASE / END count mismatch: {EVENT_KIND_SQL}");
     }
 
     /// The `pub const` predicate exports must stay in sync with the underlying
@@ -326,8 +333,8 @@ mod tests {
         ] {
             let token = format!("'{cat}'");
             assert!(
-                EVENT_TYPE_SQL.contains(&token),
-                "EVENT_TYPE_SQL missing category '{cat}': {EVENT_TYPE_SQL}"
+                EVENT_KIND_SQL.contains(&token),
+                "EVENT_KIND_SQL missing category '{cat}': {EVENT_KIND_SQL}"
             );
             assert!(
                 LANE_SQL.contains(&token),
@@ -342,20 +349,20 @@ mod tests {
         let udm = UdmProfile::new();
         let ocsf = OcsfProfile::new();
         // UDM dispatch must return the existing consts byte-for-byte.
-        assert_eq!(event_type_sql(&udm), EVENT_TYPE_SQL);
+        assert_eq!(event_kind_sql(&udm), EVENT_KIND_SQL);
         assert_eq!(lane_sql(&udm), LANE_SQL);
         assert_eq!(auth_predicate(&udm), AUTH_PREDICATE);
         assert_eq!(file_predicate(&udm), FILE_PREDICATE);
         // OCSF dispatch returns the OCSF taxonomy expressions (class_uid/category_uid).
-        assert_eq!(event_type_sql(&ocsf), OCSF_EVENT_TYPE_SQL);
+        assert_eq!(event_kind_sql(&ocsf), OCSF_EVENT_KIND_SQL);
         assert_eq!(lane_sql(&ocsf), OCSF_LANE_SQL);
-        assert!(event_type_sql(&ocsf).contains("category_uid"));
+        assert!(event_kind_sql(&ocsf).contains("category_uid"));
         assert!(lane_sql(&ocsf).contains("class_uid"));
         // Both event-type classifiers are well-formed CASE expressions.
-        assert!(OCSF_EVENT_TYPE_SQL.starts_with("CASE") && OCSF_EVENT_TYPE_SQL.ends_with("END"));
+        assert!(OCSF_EVENT_KIND_SQL.starts_with("CASE") && OCSF_EVENT_KIND_SQL.ends_with("END"));
         assert_eq!(
-            OCSF_EVENT_TYPE_SQL.matches("CASE").count(),
-            OCSF_EVENT_TYPE_SQL.matches("END").count()
+            OCSF_EVENT_KIND_SQL.matches("CASE").count(),
+            OCSF_EVENT_KIND_SQL.matches("END").count()
         );
         assert!(OCSF_LANE_SQL.starts_with("CASE") && OCSF_LANE_SQL.ends_with("END"));
     }

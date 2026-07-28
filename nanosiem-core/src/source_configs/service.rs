@@ -2950,11 +2950,15 @@ impl SourceConfigService {
     }
 
     /// Convert name to safe identifier
+    /// Delegates to [`crate::vector_naming::safe_name`].
+    ///
+    /// The transformation used to be inlined here and again in
+    /// `parsers::vector_config`. `log_sources` health now needs it too, to
+    /// attribute collector errors back to a source via `vector.component_id` —
+    /// and a third copy that could drift from this one would silently break
+    /// that attribution (NAN-2196). One definition, delegated to.
     fn safe_name(name: &str) -> String {
-        name.chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '_' })
-            .collect::<String>()
-            .to_lowercase()
+        crate::vector_naming::safe_name(name)
     }
 }
 

@@ -1005,7 +1005,12 @@ fn build_lateral_columns(profile: &dyn crate::schema::SchemaProfile) -> String {
             } else {
                 profile.udm_column_sql(field)
             };
-            col.map(|col| format!("{col} AS {field}"))
+            // NAN-2211: alias to the profile's CANONICAL name, not the raw
+            // resolution key — UDM's `action` projects as `event_type`, matching
+            // what every other search read path emits since NAN-2208. Identity
+            // for every other field and for OCSF (no renames), so the rest of
+            // the projection is byte-identical.
+            col.map(|col| format!("{col} AS {}", profile.canonical_field_name(field)))
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -1486,6 +1491,50 @@ mod auth_predicate_tests {
         assert!(
             projection.contains("source_type AS source_type"),
             "UDM projection must be byte-identical: {projection}"
+        );
+    }
+
+    /// NAN-2211: the lateral projection was the last search view still handing
+    /// the analyst the legacy `action` name. NAN-2208 made every other read path
+    /// emit the canonical `event_type`; this one aliased the resolution key
+    /// verbatim, so `| lateral` results disagreed with the event list.
+    #[test]
+    fn udm_projection_aliases_action_to_canonical_event_type() {
+        let p = crate::schema::UdmProfile::new();
+        let projection = build_lateral_columns(&p);
+        assert!(
+            projection.contains("action AS event_type"),
+            "UDM lateral projection must emit the canonical name: {projection}"
+        );
+        assert!(
+            !projection.split(", ").any(|c| c.trim().ends_with("AS action")),
+            "no column may still alias to the legacy `action`: {projection}"
+        );
+    }
+
+    /// The rename is confined to the renamed field — every other alias keeps its
+    /// canonical name, so the projection is otherwise byte-identical.
+    #[test]
+    fn udm_projection_rename_does_not_touch_other_fields() {
+        let p = crate::schema::UdmProfile::new();
+        let projection = build_lateral_columns(&p);
+        for field in ["src_ip", "dest_ip", "user", "auth_result", "process_name", "category"] {
+            assert!(
+                projection.contains(&format!("AS {field}")),
+                "{field} must keep its canonical alias: {projection}"
+            );
+        }
+    }
+
+    /// OCSF declares no renames, so its projection is unchanged — and must not
+    /// acquire a UDM-only name.
+    #[test]
+    fn ocsf_projection_has_no_udm_rename() {
+        let p = crate::schema::OcsfProfile::new();
+        let projection = build_lateral_columns(&p);
+        assert!(
+            !projection.contains("AS event_type"),
+            "OCSF must not gain the UDM rename: {projection}"
         );
     }
 }

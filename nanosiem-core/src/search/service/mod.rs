@@ -924,7 +924,10 @@ impl SearchService {
                 "dest_ip",
                 "src_host",
                 "dest_host",
-                "action",
+                // NAN-2208: canonical name, matching what `get_table_columns`
+                // now returns. The physical column is still `action`; the alias
+                // resolves in every scope the stats query runs in.
+                "event_type",
                 "status",
                 "source_type",
                 "process_name",

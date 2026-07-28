@@ -13,7 +13,7 @@ import {
   DropdownMenuShortcut,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import { ChevronDown, Plus, Minus, Copy, Search, X, Loader2, Filter, ChevronLeft, BarChart2, EyeOff } from 'lucide-react';
+import { ChevronDown, Plus, Minus, Copy, Search, X, Loader2, Filter, ChevronLeft, BarChart2, EyeOff, Group as GroupIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 interface FieldValueInfo {
@@ -56,6 +56,11 @@ interface FieldsPanelProps {
   expandedFields: Set<string>;
   onToggleField: (field: string) => void;
   onAddToQuery: (field: string, value: string, exclude: boolean) => void;
+  /**
+   * Replace the query with a one-click group-by on `field` (NAN-2209). Optional
+   * so embeddings that cannot rewrite the query simply omit the action.
+   */
+  onGroupBy?: (field: string) => void;
   isExpanded: boolean;
   onToggleExpanded: () => void;
   isLoading?: boolean;
@@ -172,6 +177,7 @@ export function FieldsPanel({
   expandedFields,
   onToggleField,
   onAddToQuery,
+  onGroupBy,
   isExpanded,
   onToggleExpanded,
   isLoading = false,
@@ -520,10 +526,29 @@ export function FieldsPanel({
                             ? 'Values loaded on demand'
                             : `${displayUnique.toLocaleString()}${plus} unique · ${(displayCount ?? 0).toLocaleString()}${plus} events`}
                       </span>
+                      {/* NAN-2209: field-scoped group-by. The value rows below
+                          filter on ONE value; this aggregates the whole field,
+                          which is the move analysts previously had to hand-write
+                          as `| stats count by <field>`. */}
+                      {onGroupBy && (
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); onGroupBy(stat.field); }}
+                          className="ml-auto flex items-center gap-1 text-muted-foreground/70 cursor-pointer px-0.5 hover:text-primary"
+                          title={`Group results by ${stat.field}`}
+                          aria-label={`Group by ${stat.field}`}
+                        >
+                          <GroupIcon className="w-3 h-3" />
+                          <span>group by</span>
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={(e) => { e.stopPropagation(); onToggleField(stat.field); }}
-                        className="ml-auto text-muted-foreground/60 cursor-pointer px-0.5 hover:text-foreground"
+                        className={cn(
+                          'text-muted-foreground/60 cursor-pointer px-0.5 hover:text-foreground',
+                          !onGroupBy && 'ml-auto'
+                        )}
                         aria-label={`Collapse ${stat.field}`}
                       >
                         <X className="w-3 h-3" />

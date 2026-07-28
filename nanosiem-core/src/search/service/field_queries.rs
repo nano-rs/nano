@@ -160,7 +160,11 @@ impl SearchService {
             // (e.g. OCSF `event_bytes`) out of the field panel (NAN-1397).
             let logs_table = crate::schema::logs_table_for(profile.id());
             ch_executor
-                .get_table_columns(logs_table, profile.materialized_columns())
+                .get_table_columns(
+                    logs_table,
+                    profile.materialized_columns(),
+                    profile.default_view_renames(),
+                )
                 .await
                 .unwrap_or_else(|e| {
                     // NAN-1559: dataset-correct fallback — a UDM list here over an
@@ -373,6 +377,7 @@ impl SearchService {
             source_type,
             scope.deny_set(),
             &mat_cols,
+            self.active_profile.default_view_renames(),
         );
 
         debug!("Fetching log by ID: {}", sql);
@@ -760,6 +765,16 @@ fn select_field_stats_columns(
 /// When `source_type` is provided it is added to the WHERE clause so the
 /// `(source_type, timestamp, ...)` PK index can do a tight range read instead
 /// of scanning every source_type's marks within the timestamp window (NAN-1032).
+///
+/// `default_view_renames` is the active profile's `(column, alias)` rewrite list
+/// (NAN-2208). ClickHouse's `SELECT *` drops ALIAS columns, so a bare `*` here
+/// returned the *physical* `action` while search results — which project
+/// `* EXCEPT (action), action AS event_type` — returned the canonical
+/// `event_type`. The row-expand inspector merges both payloads, so the same
+/// column surfaced under two different names in one view, and the field index
+/// only ever showed the legacy one. Applying the same rewrite makes this fetch
+/// agree with search. UDM passes `[("action", "event_type")]`; OCSF passes `[]`
+/// and keeps a bare `*` (byte-identical to the previous behavior).
 fn build_fetch_log_sql(
     table: &str,
     id: &str,
@@ -767,6 +782,7 @@ fn build_fetch_log_sql(
     source_type: Option<&str>,
     deny_set: &BTreeSet<String>,
     materialized_cols: &[&str],
+    default_view_renames: &[(&str, &str)],
 ) -> String {
     let escaped_id = escape_sql_string(id);
     let audit_filter = source_scope_sql_predicate("source_type", deny_set)
@@ -785,16 +801,29 @@ fn build_fetch_log_sql(
     // NAN-1241). UDM names are bare snake_case (escape is a no-op → byte-identical);
     // OCSF names are dotted (`src_endpoint.ip`) and MUST be quoted or ClickHouse
     // parses them as tuple/sub-column access.
-    let select = if materialized_cols.is_empty() {
-        "*".to_string()
+    // Wildcard first: `* EXCEPT (action)` when the profile renames columns, so the
+    // physical name does not also land in the row alongside its canonical alias
+    // (mirrors `build_default_view_base`). Empty renames → bare `*`.
+    let mut select_parts: Vec<String> = Vec::with_capacity(1 + materialized_cols.len());
+    if default_view_renames.is_empty() {
+        select_parts.push("*".to_string());
     } else {
-        let cols = materialized_cols
+        let except_cols = default_view_renames
             .iter()
-            .map(|c| escape_identifier(c))
+            .map(|(col, _)| escape_identifier(col))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("*, {}", cols)
-    };
+        select_parts.push(format!("* EXCEPT ({})", except_cols));
+        for (col, alias) in default_view_renames {
+            select_parts.push(format!(
+                "{} AS {}",
+                escape_identifier(col),
+                escape_identifier(alias)
+            ));
+        }
+    }
+    select_parts.extend(materialized_cols.iter().map(|c| escape_identifier(c)));
+    let select = select_parts.join(", ");
     if let Some(tr) = time_range {
         format!(
             "SELECT {} FROM {} WHERE id = '{}'{}{} AND timestamp BETWEEN '{}' AND '{}' LIMIT 1",
@@ -818,6 +847,11 @@ fn build_fetch_log_sql(
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+
+    /// The UDM profile's `default_view_renames` (NAN-2208). Kept as a literal
+    /// rather than reaching for the profile so these stay pure SQL-shape tests;
+    /// `udm_view_renames_match_the_profile` pins it to the real profile value.
+    const UDM_VIEW_RENAMES: &[(&str, &str)] = &[("action", "event_type")];
 
     fn inv(cols: &[&str]) -> Vec<String> {
         cols.iter().map(|s| s.to_string()).collect()
@@ -966,8 +1000,11 @@ mod tests {
 
     #[test]
     fn fetch_log_sql_without_audit_exclusion_omits_source_type_filter() {
-        let sql = build_fetch_log_sql("logs", "abc-123", None, None, &no_scope(), MATERIALIZED_COLUMNS);
-        assert!(sql.starts_with("SELECT *, "), "must re-add materialized cols: {sql}");
+        let sql = build_fetch_log_sql("logs", "abc-123", None, None, &no_scope(), MATERIALIZED_COLUMNS, UDM_VIEW_RENAMES);
+        assert!(
+            sql.starts_with("SELECT * EXCEPT (action), action AS event_type, "),
+            "must rewrite action->event_type and re-add materialized cols: {sql}"
+        );
         assert!(
             sql.ends_with("FROM logs WHERE id = 'abc-123' LIMIT 1"),
             "{sql}"
@@ -986,6 +1023,7 @@ mod tests {
             Some(r"win\evtx"),
             &no_scope(),
             MATERIALIZED_COLUMNS,
+            UDM_VIEW_RENAMES,
         );
         assert!(
             sql.contains(r"WHERE id = 'C:\\Users\\admin'"),
@@ -1001,7 +1039,7 @@ mod tests {
     fn fetch_log_sql_reads_materialized_enrichment_columns() {
         // NAN-1147 regression: `SELECT *` excludes MATERIALIZED columns, so the
         // row-expand inspector showed no enrichment. The fetch must name them.
-        let sql = build_fetch_log_sql("logs", "abc-123", None, None, &no_scope(), MATERIALIZED_COLUMNS);
+        let sql = build_fetch_log_sql("logs", "abc-123", None, None, &no_scope(), MATERIALIZED_COLUMNS, UDM_VIEW_RENAMES);
         for col in [
             "user_identity_department",
             "enriched_src_country",
@@ -1014,8 +1052,11 @@ mod tests {
 
     #[test]
     fn fetch_log_sql_with_audit_exclusion_filters_audit_rows() {
-        let sql = build_fetch_log_sql("logs", "abc-123", None, None, &audit_scope(), MATERIALIZED_COLUMNS);
-        assert!(sql.starts_with("SELECT *, "), "must re-add materialized cols: {sql}");
+        let sql = build_fetch_log_sql("logs", "abc-123", None, None, &audit_scope(), MATERIALIZED_COLUMNS, UDM_VIEW_RENAMES);
+        assert!(
+            sql.starts_with("SELECT * EXCEPT (action), action AS event_type, "),
+            "must rewrite action->event_type and re-add materialized cols: {sql}"
+        );
         assert!(
             sql.ends_with(
                 "FROM logs WHERE id = 'abc-123' AND lower(source_type) != 'audit' LIMIT 1"
@@ -1033,7 +1074,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let sql =
-            build_fetch_log_sql("logs", "abc-123", None, None, &deny, MATERIALIZED_COLUMNS);
+            build_fetch_log_sql("logs", "abc-123", None, None, &deny, MATERIALIZED_COLUMNS, UDM_VIEW_RENAMES);
         assert!(
             sql.ends_with(
                 "FROM logs WHERE id = 'abc-123' AND lower(source_type) NOT IN \
@@ -1049,7 +1090,7 @@ mod tests {
             start: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
             end: Utc.with_ymd_and_hms(2026, 1, 2, 4, 5, 6).unwrap(),
         };
-        let sql = build_fetch_log_sql("logs", "abc-123", Some(&tr), None, &audit_scope(), MATERIALIZED_COLUMNS);
+        let sql = build_fetch_log_sql("logs", "abc-123", Some(&tr), None, &audit_scope(), MATERIALIZED_COLUMNS, UDM_VIEW_RENAMES);
         assert!(
             sql.contains("AND lower(source_type) != 'audit'"),
             "audit exclusion missing: {sql}"
@@ -1062,7 +1103,7 @@ mod tests {
 
     #[test]
     fn fetch_log_sql_escapes_single_quotes_in_id() {
-        let sql = build_fetch_log_sql("logs", "abc'; DROP--", None, None, &audit_scope(), MATERIALIZED_COLUMNS);
+        let sql = build_fetch_log_sql("logs", "abc'; DROP--", None, None, &audit_scope(), MATERIALIZED_COLUMNS, UDM_VIEW_RENAMES);
         assert!(
             sql.contains("WHERE id = 'abc''; DROP--'"),
             "id quotes not escaped: {sql}"
@@ -1077,7 +1118,7 @@ mod tests {
         // as tuple sub-column access. `WHERE id =` is unchanged — OCSF now has a
         // real `id` UUID column too.
         let ocsf_cols: &[&str] = &["src_endpoint.ip", "http_response.code", "class_uid"];
-        let sql = build_fetch_log_sql("ocsf_logs", "abc-123", None, None, &no_scope(), ocsf_cols);
+        let sql = build_fetch_log_sql("ocsf_logs", "abc-123", None, None, &no_scope(), ocsf_cols, &[]);
         assert!(
             sql.contains("\"src_endpoint.ip\""),
             "dotted col must be quoted: {sql}"
@@ -1098,7 +1139,7 @@ mod tests {
     fn fetch_log_sql_with_empty_materialized_cols_emits_bare_star() {
         // Defensive: a profile with no materialized columns must not produce the
         // dangling `SELECT *, ` (trailing comma → syntax error).
-        let sql = build_fetch_log_sql("logs", "abc-123", None, None, &no_scope(), &[]);
+        let sql = build_fetch_log_sql("logs", "abc-123", None, None, &no_scope(), &[], &[]);
         assert!(
             sql.starts_with("SELECT * FROM logs WHERE id = 'abc-123'"),
             "{sql}"
@@ -1118,11 +1159,15 @@ mod tests {
             Some("windows_sysmon"),
             &no_scope(),
             MATERIALIZED_COLUMNS,
+            UDM_VIEW_RENAMES,
         );
         // source_type goes immediately after the id predicate so the PK
         // (source_type, timestamp, ...) can do a tight range read on S3-backed
         // historical partitions instead of scanning every source_type's marks.
-        assert!(sql.starts_with("SELECT *, "), "must re-add materialized cols: {sql}");
+        assert!(
+            sql.starts_with("SELECT * EXCEPT (action), action AS event_type, "),
+            "must rewrite action->event_type and re-add materialized cols: {sql}"
+        );
         assert!(
             sql.ends_with(
                 "FROM logs WHERE id = 'abc-123' AND source_type = 'windows_sysmon' AND timestamp BETWEEN '2026-01-02 03:04:05.000000' AND '2026-01-02 03:04:07.000000' LIMIT 1"
@@ -1131,10 +1176,73 @@ mod tests {
         );
     }
 
+    /// NAN-2208: the row-expand fetch must project the profile's canonical
+    /// alias, not the physical column. Before this, search returned
+    /// `event_type` and this fetch returned `action` for the same column — the
+    /// inspector merges both payloads, so one column surfaced under two names.
+    #[test]
+    fn fetch_log_sql_projects_canonical_event_type_and_drops_physical_action() {
+        let sql = build_fetch_log_sql(
+            "logs",
+            "abc-123",
+            None,
+            None,
+            &no_scope(),
+            MATERIALIZED_COLUMNS,
+            UDM_VIEW_RENAMES,
+        );
+        assert!(
+            sql.starts_with("SELECT * EXCEPT (action), action AS event_type, "),
+            "canonical alias must replace the physical column: {sql}"
+        );
+        // `action` must appear ONLY inside the EXCEPT and the alias expression —
+        // never as a bare projected column that would duplicate `event_type`.
+        let select_list = sql
+            .strip_prefix("SELECT ")
+            .and_then(|s| s.split(" FROM ").next())
+            .expect("select list");
+        assert!(
+            !select_list.split(", ").any(|c| c.trim() == "action"),
+            "physical `action` must not be projected alongside its alias: {sql}"
+        );
+    }
+
+    /// The renamed projection must match what a bare search emits, or the two
+    /// payloads disagree again the moment either side changes.
+    #[test]
+    fn fetch_log_sql_rename_shape_matches_default_view_base() {
+        let sql = build_fetch_log_sql("logs", "abc-123", None, None, &no_scope(), &[], UDM_VIEW_RENAMES);
+        assert_eq!(
+            sql,
+            "SELECT * EXCEPT (action), action AS event_type FROM logs WHERE id = 'abc-123' LIMIT 1",
+            "must mirror build_default_view_base's `* EXCEPT (col), col AS alias`"
+        );
+    }
+
+    /// OCSF has no `action` column — applying the UDM rewrite would reference a
+    /// nonexistent column and fail every row-expand. Empty renames → bare `*`.
+    #[test]
+    fn fetch_log_sql_ocsf_no_renames_keeps_bare_star() {
+        let ocsf_cols: &[&str] = &["src_endpoint.ip", "class_uid"];
+        let sql = build_fetch_log_sql("ocsf_logs", "abc-123", None, None, &no_scope(), ocsf_cols, &[]);
+        assert!(sql.starts_with("SELECT *, "), "{sql}");
+        assert!(!sql.contains("EXCEPT"), "OCSF must not emit EXCEPT: {sql}");
+        assert!(!sql.contains("event_type"), "OCSF must not emit UDM names: {sql}");
+    }
+
+    /// Pins the literal used above to the real UDM profile, so a profile change
+    /// cannot silently drift away from what these tests assert.
+    #[test]
+    fn udm_view_renames_match_the_profile() {
+        use crate::schema::SchemaProfile;
+        let udm = crate::schema::UdmProfile::new();
+        assert_eq!(udm.default_view_renames(), UDM_VIEW_RENAMES);
+    }
+
     #[test]
     fn fetch_log_sql_escapes_single_quotes_in_source_type() {
         let sql =
-            build_fetch_log_sql("logs", "abc-123", None, Some("evil'; DROP--"), &no_scope(), MATERIALIZED_COLUMNS);
+            build_fetch_log_sql("logs", "abc-123", None, Some("evil'; DROP--"), &no_scope(), MATERIALIZED_COLUMNS, UDM_VIEW_RENAMES);
         assert!(
             sql.contains("source_type = 'evil''; DROP--'"),
             "source_type quotes not escaped: {sql}"

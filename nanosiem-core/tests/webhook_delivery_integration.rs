@@ -21,7 +21,8 @@ mod common;
 use common::migrated_pool;
 use hmac::{Hmac, KeyInit, Mac};
 use nanosiem_core::webhooks::{
-    CreateWebhookRequest, UpdateWebhookRequest, WebhookRepository, WebhookResponse, WebhookService,
+    CreateWebhookRequest, UpdateWebhookRequest, WebhookDeliveryLog, WebhookRepository,
+    WebhookResponse, WebhookService,
 };
 use sha2::Sha256;
 use sqlx::PgPool;
@@ -50,6 +51,84 @@ async fn clean(pool: &PgPool) {
         .execute(pool)
         .await
         .unwrap();
+    // NAN-2207: egress redaction is now decided by this registry for every
+    // origin including `audit`, so a row leaking between tests would silently
+    // flip the expected payload shape.
+    sqlx::query("DELETE FROM restricted_source_types")
+        .execute(pool)
+        .await
+        .unwrap();
+    // NAN-2210: `resolve_base_url` prefers `system_settings.notification_base_url`
+    // OVER the `NANOSIEM_HOSTNAME` the deep-link test sets, so a database with a
+    // base URL configured silently wins and the asserted link is whatever that
+    // row says. The test passed only against a database that happened to have
+    // none — true of a fresh CI Postgres, false of any developer box that has
+    // run the dev stack, where this fails with
+    //   left: "http://localhost:5173/alerts/…"  right: "https://nano.test/alerts/…"
+    //
+    // Clearing it here makes the env var actually decide, which is what the test
+    // always meant. Scoped to the settings row's own column, so unrelated
+    // settings survive.
+    sqlx::query("UPDATE system_settings SET notification_base_url = NULL WHERE id = 'default'")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Register a `source_type` as restricted — the admin action that makes egress
+/// redaction apply to it (NAN-2207).
+async fn restrict(pool: &PgPool, source_type: &str) {
+    sqlx::query("INSERT INTO restricted_source_types (source_type) VALUES ($1)")
+        .bind(source_type)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Fire one detection alert at a single receiver and return the delivered body.
+async fn fire_and_capture(
+    pool: &PgPool,
+    matched: serde_json::Value,
+) -> serde_json::Value {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let repo = WebhookRepository::new(pool.clone());
+    repo.create(&create_req(
+        "soar",
+        format!("{}/hook", server.uri()),
+        vec!["siem_alert"],
+        None,
+    ))
+    .await
+    .unwrap();
+
+    // `new` self-builds the scope resolver from the repo pool, so redaction is
+    // live here exactly as it is in production (see `WebhookService::new`).
+    let svc = WebhookService::new(repo);
+    svc.fire_alert(
+        uuid::Uuid::now_v7(),
+        "detection",
+        Some(uuid::Uuid::now_v7()),
+        "malicious login from bad ip",
+        "medium",
+        Some("10.0.0.5".to_string()),
+        &matched,
+        chrono::Utc::now(),
+    )
+    .await;
+
+    assert_eq!(
+        wait_for(&server, 1, Duration::from_secs(5)).await,
+        1,
+        "the alert must be delivered — redaction strips evidence, it never drops the notification"
+    );
+    let reqs = server.received_requests().await.unwrap();
+    serde_json::from_slice(&reqs[0].body).unwrap()
 }
 
 fn create_req(name: &str, url: String, event_types: Vec<&str>, secret: Option<&str>) -> CreateWebhookRequest {
@@ -67,6 +146,55 @@ fn create_req(name: &str, url: String, event_types: Vec<&str>, secret: Option<&s
     }
 }
 
+/// Count requests on `server` whose payload carries `alert_id` (NAN-2210).
+///
+/// `received_requests()` counts every packet that reached the socket, which is
+/// not the same as "attempts at the delivery this test fired". Deliveries are
+/// detached (`tokio::spawn`) and retry with 0.5s + 1s backoff, so a previous
+/// test's delivery can still be retrying after that test returns and its
+/// `MockServer` is dropped — and the OS is free to hand the freed ephemeral port
+/// to the next test's server. The stale retry then lands here and is counted as
+/// ours.
+///
+/// That is how `delivery_retries_on_5xx_then_gives_up` saw a 4th attempt against
+/// a service that hard-caps at `MAX_DELIVERY_ATTEMPTS = 3` — reproducible at
+/// roughly 2-in-10 under CPU saturation, invisible on an idle machine.
+///
+/// Filtering by the alert id makes the count mean what the assertion says it
+/// means, regardless of what else reaches the socket.
+async fn requests_for_alert(server: &MockServer, alert_id: &str) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| {
+            serde_json::from_slice::<serde_json::Value>(&r.body)
+                .ok()
+                .and_then(|v| v["alert_id"].as_str().map(|s| s == alert_id))
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+/// Poll until `alert_id` has been attempted `want` times, or `timeout`.
+/// Returns the final count (may be < want on timeout).
+async fn wait_for_alert(
+    server: &MockServer,
+    alert_id: &str,
+    want: usize,
+    timeout: Duration,
+) -> usize {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let n = requests_for_alert(server, alert_id).await;
+        if n >= want || std::time::Instant::now() >= deadline {
+            return n;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Poll the mock's received-request count until it reaches `want` or `timeout`.
 /// Returns the final count (may be < want on timeout).
 async fn wait_for(server: &MockServer, want: usize, timeout: Duration) -> usize {
@@ -79,6 +207,46 @@ async fn wait_for(server: &MockServer, want: usize, timeout: Duration) -> usize 
             .unwrap_or(0);
         if n >= want || std::time::Instant::now() >= deadline {
             return n;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Poll the delivery log until it holds `want` rows or `timeout` elapses,
+/// returning whatever is there at the end (NAN-2210).
+///
+/// Observing the request at the mock server does NOT mean the delivery has been
+/// logged. `webhooks::service` is fire-and-forget by design —
+///
+///   > Fire-and-forget via `tokio::spawn` — never blocks the detection pipeline.
+///
+/// — and `log_delivery` runs inside that detached task, *after* the HTTP request
+/// the mock observes. So a test that reads the log the moment the request lands
+/// is racing a write it never ordered against: it passes when the write wins and
+/// fails when a loaded runner delays it. That is how
+/// `detection_alert_delivers_complete_payload_with_valid_hmac` failed the merge
+/// gate on an unrelated PR while the change that last touched it was green.
+///
+/// This returns rather than asserts so the caller still owns the assertion and a
+/// genuine "never logged" failure reports as the count mismatch it always did —
+/// the fix must not degrade into asserting nothing.
+///
+/// The production design is deliberate and stays as it is; the test is what
+/// needed to learn to wait.
+async fn wait_for_deliveries(
+    repo: &WebhookRepository,
+    webhook_id: uuid::Uuid,
+    want: usize,
+    timeout: Duration,
+) -> Vec<WebhookDeliveryLog> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let logs = repo
+            .list_deliveries(webhook_id, 10)
+            .await
+            .unwrap_or_default();
+        if logs.len() >= want || std::time::Instant::now() >= deadline {
+            return logs;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -165,13 +333,110 @@ async fn detection_alert_delivers_complete_payload_with_valid_hmac() {
     let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
     assert_eq!(sig, expected, "HMAC signature matches timestamp.body");
 
-    // Delivery log records success.
-    let logs = svc.repo().list_deliveries(webhook.id, 10).await.unwrap();
+    // Delivery log records success. Waited for, not assumed — the log write
+    // happens on the detached delivery task, after the request above landed.
+    let logs = wait_for_deliveries(svc.repo(), webhook.id, 1, Duration::from_secs(5)).await;
     assert_eq!(logs.len(), 1);
     assert!(logs[0].success);
     assert_eq!(logs[0].status_code, Some(200));
 
     std::env::remove_var("NANOSIEM_HOSTNAME");
+}
+
+// ---------------------------------------------------------------------------
+// Origin redaction at egress (NAN-1800 / NAN-2155 / NAN-2207)
+//
+// The regression these lock down: an audit-sourced detection rule is the normal
+// way to alert on logins to nano itself, and NAN-2155 silently reduced those
+// payloads to a stub — `matched_event_count` retained, `matched_events` and
+// `entity` gone — on deployments that had configured no source scoping at all.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires Postgres; run with --test-threads=1"]
+async fn audit_origin_delivers_full_evidence_when_nothing_is_restricted() {
+    set_env();
+    let pool = migrated_pool().await;
+    clean(&pool).await;
+
+    let body = fire_and_capture(
+        &pool,
+        serde_json::json!([{
+            "source_type": "audit",
+            "user": "admin@example.test",
+            "src_ip": "10.0.0.5",
+            "message": "[auth] login_success on user 'admin@example.test' by admin@example.test"
+        }]),
+    )
+    .await;
+
+    assert_eq!(body["matched_event_count"], 1);
+    let events = body["matched_events"]
+        .as_array()
+        .expect("audit evidence must reach the receiver when nothing is restricted");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["user"], "admin@example.test");
+    assert_eq!(
+        body["entity"], "10.0.0.5",
+        "entity is stripped by the same branch, so it proves the branch did not fire"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres; run with --test-threads=1"]
+async fn audit_origin_is_redacted_once_an_admin_registers_audit() {
+    set_env();
+    let pool = migrated_pool().await;
+    clean(&pool).await;
+    // The deployment's own statement that audit is sensitive — the escape hatch
+    // that replaces NAN-2155's unconditional hard-wire.
+    restrict(&pool, "audit").await;
+
+    let body = fire_and_capture(
+        &pool,
+        serde_json::json!([{
+            "source_type": "audit",
+            "user": "admin@example.test",
+            "message": "[auth] login_success on user 'admin@example.test' by admin@example.test"
+        }]),
+    )
+    .await;
+
+    assert_eq!(
+        body["matched_event_count"], 1,
+        "the count survives redaction — that asymmetry is the signature of the stub"
+    );
+    assert!(
+        body.get("matched_events").is_none(),
+        "registered audit must not egress evidence, got {body}"
+    );
+    assert!(body.get("entity").is_none(), "entity is stripped too");
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres; run with --test-threads=1"]
+async fn unresolved_provenance_is_redacted_with_an_empty_registry() {
+    set_env();
+    let pool = migrated_pool().await;
+    clean(&pool).await;
+
+    // The engine stamps this when it cannot attribute an aggregate window.
+    // Unlike `audit`, it must redact with NO registry entry at all: "we could
+    // not tell where this came from" is not a policy an admin opts into.
+    let body = fire_and_capture(
+        &pool,
+        serde_json::json!([{
+            "count": 7,
+            "_nano_source_types": [nanosiem_core::auth::UNRESOLVED_SOURCE_SENTINEL]
+        }]),
+    )
+    .await;
+
+    assert_eq!(body["matched_event_count"], 1);
+    assert!(
+        body.get("matched_events").is_none(),
+        "unresolved provenance must stay fail-closed, got {body}"
+    );
 }
 
 #[tokio::test]
@@ -238,17 +503,28 @@ async fn delivery_retries_on_5xx_then_gives_up() {
         "flaky", format!("{}/hook", server.uri()), vec!["siem_alert"], None)).await.unwrap();
 
     let svc = WebhookService::new(repo);
-    svc.fire_alert(uuid::Uuid::now_v7(), "detection", Some(uuid::Uuid::now_v7()),
+    // Held so attempts can be attributed to THIS delivery — a stale retry from an
+    // earlier test can reach this socket via a reused ephemeral port (NAN-2210).
+    let alert_uuid = uuid::Uuid::now_v7();
+    let alert_id = nanosiem_core::typeid::encode(nanosiem_core::typeid::alert::PREFIX, &alert_uuid);
+    svc.fire_alert(alert_uuid, "detection", Some(uuid::Uuid::now_v7()),
         "rule", "low", None, &serde_json::json!([{}]), chrono::Utc::now()).await;
 
     // 3 attempts with 0.5s + 1s backoff ≈ 1.5s; allow generous headroom.
-    let n = wait_for(&server, 3, Duration::from_secs(8)).await;
+    let n = wait_for_alert(&server, &alert_id, 3, Duration::from_secs(8)).await;
     assert_eq!(n, 3, "exactly MAX_DELIVERY_ATTEMPTS attempts on persistent 5xx");
+    // Proving a NEGATIVE, so this stays a fixed wait — there is no state to poll
+    // toward. Counted per-alert so an unrelated delivery cannot fail it.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(server.received_requests().await.unwrap().len(), 3, "no 4th attempt");
+    assert_eq!(
+        requests_for_alert(&server, &alert_id).await,
+        3,
+        "no 4th attempt"
+    );
 
-    // One delivery-log row for the logical delivery, marked failed.
-    let logs = svc.repo().list_deliveries(webhook.id, 10).await.unwrap();
+    // One delivery-log row for the logical delivery, marked failed. Same race as
+    // the success path: the row is written after the final attempt returns.
+    let logs = wait_for_deliveries(svc.repo(), webhook.id, 1, Duration::from_secs(5)).await;
     assert_eq!(logs.len(), 1, "single log row per logical delivery");
     assert!(!logs[0].success);
     assert_eq!(logs[0].status_code, Some(500));
