@@ -50,7 +50,6 @@ pub const ALERTS_VIEW: &str = "alerts:view";
 pub const ALERTS_ACKNOWLEDGE: &str = "alerts:acknowledge";
 pub const ALERTS_CLOSE: &str = "alerts:close";
 pub const ALERTS_ASSIGN: &str = "alerts:assign";
-pub const ALERTS_TRIAGE: &str = "alerts:triage";
 
 // Case permissions
 pub const CASES_VIEW: &str = "cases:view";
@@ -66,8 +65,6 @@ pub const CASES_SHARE: &str = "cases:share";
 pub const PARSERS_VIEW: &str = "parsers:view";
 pub const PARSERS_CREATE: &str = "parsers:create";
 pub const PARSERS_EDIT: &str = "parsers:edit";
-pub const PARSERS_DELETE: &str = "parsers:delete";
-pub const PARSERS_DEPLOY: &str = "parsers:deploy";
 
 // Log Source permissions
 pub const LOG_SOURCES_VIEW: &str = "log_sources:view";
@@ -93,6 +90,13 @@ pub const CREDENTIALS_DELETE: &str = "credentials:delete";
 /// Deliberately separate from `credentials:view`: viewing credential metadata
 /// must not authorize a caller to cause secret material to be decrypted.
 pub const CREDENTIALS_USE: &str = "credentials:use";
+/// Rotate or roll back the secret material on a stored credential.
+///
+/// Separate from `credentials:edit`: rotation replaces the secret itself rather
+/// than metadata, and downstream source configs pick up the new value on their
+/// next deploy. Seeded by migration 165 and, for installs that skipped it,
+/// 278 (NAN-2218).
+pub const CREDENTIALS_ROTATE: &str = "credentials:rotate";
 
 // Enrichment permissions
 pub const ENRICHMENTS_VIEW: &str = "enrichments:view";
@@ -123,14 +127,12 @@ pub const PREVALENCE_EXPORT: &str = "prevalence:export";
 
 // Notification permissions
 pub const NOTIFICATIONS_VIEW: &str = "notifications:view";
-pub const NOTIFICATIONS_MANAGE: &str = "notifications:manage";
 
 // Settings permissions
 pub const SETTINGS_VIEW: &str = "settings:view";
 pub const SETTINGS_SYSTEM: &str = "settings:system";
 pub const SETTINGS_RETENTION: &str = "settings:retention";
 pub const SETTINGS_AI: &str = "settings:ai";
-pub const SETTINGS_RISK: &str = "settings:risk";
 pub const SETTINGS_WEBHOOKS: &str = "settings:webhooks";
 pub const SETTINGS_AI_PROVIDERS: &str = "settings:ai_providers";
 pub const SETTINGS_AGENT_MODELS: &str = "settings:agent_models";
@@ -265,7 +267,6 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     ALERTS_ACKNOWLEDGE,
     ALERTS_CLOSE,
     ALERTS_ASSIGN,
-    ALERTS_TRIAGE,
     // Cases
     CASES_VIEW,
     CASES_CREATE,
@@ -279,8 +280,6 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     PARSERS_VIEW,
     PARSERS_CREATE,
     PARSERS_EDIT,
-    PARSERS_DELETE,
-    PARSERS_DEPLOY,
     // Log Sources
     LOG_SOURCES_VIEW,
     LOG_SOURCES_CREATE,
@@ -299,6 +298,7 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     CREDENTIALS_EDIT,
     CREDENTIALS_DELETE,
     CREDENTIALS_USE,
+    CREDENTIALS_ROTATE,
     // Enrichments
     ENRICHMENTS_VIEW,
     ENRICHMENTS_CONFIGURE,
@@ -323,13 +323,11 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     PREVALENCE_EXPORT,
     // Notifications
     NOTIFICATIONS_VIEW,
-    NOTIFICATIONS_MANAGE,
     // Settings
     SETTINGS_VIEW,
     SETTINGS_SYSTEM,
     SETTINGS_RETENTION,
     SETTINGS_AI,
-    SETTINGS_RISK,
     SETTINGS_WEBHOOKS,
     SETTINGS_AI_PROVIDERS,
     SETTINGS_AGENT_MODELS,
@@ -430,7 +428,6 @@ pub const DEMO_PERMISSIONS: &[&str] = &[
     ALERTS_VIEW,
     ALERTS_ACKNOWLEDGE,
     ALERTS_CLOSE,
-    ALERTS_TRIAGE,
     // Cases — full CRUD (scoped to session)
     CASES_VIEW,
     CASES_CREATE,

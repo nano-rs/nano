@@ -416,7 +416,7 @@ pub async fn update_risk_notable_config(
 
     // NAN-1805: sync the default dataset=risk rule — it is the execution
     // surface for these settings now that the scheduler is retired. Mapping
-    // `enabled` to Alerting mode via this SETTINGS_RISK-gated endpoint is
+    // `enabled` to Alerting mode via this RISK_CONFIGURE-gated endpoint is
     // behavior parity with NAN-1792 (enabling the scheduler needed the same
     // permission). enabled=false only demotes Alerting → Live; a rule the
     // operator parked in Staging/Paused is left alone.

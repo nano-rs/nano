@@ -90,6 +90,19 @@ async fn fire_and_capture(
     pool: &PgPool,
     matched: serde_json::Value,
 ) -> serde_json::Value {
+    fire_and_capture_kind(pool, "detection", "siem_alert", matched).await
+}
+
+/// Fire one alert of any `kind` at a single receiver and return the delivered
+/// body. `stream` is the subscription category the receiver signs up for —
+/// detection/risk_notable land on `siem_alert`, observability kinds on
+/// `obs_alert` (NAN-2227 needs both).
+async fn fire_and_capture_kind(
+    pool: &PgPool,
+    kind: &str,
+    stream: &str,
+    matched: serde_json::Value,
+) -> serde_json::Value {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/hook"))
@@ -101,7 +114,7 @@ async fn fire_and_capture(
     repo.create(&create_req(
         "soar",
         format!("{}/hook", server.uri()),
-        vec!["siem_alert"],
+        vec![stream],
         None,
     ))
     .await
@@ -112,8 +125,9 @@ async fn fire_and_capture(
     let svc = WebhookService::new(repo);
     svc.fire_alert(
         uuid::Uuid::now_v7(),
-        "detection",
-        Some(uuid::Uuid::now_v7()),
+        kind,
+        // Observability alerts have no rule (the FK is nullable).
+        (kind == "detection").then(uuid::Uuid::now_v7),
         "malicious login from bad ip",
         "medium",
         Some("10.0.0.5".to_string()),
@@ -436,6 +450,108 @@ async fn unresolved_provenance_is_redacted_with_an_empty_registry() {
     assert!(
         body.get("matched_events").is_none(),
         "unresolved provenance must stay fail-closed, got {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Not-source-derived alerts (NAN-2227)
+//
+// "This alert has no source dimension" and "we could not determine this alert's
+// source" are different facts. NAN-2155 collapsed them, so two whole classes of
+// alert silently lost their evidence at egress.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires Postgres; run with --test-threads=1"]
+async fn spans_metrics_shaped_alert_delivers_evidence_even_when_scoping_is_configured() {
+    set_env();
+    let pool = migrated_pool().await;
+    clean(&pool).await;
+    // A scoped deployment: something IS restricted, just not this alert's origin.
+    // This is the case the empty-registry test cannot catch — pre-NAN-2227 the
+    // unattributed fallback redacted here purely because the registry was
+    // non-empty.
+    restrict(&pool, "insider_threat").await;
+
+    // The stamp the engine writes for a spans/metrics rule: resolved, and
+    // nothing about it is source-derived.
+    let body = fire_and_capture(
+        &pool,
+        serde_json::json!([{
+            "count": 4,
+            "service_name": "checkout-api",
+            "_nano_source_types": []
+        }]),
+    )
+    .await;
+
+    assert_eq!(body["matched_event_count"], 1);
+    let events = body["matched_events"]
+        .as_array()
+        .expect("a not-source-derived alert must egress its evidence");
+    assert_eq!(events[0]["service_name"], "checkout-api");
+    assert_eq!(body["entity"], "10.0.0.5");
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres; run with --test-threads=1"]
+async fn observability_alerts_deliver_their_payload_on_a_scoped_deployment() {
+    set_env();
+    let pool = migrated_pool().await;
+
+    // The real metric-monitor payload shape (state/schedulers.rs): a descriptor
+    // of the monitor and the breach, containing no ingested event at all.
+    for kind in ["metric_monitor", "slo", "synthetic"] {
+        // Reset per iteration: `fire_and_capture_kind` registers a receiver, and
+        // `fire_alert` fans out to EVERY enabled webhook — a leftover from the
+        // previous iteration would double-deliver.
+        clean(&pool).await;
+        restrict(&pool, "insider_threat").await;
+
+        let body = fire_and_capture_kind(
+            &pool,
+            kind,
+            "obs_alert",
+            serde_json::json!([{
+                "monitor_name": "checkout latency",
+                "comparator": "gt",
+                "threshold": 500.0,
+                "value": 912.0
+            }]),
+        )
+        .await;
+
+        let events = body["matched_events"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{kind} payload must not be redacted, got {body}"));
+        assert_eq!(events[0]["monitor_name"], "checkout latency");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres; run with --test-threads=1"]
+async fn risk_notable_is_not_exempted_from_origin_checks() {
+    set_env();
+    let pool = migrated_pool().await;
+    clean(&pool).await;
+
+    // risk_notable rides the SIEM stream and is derived from the findings
+    // stream, so it CAN carry restricted-origin entity data — it must keep going
+    // through the checks rather than ride the observability exemption.
+    let body = fire_and_capture_kind(
+        &pool,
+        "risk_notable",
+        "siem_alert",
+        serde_json::json!([{
+            "count": 3,
+            "_nano_source_types": [nanosiem_core::auth::UNRESOLVED_SOURCE_SENTINEL]
+        }]),
+    )
+    .await;
+
+    assert!(
+        body.get("matched_events").is_none(),
+        "risk_notable must still fail closed on unresolved provenance, got {body}"
     );
 }
 

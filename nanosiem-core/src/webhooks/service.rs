@@ -380,10 +380,26 @@ impl WebhookService {
     /// and therefore no RBAC boundary to protect. Audit evidence is redacted
     /// here iff an admin registered `audit` in `restricted_source_types`, via
     /// the ordinary registry branches below.
-    async fn origin_restricted(&self, matched_events: &serde_json::Value) -> bool {
+    async fn origin_restricted(&self, kind: &str, matched_events: &serde_json::Value) -> bool {
         let Some(resolver) = &self.scope_resolver else {
             return false;
         };
+        // NAN-2227: observability alerts are not source-derived AT ALL. Their
+        // `matched_events` is a producer-built descriptor of the monitor, series,
+        // threshold and observed value — there is no ingested event in it and no
+        // `source_type` to attribute. They nonetheless took the unattributed
+        // fallback below and lost their payload on every deployment that had
+        // configured ANY restricted source, which contradicted the alert ROW:
+        // `distinct_source_types` stores `'{}'` for these, the value the read side
+        // treats as "known not source-derived, visible to everyone". The webhook
+        // and the alert disagreed about the same alert.
+        //
+        // `risk_notable` is deliberately NOT in this set: it maps to the SIEM
+        // stream and is derived from the findings stream, so it CAN carry
+        // restricted-origin entity data and must keep going through the checks.
+        if matches!(kind, "metric_monitor" | "slo" | "synthetic") {
+            return false;
+        }
         let (source_types, fully_attributed) = origin_source_types(matched_events);
         // The unresolved sentinel wins before the completeness split. Otherwise
         // a mixed batch containing unresolved evidence plus one malformed row
@@ -462,7 +478,7 @@ impl WebhookService {
         // The notification still fires as a redacted stub (rule name /
         // severity / count / link kept) — the receiver learns something
         // happened and pivots into the UI, where read-path RBAC applies.
-        let origin_restricted = self.origin_restricted(matched_events).await;
+        let origin_restricted = self.origin_restricted(kind, matched_events).await;
         if origin_restricted {
             info!(
                 alert_id = %alert_id,
@@ -1327,8 +1343,26 @@ pub(crate) fn origin_source_types(matched_events: &serde_json::Value) -> (Vec<St
                             fully_attributed = false;
                         }
                     }
-                    // An empty stamp conveys no usable origin; a non-array stamp is
-                    // malformed. Neither may certify this event.
+                    // NAN-2227: an EMPTY array is a positive engine statement —
+                    // "I resolved this window's provenance and nothing about it
+                    // is source-derived" — not a failure to resolve. Two engine
+                    // branches emit it deliberately:
+                    //
+                    //   * `ReservedOnly` — the window WAS attributed, but only to
+                    //     forged reserved names we refuse to honour. Treating that
+                    //     as unattributed would let one forged `X-Source-Type`
+                    //     suppress a detection's evidence.
+                    //   * `DatasetProvenance::NotSourceDerived` — spans/metrics,
+                    //     whose tables have no `source_type` column and are not
+                    //     covered by per-source RBAC at all.
+                    //
+                    // Every FAILURE branch stamps `fail_closed_stamp`, which is
+                    // never empty (it always unions the sentinel and `audit`), so
+                    // "empty" cannot arise from a fail-closed path. The stamp key
+                    // is `_nano_`-prefixed and unforgeable by ingest, so this
+                    // cannot be reached by a sender.
+                    Some(values) if values.is_empty() => event_attributed = true,
+                    // A non-array stamp is malformed and may not certify anything.
                     _ => fully_attributed = false,
                 }
             }

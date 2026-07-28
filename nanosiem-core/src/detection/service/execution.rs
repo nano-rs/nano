@@ -16,15 +16,50 @@ use crate::search::{SearchExecutionLimits, SearchRequest, TimeRangeInput};
 use super::DetectionError;
 use super::DetectionService;
 
-/// Only the `Logs` dataset carries a per-event `source_type` column. The derived
-/// risk/spans/metrics grains project aggregated columns whose outer scope has no
-/// `source_type`, so the logs-shaped source_type companion
-/// (`… | stats count by source_type`) resolves to UNKNOWN_IDENTIFIER (CH code 47)
-/// on those datasets every cycle (NAN-2024). Callers skip the companion for these
-/// and fail closed with the full restricted set — the same result the doomed
-/// query's error handler already produces.
-fn dataset_exposes_source_type(dataset: Option<&str>) -> bool {
-    crate::query::Dataset::from_selector(dataset.unwrap_or("logs")) == crate::query::Dataset::Logs
+/// How a rule's dataset relates to the `source_type` provenance dimension
+/// (NAN-2024, refined by NAN-2227).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum DatasetProvenance {
+    /// `Logs` — carries a per-event `source_type`. Run the companion.
+    SourceDerived,
+    /// `Spans` / `Metrics` — `otel_spans` / `otel_metrics` have NO `source_type`
+    /// column, and per-source RBAC does not scope those tables at all. Their
+    /// provenance is not unknown, it is ABSENT: stamp an empty manifest.
+    NotSourceDerived,
+    /// `Risk` — a derived grain aggregated from the FINDINGS stream in the logs
+    /// table, so a risk row can carry entity data whose origin was restricted.
+    /// The companion cannot resolve it (the outer projection has no
+    /// `source_type`), so this genuinely is unknown provenance: fail closed.
+    Unknowable,
+}
+
+/// Classify a rule's dataset.
+///
+/// The logs-shaped companion (`… | stats count by source_type`) resolves to
+/// UNKNOWN_IDENTIFIER (CH code 47) on every non-logs dataset, so it is skipped
+/// for all three — but NAN-2227: skipping it is not the same fact for all three.
+///
+/// NAN-2024 lumped spans/metrics/risk together and failed closed for each. Once
+/// NAN-2155 put [`UNRESOLVED_SOURCE_SENTINEL`](crate::auth::UNRESOLVED_SOURCE_SENTINEL)
+/// into that fail-closed stamp, the consequence stopped being conservative and
+/// became wrong for spans/metrics: their evidence is redacted from EVERY webhook
+/// on EVERY deployment, and the sentinel — carried in every restricted
+/// principal's deny bind — also hides those alerts from source-restricted
+/// analysts in the UI. Neither table is source-scoped in the first place, so
+/// both effects protect nothing.
+///
+/// "There is no source dimension here" is the `'{}'` manifest the read side
+/// already treats as visible-to-everyone, and the value observability alerts
+/// have always carried. Risk keeps failing closed because its rows really can
+/// embed restricted-origin entities.
+pub(super) fn dataset_provenance(dataset: Option<&str>) -> DatasetProvenance {
+    match crate::query::Dataset::from_selector(dataset.unwrap_or("logs")) {
+        crate::query::Dataset::Logs => DatasetProvenance::SourceDerived,
+        crate::query::Dataset::Spans | crate::query::Dataset::Metrics => {
+            DatasetProvenance::NotSourceDerived
+        }
+        crate::query::Dataset::Risk => DatasetProvenance::Unknowable,
+    }
 }
 
 /// NAN-2155: what the `… | stats count by source_type` companion proved about a
@@ -435,15 +470,30 @@ impl DetectionService {
         let restricted_stamp = || fail_closed_stamp(&restricted);
 
         // NAN-2024: the companion is logs-shaped (`… | stats count by source_type`),
-        // but non-Logs datasets (risk/spans/metrics) are derived grains whose outer
-        // projection has no `source_type` column — the query is UNKNOWN_IDENTIFIER
-        // (CH code 47) on every cycle. Skip the doomed round-trip and fail closed
-        // with the full restricted set (the exact stamp the catch below produces).
-        if !dataset_exposes_source_type(rule.dataset.as_deref()) {
-            debug!(rule_id = %rule.id, dataset = ?rule.dataset,
-                "NAN-2024: non-logs dataset has no source_type grain; failing closed (companion skipped)");
-            apply(results, &restricted_stamp());
-            return;
+        // but non-Logs datasets are derived grains whose outer projection has no
+        // `source_type` column — the query is UNKNOWN_IDENTIFIER (CH code 47) on
+        // every cycle. Skip the doomed round-trip either way; NAN-2227 splits
+        // WHAT the skip means (see `dataset_provenance`).
+        match dataset_provenance(rule.dataset.as_deref()) {
+            DatasetProvenance::NotSourceDerived => {
+                // Spans/metrics: absent provenance, not unknown provenance.
+                // An empty manifest is the read side's "known not source-derived"
+                // value — visible to everyone, and egressable, exactly as these
+                // alerts behaved before NAN-2155 put the sentinel in the stamp.
+                debug!(rule_id = %rule.id, dataset = ?rule.dataset,
+                    "NAN-2227: dataset has no source_type dimension; stamping an empty manifest (companion skipped)");
+                apply(results, &serde_json::Value::Array(Vec::new()));
+                return;
+            }
+            DatasetProvenance::Unknowable => {
+                // Risk: aggregated from findings that DO have origins we cannot
+                // recover here. Genuinely unknown ⇒ fail closed.
+                debug!(rule_id = %rule.id, dataset = ?rule.dataset,
+                    "NAN-2024: risk grain cannot resolve origin; failing closed (companion skipped)");
+                apply(results, &restricted_stamp());
+                return;
+            }
+            DatasetProvenance::SourceDerived => {}
         }
 
         let Some(companion) = Self::source_type_companion_query(&rule.query) else {
@@ -803,18 +853,58 @@ impl DetectionService {
 
 #[cfg(test)]
 mod tests {
-    use super::dataset_exposes_source_type;
+    use super::{dataset_provenance, DatasetProvenance};
 
-    /// NAN-2024: only the logs dataset carries a per-event `source_type`; the
-    /// derived risk/spans/metrics grains do not, so the source_type companion is
-    /// skipped (fail-closed) for them rather than run and error every cycle.
+    /// NAN-2024: only the logs dataset carries a per-event `source_type`, so the
+    /// companion runs there and is skipped everywhere else.
     #[test]
-    fn only_logs_dataset_exposes_source_type() {
-        assert!(dataset_exposes_source_type(None)); // default selector => logs
-        assert!(dataset_exposes_source_type(Some("logs")));
-        assert!(dataset_exposes_source_type(Some(""))); // unknown/empty => logs
-        assert!(!dataset_exposes_source_type(Some("risk")));
-        assert!(!dataset_exposes_source_type(Some("spans")));
-        assert!(!dataset_exposes_source_type(Some("metrics")));
+    fn only_logs_dataset_runs_the_source_type_companion() {
+        assert_eq!(dataset_provenance(None), DatasetProvenance::SourceDerived); // default => logs
+        assert_eq!(
+            dataset_provenance(Some("logs")),
+            DatasetProvenance::SourceDerived
+        );
+        assert_eq!(
+            dataset_provenance(Some("")),
+            DatasetProvenance::SourceDerived
+        ); // unknown/empty => logs
+        assert_ne!(
+            dataset_provenance(Some("risk")),
+            DatasetProvenance::SourceDerived
+        );
+        assert_ne!(
+            dataset_provenance(Some("spans")),
+            DatasetProvenance::SourceDerived
+        );
+        assert_ne!(
+            dataset_provenance(Some("metrics")),
+            DatasetProvenance::SourceDerived
+        );
+    }
+
+    /// NAN-2227: skipping the companion is not one fact. Spans/metrics have NO
+    /// source dimension (their tables have no `source_type` column and per-source
+    /// RBAC does not scope them), so their provenance is ABSENT and must stamp an
+    /// empty manifest. Risk is aggregated from the findings stream, whose rows DO
+    /// have origins this grain cannot recover — genuinely UNKNOWN, so it keeps
+    /// failing closed.
+    ///
+    /// Collapsing these two back together is what made every spans/metrics alert
+    /// lose its webhook evidence, and hid those alerts from restricted analysts.
+    #[test]
+    fn absent_provenance_is_distinguished_from_unknowable_provenance() {
+        assert_eq!(
+            dataset_provenance(Some("spans")),
+            DatasetProvenance::NotSourceDerived
+        );
+        assert_eq!(
+            dataset_provenance(Some("metrics")),
+            DatasetProvenance::NotSourceDerived
+        );
+        assert_eq!(
+            dataset_provenance(Some("risk")),
+            DatasetProvenance::Unknowable,
+            "risk aggregates findings that can carry restricted origins — must fail closed"
+        );
     }
 }

@@ -104,6 +104,20 @@ jobs:
           # triggers on any `**/*.rs` change, so this is where a non-DB
           # regression guard has to live to actually gate a PR.
           #
+          # NAN-2223: grant_authority_integration reads TEST_DATABASE_URL rather
+          # than DATABASE_URL and connects to an ALREADY-migrated database (it
+          # has no migrated_pool of its own), so it is exported below as an alias
+          # of the same URL and must run AFTER a suite that applied migrations.
+          # It had never been wired into this job at all, which is why the
+          # privilege-grant regressions it guards were never gated on a PR.
+          #
+          # NAN-2229: nanosiem-search --lib carries authz_guard, the sibling of
+          # case_route_authz_guard for the search surface. It was never wired in
+          # here, so it sat RED on main behind a parser false positive while PRs
+          # merged green. Whole --lib rather than the one module: it is 30 tests
+          # in 0.02s, and the wider net costs nothing. Needs no database, same as
+          # case_route_authz_guard, so it takes no --ignored flag.
+          #
           # IMPORTANT: the `bash -c '...'` body below MUST stay apostrophe-free.
           # An apostrophe closes the single-quoted -c string, so everything after
           # it runs on the bare host instead of in the container (cargo: command
@@ -115,10 +129,14 @@ jobs:
             -v nanosiem-pgit-cargo-registry:/usr/local/cargo/registry \
             -e CARGO_TARGET_DIR=/tmp/target \
             -e DATABASE_URL="$DATABASE_URL" \
+            -e TEST_DATABASE_URL="$DATABASE_URL" \
+            -e NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1 \
             "$RUST_IMAGE" \
             bash -euo pipefail -c '
               cargo test -p nanosiem-enterprise --test case_route_authz_guard
+              cargo test -p nanosiem-search --lib
               cargo test -p nanosiem-core --test api_key_rate_limit_integration -- --ignored
+              cargo test -p nanosiem-api-lib --test grant_authority_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-core --test source_scope_integration -- --ignored
               cargo test -p nanosiem-core --test webhook_delivery_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-enterprise --test notebook_tab_revocation_integration -- --ignored --test-threads=1

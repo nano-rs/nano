@@ -15,6 +15,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
+use nanosiem_core::auth::permissions;
 use nanosiem_core::typeid::TypeIdParam;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -512,7 +513,7 @@ pub async fn rotate_credential(
     Path(id): Path<TypeIdParam>,
     Json(request): Json<RotateCredentialRequest>,
 ) -> Result<Json<CredentialRotationResponse>, (StatusCode, Json<CredentialApiError>)> {
-    check_permission(&auth, "credentials:rotate").map_err(|_| forbidden())?;
+    check_permission(&auth, permissions::CREDENTIALS_ROTATE).map_err(|_| forbidden())?;
 
     let repo = CredentialRepository::new(state.pool.clone());
 
@@ -627,7 +628,7 @@ pub async fn rollback_credential(
     Path(id): Path<TypeIdParam>,
     Json(request): Json<RollbackCredentialRequest>,
 ) -> Result<Json<CredentialRotationResponse>, (StatusCode, Json<CredentialApiError>)> {
-    check_permission(&auth, "credentials:rotate").map_err(|_| forbidden())?;
+    check_permission(&auth, permissions::CREDENTIALS_ROTATE).map_err(|_| forbidden())?;
 
     let repo = CredentialRepository::new(state.pool.clone());
     let rollback_req = RollbackCloudCredential {

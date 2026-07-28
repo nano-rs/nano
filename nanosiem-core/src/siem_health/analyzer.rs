@@ -759,6 +759,15 @@ mod tests {
                 "windows_event".to_string()
             ]
         );
+        // NAN-2222 deliberately KEEPS this assertion. The stamp is honest —
+        // detection/alerting totals, fleet enrichment rates, integrity probes,
+        // and every generated prose block are still not partition-attributed,
+        // so flipping it to `true` would be a real source-scoped fail-open, not
+        // a paperwork fix. What was wrong was the READ gate that required this
+        // bit for a row to exist at all; completeness now governs only the
+        // narrative half of the artifact
+        // (`SiemHealthReport::narrative_visible_to`), which is exactly what it
+        // describes.
         assert!(
             !provenance.is_complete(),
             "global scores and report prose are not source-partition-attributed yet"

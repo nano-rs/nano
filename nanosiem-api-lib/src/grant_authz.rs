@@ -388,35 +388,82 @@ fn ensure_holds_source_scope(
 ///    source-scoped caller must not place an account in a group that can see a
 ///    source the caller itself is denied.
 ///
-/// This entry point ALWAYS unions the built-in `Everyone` group in, because it
-/// validates USER-MEMBERSHIP grants: a post-insert DB trigger adds every new user
-/// to Everyone and `set_user_groups` never removes it (it deletes
-/// `WHERE group_id != EVERYONE_ID`), so an account's effective entitlements always
-/// include Everyone's (its seeded ReadOnly role). Without this, `create_user` with
-/// empty `group_ids` would still confer Everyone's permissions to an account the
-/// caller could then log in as. For grants that do NOT confer Everyone membership
-/// (e.g. OIDC claim→group mappings), use [`ensure_can_grant_groups_exact`].
+/// This entry point validates USER-MEMBERSHIP grants, where the built-in
+/// `Everyone` group is an IMPLICIT FLOOR rather than a grantable entitlement
+/// (NAN-2223), and is therefore EXCLUDED from validation — see
+/// [`strip_implicit_everyone`]. Every explicitly-named group is still checked in
+/// full. For grants that do not confer Everyone membership at all (e.g. OIDC
+/// claim→group mappings), use [`ensure_can_grant_groups_exact`].
 pub async fn ensure_can_grant_groups(
     auth: &AuthContext,
     pool: &PgPool,
     required_permission: &str,
     group_ids: &[Uuid],
 ) -> Result<GrantAuthorityStamp, GrantErr> {
-    // Every account is unconditionally a member of `Everyone`; validate its
-    // entitlements too, not just the explicitly-requested groups.
-    let mut groups: Vec<Uuid> = group_ids.to_vec();
-    if !groups.contains(&builtin_groups::EVERYONE_ID) {
-        groups.push(builtin_groups::EVERYONE_ID);
-    }
-    ensure_can_grant_groups_exact(auth, pool, required_permission, &groups).await
+    let explicit = strip_implicit_everyone(group_ids);
+    ensure_can_grant_groups_exact(auth, pool, required_permission, &explicit).await
 }
 
-/// Validate the caller can grant EXACTLY the given groups — with NO implicit
-/// `Everyone`. Use this where the grant does not itself confer Everyone
-/// membership: OIDC claim→group mappings map a claim to the listed local groups,
-/// and clearing the mapping (`group_ids = []`) grants nothing and must stay
-/// possible. JIT provisioning's unavoidable Everyone baseline is enforced
-/// separately at provider provisioning/enablement (NAN-2132), not here.
+/// Drop the built-in `Everyone` group from a USER-MEMBERSHIP grant before it is
+/// validated (NAN-2223).
+///
+/// Everyone is not a privilege the caller *chooses* to confer: a post-insert DB
+/// trigger (`trigger_add_user_to_everyone`) joins every new account to it,
+/// `set_user_groups` refuses to remove it (`DELETE ... WHERE group_id !=
+/// EVERYONE_ID`), and `remove_user_from_group` rejects it outright. Account
+/// existence and Everyone membership are the same fact, so a caller authorized to
+/// create/edit the account (checked separately as `required_permission`) has no
+/// reachable request shape that omits the baseline. Requiring the caller to
+/// additionally "hold" that baseline therefore blocks nothing an attacker could
+/// otherwise do — it only denies the operation outright.
+///
+/// And it denied it often. Everyone is permanently bound to the seeded
+/// ReadOnly role (21 permissions), and an API key's grant authority is exclusively
+/// its frozen `api_keys.permissions` array — never its owner's roles — so a
+/// least-privilege provisioning key such as `["users:create","users:view"]` failed
+/// the subset check permanently, as did any full-privilege key minted before
+/// ReadOnly last grew. The observable symptom was a 403 enumerating all 21
+/// permissions on `POST /api/users`, `PUT /api/users/{id}` (with `group_ids`),
+/// `PUT /api/users/{id}/groups`, and OIDC provider create/update/enable — the last
+/// of which turned a routine client-secret rotation into a 21-permission demand.
+///
+/// **The exemption cannot be widened into an escalation.** It is keyed on one
+/// hard-coded UUID, so every other group id — including any group that happens to
+/// carry the ReadOnly role — is still validated in full. Nor can the baseline
+/// itself be inflated first: `Everyone`'s role set is immutable through the API
+/// (`set_group_roles` / `set_group_roles_authorized` both reject `EVERYONE_ID`
+/// with `CannotModifySystemGroup`, and no other write path touches `group_roles`
+/// for an existing group), and ReadOnly's permission set is likewise immutable
+/// (`update_role_inner` and `set_role_permissions` reject `READONLY_ID` with
+/// `CannotModifySystemRole`). Everyone's per-source `source_type_grants` CAN be
+/// changed, but only by a caller who already holds `source_scopes:manage` AND is
+/// not itself denied that source — and such a grant makes the source visible to
+/// every existing account by definition, so it confers nothing on the grantee that
+/// creating one more account could add.
+///
+/// What remains is the honest residual: a principal holding `users:create` can
+/// obtain a session carrying the tenant-wide baseline, by creating an account and
+/// signing in as it. That is inherent in the authority to create accounts — the
+/// pre-NAN-2223 check did not prevent it either, it merely required the caller to
+/// already hold the baseline — and it is bounded by the baseline being, by
+/// construction, what the tenant grants everyone.
+fn strip_implicit_everyone(group_ids: &[Uuid]) -> Vec<Uuid> {
+    group_ids
+        .iter()
+        .copied()
+        .filter(|id| *id != builtin_groups::EVERYONE_ID)
+        .collect()
+}
+
+/// Validate the caller can grant EXACTLY the given groups. Use this where the
+/// grant does not itself confer Everyone membership: OIDC claim→group mappings map
+/// a claim to the listed local groups, and clearing the mapping (`group_ids = []`)
+/// grants nothing and must stay possible. JIT provisioning's unavoidable Everyone
+/// baseline is an implicit floor, not a grant — see [`strip_implicit_everyone`].
+///
+/// Callers that DO confer Everyone membership go through
+/// [`ensure_can_grant_groups`], which strips the baseline first; this entry point
+/// validates whatever it is handed verbatim.
 pub async fn ensure_can_grant_groups_exact(
     auth: &AuthContext,
     pool: &PgPool,
@@ -661,6 +708,33 @@ mod tests {
         let many: Vec<Uuid> = (0..=(MAX_GRANT_IDS as u128)).map(Uuid::from_u128).collect();
         let err = dedup_capped(&many).unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    /// NAN-2223: the membership entry point must not validate the built-in
+    /// Everyone baseline — it is conferred by a DB trigger on every account and
+    /// cannot be declined, so it is a floor, not a grant.
+    #[test]
+    fn implicit_everyone_is_not_validated_as_a_grant() {
+        // Empty request (create_user with no groups, OIDC JIT) stays empty
+        // rather than becoming a one-element `[Everyone]` validation.
+        assert!(strip_implicit_everyone(&[]).is_empty());
+        // Naming Everyone explicitly is equivalent to omitting it: membership is
+        // unconditional either way, so the request shapes must not diverge.
+        assert!(strip_implicit_everyone(&[builtin_groups::EVERYONE_ID]).is_empty());
+    }
+
+    /// The exemption is keyed on exactly one hard-coded id. Naming Everyone must
+    /// not launder any OTHER group past the hold-to-grant check (NAN-2121).
+    #[test]
+    fn stripping_everyone_preserves_every_other_group() {
+        let other = Uuid::from_u128(0xfeed);
+        let another = Uuid::from_u128(0xbeef);
+        assert_eq!(
+            strip_implicit_everyone(&[other, builtin_groups::EVERYONE_ID, another]),
+            vec![other, another],
+        );
+        // Order is preserved and nothing but Everyone is removed.
+        assert_eq!(strip_implicit_everyone(&[other]), vec![other]);
     }
 
     #[test]

@@ -143,8 +143,21 @@ export SEARCH_SERVICE_URL="http://localhost:3002/health"
 if [ "$AIRGAP_MODE" = "true" ]; then
     echo -e "${YELLOW}   AIRGAP_MODE: not setting Cloudflare AI Gateway env — configure an on-prem AI endpoint in Settings → AI providers${NC}"
 else
-    export CLOUDFLARE_AI_GATEWAY_URL="${CLOUDFLARE_AI_GATEWAY_URL:-https://gateway.ai.cloudflare.com/v1/156f6c44a634420513a63a3929ea201d/nano}"
-    export CF_AIG_AUTH_TOKEN="${CF_AIG_AUTH_TOKEN:-cfut_YyrNMUOzJ2PD8CPioBxmXnZrqEMXfJZCpj9zU90Rdc8f74ab}"
+    # NAN-2228: CF_AIG_AUTH_TOKEN must come from the environment. It previously
+    # carried a working token as a shell default, and this script is the one
+    # file under scripts/ that `tools/sync-to-nano-mirror.sh` preserves — so
+    # that default was published verbatim to the public mirror. Never inline a
+    # credential here again; anything in this file is public by design.
+    #
+    # Unset is not fatal: the stack starts fine without AI, and most dev work
+    # does not need it. Warn and continue rather than blocking `pnpm dev`.
+    export CLOUDFLARE_AI_GATEWAY_URL="${CLOUDFLARE_AI_GATEWAY_URL:-}"
+    export CF_AIG_AUTH_TOKEN="${CF_AIG_AUTH_TOKEN:-}"
+
+    if [ -z "$CF_AIG_AUTH_TOKEN" ] || [ -z "$CLOUDFLARE_AI_GATEWAY_URL" ]; then
+        echo -e "${YELLOW}   AI features disabled — set CLOUDFLARE_AI_GATEWAY_URL and CF_AIG_AUTH_TOKEN to enable them.${NC}"
+        echo -e "${YELLOW}   Both live in the team password manager; export them in your shell or a local .env (never commit them).${NC}"
+    fi
 fi
 
 # AI behaviour flags. Both are read directly from process env at the call

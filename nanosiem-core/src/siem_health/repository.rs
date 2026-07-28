@@ -103,51 +103,31 @@ impl SiemHealthRepository {
         Ok(row.as_ref().map(Self::row_to_report))
     }
 
-    /// Get the most recent report whose complete provenance is visible to
-    /// `scope`.
+    /// Get the most recent report, reduced to what `scope` may see.
     ///
-    /// SIEM-health scores, status, prose, recommendations, dimension details,
-    /// and non-partitioned totals are one persistent derived artifact. They
-    /// cannot be safely omitted from the current DTO or reconstructed by
-    /// string-redacting prose. Restricted readers therefore fail closed on an
-    /// incomplete or overlapping report before `ORDER BY ... LIMIT 1`.
+    /// NAN-2222: this used to require `source_types_complete` in SQL. No writer
+    /// has ever produced a complete stamp for this table and the column was
+    /// added `DEFAULT FALSE` with no backfill, so the predicate was
+    /// unsatisfiable by construction — every restricted principal got a 404
+    /// claiming no report existed, including the `settings:system` monitoring
+    /// credentials the endpoint exists for.
+    ///
+    /// A health report is separable, so the policy now runs per part rather
+    /// than per row: denied `source_type` partitions are pruned and the
+    /// unattributable narrative is withheld, both by
+    /// [`SiemHealthReport::apply_artifact_scope`]. `ORDER BY ... LIMIT 1` is
+    /// therefore evaluated over the real newest row rather than over a
+    /// filtered subset — a restricted reader sees the *current* health of the
+    /// deployment, which was the point of the endpoint.
     pub async fn get_latest_for_scope(
         &self,
         scope: &ArtifactScope,
     ) -> Result<Option<SiemHealthReport>, SiemHealthRepositoryError> {
-        if scope.is_unrestricted() {
-            return self.get_latest().await;
+        let mut report = self.get_latest().await?;
+        if let Some(report) = report.as_mut() {
+            report.apply_artifact_scope(scope);
         }
-
-        let mut sql = String::from(
-            r#"
-            SELECT id, overall_score, overall_status, ingestion_score, parsing_score,
-                   detection_score, enrichment_score, alerting_score,
-                   summary, metrics, recommendations, dimension_details,
-                   triggered_by, created_at, duration_ms,
-                   source_types, source_types_complete
-            FROM siem_health_reports
-            WHERE TRUE
-            "#,
-        );
-        sql.push_str(&ArtifactScope::sql_predicate(
-            "source_types",
-            "source_types_complete",
-            1,
-        ));
-        sql.push_str(
-            r#"
-            ORDER BY created_at DESC
-            LIMIT 1
-            "#,
-        );
-
-        let row = sqlx::query(&sql)
-            .bind(scope.deny_bind_values())
-            .fetch_optional(&self.pool)
-            .await?;
-
-        Ok(row.as_ref().map(Self::row_to_report))
+        Ok(report)
     }
 
     /// Get a report by ID
@@ -171,43 +151,21 @@ impl SiemHealthRepository {
         Ok(Self::row_to_report(&row))
     }
 
-    /// Get a report by ID only when its complete provenance is visible to
-    /// `scope`. A denied artifact is deliberately indistinguishable from a
-    /// missing one.
+    /// Get a report by ID, reduced to what `scope` may see.
+    ///
+    /// NAN-2222: `NotFound` now means the row genuinely does not exist. The
+    /// previous "denied is indistinguishable from missing" posture applied to
+    /// every row for every restricted principal, which turned the trigger
+    /// endpoint into a create-then-vanish loop: the same caller could run a
+    /// health check, receive a `report_id`, and 404 fetching it.
     pub async fn get_by_id_for_scope(
         &self,
         id: Uuid,
         scope: &ArtifactScope,
     ) -> Result<SiemHealthReport, SiemHealthRepositoryError> {
-        if scope.is_unrestricted() {
-            return self.get_by_id(id).await;
-        }
-
-        let mut sql = String::from(
-            r#"
-            SELECT id, overall_score, overall_status, ingestion_score, parsing_score,
-                   detection_score, enrichment_score, alerting_score,
-                   summary, metrics, recommendations, dimension_details,
-                   triggered_by, created_at, duration_ms,
-                   source_types, source_types_complete
-            FROM siem_health_reports
-            WHERE id = $1
-            "#,
-        );
-        sql.push_str(&ArtifactScope::sql_predicate(
-            "source_types",
-            "source_types_complete",
-            2,
-        ));
-
-        let row = sqlx::query(&sql)
-            .bind(id)
-            .bind(scope.deny_bind_values())
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or_else(|| SiemHealthRepositoryError::NotFound(id.to_string()))?;
-
-        Ok(Self::row_to_report(&row))
+        let mut report = self.get_by_id(id).await?;
+        report.apply_artifact_scope(scope);
+        Ok(report)
     }
 
     /// List report summaries (without full metrics/details), newest first
@@ -224,7 +182,8 @@ impl SiemHealthRepository {
             r#"
             SELECT id, overall_score, overall_status, ingestion_score, parsing_score,
                    detection_score, enrichment_score, alerting_score,
-                   summary, triggered_by, created_at, duration_ms
+                   summary, triggered_by, created_at, duration_ms,
+                   source_types, source_types_complete
             FROM siem_health_reports
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2
@@ -238,60 +197,26 @@ impl SiemHealthRepository {
         Ok((Self::rows_to_summaries(&rows), count.0))
     }
 
-    /// List only whole reports visible to `scope`.
+    /// List report summaries, each reduced to what `scope` may see.
     ///
-    /// The same provenance predicate is applied to both count and page query,
-    /// before pagination. Post-fetch filtering would make page size and total
-    /// an oracle for denied report activity.
+    /// NAN-2222: rows are no longer dropped. The previous SQL predicate hid
+    /// every row from every restricted principal (see
+    /// [`Self::get_latest_for_scope`]), so `total` was always 0 and the list
+    /// always empty. Because nothing is dropped, page size and `total` cannot
+    /// leak anything: they are the same values a SYSTEM caller sees. What a
+    /// restricted reader loses is the narrative column of the rows whose
+    /// provenance is not provably disjoint from their deny set.
     pub async fn list_summaries_for_scope(
         &self,
         limit: i64,
         offset: i64,
         scope: &ArtifactScope,
     ) -> Result<(Vec<SiemHealthReportSummary>, i64), SiemHealthRepositoryError> {
-        if scope.is_unrestricted() {
-            return self.list_summaries(limit, offset).await;
+        let (mut summaries, total) = self.list_summaries(limit, offset).await?;
+        for summary in summaries.iter_mut() {
+            summary.apply_artifact_scope(scope);
         }
-
-        let mut count_sql = String::from("SELECT COUNT(*) FROM siem_health_reports WHERE TRUE");
-        count_sql.push_str(&ArtifactScope::sql_predicate(
-            "source_types",
-            "source_types_complete",
-            1,
-        ));
-        let count = sqlx::query_as::<_, (i64,)>(&count_sql)
-            .bind(scope.deny_bind_values())
-            .fetch_one(&self.pool)
-            .await?;
-
-        let mut list_sql = String::from(
-            r#"
-            SELECT id, overall_score, overall_status, ingestion_score, parsing_score,
-                   detection_score, enrichment_score, alerting_score,
-                   summary, triggered_by, created_at, duration_ms
-            FROM siem_health_reports
-            WHERE TRUE
-            "#,
-        );
-        list_sql.push_str(&ArtifactScope::sql_predicate(
-            "source_types",
-            "source_types_complete",
-            3,
-        ));
-        list_sql.push_str(
-            r#"
-            ORDER BY created_at DESC
-            LIMIT $1 OFFSET $2
-            "#,
-        );
-        let rows = sqlx::query(&list_sql)
-            .bind(limit)
-            .bind(offset)
-            .bind(scope.deny_bind_values())
-            .fetch_all(&self.pool)
-            .await?;
-
-        Ok((Self::rows_to_summaries(&rows), count.0))
+        Ok((summaries, total))
     }
 
     fn rows_to_summaries(rows: &[sqlx::postgres::PgRow]) -> Vec<SiemHealthReportSummary> {
@@ -309,6 +234,8 @@ impl SiemHealthRepository {
                 triggered_by: r.get("triggered_by"),
                 created_at: r.get("created_at"),
                 duration_ms: r.get("duration_ms"),
+                source_types: r.get("source_types"),
+                source_types_complete: r.get("source_types_complete"),
             })
             .collect()
     }

@@ -16,21 +16,15 @@ use crate::error::ApiError;
 use crate::middleware::AuthContext;
 use crate::state::AppState;
 use nanosiem_core::auth::{ArtifactScope, ScopeSet};
-use nanosiem_core::siem_health::types::CollectedMetrics;
 use nanosiem_core::siem_health::{SiemHealthReport, SiemHealthReportSummary, SiemHealthRepository};
 
-/// NAN-1801 / NAN-2153: typed defense-in-depth for a visible health report.
+/// NAN-1801 / NAN-2153 / NAN-2222: typed defense-in-depth for a health report
+/// leaving the API.
 ///
 /// Scheduled health reports are generated with an unrestricted SYSTEM scope.
 /// Their typed source partitions are therefore re-filtered against the reader's
 /// current effective scope (per-source RBAC ∪ the `audit` gate) before the
 /// report leaves the API. This also covers grant revocation after generation.
-///
-/// NAN-2089's repository gate runs first and admits a restricted reader only
-/// when the complete report provenance is disjoint from the deny set. That
-/// whole-artifact decision protects prose, recommendations, dimension details,
-/// scores, status, and non-partitioned totals; this function does not attempt
-/// to string-redact or synthesize replacements for them.
 ///
 /// Filtered paths (every `source_type`-keyed vector in `CollectedMetrics`):
 /// - `ingestion.source_volumes`      (`SourceVolumeMetric.source_type`)
@@ -40,24 +34,30 @@ use nanosiem_core::siem_health::{SiemHealthReport, SiemHealthReportSummary, Siem
 /// - `enrichment.per_source_coverage` (`EnrichmentCoverageMetric.source_type`)
 ///
 /// Exact ingestion totals are recomputed from the retained source-volume rows.
-/// Other cluster-wide/global fields remain byte-identical only because the
-/// repository has already proven the complete enclosing artifact visible.
+/// The unattributable narrative (summary, recommendations, dimension details)
+/// is withheld unless the stored provenance proves the report disjoint from the
+/// deny set — NAN-2089's classifier, applied to the part of the artifact it
+/// truthfully describes rather than to the row's existence.
 ///
-/// An EMPTY deny set returns immediately — the report stays byte-identical
-/// for unrestricted viewers. Comparison is lowercase-on-both-sides, mirroring
-/// the F1 SQL predicate builder. A restricted viewer gets no metrics if the
-/// stored JSON cannot be deserialized into the typed partition contract.
+/// The repository applies exactly this reduction already; running it again here
+/// is idempotent and keeps the guarantee at the HTTP boundary where the DTO is
+/// serialized, so a future repository path cannot ship an unreduced report.
+///
+/// An EMPTY deny set returns immediately — the report stays byte-identical for
+/// unrestricted viewers. Comparison is lowercase-on-both-sides. A restricted
+/// viewer gets no metrics if the stored JSON cannot be deserialized into the
+/// typed partition contract.
 fn filter_report_for_viewer(report: &mut SiemHealthReport, scope: &ScopeSet) {
-    if !scope.is_restricted() {
-        return;
-    }
+    report.apply_artifact_scope(&ArtifactScope::from_scope(scope));
+}
 
-    let Ok(mut metrics) = serde_json::from_value::<CollectedMetrics>(report.metrics.clone()) else {
-        report.metrics = serde_json::json!({});
-        return;
-    };
-    metrics.retain_source_partitions(scope);
-    report.metrics = serde_json::to_value(metrics).unwrap_or_else(|_| serde_json::json!({}));
+/// List-view counterpart of [`filter_report_for_viewer`], for the same
+/// defense-in-depth reason: the policy that decides whether a summary row keeps
+/// its narrative is re-applied at the boundary that serializes it.
+fn filter_summaries_for_viewer(summaries: &mut [SiemHealthReportSummary], scope: &ArtifactScope) {
+    for summary in summaries.iter_mut() {
+        summary.apply_artifact_scope(scope);
+    }
 }
 
 /// One canonical conversion for JWT and API-key request paths.
@@ -100,9 +100,10 @@ pub struct TriggerResponse {
 
 /// List SIEM health report summaries (paginated)
 ///
-/// Returns a paginated list of visible health report summaries, ordered by most
-/// recent first. The persistent-artifact policy runs in SQL before count,
-/// pagination, and limit so hidden report activity is not an oracle.
+/// Returns a paginated list of health report summaries, ordered by most recent
+/// first. No row is hidden — a source-restricted reader receives the same page
+/// and `total` as an unrestricted one, with the narrative column withheld on
+/// every row whose provenance is not provably disjoint from their deny set.
 ///
 /// Requires the `settings:system` permission (NAN-1801 — health reports carry
 /// fleet-wide per-source telemetry).
@@ -131,10 +132,12 @@ pub async fn list_reports(
     let artifact_scope = effective_artifact_scope(&auth);
 
     let repo = SiemHealthRepository::new(state.pool.clone());
-    let (reports, total) = repo
+    let (mut reports, total) = repo
         .list_summaries_for_scope(limit, offset, &artifact_scope)
         .await
         .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+
+    filter_summaries_for_viewer(&mut reports, &artifact_scope);
 
     Ok(Json(ListReportsResponse {
         reports,
@@ -150,8 +153,10 @@ pub async fn list_reports(
 /// and dimension details. Returns 404 if no reports exist yet.
 ///
 /// Requires the `settings:system` permission. Restricted viewers see the latest
-/// whole report whose complete provenance is disjoint from their current deny
-/// set; legacy, incomplete, denied, and mixed-origin reports fail closed.
+/// report with their denied `source_type` partitions pruned; the AI narrative,
+/// recommendations, and dimension details are withheld unless the stored
+/// provenance proves the report disjoint from their deny set. A 404 therefore
+/// means what it says: no report has ever been generated.
 ///
 /// GET /api/siem-health/reports/latest
 #[utoipa::path(
@@ -190,8 +195,9 @@ pub async fn get_latest_report(
 /// Returns the full health report including metrics, recommendations,
 /// and dimension details.
 ///
-/// Requires the `settings:system` permission. A restricted viewer receives 404
-/// unless the complete report provenance is disjoint from the current deny set.
+/// Requires the `settings:system` permission. A restricted viewer receives the
+/// report with denied `source_type` partitions pruned and the unattributable
+/// narrative withheld; 404 means the report id does not exist.
 ///
 /// GET /api/siem-health/reports/{id}
 #[utoipa::path(
@@ -509,6 +515,19 @@ mod tests {
         }
     }
 
+    /// The archetypal NAN-2222 victim: a monitoring credential holding
+    /// `settings:system` and nothing else. Neither Editor nor ReadOnly holds
+    /// `settings:system`, and no migration grants `audit:view` alongside it, so
+    /// this is the shape of every custom role / API key built to poll /health.
+    fn monitoring_auth() -> AuthContext {
+        AuthContext::from_api_key(&ApiKeyInfo {
+            id: Uuid::now_v7(),
+            name: "health-check integration".to_string(),
+            permissions: vec![permissions::SETTINGS_SYSTEM.to_string()],
+            user_id: Some(Uuid::now_v7()),
+        })
+    }
+
     #[test]
     fn persisted_typed_partitions_are_filtered_and_ingestion_totals_recomputed() {
         let mut report = report(metrics_fixture());
@@ -548,10 +567,20 @@ mod tests {
                 .len(),
             1
         );
+        // NAN-2222: this used to assert the fleet rollup stayed at 13. It is
+        // `count()` over the same logs/window/predicate the ingestion group-by
+        // sums, so `13 - 10` published insider_threat's exact 24h volume — the
+        // one datum the pruning above exists to hide. It is now re-denominated
+        // over the partitions that survived.
+        assert_eq!(report.metrics["enrichment"]["total_events_24h"], 10);
         assert_eq!(
-            report.metrics["enrichment"]["total_events_24h"], 13,
-            "non-exact global fields remain for NAN-2089's fail-closed policy"
+            report.metrics["enrichment"]["total_events_24h"],
+            report.metrics["ingestion"]["total_events_24h"],
+            "the two totals must not differ by the denied sources' volume"
         );
+        // Ratios over a population the reader cannot see are still NAN-2089's:
+        // they carry no denominator, so they are not invertible on their own.
+        assert_eq!(report.metrics["enrichment"]["geoip_fill_pct"], 50.0);
     }
 
     #[test]
@@ -583,6 +612,198 @@ mod tests {
         filter_report_for_viewer(&mut report, &ScopeSet::unrestricted());
 
         assert_eq!(report.metrics, legacy);
+    }
+
+    /// NAN-2222: a `settings:system` caller WITHOUT `audit:view` must receive a
+    /// usable report.
+    ///
+    /// Its effective scope is `{audit}` (plus the unresolved sentinel), and
+    /// every real deployment's health report lists `audit` among its source
+    /// volumes — audit events are ordinary `source_type = 'audit'` rows in the
+    /// logs table. Under the old gate that combination could never satisfy
+    /// `source_types_complete AND NOT (source_types && deny)`, so this caller
+    /// got `404 "No health reports exist yet"` forever and concluded the SIEM
+    /// was healthy. It now gets the report: scores, status, and every partition
+    /// it is entitled to.
+    #[test]
+    fn settings_system_without_audit_view_still_receives_the_report() {
+        let auth = monitoring_auth();
+        let viewer_scope = auth.effective_viewer_scope();
+
+        // Precondition: this principal IS source-restricted. That is the state
+        // the unsatisfiable gate keyed on.
+        assert!(viewer_scope.deny_set().contains("audit"));
+        assert!(!effective_artifact_scope(&auth).is_unrestricted());
+
+        let mut report = report(json!({
+            "ingestion": {
+                "source_volumes": [
+                    {"source_type": "apache", "count_24h": 10, "count_prior_24h": 7, "change_pct": 42.8},
+                    {"source_type": "audit", "count_24h": 4, "count_prior_24h": 4, "change_pct": 0.0}
+                ],
+                "total_events_24h": 14,
+                "total_events_prior_24h": 11,
+                "silent_sources": [],
+                "insert_integrity": serde_json::to_value(InsertIntegrityMetrics::default())
+                    .expect("serialize default integrity metrics")
+            },
+            "parsing": {"field_coverage": [], "high_ext_sources": [], "lowercase_invariant_violations": []},
+            "enrichment": {
+                "total_events_24h": 14, "geoip_fill_pct": 0.0, "asn_fill_pct": 0.0,
+                "ioc_hit_pct": 0.0, "identity_fill_pct": 0.0, "identity_fill_prior_pct": 0.0,
+                "per_source_coverage": [], "providers": []
+            },
+            "detection": {
+                "total_enabled_rules": 3, "total_matches_24h": 2, "rules_by_mode": [],
+                "stale_rules": [], "noisy_rules": [], "alerts_24h_by_severity": []
+            },
+            "alerting": {
+                "total_alerts_24h": 2, "total_alerts_prior_24h": 1, "by_status": [],
+                "mean_mtta_minutes": null, "active_webhooks": 0, "webhook_deliveries_24h": 0,
+                "webhook_success_pct": null, "active_routing_rules": 0
+            },
+            "collected_at": Utc::now()
+        }));
+        let report_id = report.id;
+
+        filter_report_for_viewer(&mut report, &viewer_scope);
+
+        // The report survives — this is the whole bug.
+        assert_eq!(report.id, report_id);
+        assert_eq!(report.overall_score, 75);
+        assert_eq!(report.overall_status, "warning");
+        assert_eq!(report.ingestion_score, 75);
+        assert_eq!(report.alerting_score, Some(75));
+        // …and stays useful: the partitions it may see are intact, with exact
+        // totals recomputed over them.
+        assert_eq!(
+            report.metrics["ingestion"]["source_volumes"],
+            json!([{
+                "source_type": "apache",
+                "count_24h": 10,
+                "count_prior_24h": 7,
+                "change_pct": 42.8
+            }])
+        );
+        assert_eq!(report.metrics["ingestion"]["total_events_24h"], 10);
+        assert_eq!(report.metrics["alerting"]["total_alerts_24h"], 2);
+    }
+
+    /// The other half of the contract: restoring availability must not restore
+    /// the leak. Every mention of a denied source — partitioned metric, silent
+    /// source, AI narrative, recommendation, or dimension detail — must be gone
+    /// from the serialized DTO.
+    #[test]
+    fn denied_source_data_is_absent_from_the_serialized_report() {
+        let mut report = report(metrics_fixture());
+        report.summary = "insider_threat volume fell 40% overnight".to_string();
+        report.recommendations = json!([{
+            "title": "Investigate insider_threat ingestion",
+            "description": "insider_threat stopped reporting",
+            "priority": "high"
+        }]);
+        report.dimension_details = json!({
+            "ingestion": "insider_threat is the second largest source",
+            "parsing": "insider_threat field coverage is 1%",
+            "enrichment": "n/a",
+            "detection": "n/a",
+            "alerting": "n/a"
+        });
+
+        filter_report_for_viewer(&mut report, &scope(&["insider_threat"]));
+
+        let serialized = serde_json::to_string(&report)
+            .expect("serialize filtered report")
+            .to_lowercase();
+        assert!(
+            !serialized.contains("insider_threat"),
+            "denied source leaked into the response: {serialized}"
+        );
+        // The narrative is withheld rather than silently blanked, so the caller
+        // can tell "nothing to report" from "not yours to read".
+        assert_eq!(
+            report.summary,
+            nanosiem_core::siem_health::types::WITHHELD_NARRATIVE_NOTICE
+        );
+        assert_eq!(report.recommendations, json!([]));
+        assert_eq!(report.dimension_details, json!({}));
+        // Non-source-derived scores survive: withholding them would leave the
+        // monitoring caller with nothing to poll.
+        assert_eq!(report.overall_score, 75);
+    }
+
+    /// The list view applies the same narrative policy as the detail view, and
+    /// — unlike the old SQL gate — never drops a row, so page size and `total`
+    /// stay identical to what a SYSTEM caller sees.
+    #[test]
+    fn list_summaries_withhold_narrative_without_dropping_rows() {
+        fn summary(source_types: &[&str], complete: bool) -> SiemHealthReportSummary {
+            SiemHealthReportSummary {
+                id: Uuid::now_v7(),
+                overall_score: 75,
+                overall_status: "warning".to_string(),
+                ingestion_score: 75,
+                parsing_score: 75,
+                detection_score: 75,
+                enrichment_score: Some(75),
+                alerting_score: Some(75),
+                summary: "insider_threat ingestion stalled".to_string(),
+                triggered_by: None,
+                created_at: Utc::now(),
+                duration_ms: Some(1),
+                source_types: source_types.iter().map(|s| s.to_string()).collect(),
+                source_types_complete: complete,
+            }
+        }
+
+        let mut rows = vec![
+            summary(&["apache", "insider_threat"], true), // overlapping
+            summary(&["apache"], false),                  // incomplete stamp
+            summary(&[], false),                          // legacy row
+            summary(&["apache"], true),                   // provably disjoint
+        ];
+        let ids: Vec<Uuid> = rows.iter().map(|row| row.id).collect();
+
+        filter_summaries_for_viewer(
+            &mut rows,
+            &ArtifactScope::from_scope(&scope(&["insider_threat"])),
+        );
+
+        assert_eq!(rows.len(), 4, "no row may be dropped");
+        assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), ids);
+        for row in &rows[..3] {
+            assert_eq!(
+                row.summary,
+                nanosiem_core::siem_health::types::WITHHELD_NARRATIVE_NOTICE
+            );
+            assert_eq!(row.overall_score, 75, "scores survive on every row");
+        }
+        assert_eq!(rows[3].summary, "insider_threat ingestion stalled");
+
+        // Unrestricted readers are untouched.
+        let mut unrestricted = vec![summary(&[], false)];
+        filter_summaries_for_viewer(&mut unrestricted, &ArtifactScope::system());
+        assert_eq!(unrestricted[0].summary, "insider_threat ingestion stalled");
+    }
+
+    /// A report whose provenance IS provably complete and disjoint keeps its
+    /// narrative. Without this, the completeness bit would be decorative and
+    /// NAN-2089's eventual attribution work would change nothing.
+    #[test]
+    fn provably_disjoint_complete_report_keeps_its_narrative() {
+        let mut report = report(metrics_fixture());
+        report.source_types = vec!["apache".to_string()];
+        report.source_types_complete = true;
+        report.summary = "apache ingestion is healthy".to_string();
+
+        filter_report_for_viewer(&mut report, &scope(&["insider_threat"]));
+
+        assert_eq!(report.summary, "apache ingestion is healthy");
+        // Partition pruning still runs — the two policies are independent.
+        assert_eq!(
+            report.metrics["ingestion"]["silent_sources"],
+            json!(["apache"])
+        );
     }
 
     #[test]

@@ -413,8 +413,14 @@ impl RoleRepository {
             .await?
             .ok_or(RoleRepositoryError::NotFound(role_id))?;
 
-        // Cannot modify Admin role permissions
-        if role_id == builtin_roles::ADMIN_ID {
+        // Cannot modify Admin or ReadOnly role permissions. `update_role_inner`
+        // already guards BOTH (see its comment); this path guarded only Admin,
+        // which was harmless while it had no handler wired to it but left the
+        // ReadOnly half of the invariant resting on "nothing calls this yet".
+        // NAN-2223 makes that invariant load-bearing — the Everyone baseline is
+        // exempt from the privilege-grant subset check precisely BECAUSE it is
+        // immutable — so state it structurally in every write path.
+        if role_id == builtin_roles::ADMIN_ID || role_id == builtin_roles::READONLY_ID {
             return Err(RoleRepositoryError::CannotModifySystemRole(role.name));
         }
 

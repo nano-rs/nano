@@ -278,8 +278,32 @@ fn every_handler_is_authorization_accounted_for() {
         // Split the file into per-handler regions on the `pub async fn` marker.
         // Each region runs to the next handler (or EOF) — enough to see whether
         // that handler's body performs the gate.
+        //
+        // NAN-2229: the marker must open a LINE, not merely appear somewhere in
+        // one. A bare `match_indices` also matched the marker inside string
+        // literals — `assets.rs`'s `let marker = "pub async fn
+        // get_asset_true_time_range(";` and `search.rs`'s `const MARKER: &str =
+        // "pub async fn ";`, both in unrelated tests. Each minted a phantom
+        // region starting mid-file: the first duplicated a real handler's name
+        // with a body containing no gate (reporting a correctly-gated handler as
+        // ungated), the second produced an empty name (`search.rs::`). This
+        // guard therefore failed closed against itself and sat red on main,
+        // which is worse than useless — a check whose normal state is red gets
+        // ignored, then deleted.
+        //
+        // Real handlers are free functions at module scope, so their definition
+        // always begins a line. Leading whitespace is tolerated; a marker
+        // preceded by anything else on its line (`= "`, `// `) is not a
+        // definition.
         const MARKER: &str = "pub async fn ";
-        let starts: Vec<usize> = src.match_indices(MARKER).map(|(i, _)| i).collect();
+        let starts: Vec<usize> = src
+            .match_indices(MARKER)
+            .map(|(i, _)| i)
+            .filter(|&i| {
+                let line_start = src[..i].rfind('\n').map_or(0, |nl| nl + 1);
+                src[line_start..i].chars().all(char::is_whitespace)
+            })
+            .collect();
         for (idx, &start) in starts.iter().enumerate() {
             let end = starts.get(idx + 1).copied().unwrap_or(src.len());
             let region = &src[start..end];
@@ -303,6 +327,18 @@ fn every_handler_is_authorization_accounted_for() {
         discovered.len() >= 30,
         "handler scan found only {} handlers — did the path or `pub async fn` marker change?",
         discovered.len()
+    );
+
+    // NAN-2229: an empty name means the marker matched something that is not a
+    // function definition — the exact signature of the string-literal matches
+    // that used to poison this scan. Assert it directly, because the symptom
+    // ("handler `search.rs::` is ungated") reads like a missing gate and sent
+    // the last reader looking for an authorization bug that did not exist.
+    assert!(
+        !discovered.contains(""),
+        "handler scan produced an empty handler name — the `pub async fn` marker \
+         matched a non-definition (string literal or comment); fix the scan, do \
+         not add an exemption"
     );
 
     assert!(

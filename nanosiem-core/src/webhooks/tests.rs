@@ -307,8 +307,10 @@ fn partial_batch_with_audit_falls_to_the_registry_branch() {
 
 #[test]
 fn malformed_engine_stamp_cannot_certify_an_aggregate() {
+    // NAN-2227: `[]` moved OUT of this list — see
+    // `empty_engine_stamp_means_not_source_derived`. These remain malformed:
+    // a blank or non-string element, and a stamp that is not an array at all.
     for stamp in [
-        serde_json::json!([]),
         serde_json::json!(["audit", ""]),
         serde_json::json!(["audit", 7]),
         serde_json::json!("audit"),
@@ -320,6 +322,62 @@ fn malformed_engine_stamp_cannot_certify_an_aggregate() {
         let (_, fully_attributed) = origin_source_types(&events);
         assert!(!fully_attributed, "must not certify stamp {stamp}");
     }
+}
+
+#[test]
+fn ingested_ext_fields_cannot_impersonate_the_engine_stamp() {
+    // The empty-stamp rule (below) only holds because ingest cannot WRITE that
+    // key. Attacker-controlled `ext` JSON is flattened into result rows, but
+    // `merge_ext_fields_into` namespaces every entry as `ext.<key>`, so a sender
+    // supplying `ext: {"_nano_source_types": []}` produces `ext._nano_source_types`
+    // — a different key that the extractor never reads.
+    //
+    // That prefix is load-bearing for the whole trust model: without it, ingest
+    // could certify its own events as unrestricted and defeat egress redaction.
+    // Pin it here, at the consumer, so a future change to the flattening cannot
+    // silently make forged stamps readable.
+    let events = serde_json::json!([{
+        "count": 7,
+        "ext._nano_source_types": [],
+        "ext.source_type": "syslog"
+    }]);
+
+    let (types, fully_attributed) = origin_source_types(&events);
+
+    assert!(
+        !fully_attributed,
+        "namespaced ext keys must not certify a row"
+    );
+    assert!(types.is_empty(), "and must contribute no source types");
+}
+
+#[test]
+fn empty_engine_stamp_means_not_source_derived() {
+    // NAN-2227: an EMPTY array is a positive engine statement — "resolved, and
+    // nothing here is source-derived" — not a failure to resolve. NAN-2155 read
+    // it as unattributed, which sent spans/metrics detections (and windows
+    // attributed only to forged reserved names) down the fail-closed fallback,
+    // stripping their evidence on every deployment with a non-empty registry.
+    //
+    // Every FAILURE branch stamps `fail_closed_stamp`, which always unions the
+    // sentinel and `audit` and so is never empty — an empty stamp cannot arise
+    // from a fail-closed path.
+    let events = serde_json::json!([{
+        "count": 7,
+        "_nano_source_types": []
+    }]);
+
+    let (types, fully_attributed) = origin_source_types(&events);
+
+    assert!(
+        fully_attributed,
+        "an explicitly empty stamp is attributed, not unknown"
+    );
+    assert!(types.is_empty(), "it contributes no source types");
+    assert!(
+        !crate::auth::is_unresolved_provenance(&types),
+        "and must not be confused with unresolved provenance"
+    );
 }
 
 // ---------------------------------------------------------------------------

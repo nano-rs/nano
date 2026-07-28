@@ -22,9 +22,9 @@ use crate::state::AppState;
 use crate::utils::{extract_client_ip, extract_user_agent};
 use nanosiem_core::audit::{actions as audit_actions, AuditEvent, AuditSource, ClientContext};
 use nanosiem_core::auth::{
-    mfa, AuthError, MfaChallengeRequest, MfaDisableRequest, MfaRegenerateBackupCodesRequest,
-    MfaSetupCompleteResponse, MfaSetupRequest, MfaSetupResponse, MfaStatusResponse,
-    MfaVerifySetupRequest,
+    mfa, permissions, AuthError, MfaChallengeRequest, MfaDisableRequest,
+    MfaRegenerateBackupCodesRequest, MfaSetupCompleteResponse, MfaSetupRequest, MfaSetupResponse,
+    MfaStatusResponse, MfaVerifySetupRequest,
 };
 use nanosiem_core::typeid::TypeIdParam;
 
@@ -907,6 +907,23 @@ pub async fn regenerate_backup_codes(
     Ok(Json(MfaSetupCompleteResponse { backup_codes }))
 }
 
+/// Permission required to clear another user's second factor (NAN-2226).
+///
+/// This gate used to name `users:manage`, an id that exists in NO migration,
+/// is absent from [`nanosiem_core::auth::permissions::ALL_PERMISSIONS`], and is
+/// therefore not offered by `GET /api/permissions`. Because `role_permissions`
+/// carries an FK onto the seeded catalogue, and a role may only be granted
+/// permissions the grantor holds, no principal could ever hold it — the route
+/// was a permanent 403 on fresh AND legacy installs, so an admin had no way to
+/// unlock a user who lost their authenticator.
+///
+/// [`permissions::USERS_EDIT`] is the correct authority level: it is what every
+/// other "administer someone else's account" route already requires
+/// (`update_user`, `enable_user`, `disable_user`, group membership changes in
+/// `handlers::users`), and clearing a factor is an account modification of the
+/// same weight — strictly less than `users:delete`, and not merely `users:view`.
+const ADMIN_RESET_MFA_PERMISSION: &str = permissions::USERS_EDIT;
+
 /// Admin: reset MFA for a user
 ///
 /// DELETE /api/admin/users/{id}/mfa
@@ -933,8 +950,8 @@ pub async fn admin_reset_mfa(
     let user_agent = extract_user_agent(&headers);
     let client_ctx = ClientContext::new(ip_address, user_agent);
 
-    // Require users:manage permission
-    if !auth.claims.has_permission("users:manage") {
+    // Require the permission that authorizes modifying another user's account.
+    if !auth.claims.has_permission(ADMIN_RESET_MFA_PERMISSION) {
         return Err((
             StatusCode::FORBIDDEN,
             Json(MfaApiError {
@@ -1000,8 +1017,9 @@ pub async fn set_mfa_required(
     let user_agent = extract_user_agent(&headers);
     let client_ctx = ClientContext::new(ip_address, user_agent);
 
-    // Require settings:system permission
-    if !auth.claims.has_permission("settings:system") {
+    // Require settings:system permission. Named via the constant, not a string
+    // literal, so it cannot drift out of the seeded catalogue (NAN-2226).
+    if !auth.claims.has_permission(permissions::SETTINGS_SYSTEM) {
         return Err((
             StatusCode::FORBIDDEN,
             Json(MfaApiError {
@@ -1127,5 +1145,51 @@ mod tests {
             .expect_err("api-key principal must be rejected on MFA endpoints");
         assert_eq!(err.0, StatusCode::FORBIDDEN);
         assert!(!err.1.message.is_empty(), "403 body should carry a message");
+    }
+
+    /// NAN-2226: the gate on `DELETE /api/admin/users/{id}/mfa` must name a
+    /// permission the catalogue actually seeds. It previously named
+    /// `users:manage`, which exists in no migration and in no constant — so it
+    /// could never be held, and the route was an unconditional 403 that left
+    /// admins unable to unlock a user who lost their authenticator.
+    ///
+    /// `has_permission` is an exact string match with no wildcard and no admin
+    /// bypass, so an unseeded id here is not a lint nit — it is a dead route.
+    #[test]
+    fn admin_reset_mfa_permission_exists_in_the_catalogue() {
+        assert!(
+            permissions::is_valid_permission(ADMIN_RESET_MFA_PERMISSION),
+            "admin MFA reset gates on `{}`, which is not in ALL_PERMISSIONS — \
+             no role can be granted it, so the route would 403 forever",
+            ADMIN_RESET_MFA_PERMISSION,
+        );
+        assert!(
+            permissions::is_valid_permission(permissions::SETTINGS_SYSTEM),
+            "set_mfa_required gates on `{}`, which is not in ALL_PERMISSIONS",
+            permissions::SETTINGS_SYSTEM,
+        );
+    }
+
+    /// A principal holding the gate permission passes, one without it does not.
+    /// Guards the swap itself, not just the id's existence.
+    #[test]
+    fn admin_reset_mfa_gate_admits_only_the_permission_holder() {
+        use nanosiem_core::auth::ApiKeyInfo;
+
+        let holder = AuthContext::from_api_key(&ApiKeyInfo {
+            id: Uuid::now_v7(),
+            name: "admin-tooling".to_string(),
+            permissions: vec![ADMIN_RESET_MFA_PERMISSION.to_string()],
+            user_id: Some(Uuid::now_v7()),
+        });
+        assert!(holder.claims.has_permission(ADMIN_RESET_MFA_PERMISSION));
+
+        let viewer = AuthContext::from_api_key(&ApiKeyInfo {
+            id: Uuid::now_v7(),
+            name: "read-only".to_string(),
+            permissions: vec![permissions::USERS_VIEW.to_string()],
+            user_id: Some(Uuid::now_v7()),
+        });
+        assert!(!viewer.claims.has_permission(ADMIN_RESET_MFA_PERMISSION));
     }
 }

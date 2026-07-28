@@ -6,7 +6,19 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::auth::{ArtifactScope, ScopeSet, SourceProvenance};
+use crate::auth::{ArtifactScope, SourceProvenance};
+
+/// Replacement text for the free-prose half of a health report that a
+/// source-restricted reader may not receive (NAN-2222).
+///
+/// A health report is a *separable* artifact. Its `source_type`-keyed metric
+/// vectors are attributable and can be pruned per partition
+/// ([`CollectedMetrics::retain_source_partitions`]); its AI narrative,
+/// recommendations, and per-dimension analysis are free text that can name any
+/// contributing source and cannot be pruned. Only the second half is withheld,
+/// and only when the stored provenance does not prove the report disjoint from
+/// the reader's deny set.
+pub const WITHHELD_NARRATIVE_NOTICE: &str = "Health-report narrative withheld: the AI summary, recommendations, and per-dimension analysis are not source-attributed, and this report's stored provenance does not prove it disjoint from the source types you are denied. Scores and the per-source metrics you are permitted to see are unaffected.";
 
 /// Overall health status
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
@@ -65,7 +77,8 @@ pub struct SiemHealthReport {
     pub triggered_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub duration_ms: Option<i32>,
-    /// Internal conservative envelope for future source-scoped report reads.
+    /// Known origin manifest for the stored payload, used to decide which
+    /// parts of the report a source-restricted reader may receive.
     #[serde(skip)]
     #[schema(ignore)]
     pub source_types: Vec<String>,
@@ -74,6 +87,59 @@ pub struct SiemHealthReport {
     #[serde(skip)]
     #[schema(ignore)]
     pub source_types_complete: bool,
+}
+
+impl SiemHealthReport {
+    /// May this reader receive the report's unattributed free prose?
+    ///
+    /// This is NAN-2089's whole-artifact classifier, unchanged — applied to the
+    /// narrative instead of to the row's existence. It is satisfied only by a
+    /// non-empty, resolved, provably complete manifest disjoint from the deny
+    /// set, so legacy (`'{}'` + FALSE) and partially attributed reports keep
+    /// failing closed exactly as before.
+    pub fn narrative_visible_to(&self, scope: &ArtifactScope) -> bool {
+        scope.allows(&self.source_types, self.source_types_complete)
+    }
+
+    /// Reduce a stored report to what `scope` may see (NAN-2222).
+    ///
+    /// 1. Every `source_type`-keyed partition denied to the reader is dropped
+    ///    and the exact ingestion totals are recomputed from what remains.
+    /// 2. The non-attributable narrative is replaced with
+    ///    [`WITHHELD_NARRATIVE_NOTICE`] unless the stored provenance proves the
+    ///    report disjoint from the deny set.
+    ///
+    /// Scores, status, timing, and non-partitioned fleet aggregates are
+    /// deliberately preserved: they are scalars over the whole deployment
+    /// rather than per-source data, and withholding them would leave the
+    /// `settings:system` monitoring callers this endpoint exists for with
+    /// nothing to poll. Attributing them remains NAN-2089's work.
+    ///
+    /// An unrestricted scope returns immediately, so a SYSTEM/admin read stays
+    /// byte-identical to the stored row.
+    pub fn apply_artifact_scope(&mut self, scope: &ArtifactScope) {
+        if scope.is_unrestricted() {
+            return;
+        }
+
+        // A restricted viewer gets no metrics at all if the stored JSON cannot
+        // be deserialized into the typed partition contract — an unparseable
+        // blob cannot be pruned, so it fails closed.
+        match serde_json::from_value::<CollectedMetrics>(self.metrics.clone()) {
+            Ok(mut metrics) => {
+                metrics.retain_source_partitions(scope);
+                self.metrics =
+                    serde_json::to_value(metrics).unwrap_or_else(|_| serde_json::json!({}));
+            }
+            Err(_) => self.metrics = serde_json::json!({}),
+        }
+
+        if !self.narrative_visible_to(scope) {
+            self.summary = WITHHELD_NARRATIVE_NOTICE.to_string();
+            self.recommendations = serde_json::json!([]);
+            self.dimension_details = serde_json::json!({});
+        }
+    }
 }
 
 /// Summary of a report (for list views, without full metrics/details)
@@ -91,6 +157,31 @@ pub struct SiemHealthReportSummary {
     pub triggered_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub duration_ms: Option<i32>,
+    /// Same manifest as [`SiemHealthReport::source_types`]; carried so the list
+    /// view applies the identical narrative policy as the detail view.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub source_types: Vec<String>,
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub source_types_complete: bool,
+}
+
+impl SiemHealthReportSummary {
+    /// List-view counterpart of [`SiemHealthReport::apply_artifact_scope`].
+    ///
+    /// A summary row carries no per-source partitions, so only the narrative
+    /// half of the policy applies. Rows are never dropped: the list is not
+    /// filtered, so page size and `total` cannot become an oracle for report
+    /// activity the reader may not see.
+    pub fn apply_artifact_scope(&mut self, scope: &ArtifactScope) {
+        if scope.is_unrestricted() {
+            return;
+        }
+        if !scope.allows(&self.source_types, self.source_types_complete) {
+            self.summary = WITHHELD_NARRATIVE_NOTICE.to_string();
+        }
+    }
 }
 
 /// Collected metrics from ClickHouse + PostgreSQL
@@ -112,6 +203,15 @@ impl CollectedMetrics {
     /// generated prose are not yet partition-attributed. Persisting the known
     /// envelope is useful to the follow-up migrations, but claiming it is the
     /// complete report provenance would be a source-scoped fail-open.
+    ///
+    /// NAN-2222: this stamp is honest and stays. What changed is that report
+    /// VISIBILITY no longer hinges on it — an unconditionally incomplete stamp
+    /// combined with a read gate that required `source_types_complete` made
+    /// every report permanently unreadable by every restricted principal. The
+    /// completeness bit now governs the narrative half of the artifact
+    /// ([`SiemHealthReport::narrative_visible_to`]), which is exactly the part
+    /// it truthfully describes, and will start admitting prose on its own once
+    /// NAN-2089 attributes the global scores and generated text.
     pub fn source_provenance(&self) -> SourceProvenance {
         let source_types = self
             .ingestion
@@ -149,18 +249,24 @@ impl CollectedMetrics {
     /// therefore fail closed for a restricted viewer.
     ///
     /// The ingestion totals are exact sums of `source_volumes` and are
-    /// recomputed after filtering. Other fleet/global fields are not derivable
-    /// from the persisted top-N partitions and remain unchanged for NAN-2089 to
-    /// handle together with narrative, recommendations, and scores.
-    pub fn retain_source_partitions(&mut self, scope: &ScopeSet) {
-        if !scope.is_restricted() {
+    /// recomputed after filtering. The remaining fleet-wide RATIOS
+    /// (`enrichment.*_pct`) are not derivable from the persisted top-N
+    /// partitions and stay for NAN-2089 to handle together with narrative,
+    /// recommendations, and scores.
+    ///
+    /// `enrichment.total_events_24h` is recomputed too (NAN-2222). It is
+    /// `count()` over the same logs, window, and predicate the ingestion
+    /// group-by sums, so leaving it while pruning `ingestion.total_events_24h`
+    /// published the denied sources' exact 24h event volume as the difference
+    /// of two returned fields — the precise datum this pruning exists to hide,
+    /// recoverable with one subtraction.
+    pub fn retain_source_partitions(&mut self, scope: &ArtifactScope) {
+        if scope.is_unrestricted() {
             return;
         }
 
-        let artifact_scope = ArtifactScope::from_scope(scope);
-        let is_visible = |source_type: &str| {
-            artifact_scope.allows_provenance(&SourceProvenance::complete([source_type]))
-        };
+        let is_visible =
+            |source_type: &str| scope.allows_provenance(&SourceProvenance::complete([source_type]));
 
         self.ingestion
             .source_volumes
@@ -192,6 +298,18 @@ impl CollectedMetrics {
         self.enrichment
             .per_source_coverage
             .retain(|metric| is_visible(&metric.source_type));
+        // Re-denominate the fleet rollup over the partitions that survived, so
+        // it can no longer be differenced against the pruned ingestion total.
+        // The retained rows are the collector's top-N (≥100 events), so this
+        // UNDER-counts the reader's own visible volume — an undercount only
+        // ever hides visible data, never denied data.
+        self.enrichment.total_events_24h = self
+            .enrichment
+            .per_source_coverage
+            .iter()
+            .fold(0_u64, |total, metric| {
+                total.saturating_add(metric.total_events)
+            });
     }
 }
 

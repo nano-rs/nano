@@ -1,7 +1,7 @@
 {
   "name": "vite-react-typescript-starter",
   "private": true,
-  "version": "0.1.686",
+  "version": "0.1.687",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -18,6 +18,7 @@
     "test:theme-tokens": "node --test src/lib/theme-tokens.test.ts",
     "test:notification-permissions": "node --test src/components/notification-query-policy.test.ts",
     "test:repository-permissions": "node --test src/components/repositories/repository-action-policy.test.ts",
+    "test:scope-presets": "node --test src/components/settings/access-control/scope-presets.test.ts",
     "test:oidc-provider-slug": "node --test src/enterprise/pages/Settings/oidc-provider-slug.test.ts",
     "test:login-auth-methods": "node --test src/pages/login-auth-methods.test.ts",
     "test:lazy-route-exports": "node tests/e2e/check-lazy-route-exports.mjs",
