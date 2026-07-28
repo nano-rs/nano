@@ -89,6 +89,7 @@ const TRANSPORTS: TransportSpec[] = [
   { value: 'vector', label: 'Vector', icon: Radio, description: 'Upstream Vector forwarders over the native Vector protocol.', popular: true },
   { value: 'otlp', label: 'OpenTelemetry (OTLP)', icon: Plug, description: 'OTLP logs over gRPC (:4317) / HTTP (:4318).', popular: true },
   { value: 'aws_s3', label: 'AWS S3', icon: Cloud, description: 'Ingest objects from S3 via SQS notifications.', popular: true },
+  { value: 'aws_sqs', label: 'AWS SQS', icon: Cloud, description: 'Consume an SQS queue directly, where the message body is the log.', popular: false },
   { value: 'gcp_pubsub', label: 'GCP Pub/Sub', icon: Cloud, description: 'Subscribe to a Google Cloud Pub/Sub topic.' },
   { value: 'kafka', label: 'Kafka', icon: Database, description: 'Consume events from one or more Kafka topics.' },
   { value: 'splunk_hec', label: 'Splunk HEC', icon: Zap, description: 'Splunk HTTP Event Collector compatibility endpoint.' },

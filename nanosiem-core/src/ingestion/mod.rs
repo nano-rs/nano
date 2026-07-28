@@ -9,6 +9,8 @@
 
 mod parser;
 mod row;
+mod vector_client;
 
 pub use parser::ParsedLog;
 pub use row::ClickHouseLogRow;
+pub use vector_client::{to_ndjson, VectorIngestClient, VectorIngestError};

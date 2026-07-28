@@ -23,6 +23,69 @@ use crate::parsers::{
     base_router_inputs, hec_normalize_present, redact_config_snapshot, CredentialRepository,
 };
 
+/// SQS poll interval emitted when a source config does not override it.
+///
+/// Was hard-coded at this value before NAN-2188; keeping it as the default
+/// means every existing config emits byte-identical TOML.
+pub(crate) const DEFAULT_SQS_POLL_SECS: u32 = 15;
+
+/// Ceiling for `poll_secs` — one day, far past anything deliberate.
+///
+/// Generous on purpose: a long poll interval is merely useless, not dangerous.
+pub(crate) const MAX_POLL_SECS: u32 = 86_400;
+
+/// Ceiling for `client_concurrency`.
+///
+/// Deliberately MUCH tighter than [`MAX_POLL_SECS`], because the two knobs fail
+/// differently. An absurd poll interval just stalls one queue; an absurd
+/// concurrency spawns that many parallel S3 fetches against the customer's
+/// account — a request storm, on their bill, that they did not ask for. A
+/// shared ceiling would have let a fat-fingered `50000` straight through.
+/// 1024 is far above any real tuning (Vector's own default is CPU-scaled)
+/// while keeping the blast radius of a typo bounded.
+pub(crate) const MAX_CLIENT_CONCURRENCY: u32 = 1_024;
+
+/// SQS's own hard maximum for a message visibility timeout: 12 hours.
+/// Anything above this is rejected by AWS, so reject it here where the error
+/// can name the field rather than surfacing as a Vector runtime failure.
+pub(crate) const MAX_SQS_VISIBILITY_SECS: u32 = 43_200;
+
+/// Build an `sts:AssumeRole` session name from a nano source name (NAN-2194).
+///
+/// This string is what the CUSTOMER sees in their own CloudTrail for every
+/// assumption we make into their account, so it should say which nano source
+/// was responsible rather than leaving them with an anonymous session.
+///
+/// AWS constrains `RoleSessionName` to `[\w+=,.@-]{2,64}`. A name outside that
+/// set does not degrade — `AssumeRole` fails outright — so a source named with
+/// anything exotic would turn a logging improvement into an ingest outage.
+/// Every disallowed character is therefore folded to `-`, and the result is
+/// clamped to the length bound.
+fn role_session_name(source_name: &str) -> String {
+    const PREFIX: &str = "nano-";
+    const MAX: usize = 64;
+
+    let cleaned: String = source_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '=' | ',' | '.' | '@' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    let mut out = String::with_capacity(MAX);
+    out.push_str(PREFIX);
+    out.push_str(cleaned.trim_matches('-'));
+    out.truncate(MAX);
+
+    // A source name that sanitized to nothing leaves the bare prefix, which is
+    // still >= the 2-char minimum, so the floor is satisfied by construction.
+    out
+}
+
 /// Reduce a Pub/Sub subscription value to its bare name. Vector's `gcp_pubsub`
 /// source builds `projects/<p>/subscriptions/<n>` itself, so a fully-qualified
 /// value would be double-prefixed and rejected with InvalidArgument by gRPC.
@@ -517,6 +580,7 @@ impl SourceConfigService {
         match config_type {
             "kafka" => Self::validate_kafka_conn(conn)?,
             "aws_s3" => Self::validate_aws_s3_conn(conn)?,
+            "aws_sqs" => Self::validate_aws_sqs_conn(conn)?,
             "gcp_pubsub" => Self::validate_gcp_pubsub_conn(conn)?,
             "splunk_hec" => Self::validate_splunk_hec_conn(conn)?,
             _ => {}
@@ -552,6 +616,49 @@ impl SourceConfigService {
         Self::expect_string_if_present(conn, "region")?;
         Self::expect_string_if_present(conn, "compression")?;
         Self::expect_string_if_present(conn, "endpoint")?;
+        // NAN-2188: reject bad tuning values HERE, with a message naming the
+        // field, rather than letting the generator quietly fall back to its
+        // default. A silently-ignored `poll_secs` is worse than a rejected one
+        // — the operator believes they changed the ingest cadence and nothing
+        // in the deployed config says otherwise.
+        Self::expect_bounded_int_if_present(conn, "poll_secs", MAX_POLL_SECS)?;
+        Self::expect_bounded_int_if_present(conn, "client_concurrency", MAX_CLIENT_CONCURRENCY)?;
+        Ok(())
+    }
+
+    /// A tuning knob must be a positive integer within [`MAX_TUNING_VALUE`].
+    /// Absent and explicit null both mean "use the default" and pass.
+    fn expect_bounded_int_if_present(
+        conn: &serde_json::Value,
+        key: &str,
+        max: u32,
+    ) -> Result<(), SourceConfigServiceError> {
+        let Some(v) = conn.get(key) else {
+            return Ok(());
+        };
+        if v.is_null() {
+            return Ok(());
+        }
+        let ok = v
+            .as_i64()
+            .and_then(|n| u32::try_from(n).ok())
+            .is_some_and(|n| n > 0 && n <= max);
+        if ok {
+            return Ok(());
+        }
+        Err(SourceConfigServiceError::InvalidConfig(format!("aws_s3 connection_config.{key} must be an integer between 1 and {max}")))
+    }
+
+    fn validate_aws_sqs_conn(conn: &serde_json::Value) -> Result<(), SourceConfigServiceError> {
+        Self::expect_string_if_present(conn, "queue_url")?;
+        Self::expect_string_if_present(conn, "region")?;
+        Self::expect_string_if_present(conn, "endpoint")?;
+        Self::expect_bounded_int_if_present(conn, "poll_secs", MAX_POLL_SECS)?;
+        Self::expect_bounded_int_if_present(conn, "client_concurrency", MAX_CLIENT_CONCURRENCY)?;
+        // Vector's visibility timeout must exceed the time it takes to process
+        // a batch, or SQS redelivers messages that are still in flight and the
+        // pipeline duplicates them. Bounded by SQS's own 12-hour maximum.
+        Self::expect_bounded_int_if_present(conn, "visibility_timeout_secs", MAX_SQS_VISIBILITY_SECS)?;
         Ok(())
     }
 
@@ -1744,6 +1851,7 @@ impl SourceConfigService {
                 kafka_ca_path.as_deref(),
             ),
             "aws_s3" => Self::generate_aws_s3_source(&source_name, conn, creds.as_ref()),
+            "aws_sqs" => Self::generate_aws_sqs_source(&source_name, conn, creds.as_ref()),
             "gcp_pubsub" => {
                 Self::generate_gcp_pubsub_source(&source_name, conn, gcp_creds_path.as_deref())
             }
@@ -1900,29 +2008,189 @@ impl SourceConfigService {
             }
         }
 
+        // NAN-2188: `client_concurrency` is the first knob worth touching on a
+        // high-object-count feed, and it was previously unreachable. Omitted
+        // entirely when unset so Vector's own default applies — emitting a
+        // guess here would silently override it for every existing deployment.
+        if let Some(concurrency) = Self::positive_u32(conn, "client_concurrency", MAX_CLIENT_CONCURRENCY) {
+            source.insert(
+                "client_concurrency".into(),
+                toml::Value::Integer(i64::from(concurrency)),
+            );
+        }
+
         let mut sqs = toml::Table::new();
         sqs.insert("queue_url".into(), sqs_queue_url.into());
-        sqs.insert("poll_secs".into(), toml::Value::Integer(15));
+        // Defaults to the previously hard-coded 15, so an existing config that
+        // does not set it emits byte-identical TOML. `poll_secs` governs
+        // empty-queue backoff, NOT throughput — with a backlog Vector keeps
+        // polling — so the reason to lower it is ingest LATENCY on a quiet
+        // queue, where 15s is the floor on noticing a new object.
+        sqs.insert(
+            "poll_secs".into(),
+            toml::Value::Integer(i64::from(
+                Self::positive_u32(conn, "poll_secs", MAX_POLL_SECS).unwrap_or(DEFAULT_SQS_POLL_SECS),
+            )),
+        );
         sqs.insert("delete_message".into(), true.into());
         source.insert("sqs".into(), toml::Value::Table(sqs));
 
-        // Add AWS credentials
-        if let Some(c) = creds {
-            let access_key = c["access_key_id"].as_str().unwrap_or("");
-            let secret_key = c["secret_access_key"].as_str().unwrap_or("");
+        if let Some(auth) = Self::aws_auth_table(creds, region, source_name) {
+            source.insert("auth".into(), toml::Value::Table(auth));
+        }
 
-            if !access_key.is_empty() && !secret_key.is_empty() {
-                let mut auth = toml::Table::new();
-                auth.insert("access_key_id".into(), access_key.into());
-                auth.insert("secret_access_key".into(), secret_key.into());
-                auth.insert("region".into(), region.into());
-                if let Some(role) = c["assume_role_arn"].as_str() {
-                    if !role.is_empty() {
-                        auth.insert("assume_role".into(), role.into());
-                    }
-                }
-                source.insert("auth".into(), toml::Value::Table(auth));
+        Self::wrap_source_table(source_name, source)
+    }
+
+    /// Read a positive integer tuning knob from a connection config.
+    ///
+    /// Returns `None` for absent, null, non-numeric, zero, negative, or
+    /// above the caller's `max` — every one of which means "no usable value",
+    /// so the caller falls back to its default rather than emitting something
+    /// Vector will reject at load. Validation (`validate_aws_s3_conn`) rejects
+    /// these at write time with a real error; this is the belt-and-braces read
+    /// side, since connection configs predate the validator and can also be
+    /// written by other paths.
+    fn positive_u32(conn: &serde_json::Value, key: &str, max: u32) -> Option<u32> {
+        let n = conn.get(key)?.as_i64()?;
+        u32::try_from(n).ok().filter(|v| *v > 0 && *v <= max)
+    }
+
+    /// Build the `[sources.<name>.auth]` table shared by the AWS sources.
+    ///
+    /// Returns `None` when the credential carries nothing we can act on, which
+    /// is the load-bearing case: with no `auth` block Vector falls through to
+    /// the AWS SDK provider chain — EC2 instance profile, EKS IRSA, ECS task
+    /// role. That is how a keyless deployment consumes a queue in its OWN
+    /// account, and `CredentialPicker` already advertises it as
+    /// "None (use environment / IAM role)".
+    ///
+    /// NAN-2186: `assume_role` used to be nested INSIDE the both-static-keys
+    /// branch, so the one posture a security-conscious customer actually wants
+    /// — ambient identity assuming a role in ANOTHER account — could not be
+    /// expressed at all. You had to hand over the long-lived access key you
+    /// were trying to avoid. The four postures are now independent:
+    ///
+    /// | static keys | assume_role | result                                  |
+    /// |-------------|-------------|-----------------------------------------|
+    /// | no          | no          | no auth block → ambient identity        |
+    /// | yes         | no          | static keys (unchanged)                 |
+    /// | yes         | yes         | static keys chain into the role         |
+    /// | no          | yes         | ambient identity assumes the role (NEW) |
+    ///
+    /// `external_id` accompanies `assume_role` and is what makes the
+    /// cross-account grant safe for a MANAGED deployment: it is AWS's
+    /// prescribed defense against the confused-deputy problem. Without it, a
+    /// tenant's role ARN leaking plus a system that can be induced to assume an
+    /// arbitrary ARN is a cross-tenant access path. It is meaningless without a
+    /// role, so it is only emitted alongside one.
+    fn aws_auth_table(
+        creds: Option<&serde_json::Value>,
+        region: &str,
+        source_name: &str,
+    ) -> Option<toml::Table> {
+        let c = creds?;
+        let field = |k: &str| c[k].as_str().unwrap_or("").trim().to_string();
+
+        let access_key = field("access_key_id");
+        let secret_key = field("secret_access_key");
+        let assume_role = field("assume_role_arn");
+        let external_id = field("external_id");
+
+        // A half-filled key pair is a misconfiguration, not a credential —
+        // emitting one field alone yields a Vector config that fails at
+        // runtime. Treat it as absent and let the role (or ambient identity)
+        // carry the request.
+        let has_static_keys = !access_key.is_empty() && !secret_key.is_empty();
+        let has_role = !assume_role.is_empty();
+
+        if !has_static_keys && !has_role {
+            return None;
+        }
+
+        let mut auth = toml::Table::new();
+        if has_static_keys {
+            auth.insert("access_key_id".into(), access_key.into());
+            auth.insert("secret_access_key".into(), secret_key.into());
+        }
+        if has_role {
+            auth.insert("assume_role".into(), assume_role.into());
+            if !external_id.is_empty() {
+                auth.insert("external_id".into(), external_id.into());
             }
+            // NAN-2194: the RoleSessionName lands in the CUSTOMER's CloudTrail.
+            // Without one, every assumption we make into their account is
+            // indistinguishable from any other caller — a bad answer when their
+            // security team asks who touched their data. Naming the source makes
+            // their audit trail legible without them having to ask us.
+            auth.insert("session_name".into(), role_session_name(source_name).into());
+        }
+        auth.insert("region".into(), region.into());
+        Some(auth)
+    }
+
+    /// Build the `[sources.<name>]` block for an AWS SQS source (NAN-2187).
+    ///
+    /// Distinct from [`Self::generate_aws_s3_source`] despite the shared
+    /// transport: there, SQS carries S3 `ObjectCreated` NOTIFICATIONS and the
+    /// log is the S3 object Vector then fetches. Here the message body IS the
+    /// log, so there is no bucket, no object fetch, and routing keys are
+    /// message attributes rather than bucket/key.
+    ///
+    /// Auth and the tuning knobs come from the shared helpers, so a
+    /// cross-account role (NAN-2186) and concurrency limits (NAN-2188) work
+    /// identically on both AWS drivers.
+    fn generate_aws_sqs_source(
+        source_name: &str,
+        conn: &serde_json::Value,
+        creds: Option<&serde_json::Value>,
+    ) -> String {
+        let queue_url = conn["queue_url"].as_str().unwrap_or("");
+        let region = conn["region"].as_str().unwrap_or("us-east-1");
+
+        let mut source = toml::Table::new();
+        source.insert("type".into(), "aws_sqs".into());
+        source.insert("region".into(), region.into());
+        source.insert("queue_url".into(), queue_url.into());
+
+        if let Some(endpoint) = conn["endpoint"].as_str() {
+            if !endpoint.is_empty() {
+                source.insert("endpoint".into(), endpoint.into());
+            }
+        }
+
+        source.insert(
+            "poll_secs".into(),
+            toml::Value::Integer(i64::from(
+                Self::positive_u32(conn, "poll_secs", MAX_POLL_SECS)
+                    .unwrap_or(DEFAULT_SQS_POLL_SECS),
+            )),
+        );
+
+        if let Some(concurrency) =
+            Self::positive_u32(conn, "client_concurrency", MAX_CLIENT_CONCURRENCY)
+        {
+            source.insert(
+                "client_concurrency".into(),
+                toml::Value::Integer(i64::from(concurrency)),
+            );
+        }
+
+        // Omitted unless set: Vector inherits the queue's own configured
+        // timeout, which is what an operator who has not thought about it
+        // wants. Overriding with a guess would silently change redelivery
+        // behaviour on an existing queue.
+        if let Some(visibility) =
+            Self::positive_u32(conn, "visibility_timeout_secs", MAX_SQS_VISIBILITY_SECS)
+        {
+            source.insert(
+                "visibility_timeout_secs".into(),
+                toml::Value::Integer(i64::from(visibility)),
+            );
+        }
+
+        if let Some(auth) = Self::aws_auth_table(creds, region, source_name) {
+            source.insert("auth".into(), toml::Value::Table(auth));
         }
 
         Self::wrap_source_table(source_name, source)
@@ -2573,6 +2841,7 @@ impl SourceConfigService {
         match config_type {
             "kafka" => Some("kafka"),
             "aws_s3" => Some("aws_s3"),
+            "aws_sqs" => Some("aws_sqs"),
             "gcp_pubsub" => Some("gcp_pubsub"),
             _ => None,
         }

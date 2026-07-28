@@ -202,14 +202,22 @@ pub async fn create_credential(
     }
 
     if request.provider == "aws_s3" {
-        if request.credentials.get("access_key_id").is_none()
-            || request.credentials.get("secret_access_key").is_none()
-        {
+        // NAN-2186: two valid postures. Static keys, OR a role this deployment
+        // assumes with its own ambient identity (instance profile / IRSA) —
+        // which is the whole point for a customer who will not mint an access
+        // key. Requiring keys unconditionally made the role posture
+        // unreachable through the API.
+        let has_static_keys = request.credentials.get("access_key_id").is_some()
+            && request.credentials.get("secret_access_key").is_some();
+        let has_assume_role = request.credentials.get("assume_role_arn").is_some();
+        if !has_static_keys && !has_assume_role {
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(CredentialApiError::new(
                     "invalid_credentials",
-                    "AWS S3 credentials must include 'access_key_id' and 'secret_access_key'",
+                    "AWS S3 credentials must include either 'access_key_id' and \
+                     'secret_access_key', or 'assume_role_arn' for cross-account \
+                     role assumption",
                 )),
             ));
         }
@@ -228,10 +236,25 @@ pub async fn create_credential(
 
     let cred_name = request.name.clone();
     let cred_provider = request.provider.clone();
+
+    // NAN-2186: lift `external_id` OUT of the encrypted payload into its own
+    // column. Clients send it inside `credentials` because that is where the
+    // rest of the AWS auth fields live, but it must survive as readable
+    // metadata — the account owner needs it to write their trust policy, and
+    // `GET /api/credentials` returns no payload at all. `get_decrypted` merges
+    // it back in for the config generators, so the column is the only copy.
+    let mut credentials = request.credentials;
+    let external_id = credentials
+        .as_object_mut()
+        .and_then(|m| m.remove("external_id"))
+        .and_then(|v| v.as_str().map(str::to_string))
+        .filter(|s| !s.trim().is_empty());
+
     let create_req = CreateCloudCredential {
         name: request.name,
         provider: request.provider,
-        credentials: request.credentials,
+        credentials,
+        external_id,
         description: request.description,
         region: request.region,
         environment: request.environment,
@@ -492,8 +515,20 @@ pub async fn rotate_credential(
     check_permission(&auth, "credentials:rotate").map_err(|_| forbidden())?;
 
     let repo = CredentialRepository::new(state.pool.clone());
+
+    // Same lift as create: `external_id` is readable metadata, not payload.
+    // A rotation may switch posture (static keys -> cross-account role), so it
+    // rewrites the column rather than inheriting the previous value.
+    let mut credentials = request.credentials;
+    let external_id = credentials
+        .as_object_mut()
+        .and_then(|m| m.remove("external_id"))
+        .and_then(|v| v.as_str().map(str::to_string))
+        .filter(|s| !s.trim().is_empty());
+
     let rotate_req = RotateCloudCredential {
-        credentials: request.credentials,
+        credentials,
+        external_id,
         note: request.note.clone(),
     };
 

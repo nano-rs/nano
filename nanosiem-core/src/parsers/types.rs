@@ -21,6 +21,8 @@ pub enum SourceType {
     Routed,
     /// AWS S3 bucket via SQS notifications
     AwsS3,
+    /// AWS SQS consumed directly — the message body IS the log (NAN-2187)
+    AwsSqs,
     /// GCP Pub/Sub subscription
     GcpPubSub,
 }
@@ -35,6 +37,7 @@ impl SourceType {
             Self::Stdin => "stdin",
             Self::Routed => "routed",
             Self::AwsS3 => "aws_s3",
+            Self::AwsSqs => "aws_sqs",
             Self::GcpPubSub => "gcp_pubsub",
         }
     }
@@ -47,7 +50,8 @@ impl SourceType {
             "kafka" => Some(Self::Kafka),
             "stdin" => Some(Self::Stdin),
             "routed" => Some(Self::Routed),
-            "aws_s3" | "aws_sqs" | "s3" => Some(Self::AwsS3),
+            "aws_s3" | "s3" => Some(Self::AwsS3),
+            "aws_sqs" | "sqs" => Some(Self::AwsSqs),
             "gcp_pubsub" | "pubsub" => Some(Self::GcpPubSub),
             _ => None,
         }
@@ -63,6 +67,7 @@ impl SourceType {
             "stdin",
             "routed",
             "aws_s3",
+            "aws_sqs",
             "gcp_pubsub",
         ]
     }
@@ -106,6 +111,15 @@ pub struct CloudCredential {
     pub provider: String,
     pub description: Option<String>,
     pub region: Option<String>,
+    /// `sts:ExternalId` for a cross-account role assumption (NAN-2186).
+    ///
+    /// Stored and returned UNENCRYPTED, unlike the credential payload. An
+    /// ExternalId is not a secret — it is an unguessable identifier the account
+    /// owner must know to write the trust policy that lets us assume their
+    /// role. Keeping it in the encrypted blob made it write-only, since this
+    /// struct (what `GET /api/credentials` returns) carries no payload at all.
+    /// `None` for static-key and ambient-identity credentials.
+    pub external_id: Option<String>,
     /// Optional environment tag — one of "prod" / "staging" / "dev"
     pub environment: Option<String>,
     /// Optional rotation deadline — drives the Health badge in the UI
@@ -123,6 +137,10 @@ pub struct CloudCredential {
 pub struct CreateCloudCredential {
     pub name: String,
     pub provider: String,
+    /// See [`CloudCredential::external_id`] — lifted out of `credentials` so it
+    /// stays readable after creation.
+    #[serde(default)]
+    pub external_id: Option<String>,
     /// Provider-specific credential JSON (will be encrypted before storage)
     pub credentials: serde_json::Value,
     pub description: Option<String>,
@@ -148,6 +166,12 @@ pub struct UpdateCloudCredential {
 pub struct RotateCloudCredential {
     /// Provider-specific credential JSON (encrypted before storage)
     pub credentials: serde_json::Value,
+    /// See [`CloudCredential::external_id`]. A rotation may change the auth
+    /// POSTURE — static keys today, a cross-account role tomorrow — so this
+    /// must be rewritten alongside the payload. `None` clears it, which is
+    /// correct when rotating from a role back to static keys.
+    #[serde(default)]
+    pub external_id: Option<String>,
     pub note: Option<String>,
 }
 

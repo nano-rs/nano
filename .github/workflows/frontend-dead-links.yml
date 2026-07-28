@@ -1,6 +1,10 @@
 name: frontend dead-links gate
 
-# NAN-1934 — static "no new dead internal links" gate. Catches the class of bug
+# Static gates for the "route renders wrong" bug class. Pure text analysis — no
+# stack, no browser, no build, ~1s each. (Workflow name kept as-is so the
+# required-check name does not move.)
+#
+# NAN-1934 — "no new dead internal links" gate. Catches the class of bug
 # that shipped NAN-1933: an in-app/notification link whose target matches no
 # React Router route, so it renders the 404 page. Pure text analysis — no stack,
 # no browser, no build, ~1s. The Puppeteer crawler (tests/e2e/crawl-404.mjs) is
@@ -42,3 +46,9 @@ jobs:
 
       - name: Check for new dead internal links
         run: node nanosiem-web/tests/e2e/check-dead-links.mjs
+
+      # NAN-2190 — lazyWithRetryNamed names its export with a STRING, so a
+      # mismatch survives tsc and vite build and only throws when a user
+      # navigates to the route. That is how /integrations shipped broken.
+      - name: Check lazy route exports resolve
+        run: node nanosiem-web/tests/e2e/check-lazy-route-exports.mjs

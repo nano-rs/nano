@@ -1631,6 +1631,14 @@ export interface CloudCredential {
   provider: 'aws_s3' | 'gcp_pubsub' | 'kafka';
   description?: string;
   region?: string;
+  /**
+   * `sts:ExternalId` for a cross-account role credential (NAN-2186).
+   *
+   * Returned in the clear, unlike the credential payload — the account owner
+   * needs this value to write their role's trust policy, so it has to be
+   * readable after creation. `null` for static-key credentials.
+   */
+  external_id?: string | null;
   environment?: CredentialEnvironment | null;
   expires_at?: string | null;
   last_used_at?: string | null;
@@ -1689,11 +1697,29 @@ export interface CredentialVersionListResponse {
   total: number;
 }
 
+/**
+ * Two postures, and the fields are deliberately all optional (NAN-2186):
+ *
+ *  - **Static keys** — `access_key_id` + `secret_access_key`, optionally
+ *    chaining into `assume_role_arn`.
+ *  - **Role only** — `assume_role_arn` (+ `external_id`) with NO keys. The
+ *    deployment's own ambient identity (EC2 instance profile / EKS IRSA / ECS
+ *    task role) assumes the customer's role. Nothing long-lived is stored, so
+ *    this is what a customer who refuses to mint access keys should be given.
+ *
+ * Sending neither is also valid: the source then emits no `auth` block and
+ * Vector falls through to the AWS SDK provider chain.
+ *
+ * `external_id` is the `sts:ExternalId` condition on the customer's trust
+ * policy — AWS's defense against the confused-deputy problem, and effectively
+ * mandatory when WE assume a role in a tenant's account.
+ */
 export interface AwsS3Credentials {
-  access_key_id: string;
-  secret_access_key: string;
+  access_key_id?: string;
+  secret_access_key?: string;
   session_token?: string;
   assume_role_arn?: string;
+  external_id?: string;
 }
 
 export interface GcpPubSubCredentials {
@@ -5244,7 +5270,7 @@ export interface LogSourceWithDraftStatus extends LogSource {
 // Source Configurations (Infrastructure + Routing)
 // ============================================================================
 
-export type SourceConfigType = 'http' | 'kafka' | 'aws_s3' | 'gcp_pubsub' | 'splunk_hec' | 'vector' | 'otlp';
+export type SourceConfigType = 'http' | 'kafka' | 'aws_s3' | 'aws_sqs' | 'gcp_pubsub' | 'splunk_hec' | 'vector' | 'otlp';
 export type MatchType = 'exact' | 'prefix' | 'suffix' | 'regex' | 'contains' | 'default';
 
 export interface RoutingRule {

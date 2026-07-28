@@ -48,6 +48,17 @@ export function SourceConfigForm({
         />
       );
 
+    case 'aws_sqs':
+      return (
+        <SqsConfigForm
+          config={config}
+          onChange={onConfigChange}
+          credentialId={credentialId}
+          onCredentialChange={onCredentialChange}
+          disabled={disabled}
+        />
+      );
+
     case 'aws_s3':
       return (
         <S3ConfigForm
@@ -244,14 +255,151 @@ function KafkaConfigForm({ config, onChange, credentialId, onCredentialChange, d
   );
 }
 
-function S3ConfigForm({ config, onChange, credentialId, onCredentialChange, disabled }: FormWithCredentialsProps) {
-  const AWS_REGIONS = [
-    'us-east-1', 'us-east-2', 'us-west-1', 'us-west-2',
-    'eu-west-1', 'eu-west-2', 'eu-west-3', 'eu-central-1', 'eu-north-1',
-    'ap-southeast-1', 'ap-southeast-2', 'ap-northeast-1', 'ap-northeast-2', 'ap-south-1',
-    'sa-east-1', 'ca-central-1',
-  ];
+/** Shared by both AWS drivers (NAN-2187 — was local to S3ConfigForm). */
+const AWS_REGIONS = [
+  'us-east-1', 'us-east-2', 'us-west-1', 'us-west-2',
+  'eu-west-1', 'eu-west-2', 'eu-west-3', 'eu-central-1', 'eu-north-1',
+  'ap-southeast-1', 'ap-southeast-2', 'ap-northeast-1', 'ap-northeast-2', 'ap-south-1',
+  'sa-east-1', 'ca-central-1',
+];
 
+/**
+ * NAN-2187: SQS consumed DIRECTLY — the message body is the log.
+ *
+ * Distinct from `S3ConfigForm` despite the shared transport: there, SQS carries
+ * S3 ObjectCreated notifications and the log is the object Vector then fetches.
+ * Here there is no bucket and no object fetch, so the field is `queue_url`
+ * rather than `sqs_queue_url` and routing keys are message attributes.
+ */
+function SqsConfigForm({ config, onChange, credentialId, onCredentialChange, disabled }: FormWithCredentialsProps) {
+  return (
+    <div className="space-y-3">
+      <div className="space-y-1.5">
+        <Label className={FIELD_LABEL}>SQS Queue URL *</Label>
+        <Input
+          value={(config.queue_url as string) || ''}
+          onChange={(e) => onChange({ ...config, queue_url: e.target.value })}
+          placeholder="https://sqs.ap-south-1.amazonaws.com/123456789/my-queue"
+          disabled={disabled}
+          className={INPUT_MONO}
+        />
+        <p className={HELP_TEXT}>
+          Queue whose messages ARE the logs. If your queue instead carries S3 object
+          notifications, use the AWS S3 source type.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <div className="space-y-1.5">
+          <Label className={FIELD_LABEL}>AWS Region</Label>
+          <Select
+            value={(config.region as string) || 'us-east-1'}
+            onValueChange={(v) => onChange({ ...config, region: v })}
+            disabled={disabled}
+          >
+            <SelectTrigger className={INPUT_MONO}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {AWS_REGIONS.map((r) => (
+                <SelectItem key={r} value={r} className={SELECT_ITEM}>
+                  {r}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="space-y-1.5">
+          <Label className={FIELD_LABEL}>Custom Endpoint (optional)</Label>
+          <Input
+            value={(config.endpoint as string) || ''}
+            onChange={(e) => onChange({ ...config, endpoint: e.target.value || undefined })}
+            placeholder="https://localstack:4566"
+            disabled={disabled}
+            className={INPUT_MONO}
+          />
+        </div>
+      </div>
+
+      <details className="group">
+        <summary className="cursor-pointer select-none text-[11.5px] text-muted-foreground hover:text-fg">
+          Advanced tuning
+        </summary>
+        <div className="mt-2.5 space-y-3 border-l border-border pl-3">
+          <div className="space-y-1.5">
+            <Label className={FIELD_LABEL}>Poll interval (seconds)</Label>
+            <Input
+              type="number"
+              min={1}
+              value={(config.poll_secs as number | undefined) ?? ''}
+              onChange={(e) =>
+                onChange({ ...config, poll_secs: e.target.value ? Number(e.target.value) : undefined })
+              }
+              placeholder="15"
+              disabled={disabled}
+              className={INPUT_MONO}
+            />
+            <p className={HELP_TEXT}>
+              Wait between polls of an <em>empty</em> queue. Does not throttle throughput.
+              Default 15.
+            </p>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label className={FIELD_LABEL}>Client concurrency</Label>
+            <Input
+              type="number"
+              min={1}
+              value={(config.client_concurrency as number | undefined) ?? ''}
+              onChange={(e) =>
+                onChange({
+                  ...config,
+                  client_concurrency: e.target.value ? Number(e.target.value) : undefined,
+                })
+              }
+              placeholder="Vector default"
+              disabled={disabled}
+              className={INPUT_MONO}
+            />
+          </div>
+
+          <div className="space-y-1.5">
+            <Label className={FIELD_LABEL}>Visibility timeout (seconds)</Label>
+            <Input
+              type="number"
+              min={1}
+              value={(config.visibility_timeout_secs as number | undefined) ?? ''}
+              onChange={(e) =>
+                onChange({
+                  ...config,
+                  visibility_timeout_secs: e.target.value ? Number(e.target.value) : undefined,
+                })
+              }
+              placeholder="Queue default"
+              disabled={disabled}
+              className={INPUT_MONO}
+            />
+            <p className={HELP_TEXT}>
+              Must exceed how long a batch takes to process, or SQS redelivers messages
+              still in flight and events are duplicated. Leave blank to inherit the
+              queue's own setting.
+            </p>
+          </div>
+        </div>
+      </details>
+
+      <CredentialPicker
+        provider="aws_s3"
+        value={credentialId}
+        onChange={onCredentialChange}
+        disabled={disabled}
+      />
+    </div>
+  );
+}
+
+function S3ConfigForm({ config, onChange, credentialId, onCredentialChange, disabled }: FormWithCredentialsProps) {
   return (
     <div className="space-y-3">
       <div className="space-y-1.5">
@@ -326,6 +474,63 @@ function S3ConfigForm({ config, onChange, credentialId, onCredentialChange, disa
         />
         <p className={HELP_TEXT}>For S3-compatible storage like MinIO</p>
       </div>
+
+      {/* NAN-2188: behind a disclosure so the default path stays uncluttered —
+          these only matter on high-volume feeds, and a wrong value is worse
+          than no value. Both are validated server-side; leaving them blank
+          keeps today's behaviour exactly. */}
+      <details className="group">
+        <summary className="cursor-pointer select-none text-[11.5px] text-muted-foreground hover:text-fg">
+          Advanced tuning
+        </summary>
+        <div className="mt-2.5 space-y-3 border-l border-border pl-3">
+          <div className="space-y-1.5">
+            <Label className={FIELD_LABEL}>SQS poll interval (seconds)</Label>
+            <Input
+              type="number"
+              min={1}
+              value={(config.poll_secs as number | undefined) ?? ''}
+              onChange={(e) =>
+                onChange({
+                  ...config,
+                  poll_secs: e.target.value ? Number(e.target.value) : undefined,
+                })
+              }
+              placeholder="15"
+              disabled={disabled}
+              className={INPUT_MONO}
+            />
+            <p className={HELP_TEXT}>
+              How long to wait between polls of an <em>empty</em> queue. Does not throttle
+              throughput — with a backlog, collection is continuous. Lower this only to
+              reduce how long a new object sits unnoticed on a quiet queue. Default 15.
+            </p>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label className={FIELD_LABEL}>Client concurrency</Label>
+            <Input
+              type="number"
+              min={1}
+              value={(config.client_concurrency as number | undefined) ?? ''}
+              onChange={(e) =>
+                onChange({
+                  ...config,
+                  client_concurrency: e.target.value ? Number(e.target.value) : undefined,
+                })
+              }
+              placeholder="Vector default"
+              disabled={disabled}
+              className={INPUT_MONO}
+            />
+            <p className={HELP_TEXT}>
+              Parallel S3 object fetches. Worth raising on feeds with many small objects,
+              where per-object latency rather than bandwidth is the limit. Leave blank to
+              use Vector's default.
+            </p>
+          </div>
+        </div>
+      </details>
 
       <CredentialPicker
         provider="aws_s3"

@@ -53,6 +53,47 @@ import type {
 import { cn } from '@/lib/utils';
 
 type Provider = 'aws_s3' | 'gcp_pubsub' | 'kafka';
+/** How an AWS credential authenticates — see `AwsS3Credentials` (NAN-2186). */
+type AwsAuthMode = 'keys' | 'role';
+
+/**
+ * A fresh `sts:ExternalId` for a cross-account trust policy.
+ *
+ * Random by construction: the whole point of an ExternalId is that the tenant
+ * whose role we assume can pin it to a value only we know, so an operator-typed
+ * (and therefore guessable) one provides no confused-deputy protection at all.
+ */
+/** One segment of the AWS auth-mode switch (NAN-2186). */
+function AwsAuthModeButton({
+  mode,
+  label,
+  active,
+  onSelect,
+}: {
+  mode: AwsAuthMode;
+  label: string;
+  active: boolean;
+  onSelect: (mode: AwsAuthMode) => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => onSelect(mode)}
+      className={cn(
+        'h-7 px-2.5 text-[11.5px] border rounded-sm transition-colors',
+        active
+          ? 'border-primary text-primary bg-primary/10'
+          : 'border-border text-muted-foreground hover:text-fg',
+      )}
+    >
+      {label}
+    </button>
+  );
+}
+
+function newExternalId(): string {
+  return `nano-${crypto.randomUUID()}`;
+}
 type ProviderFilter = 'all' | Provider;
 type EnvironmentFilter = 'all' | CredentialEnvironment;
 type InspectorTab = 'overview' | 'versions' | 'usage' | 'danger';
@@ -1405,6 +1446,26 @@ function OverviewTab({
             </FieldRow>
           )}
         </div>
+        {/* NAN-2186: the ExternalId is readable on purpose — the account owner
+            needs it for their trust policy, and it is worthless to an attacker
+            without the role ARN it conditions. Read-only: changing it means
+            rotating the credential, which regenerates it. */}
+        {cred.external_id && (
+          <FieldRow label="External ID">
+            <div className="space-y-1">
+              <Input
+                value={cred.external_id}
+                readOnly
+                className="h-8 text-[12px] bg-card font-mono text-muted-foreground"
+              />
+              <p className="text-[10.5px] text-muted-foreground leading-snug">
+                This credential assumes a role rather than storing a key. The account
+                owner's trust policy must require this value via{' '}
+                <span className="font-mono">sts:ExternalId</span>.
+              </p>
+            </div>
+          </FieldRow>
+        )}
         {canEdit && dirty && (
           <div className="flex items-center gap-2 mt-3">
             <Button
@@ -1720,6 +1781,19 @@ function AddCredentialForm({
   const [accessKeyId, setAccessKeyId] = useState('');
   const [secretAccessKey, setSecretAccessKey] = useState('');
   const [showAwsSecret, setShowAwsSecret] = useState(false);
+  // NAN-2186: static keys vs. cross-account role assumption. Kept as an
+  // explicit choice rather than "fill in whichever fields you like" because the
+  // two postures have different security stories and mixing them silently is
+  // how you end up storing a long-lived key nobody meant to create.
+  const [awsAuthMode, setAwsAuthMode] = useState<AwsAuthMode>('keys');
+  const [assumeRoleArn, setAssumeRoleArn] = useState('');
+  // Generated, not typed: an ExternalId the operator can choose is an
+  // ExternalId an attacker can guess, which defeats the confused-deputy
+  // protection it exists to provide.
+  // Read-only by design: to change it, rotate the credential — the rotate
+  // form mints a fresh one, which is the operation you actually want if an
+  // ExternalId is ever exposed.
+  const [externalId] = useState(newExternalId);
 
   // GCP Pub/Sub
   const [credentialsJson, setCredentialsJson] = useState('');
@@ -1738,7 +1812,10 @@ function AddCredentialForm({
   const isValid = (() => {
     if (!name.trim()) return false;
     if (provider === 'aws_s3') {
-      return accessKeyId.trim() !== '' && secretAccessKey.trim() !== '';
+      // Role mode stores no secret at all — the ARN is the whole credential.
+      return awsAuthMode === 'role'
+        ? assumeRoleArn.trim() !== ''
+        : accessKeyId.trim() !== '' && secretAccessKey.trim() !== '';
     }
     if (provider === 'gcp_pubsub') return credentialsJson.trim() !== '';
     if (provider === 'kafka') {
@@ -1754,10 +1831,16 @@ function AddCredentialForm({
     let credentials: AwsS3Credentials | GcpPubSubCredentials | KafkaCredentials;
     switch (provider) {
       case 'aws_s3':
-        credentials = {
-          access_key_id: accessKeyId.trim(),
-          secret_access_key: secretAccessKey,
-        };
+        credentials =
+          awsAuthMode === 'role'
+            ? {
+                assume_role_arn: assumeRoleArn.trim(),
+                external_id: externalId.trim() || undefined,
+              }
+            : {
+                access_key_id: accessKeyId.trim(),
+                secret_access_key: secretAccessKey,
+              };
         break;
       case 'gcp_pubsub':
         credentials = { credentials_json: credentialsJson };
@@ -1902,22 +1985,72 @@ function AddCredentialForm({
                   className="h-8 text-[12px] bg-card font-mono"
                 />
               </FieldRow>
-              <FieldRow label="Access key ID" required>
-                <Input
-                  value={accessKeyId}
-                  onChange={(e) => setAccessKeyId(e.target.value)}
-                  placeholder="AKIA…"
-                  className="h-8 text-[12px] bg-card font-mono"
-                />
+              <FieldRow label="Authentication">
+                <div className="flex gap-1.5">
+                  <AwsAuthModeButton
+                    mode="keys"
+                    label="Access key"
+                    active={awsAuthMode === 'keys'}
+                    onSelect={setAwsAuthMode}
+                  />
+                  <AwsAuthModeButton
+                    mode="role"
+                    label="Assume role"
+                    active={awsAuthMode === 'role'}
+                    onSelect={setAwsAuthMode}
+                  />
+                </div>
               </FieldRow>
-              <FieldRow label="Secret access key" required secret>
-                <SecretInput
-                  value={secretAccessKey}
-                  onChange={setSecretAccessKey}
-                  reveal={showAwsSecret}
-                  onToggleReveal={() => setShowAwsSecret((v) => !v)}
-                />
-              </FieldRow>
+              {awsAuthMode === 'role' ? (
+                <>
+                  <FieldRow label="Role ARN" required>
+                    <Input
+                      value={assumeRoleArn}
+                      onChange={(e) => setAssumeRoleArn(e.target.value)}
+                      placeholder="arn:aws:iam::123456789012:role/nano-ingest"
+                      className="h-8 text-[12px] bg-card font-mono"
+                    />
+                  </FieldRow>
+                  <FieldRow label="External ID">
+                    <div className="space-y-1">
+                      <Input
+                        value={externalId}
+                        readOnly
+                        className="h-8 text-[12px] bg-card font-mono text-muted-foreground"
+                      />
+                      <p className="text-[10.5px] text-muted-foreground leading-snug">
+                        Give this to the account owner — their role's trust policy must
+                        require it via <span className="font-mono">sts:ExternalId</span>.
+                        Generated per credential so it cannot be guessed.
+                      </p>
+                    </div>
+                  </FieldRow>
+                  <p className="text-[10.5px] text-muted-foreground leading-snug">
+                    Nothing long-lived is stored. This deployment's own identity (instance
+                    profile / IRSA) assumes the role, so the account owner never issues an
+                    access key and can revoke by deleting the role.
+                  </p>
+                </>
+              ) : (
+                <>
+  <FieldRow label="Access key ID" required>
+                  <Input
+                    value={accessKeyId}
+                    onChange={(e) => setAccessKeyId(e.target.value)}
+                    placeholder="AKIA…"
+                    className="h-8 text-[12px] bg-card font-mono"
+                  />
+                </FieldRow>
+                <FieldRow label="Secret access key" required secret>
+                  <SecretInput
+                    value={secretAccessKey}
+                    onChange={setSecretAccessKey}
+                    reveal={showAwsSecret}
+                    onToggleReveal={() => setShowAwsSecret((v) => !v)}
+                  />
+                </FieldRow>
+                </>
+              )}
             </div>
           )}
 
@@ -2075,6 +2208,14 @@ function RotateCredentialForm({
   const [accessKeyId, setAccessKeyId] = useState('');
   const [secretAccessKey, setSecretAccessKey] = useState('');
   const [showAwsSecret, setShowAwsSecret] = useState(false);
+  // NAN-2186: a rotation may also switch posture — a tenant that started on
+  // static keys and moved to a cross-account role rotates INTO role mode.
+  const [awsAuthMode, setAwsAuthMode] = useState<AwsAuthMode>('keys');
+  const [assumeRoleArn, setAssumeRoleArn] = useState('');
+  // Read-only by design: to change it, rotate the credential — the rotate
+  // form mints a fresh one, which is the operation you actually want if an
+  // ExternalId is ever exposed.
+  const [externalId] = useState(newExternalId);
   const [credentialsJson, setCredentialsJson] = useState('');
   const [saslMechanism, setSaslMechanism] = useState<string>('_none');
   const [saslUsername, setSaslUsername] = useState('');
@@ -2086,7 +2227,9 @@ function RotateCredentialForm({
 
   const isValid = (() => {
     if (cred.provider === 'aws_s3') {
-      return accessKeyId.trim() !== '' && secretAccessKey.trim() !== '';
+      return awsAuthMode === 'role'
+        ? assumeRoleArn.trim() !== ''
+        : accessKeyId.trim() !== '' && secretAccessKey.trim() !== '';
     }
     if (cred.provider === 'gcp_pubsub') return credentialsJson.trim() !== '';
     if (cred.provider === 'kafka') {
@@ -2102,10 +2245,16 @@ function RotateCredentialForm({
     let credentials: AwsS3Credentials | GcpPubSubCredentials | KafkaCredentials;
     switch (cred.provider) {
       case 'aws_s3':
-        credentials = {
-          access_key_id: accessKeyId.trim(),
-          secret_access_key: secretAccessKey,
-        };
+        credentials =
+          awsAuthMode === 'role'
+            ? {
+                assume_role_arn: assumeRoleArn.trim(),
+                external_id: externalId.trim() || undefined,
+              }
+            : {
+                access_key_id: accessKeyId.trim(),
+                secret_access_key: secretAccessKey,
+              };
         break;
       case 'gcp_pubsub':
         credentials = { credentials_json: credentialsJson };
@@ -2162,23 +2311,74 @@ function RotateCredentialForm({
 
           {cred.provider === 'aws_s3' && (
             <div className="space-y-2.5">
-              <FieldRow label="Access key ID" required>
-                <Input
-                  value={accessKeyId}
-                  onChange={(e) => setAccessKeyId(e.target.value)}
-                  placeholder="AKIA…"
-                  className="h-8 text-[12px] bg-card font-mono"
-                  autoFocus
-                />
+              <FieldRow label="Authentication">
+                <div className="flex gap-1.5">
+                  <AwsAuthModeButton
+                    mode="keys"
+                    label="Access key"
+                    active={awsAuthMode === 'keys'}
+                    onSelect={setAwsAuthMode}
+                  />
+                  <AwsAuthModeButton
+                    mode="role"
+                    label="Assume role"
+                    active={awsAuthMode === 'role'}
+                    onSelect={setAwsAuthMode}
+                  />
+                </div>
               </FieldRow>
-              <FieldRow label="Secret access key" required secret>
-                <SecretInput
-                  value={secretAccessKey}
-                  onChange={setSecretAccessKey}
-                  reveal={showAwsSecret}
-                  onToggleReveal={() => setShowAwsSecret((v) => !v)}
-                />
-              </FieldRow>
+              {awsAuthMode === 'role' ? (
+                <>
+                  <FieldRow label="Role ARN" required>
+                    <Input
+                      value={assumeRoleArn}
+                      onChange={(e) => setAssumeRoleArn(e.target.value)}
+                      placeholder="arn:aws:iam::123456789012:role/nano-ingest"
+                      autoFocus
+                      className="h-8 text-[12px] bg-card font-mono"
+                    />
+                  </FieldRow>
+                  <FieldRow label="External ID">
+                    <div className="space-y-1">
+                      <Input
+                        value={externalId}
+                        readOnly
+                        className="h-8 text-[12px] bg-card font-mono text-muted-foreground"
+                      />
+                      <p className="text-[10.5px] text-muted-foreground leading-snug">
+                        Give this to the account owner — their role's trust policy must
+                        require it via <span className="font-mono">sts:ExternalId</span>.
+                        Generated per credential so it cannot be guessed.
+                      </p>
+                    </div>
+                  </FieldRow>
+                  <p className="text-[10.5px] text-muted-foreground leading-snug">
+                    Nothing long-lived is stored. This deployment's own identity (instance
+                    profile / IRSA) assumes the role, so the account owner never issues an
+                    access key and can revoke by deleting the role.
+                  </p>
+                </>
+              ) : (
+                <>
+  <FieldRow label="Access key ID" required>
+                  <Input
+                    value={accessKeyId}
+                    onChange={(e) => setAccessKeyId(e.target.value)}
+                    placeholder="AKIA…"
+                    className="h-8 text-[12px] bg-card font-mono"
+                    autoFocus
+                  />
+                </FieldRow>
+                <FieldRow label="Secret access key" required secret>
+                  <SecretInput
+                    value={secretAccessKey}
+                    onChange={setSecretAccessKey}
+                    reveal={showAwsSecret}
+                    onToggleReveal={() => setShowAwsSecret((v) => !v)}
+                  />
+                </FieldRow>
+                </>
+              )}
             </div>
           )}
 

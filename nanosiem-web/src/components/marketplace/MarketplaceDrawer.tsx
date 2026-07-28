@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import {
   AlertTriangle, Check, CheckCircle, Code as CodeIcon, Copy, Download,
-  Eye, EyeOff, FileDown, Info, KeyRound, Loader2, Lock, RefreshCw, Save,
+  Eye, EyeOff, FileDown, Info, KeyRound, Loader2, Lock, Plug, RefreshCw, Save,
   Settings as SettingsIcon, Trash2, Zap,
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
@@ -21,12 +21,17 @@ import { useToast } from '@/hooks/use-toast';
 import { formatNumber, formatUTCCompact } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
 import { isDataFeed, isIpInfoEntry } from '@/lib/api/marketplace';
+import { ConnectionsTab } from './ConnectionsTab';
 import { MonoSwatch, getCategoryTone } from './MonoSwatch';
 import { StateBadge, getIntegrationState, IpInfoCredit } from './IntegrationCard';
 
 const TABS = [
   { id: 'about',  label: 'About',       icon: Info },
   { id: 'config', label: 'Config',      icon: SettingsIcon },
+  // NAN-2192: collectors only. A marketplace entry is 1:1 with its config, but
+  // a collector is 1:N — one integration, many vendor tenants — so it needs a
+  // place to manage connections. Filtered out for enrichments, which have none.
+  { id: 'connections', label: 'Connections', icon: Plug },
   { id: 'code',   label: 'Code',        icon: CodeIcon },
   { id: 'perms',  label: 'Permissions', icon: Lock },
 ] as const;
@@ -325,7 +330,10 @@ function DrawerInner(props: DrawerInnerProps) {
 
       {/* Tabs */}
       <div className="border-b border-border flex items-center px-2 bg-muted/20">
-        {TABS.filter(t => t.id !== 'code' || canViewCode).map(t => {
+        {TABS
+          .filter(t => t.id !== 'code' || canViewCode)
+          .filter(t => t.id !== 'connections' || entry.execution_backend === 'collector')
+          .map(t => {
           const Tg = t.icon;
           return (
             <button
@@ -383,6 +391,9 @@ function DrawerInner(props: DrawerInnerProps) {
             handleUpdate={handleUpdate}
             updating={updating}
           />
+        )}
+        {tab === 'connections' && entry.execution_backend === 'collector' && (
+          <ConnectionsTab entry={entry} />
         )}
         {tab === 'code' && canViewCode && (
           <CodeTab entry={entry} handleExport={handleExport} exporting={exporting} />

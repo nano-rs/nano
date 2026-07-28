@@ -1487,6 +1487,28 @@ pub fn create_router(state: AppState) -> Router {
             );
     }
 
+    // Integration collectors (NAN-2189). Enterprise only — the sandbox runtime
+    // and scheduler that back these live in nanosiem-enterprise.
+    #[cfg(feature = "enterprise")]
+    {
+        app = app
+            .route(
+                "/api/integrations/instances",
+                get(handlers::integrations::list_instances)
+                    .post(handlers::integrations::create_instance),
+            )
+            .route(
+                "/api/integrations/instances/{id}",
+                get(handlers::integrations::get_instance)
+                    .put(handlers::integrations::update_instance)
+                    .delete(handlers::integrations::delete_instance),
+            )
+            .route(
+                "/api/integrations/instances/{id}/run",
+                post(handlers::integrations::trigger_run),
+            );
+    }
+
     app = app
         // Enrichment Marketplace (unified catalog)
         .route(

@@ -95,6 +95,82 @@ const MIGRATION_153: &str = include_str!(concat!(
     "/../clickhouse/153_prevalence_new_artifact_default.sql"
 ));
 
+/// NAN-1732 P2-D phase 2 cut the pushdown dicts' SOURCE over from
+/// `*_prevalence_summary` to the pre-finalized `*_prevalence_final` tables — a
+/// point lookup via `argMax(col, version)` instead of a per-miss `uniqMerge`
+/// fan-out across shards (254 GiB / 16.1B rows / 3h on Saturn, slow enough that
+/// batches hit the 6000ms dict-source timeout and fell back to the 9999
+/// default, returning genuinely rare artifacts as common — NAN-1761 #2).
+///
+/// This SUPERSEDES migration 153 as the canonical body for `PUSHDOWN_DICTS`.
+/// 153 remains immutable history, exactly as 133 does for the staged dicts.
+/// The guard compared init.sql against 153 and never learned about 162, so it
+/// reported drift on a pair that had legitimately diverged months earlier
+/// (NAN-2197).
+const MIGRATION_162: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../clickhouse/162_prevalence_dicts_read_final.sql"
+));
+
+/// NAN-1732 P2-C deduplicated the enrichment refresh MVs: the SELECT now wraps
+/// its source in an `argMax(col, version) GROUP BY namespace, …` subquery so a
+/// re-ingested key does not fan out into duplicate staging rows.
+///
+/// That rewrite landed in `clickhouse/init.sql` FIRST — fresh installs get it
+/// from the `CREATE MATERIALIZED VIEW IF NOT EXISTS` — and migration 161 exists
+/// solely to apply the same body to EXISTING installs, where the `IF NOT
+/// EXISTS` is a no-op. It therefore uses `ALTER TABLE <mv> MODIFY QUERY`, not
+/// `CREATE`, so the CREATE-statement extractor never saw it.
+///
+/// Net effect: init.sql legitimately diverged from migration 133 for these
+/// three MVs, and the guard reported it as drift (NAN-2197). Their canonical
+/// body is 161's.
+const MIGRATION_161: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../clickhouse/161_enrichment_dict_dedup_existing_installs.sql"
+));
+
+/// Refresh MVs whose canonical body moved off migration 133 to migration 161.
+const MVS_REDEFINED_BY_161: &[&str] = &[
+    "nanosiem.custom_enrichment_dict_refresh",
+    "nanosiem.custom_ioc_enrichment_dict_refresh",
+    "nanosiem.ioc_enrichment_dict_refresh",
+];
+
+/// The SELECT half of an MV body. A CREATE-extracted body reads
+/// `<name> TO <target> AS SELECT …` while `MODIFY QUERY` yields the bare
+/// SELECT, so only this part is comparable across the two forms.
+fn select_body(mv_body: &str) -> String {
+    match mv_body.find(" AS SELECT ") {
+        Some(i) => mv_body[i + " AS ".len()..].to_string(),
+        None => mv_body.to_string(),
+    }
+}
+
+/// Extract `ALTER TABLE <name> MODIFY QUERY <select>` bodies, keyed by MV name.
+///
+/// A second extractor is needed because `create_mv_statements` only understands
+/// `CREATE MATERIALIZED VIEW`. Note `MODIFY QUERY` has no `AS` before the
+/// SELECT, unlike CREATE — a difference that has bitten before.
+fn modify_query_statements(sql: &str) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for chunk in sql.split("ALTER TABLE ").skip(1) {
+        let Some((name, rest)) = chunk.split_once("MODIFY QUERY") else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() || name.contains(char::is_whitespace) {
+            continue;
+        }
+        let body = rest.split(';').next().unwrap_or("").trim();
+        if body.is_empty() {
+            continue;
+        }
+        out.insert(name.to_string(), normalize(body));
+    }
+    out
+}
+
 /// The first numbered migration written under the NAN-1404 rule. Migrations
 /// before this predate it and are immutable (editing them trips
 /// ChecksumMismatch), so the guard only scans >= this version.
@@ -266,6 +342,76 @@ fn alter_refresh_intervals(sql: &str) -> BTreeMap<String, String> {
 /// Extract the SOURCE QUERY string literal from a normalized dictionary
 /// statement (handles the `''` escape CH uses inside `'...'` literals).
 /// Returns None when the dict has no `QUERY '...'` source.
+/// The dictionary's declared `PRIMARY KEY` column.
+fn dict_primary_key(stmt: &str) -> Option<String> {
+    let start = stmt.find("PRIMARY KEY ")? + "PRIMARY KEY ".len();
+    let rest = &stmt[start..];
+    let end = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    let key = rest[..end].trim();
+    (!key.is_empty()).then(|| key.to_string())
+}
+
+/// True when a CACHE dict's aggregating source is bounded by KEY PUSHDOWN
+/// rather than by explicit memory settings (NAN-2197).
+///
+/// ClickHouse loads a cache dict by WRAPPING the source query:
+///
+///   SELECT * FROM (<source query>) AS subquery WHERE (`key`) IN ((…))
+///
+/// When the filtered column is also the GROUP BY key, the optimizer pushes that
+/// predicate through the aggregation into the primary-key scan, so the
+/// aggregation only ever sees the requested keys' rows — bounded by BATCH SIZE,
+/// not table size, and no memory settings are needed.
+///
+/// Measured against a live ClickHouse (3.5M-row `ip_prevalence_final`):
+///   - one present key  -> 24,779 rows read, 326 KiB
+///   - absent keys      -> 0 rows read
+/// Reading ZERO for an absent key is the proof: an unbounded inner aggregation
+/// would have to scan the whole table regardless of the outer filter. For
+/// reference the settings migration 153 carried bounded memory at 512 MiB —
+/// roughly 1600x what the query actually uses.
+///
+/// This is why migration 162 dropped the settings, and it is the property worth
+/// asserting: the settings were never what made this safe. If a future source
+/// query groups by something other than the dict key, pushdown stops and the
+/// aggregation really does become unbounded — which this catches, and a
+/// settings-presence check would not.
+fn is_key_pushdown_bounded(stmt: &str, query: &str) -> bool {
+    // ONLY a CACHE layout loads per-key batches with a `WHERE key IN (…)`
+    // predicate. HASHED / COMPLEX_KEY_HASHED / IP_TRIE load the ENTIRE source
+    // in one query with no predicate at all, so grouping by the key bounds
+    // nothing and the memory settings are the only protection. This repo has
+    // all three of those layouts (migration 133), so without this check a
+    // future HASHED dict grouping by its key would be silently exempted —
+    // exactly the NAN-1404 OOM the guard exists to prevent.
+    if !stmt.to_uppercase().contains("_CACHE") && !stmt.to_uppercase().contains("LAYOUT(CACHE") {
+        return false;
+    }
+    let Some(key) = dict_primary_key(stmt) else {
+        return false;
+    };
+    let upper = query.to_uppercase();
+    let Some(idx) = upper.find("GROUP BY") else {
+        return false;
+    };
+    // The grouping list must be EXACTLY the dict key. Grouping by additional
+    // columns emits multiple rows per key, breaking the lookup contract, and
+    // means the filter no longer covers the whole grouping set.
+    //
+    // Read to the end of the clause rather than to the first non-identifier
+    // character: stopping at the comma made `GROUP BY file_hash, version` look
+    // identical to `GROUP BY file_hash` and wrongly exempted it.
+    let after = &query[idx + "GROUP BY".len()..];
+    let end = ["SETTINGS", "ORDER BY", "HAVING", "LIMIT", "UNION"]
+        .iter()
+        .filter_map(|kw| after.to_uppercase().find(kw))
+        .min()
+        .unwrap_or(after.len());
+    after[..end].trim() == key
+}
+
 fn source_query(stmt: &str) -> Option<String> {
     let start = stmt.find("QUERY '")? + "QUERY '".len();
     let bytes = stmt.as_bytes();
@@ -325,8 +471,20 @@ fn check_memory_bounds(label: &str, sql: &str) -> usize {
             continue;
         };
         if aggregates(&query) {
-            assert_query_memory_bounded(label, name, &query);
+            // Count it either way: this counter exists to prove EXTRACTION
+            // still works ("found no aggregating queries — extraction broke?"),
+            // and an exempted query is just as much evidence of that as an
+            // asserted one. Not counting exemptions made that sanity check fire
+            // once every dict in a file became pushdown-bounded.
             checked += 1;
+            if is_key_pushdown_bounded(stmt, &query) {
+                // Bounded by the key predicate the cache dict pushes in; see
+                // `is_key_pushdown_bounded` for the measurements. Requiring
+                // memory settings here would fail migration 162 for removing
+                // bounds that were never doing the work.
+                continue;
+            }
+            assert_query_memory_bounded(label, name, &query);
         }
     }
     for (name, stmt) in &create_mv_statements(sql) {
@@ -400,6 +558,7 @@ fn migration_133_matches_init_definitions() {
     let mig136_dicts = create_dictionary_statements(MIGRATION_136);
     let mig148_dicts = create_dictionary_statements(MIGRATION_148);
     let mig153_dicts = create_dictionary_statements(MIGRATION_153);
+    let mig162_dicts = create_dictionary_statements(MIGRATION_162);
 
     // Migration 136 must redefine exactly the dicts it claims to (catches an
     // accidental extra/missing CREATE OR REPLACE).
@@ -443,30 +602,44 @@ fn migration_133_matches_init_definitions() {
         expected_pushdown,
         "migration 153 redefines a different dict set than PUSHDOWN_DICTS"
     );
+    // Migration 162 must redefine exactly the pushdown set — a partial cutover
+    // would leave some dicts on `summary` and some on `final`.
+    assert_eq!(
+        mig162_dicts.keys().map(String::as_str).collect::<Vec<_>>(),
+        expected_pushdown,
+        "migration 162 redefines a different dict set than PUSHDOWN_DICTS"
+    );
     for name in PUSHDOWN_DICTS {
-        let canonical = mig153_dicts.get(*name);
+        let canonical = mig162_dicts.get(*name);
         assert_eq!(
             canonical,
             udm_dicts.get(*name),
-            "{name} differs between migration 153 and clickhouse/init.sql"
+            "{name} differs between migration 162 and clickhouse/init.sql"
         );
         assert_eq!(
             canonical,
             ocsf_dicts.get(*name),
-            "{name} differs between migration 153 and clickhouse/ocsf/init.sql"
+            "{name} differs between migration 162 and clickhouse/ocsf/init.sql"
         );
-        // NAN-1440: pushdown sources read the *_prevalence_summary tables
-        // directly — never a staging table (the full-keyspace staging rewrite
-        // OOMed Saturn's boot-gating migrator).
-        let query = source_query(canonical.expect("pushdown dict in 153"))
+        let query = source_query(canonical.expect("pushdown dict in 162"))
             .expect("pushdown dict has a QUERY source");
-        assert!(
-            query.contains("_prevalence_summary"),
-            "{name} must aggregate *_prevalence_summary directly (key pushdown)"
-        );
+        // NAN-1440, the invariant that actually matters: a pushdown source must
+        // NEVER read a staging table. The full-keyspace staging rewrite OOMed
+        // Saturn's boot-gating migrator, which is why these dicts are exempt
+        // from the staged trio in the first place.
+        //
+        // This used to also assert the source read `*_prevalence_summary`,
+        // which conflated the invariant with the table that happened to satisfy
+        // it. Migration 162 moved to `*_prevalence_final` — still a direct
+        // point lookup, still no staging — and the assertion failed on a
+        // legitimate change (NAN-2197). Assert the property, not the table.
         assert!(
             !query.contains("_dict_staging"),
             "{name} must NOT read a staging table (NAN-1440)"
+        );
+        assert!(
+            query.contains("_prevalence_final") || query.contains("_prevalence_summary"),
+            "{name} must read a prevalence table directly (key pushdown), got: {query}"
         );
     }
     assert_eq!(
@@ -520,11 +693,27 @@ fn migration_133_matches_init_definitions() {
         let udm_mv = udm_mvs
             .get(&refresh)
             .expect("refresh MV in clickhouse/init.sql");
-        assert_eq!(
-            strip_refresh(mig_mv),
-            strip_refresh(udm_mv),
-            "{refresh} body (excluding REFRESH cadence) differs between migration 133 and clickhouse/init.sql"
-        );
+        if MVS_REDEFINED_BY_161.contains(&refresh.as_str()) {
+            // NAN-2197: the dedup rewrite landed in init.sql first and reached
+            // existing installs via migration 161's ALTER … MODIFY QUERY, so
+            // 133 is no longer canonical for these three. Compare the SELECT
+            // halves — the only part the two statement forms share.
+            let mig161 = modify_query_statements(MIGRATION_161);
+            let canonical = mig161.get(&refresh).unwrap_or_else(|| {
+                panic!("{refresh} is listed in MVS_REDEFINED_BY_161 but migration 161 does not MODIFY QUERY it")
+            });
+            assert_eq!(
+                select_body(canonical),
+                select_body(&strip_refresh(udm_mv)),
+                "{refresh} body differs between migration 161 and clickhouse/init.sql"
+            );
+        } else {
+            assert_eq!(
+                strip_refresh(mig_mv),
+                strip_refresh(udm_mv),
+                "{refresh} body (excluding REFRESH cadence) differs between migration 133 and clickhouse/init.sql"
+            );
+        }
         // init.sql's cadence must be exactly what migration 137 recadences to,
         // so fresh bootstraps and upgraded tenants converge on the same interval.
         assert_eq!(

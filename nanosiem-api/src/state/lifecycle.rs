@@ -276,6 +276,13 @@ impl AppState {
             {
                 handles.push(self.start_custom_enrichment_scheduler());
                 tracing::info!("Custom enrichment scheduler started (leader-only)");
+
+                // Collector scheduler (NAN-2189) — pulls SaaS events into the
+                // ingest lane. Sits under the egress gate deliberately: a
+                // collector's whole job is reaching a vendor API, so it has no
+                // meaning in an air-gapped install.
+                handles.push(self.start_collector_scheduler());
+                tracing::info!("Collector scheduler started (leader-only)");
             }
 
             // Identity provider sync scheduler

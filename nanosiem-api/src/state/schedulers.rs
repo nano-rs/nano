@@ -16,6 +16,8 @@ use nanosiem_core::{DistributedDetectionScheduler, DistributedSchedulerConfig};
 #[cfg(feature = "enterprise")]
 use nanosiem_enterprise::custom_enrichment::scheduler::CustomEnrichmentScheduler;
 #[cfg(feature = "enterprise")]
+use nanosiem_enterprise::integrations::CollectorScheduler;
+#[cfg(feature = "enterprise")]
 use nanosiem_enterprise::melod::ModelCatalogScheduler;
 use std::sync::Arc;
 
@@ -340,6 +342,27 @@ impl AppState {
             .and_then(|v| v.parse().ok())
             .unwrap_or(60); // Check every 60 seconds
         scheduler.start_scheduler(poll_interval)
+    }
+
+    /// Start the collector scheduler (NAN-2189) — pulls events from SaaS APIs
+    /// on their cron schedules. Enterprise only, and egress-gated by the caller
+    /// since collectors are unsupported in air-gapped deployments.
+    ///
+    /// Leadership keeps replicas from stampeding, but the real single-flight
+    /// guard is the per-instance database lease: iterator APIs lose events when
+    /// the same cursor is consumed twice, and a leader handover mid-run would
+    /// otherwise do exactly that.
+    #[cfg(feature = "enterprise")]
+    pub fn start_collector_scheduler(&self) -> tokio::task::JoinHandle<()> {
+        let scheduler = Arc::new(CollectorScheduler::new(
+            self.pool.clone(),
+            Arc::new(EncryptionService::from_env()),
+        ));
+        let poll_interval: u64 = std::env::var("COLLECTOR_POLL_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
+        scheduler.start(poll_interval)
     }
 
     /// Start the identity sync scheduler

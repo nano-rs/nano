@@ -345,6 +345,19 @@ pub const LOG_SOURCE_REVERTED: &str = "log_source_reverted";
 pub const LOG_SOURCE_DEPLOY_ALL: &str = "log_source_deploy_all";
 
 // =============================================================================
+// Integration Collector Actions (NAN-2189)
+// =============================================================================
+
+/// A collector instance (one connection to a vendor tenant) was created
+pub const INTEGRATION_INSTANCE_CREATED: &str = "integration_instance_created";
+/// A collector instance's config, credentials or stream selection changed
+pub const INTEGRATION_INSTANCE_UPDATED: &str = "integration_instance_updated";
+/// A collector instance was deleted, discarding its cursors
+pub const INTEGRATION_INSTANCE_DELETED: &str = "integration_instance_deleted";
+/// A collector run was triggered by hand rather than by the scheduler
+pub const INTEGRATION_RUN_TRIGGERED: &str = "integration_run_triggered";
+
+// =============================================================================
 // Source Config Actions
 // =============================================================================
 

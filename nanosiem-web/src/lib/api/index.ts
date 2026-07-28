@@ -46,6 +46,7 @@ import { DetectionCodeTargetsApi } from './detection-code-targets';
 import { ParserRepositoriesApi } from './parser-repositories';
 import { WebhooksApi } from './webhooks';
 import { MarketplaceApi } from './marketplace';
+import { IntegrationsApi } from './integrations';
 import { GdprApi } from './gdpr';
 import { TierApi } from './tier';
 import { IpAllowlistApi } from './ip-allowlist';
@@ -79,6 +80,12 @@ export type {
   CreateMarketplaceRepoRequest, UpdateMarketplaceRepoRequest, RepoBrowseEntry,
   CatalogListResponse, CredentialFieldDef,
 } from './marketplace';
+export type {
+  IntegrationInstance, StreamStatus, CreateInstanceRequest as CreateIntegrationInstanceRequest,
+  UpdateInstanceRequest as UpdateIntegrationInstanceRequest, ListInstancesResponse,
+  TriggerRunResponse, CollectorStreamDef, CollectorConfigFieldDef, StreamProvisionReport,
+} from './integrations';
+export { collectorManifest } from './integrations';
 
 /**
  * Cache transparency (NAN-1595). Parsed from the `x-nano-cache` / `x-nano-cache-age`
@@ -166,6 +173,7 @@ class ApiClient {
   private _parserRepositories: ParserRepositoriesApi;
   private _webhooks: WebhooksApi;
   private _marketplace: MarketplaceApi;
+  private _integrations: IntegrationsApi;
   private _gdpr: GdprApi;
   private _tier: TierApi;
   private _ipAllowlist: IpAllowlistApi;
@@ -235,6 +243,7 @@ class ApiClient {
     this._parserRepositories = new ParserRepositoriesApi(this.request.bind(this));
     this._webhooks = new WebhooksApi(this.request.bind(this));
     this._marketplace = new MarketplaceApi(this.request.bind(this));
+    this._integrations = new IntegrationsApi(this.request.bind(this));
     this._gdpr = new GdprApi(this.request.bind(this));
     this._tier = new TierApi(this.request.bind(this));
     this._ipAllowlist = new IpAllowlistApi(this.request.bind(this));
@@ -284,6 +293,12 @@ class ApiClient {
 
   get marketplace(): MarketplaceApi {
     return this._marketplace;
+  }
+
+  /** Integration collectors (NAN-2189) — instances of collector-category
+   *  marketplace entries. Enterprise only; the routes 404 on open builds. */
+  get integrations(): IntegrationsApi {
+    return this._integrations;
   }
 
   get tier(): TierApi {

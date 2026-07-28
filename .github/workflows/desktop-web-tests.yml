@@ -1,0 +1,127 @@
+name: desktop + web tests
+
+# NAN-2198 — the merge gate ran NOTHING for either of these packages.
+#
+# `nanosiem-web` has a dozen `npm run test:*` suites and `nano-desktop/src-tauri`
+# has 111 Rust tests. No workflow invoked any of them: the only web-touching
+# jobs were the dead-links gate, the image build, and `desktop-release.yml`,
+# which is `workflow_dispatch`-only. The main `test` job covers the root cargo
+# workspace, and `src-tauri` is deliberately its OWN workspace — so it was
+# outside that too.
+#
+# Three bugs shipped through that gap in a single day:
+#   - NAN-2185  the desktop terminal could not spawn a shell on Windows at all;
+#               a `#[cfg(windows)]` branch nothing compiled, let alone ran.
+#   - NAN-2191  UI text painted in a surface colour, invisible in both themes.
+#               Valid Tailwind, so typecheck and build both passed.
+#   - NAN-2193  routing presets naming fields the collector never emits.
+#
+# Each had (or now has) a test that catches it. None of those tests ran anywhere
+# except on a developer's laptop, which is the same as not existing.
+
+on:
+  pull_request:
+    paths:
+      - "nano-desktop/**"
+      - "nanosiem-web/**"
+      - ".github/workflows/desktop-web-tests.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: desktop-web-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    # Self-hosted only (repo rule — never ubuntu-latest).
+    runs-on: [self-hosted, X64]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install deps
+        working-directory: nanosiem-web
+        run: npm ci
+
+      # Typecheck is not a substitute for the suites below — NAN-2191 shipped
+      # invisible text through a clean `tsc`.
+      - name: Typecheck
+        working-directory: nanosiem-web
+        run: npm run typecheck
+
+      # Run every `test:*` suite the package declares, discovered from
+      # package.json rather than listed here, so a newly added suite is picked
+      # up automatically instead of silently never running — which is the exact
+      # failure this workflow exists to end.
+      #
+      # `test:deadlinks` and `test:e2e:404` are excluded: the first already has
+      # its own required gate (frontend dead-links) and the second needs a live
+      # stack with auth.
+      - name: Run web test suites
+        working-directory: nanosiem-web
+        run: |
+          set -euo pipefail
+          suites=$(node -e "
+            const s = require('./package.json').scripts;
+            const skip = new Set(['test:deadlinks', 'test:e2e:404']);
+            console.log(Object.keys(s).filter(k => k.startsWith('test:') && !skip.has(k)).join(' '));
+          ")
+          echo "discovered suites: $suites"
+          [ -n "$suites" ] || { echo 'no test:* scripts found — did they get renamed?'; exit 1; }
+          failed=""
+          for s in $suites; do
+            echo "::group::npm run $s"
+            npm run --silent "$s" || failed="$failed $s"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "FAILED:$failed"
+            exit 1
+          fi
+
+  desktop:
+    # `nano-desktop/src-tauri` is its own cargo workspace, excluded from the
+    # root one, so the main `test` job never saw it.
+    #
+    # GitHub-hosted macOS rather than the self-hosted Linux runners, for the
+    # same reason `desktop-release.yml` uses it: Tauri needs a system webview,
+    # and macOS already has one. On Linux this job would need
+    # libwebkit2gtk/libsoup/libjavascriptcoregtk installed — and the repo has
+    # exactly one precedent for `apt-get` (sync-mirror), which does it inside
+    # `container: rust:1-bookworm`, not on the bare runner. Installing on the
+    # shared self-hosted box would assume passwordless sudo and pollute it on
+    # every run; using a container instead trades that for the root-owned
+    # workspace files `build-and-push` deliberately avoids. macOS sidesteps
+    # both — verified: the 111 tests run there with zero extra packages.
+    #
+    # Path-filtered to nano-desktop, so the pricier runner is only used when
+    # that package actually changes.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: nano-desktop/src-tauri
+
+      # NOT `--locked`: `.gitignore` blanket-ignores `Cargo.lock` and the
+      # desktop lockfile was never force-added, unlike the root workspace's.
+      # So `src-tauri` resolves dependencies fresh on every build and this job
+      # cannot pin them. Worth fixing separately — a shipped installer built
+      # from a floating dependency set is not reproducible — but committing the
+      # lockfile is its own decision, so it does not belong in this workflow.
+      - name: Run desktop tests
+        working-directory: nano-desktop/src-tauri
+        run: cargo test

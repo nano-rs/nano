@@ -2646,3 +2646,715 @@
         )
         .is_ok());
     }
+
+// ---------------------------------------------------------------------------
+// NAN-2186: AWS auth postures. `assume_role` used to be emitted ONLY inside the
+// both-static-keys branch, so "ambient identity assumes a role in another
+// account" — the exact posture a customer who refuses to mint access keys asks
+// for — was unreachable. These pin all four combinations.
+// ---------------------------------------------------------------------------
+
+/// Parse a generated source and hand back its `auth` table, if any.
+fn auth_of(out: &str) -> Option<toml::Value> {
+    let parsed: toml::Value = toml::from_str(out).expect("generated config must parse");
+    parsed["sources"]["test"].get("auth").cloned()
+}
+
+fn s3_conn() -> serde_json::Value {
+    serde_json::json!({
+        "region": "ap-south-1",
+        "sqs_queue_url": "https://sqs.ap-south-1.amazonaws.com/123456789012/logs",
+    })
+}
+
+#[test]
+fn aws_s3_no_credential_emits_no_auth_block() {
+    // The keyless path: Vector falls through to the SDK provider chain
+    // (instance profile / IRSA / task role). Emitting an empty or partial auth
+    // block here would BREAK that, so absence is load-bearing.
+    let out = SourceConfigService::generate_aws_s3_source("test", &s3_conn(), None);
+    assert!(auth_of(&out).is_none(), "expected no auth block:\n{out}");
+}
+
+#[test]
+fn aws_s3_static_keys_only_are_unchanged() {
+    let creds = serde_json::json!({
+        "access_key_id": "AKIAEXAMPLE",
+        "secret_access_key": "secret",
+    });
+    let out = SourceConfigService::generate_aws_s3_source("test", &s3_conn(), Some(&creds));
+    let auth = auth_of(&out).expect("auth block");
+    assert_eq!(auth["access_key_id"].as_str().unwrap(), "AKIAEXAMPLE");
+    assert_eq!(auth["secret_access_key"].as_str().unwrap(), "secret");
+    assert_eq!(auth["region"].as_str().unwrap(), "ap-south-1");
+    assert!(auth.get("assume_role").is_none());
+    assert!(auth.get("external_id").is_none());
+}
+
+#[test]
+fn aws_s3_role_only_emits_assume_role_without_any_key_fields() {
+    // THE regression this issue exists for.
+    let creds = serde_json::json!({
+        "assume_role_arn": "arn:aws:iam::210987654321:role/nano-ingest",
+        "external_id": "tenant-abc-123",
+    });
+    let out = SourceConfigService::generate_aws_s3_source("test", &s3_conn(), Some(&creds));
+    let auth = auth_of(&out).expect("role-only credential must still emit auth");
+    assert_eq!(
+        auth["assume_role"].as_str().unwrap(),
+        "arn:aws:iam::210987654321:role/nano-ingest"
+    );
+    assert_eq!(auth["external_id"].as_str().unwrap(), "tenant-abc-123");
+    assert_eq!(auth["region"].as_str().unwrap(), "ap-south-1");
+    assert!(
+        auth.get("access_key_id").is_none() && auth.get("secret_access_key").is_none(),
+        "no static key fields may appear for a role-only credential:\n{out}"
+    );
+}
+
+#[test]
+fn aws_s3_static_keys_still_chain_into_a_role() {
+    let creds = serde_json::json!({
+        "access_key_id": "AKIAEXAMPLE",
+        "secret_access_key": "secret",
+        "assume_role_arn": "arn:aws:iam::210987654321:role/nano-ingest",
+    });
+    let out = SourceConfigService::generate_aws_s3_source("test", &s3_conn(), Some(&creds));
+    let auth = auth_of(&out).expect("auth block");
+    assert_eq!(auth["access_key_id"].as_str().unwrap(), "AKIAEXAMPLE");
+    assert_eq!(
+        auth["assume_role"].as_str().unwrap(),
+        "arn:aws:iam::210987654321:role/nano-ingest"
+    );
+}
+
+#[test]
+fn aws_s3_external_id_without_a_role_is_dropped() {
+    // `external_id` is only meaningful as a condition on sts:AssumeRole.
+    // Emitting it alone would be config noise Vector ignores.
+    let creds = serde_json::json!({
+        "access_key_id": "AKIAEXAMPLE",
+        "secret_access_key": "secret",
+        "external_id": "orphaned",
+    });
+    let out = SourceConfigService::generate_aws_s3_source("test", &s3_conn(), Some(&creds));
+    let auth = auth_of(&out).expect("auth block");
+    assert!(auth.get("external_id").is_none(), "{out}");
+}
+
+#[test]
+fn aws_s3_half_a_key_pair_is_treated_as_absent() {
+    // A key id with no secret cannot authenticate. Emitting it produces a
+    // config that fails at runtime; falling through to ambient identity at
+    // least has a chance of working and matches the "no credential" posture.
+    for creds in [
+        serde_json::json!({ "access_key_id": "AKIAEXAMPLE" }),
+        serde_json::json!({ "secret_access_key": "secret" }),
+    ] {
+        let out = SourceConfigService::generate_aws_s3_source("test", &s3_conn(), Some(&creds));
+        assert!(auth_of(&out).is_none(), "half a key pair must not emit auth:\n{out}");
+    }
+}
+
+#[test]
+fn aws_s3_whitespace_only_credential_fields_are_treated_as_absent() {
+    let creds = serde_json::json!({
+        "access_key_id": "   ",
+        "secret_access_key": "\t",
+        "assume_role_arn": " ",
+    });
+    let out = SourceConfigService::generate_aws_s3_source("test", &s3_conn(), Some(&creds));
+    assert!(auth_of(&out).is_none(), "{out}");
+}
+
+#[test]
+fn aws_s3_role_arn_cannot_inject_toml() {
+    let payload = "arn:aws:iam::1:role/x\"\n[transforms.evil]\nsource = \"\"";
+    let creds = serde_json::json!({ "assume_role_arn": payload });
+    let out = SourceConfigService::generate_aws_s3_source("test", &s3_conn(), Some(&creds));
+    let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+    assert!(!parsed_has_unexpected_top_level_tables(&parsed), "{out}");
+    assert_eq!(
+        parsed["sources"]["test"]["auth"]["assume_role"].as_str().unwrap(),
+        payload,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// NAN-2188: SQS poll interval and S3 client concurrency are operator-tunable.
+// `poll_secs` was hard-coded at 15 and `client_concurrency` was unreachable,
+// which is a sizing-headroom gap that only bites on large feeds — exactly
+// where it hurts. The default path must stay byte-identical.
+// ---------------------------------------------------------------------------
+
+fn s3_tuning_conn(extra: serde_json::Value) -> serde_json::Value {
+    let mut conn = serde_json::json!({
+        "region": "ap-south-1",
+        "sqs_queue_url": "https://sqs.ap-south-1.amazonaws.com/123456789012/logs",
+    });
+    if let (Some(base), Some(add)) = (conn.as_object_mut(), extra.as_object()) {
+        for (k, v) in add {
+            base.insert(k.clone(), v.clone());
+        }
+    }
+    conn
+}
+
+#[test]
+fn s3_tuning_absent_is_byte_identical_to_the_old_hard_coded_output() {
+    // The regression that matters most: every existing source config must emit
+    // exactly what it emitted before this change.
+    let out = SourceConfigService::generate_aws_s3_source(
+        "test",
+        &s3_tuning_conn(serde_json::json!({})),
+        None,
+    );
+    let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+    let source = &parsed["sources"]["test"];
+    assert_eq!(source["sqs"]["poll_secs"].as_integer(), Some(15));
+    assert!(
+        source.get("client_concurrency").is_none(),
+        "concurrency must be omitted so Vector's own default applies:\n{out}"
+    );
+}
+
+#[test]
+fn s3_tuning_values_are_emitted_when_set() {
+    let out = SourceConfigService::generate_aws_s3_source(
+        "test",
+        &s3_tuning_conn(serde_json::json!({ "poll_secs": 2, "client_concurrency": 16 })),
+        None,
+    );
+    let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+    let source = &parsed["sources"]["test"];
+    assert_eq!(source["sqs"]["poll_secs"].as_integer(), Some(2));
+    assert_eq!(source["client_concurrency"].as_integer(), Some(16));
+}
+
+#[test]
+fn s3_tuning_junk_values_fall_back_rather_than_emitting_broken_toml() {
+    // Belt-and-braces read side: validation rejects these at write time, but
+    // connection configs predate the validator and other paths can write them.
+    for junk in [
+        serde_json::json!({ "poll_secs": 0 }),
+        serde_json::json!({ "poll_secs": -5 }),
+        serde_json::json!({ "poll_secs": "fifteen" }),
+        serde_json::json!({ "poll_secs": null }),
+        serde_json::json!({ "poll_secs": 999_999 }),
+    ] {
+        let out =
+            SourceConfigService::generate_aws_s3_source("test", &s3_tuning_conn(junk.clone()), None);
+        let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+        assert_eq!(
+            parsed["sources"]["test"]["sqs"]["poll_secs"].as_integer(),
+            Some(15),
+            "junk {junk} should fall back to the default, got:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn s3_tuning_junk_concurrency_is_omitted_not_emitted_as_zero() {
+    for junk in [
+        serde_json::json!({ "client_concurrency": 0 }),
+        serde_json::json!({ "client_concurrency": -1 }),
+        serde_json::json!({ "client_concurrency": "many" }),
+    ] {
+        let out =
+            SourceConfigService::generate_aws_s3_source("test", &s3_tuning_conn(junk.clone()), None);
+        let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+        assert!(
+            parsed["sources"]["test"].get("client_concurrency").is_none(),
+            "junk {junk} must omit the key entirely, got:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn s3_tuning_validation_rejects_out_of_range_values() {
+    // A silently-ignored knob is worse than a rejected one — the operator
+    // believes they changed the ingest cadence and nothing says otherwise.
+    for bad in [
+        serde_json::json!({ "poll_secs": 0 }),
+        serde_json::json!({ "poll_secs": -1 }),
+        serde_json::json!({ "poll_secs": "15" }),
+        serde_json::json!({ "client_concurrency": 0 }),
+        serde_json::json!({ "client_concurrency": 100_000 }),
+    ] {
+        let conn = s3_tuning_conn(bad.clone());
+        assert!(
+            SourceConfigService::validate_aws_s3_conn(&conn).is_err(),
+            "expected {bad} to be rejected at validation",
+        );
+    }
+}
+
+#[test]
+fn s3_tuning_validation_accepts_absent_null_and_sane_values() {
+    for ok in [
+        serde_json::json!({}),
+        serde_json::json!({ "poll_secs": null, "client_concurrency": null }),
+        serde_json::json!({ "poll_secs": 1 }),
+        serde_json::json!({ "poll_secs": 15, "client_concurrency": 32 }),
+        serde_json::json!({ "client_concurrency": 1 }),
+    ] {
+        let conn = s3_tuning_conn(ok.clone());
+        assert!(
+            SourceConfigService::validate_aws_s3_conn(&conn).is_ok(),
+            "expected {ok} to validate",
+        );
+    }
+}
+
+#[test]
+fn s3_concurrency_ceiling_is_far_tighter_than_the_poll_ceiling() {
+    // The two knobs fail differently: an absurd poll interval stalls one queue,
+    // an absurd concurrency spawns that many parallel S3 fetches against the
+    // customer's account. A shared ceiling let `50000` straight through.
+    let poll_ok = s3_tuning_conn(serde_json::json!({ "poll_secs": 50_000 }));
+    assert!(
+        SourceConfigService::validate_aws_s3_conn(&poll_ok).is_ok(),
+        "a long poll interval is useless, not dangerous — it should validate",
+    );
+
+    let conc_bad = s3_tuning_conn(serde_json::json!({ "client_concurrency": 50_000 }));
+    assert!(
+        SourceConfigService::validate_aws_s3_conn(&conc_bad).is_err(),
+        "50000 parallel S3 fetches is a request storm and must be rejected",
+    );
+
+    // And the generator refuses it too, rather than emitting it.
+    let out = SourceConfigService::generate_aws_s3_source("test", &conc_bad, None);
+    let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+    assert!(
+        parsed["sources"]["test"].get("client_concurrency").is_none(),
+        "out-of-range concurrency must be omitted, got:\n{out}"
+    );
+}
+
+#[test]
+fn s3_concurrency_accepts_a_realistic_high_value() {
+    let conn = s3_tuning_conn(serde_json::json!({ "client_concurrency": 256 }));
+    assert!(SourceConfigService::validate_aws_s3_conn(&conn).is_ok());
+    let out = SourceConfigService::generate_aws_s3_source("test", &conn, None);
+    let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+    assert_eq!(
+        parsed["sources"]["test"]["client_concurrency"].as_integer(),
+        Some(256)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// NAN-2187: aws_sqs — the log payload IS the message body, as distinct from
+// aws_s3 where SQS only carries ObjectCreated notifications. The dispatch layer
+// already listed "aws_sqs" as a known source_type; only the config type and
+// generator were missing.
+// ---------------------------------------------------------------------------
+
+fn sqs_conn(extra: serde_json::Value) -> serde_json::Value {
+    let mut conn = serde_json::json!({
+        "region": "ap-south-1",
+        "queue_url": "https://sqs.ap-south-1.amazonaws.com/123456789012/logs",
+    });
+    if let (Some(base), Some(add)) = (conn.as_object_mut(), extra.as_object()) {
+        for (k, v) in add {
+            base.insert(k.clone(), v.clone());
+        }
+    }
+    conn
+}
+
+#[test]
+fn aws_sqs_emits_a_queue_source_not_an_s3_one() {
+    let out = SourceConfigService::generate_aws_sqs_source(
+        "test",
+        &sqs_conn(serde_json::json!({})),
+        None,
+    );
+    let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+    let source = &parsed["sources"]["test"];
+    assert_eq!(source["type"].as_str(), Some("aws_sqs"));
+    assert_eq!(
+        source["queue_url"].as_str(),
+        Some("https://sqs.ap-south-1.amazonaws.com/123456789012/logs")
+    );
+    assert_eq!(source["region"].as_str(), Some("ap-south-1"));
+    // The whole distinction from aws_s3: no nested sqs table, no object fetch.
+    assert!(source.get("sqs").is_none(), "aws_sqs has no nested sqs table:\n{out}");
+    assert_eq!(source["poll_secs"].as_integer(), Some(15));
+}
+
+#[test]
+fn aws_sqs_shares_the_cross_account_role_path() {
+    // NAN-2186's auth helper is reused rather than reimplemented, so a
+    // role-only credential works identically on both AWS drivers.
+    let creds = serde_json::json!({
+        "assume_role_arn": "arn:aws:iam::210987654321:role/nano-ingest",
+        "external_id": "tenant-abc-123",
+    });
+    let out = SourceConfigService::generate_aws_sqs_source(
+        "test",
+        &sqs_conn(serde_json::json!({})),
+        Some(&creds),
+    );
+    let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+    let auth = &parsed["sources"]["test"]["auth"];
+    assert_eq!(
+        auth["assume_role"].as_str(),
+        Some("arn:aws:iam::210987654321:role/nano-ingest")
+    );
+    assert_eq!(auth["external_id"].as_str(), Some("tenant-abc-123"));
+    assert!(auth.get("access_key_id").is_none());
+}
+
+#[test]
+fn aws_sqs_no_credential_falls_through_to_ambient_identity() {
+    let out = SourceConfigService::generate_aws_sqs_source(
+        "test",
+        &sqs_conn(serde_json::json!({})),
+        None,
+    );
+    let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+    assert!(parsed["sources"]["test"].get("auth").is_none(), "{out}");
+}
+
+#[test]
+fn aws_sqs_visibility_timeout_is_omitted_unless_set() {
+    // Omitted => Vector inherits the queue's own configured timeout. Guessing
+    // one would silently change redelivery behaviour on an existing queue.
+    let out = SourceConfigService::generate_aws_sqs_source(
+        "test",
+        &sqs_conn(serde_json::json!({})),
+        None,
+    );
+    let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+    assert!(parsed["sources"]["test"]
+        .get("visibility_timeout_secs")
+        .is_none());
+
+    let out = SourceConfigService::generate_aws_sqs_source(
+        "test",
+        &sqs_conn(serde_json::json!({ "visibility_timeout_secs": 300 })),
+        None,
+    );
+    let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+    assert_eq!(
+        parsed["sources"]["test"]["visibility_timeout_secs"].as_integer(),
+        Some(300)
+    );
+}
+
+#[test]
+fn aws_sqs_validation_bounds_visibility_at_sqs_own_maximum() {
+    // SQS rejects anything over 12h itself; reject it here where the error can
+    // name the field instead of surfacing as a Vector runtime failure.
+    let ok = sqs_conn(serde_json::json!({ "visibility_timeout_secs": 43_200 }));
+    assert!(SourceConfigService::validate_aws_sqs_conn(&ok).is_ok());
+
+    let bad = sqs_conn(serde_json::json!({ "visibility_timeout_secs": 43_201 }));
+    assert!(SourceConfigService::validate_aws_sqs_conn(&bad).is_err());
+}
+
+#[test]
+fn aws_sqs_validation_shares_the_tuning_bounds() {
+    for bad in [
+        serde_json::json!({ "poll_secs": 0 }),
+        serde_json::json!({ "client_concurrency": 50_000 }),
+        serde_json::json!({ "client_concurrency": -1 }),
+    ] {
+        assert!(
+            SourceConfigService::validate_aws_sqs_conn(&sqs_conn(bad.clone())).is_err(),
+            "expected {bad} to be rejected",
+        );
+    }
+    assert!(SourceConfigService::validate_aws_sqs_conn(&sqs_conn(
+        serde_json::json!({ "poll_secs": 5, "client_concurrency": 32 })
+    ))
+    .is_ok());
+}
+
+#[test]
+fn aws_sqs_routing_is_body_only_because_vector_hides_message_attributes() {
+    // NAN-2193: this replaced a test asserting message-attribute routing was
+    // null-coerced like Kafka headers. Verified against a live queue: Vector
+    // 0.56's aws_sqs source emits ONLY message/source_type/timestamp, and an
+    // SQS message attribute sent alongside the body never appears. No config
+    // option surfaces them either. So there is nothing to coerce, and body
+    // routing is a plain path like every other driver.
+    assert_eq!(
+        SourceConfigService::routing_field_expression("aws_sqs", "message"),
+        ".message"
+    );
+}
+
+#[test]
+fn aws_sqs_is_stamped_with_its_own_forwarded_via() {
+    assert_eq!(
+        SourceConfigService::forwarded_via_for_pull_source("aws_sqs"),
+        Some("aws_sqs"),
+        "without this the routing transform stamps nothing and detection rules \
+         cannot filter by transport",
+    );
+}
+
+#[test]
+fn aws_sqs_source_config_type_round_trips() {
+    use crate::source_configs::types::SourceConfigType;
+    assert_eq!(
+        SourceConfigType::from_str("aws_sqs"),
+        Some(SourceConfigType::AwsSqs)
+    );
+    assert_eq!(
+        SourceConfigType::from_str("sqs"),
+        Some(SourceConfigType::AwsSqs)
+    );
+    assert_eq!(SourceConfigType::AwsSqs.as_str(), "aws_sqs");
+    assert!(SourceConfigType::AwsSqs.requires_credentials());
+    assert!(SourceConfigType::AwsSqs.is_pull_source());
+    assert!(SourceConfigType::all_types().contains(&SourceConfigType::AwsSqs));
+    assert!(!SourceConfigType::AwsSqs.match_field_presets().is_empty());
+}
+
+#[test]
+fn aws_sqs_parser_source_type_round_trips_without_aliasing_to_s3() {
+    // NAN-2187 review catch: `SourceType::from_str` used to alias "aws_sqs"
+    // onto `AwsS3`, so from_str -> as_str rewrote it to "aws_s3". The dispatch
+    // layer (vector_config/sources.rs, router.rs, source_configs/repository.rs)
+    // keys off the LITERAL string, so that round trip silently dropped an
+    // aws_sqs parser out of its own routing — a parser that looks configured
+    // and receives nothing.
+    use crate::parsers::SourceType;
+    let parsed = SourceType::from_str("aws_sqs").expect("aws_sqs must parse");
+    assert_eq!(
+        parsed.as_str(),
+        "aws_sqs",
+        "round trip must not rewrite aws_sqs to aws_s3",
+    );
+    assert_eq!(
+        SourceType::from_str("sqs").map(|s: SourceType| s.as_str()),
+        Some("aws_sqs")
+    );
+    assert_eq!(
+        SourceType::from_str("aws_s3").map(|s: SourceType| s.as_str()),
+        Some("aws_s3")
+    );
+    assert!(
+        SourceType::all_types().contains(&"aws_sqs"),
+        "parser creation string-checks against all_types(); omitting aws_sqs \
+         rejects every aws_sqs parser as an invalid source type",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// NAN-2193: match-field preset paths must name fields the driver ACTUALLY
+// emits. The aws_s3 "Object key" preset offered `key` for as long as it had
+// existed, but Vector emits the object path as `object` — so every
+// prefix-based routing rule built from that preset matched nothing, silently.
+//
+// The pre-existing tests asserted the preset LIST (labels, counts), never that
+// a path corresponds to a real field, which is why it survived. These pin the
+// paths against observed Vector output.
+// ---------------------------------------------------------------------------
+
+/// Fields observed on real Vector 0.56 output, per driver.
+///
+/// `aws_s3` is from an actual end-to-end run against AWS during NAN-2186
+/// validation — an S3-via-SQS feed emitted exactly:
+///   {"bucket", "message", "object", "region", "source_type", "timestamp"}
+/// Note `object`, not `key`; that mismatch is the bug this test exists for.
+const AWS_S3_EMITTED_FIELDS: &[&str] =
+    &["bucket", "message", "object", "region", "source_type", "timestamp"];
+
+/// Observed the same way, from a live SQS queue carrying a message that ALSO
+/// had an SQS message attribute set. The attribute did not appear: Vector's
+/// aws_sqs source surfaces only these three fields, and offers no option to
+/// include attributes.
+const AWS_SQS_EMITTED_FIELDS: &[&str] = &["message", "source_type", "timestamp"];
+
+#[test]
+fn aws_s3_match_presets_name_fields_vector_actually_emits() {
+    use crate::source_configs::types::SourceConfigType;
+    for preset in SourceConfigType::AwsS3.match_field_presets() {
+        // A dotted path routes into a decoded payload (content sniffing) and
+        // cannot be checked against top-level fields; only bare names are
+        // claims about what the driver emits.
+        if preset.path.contains('.') {
+            continue;
+        }
+        assert!(
+            AWS_S3_EMITTED_FIELDS.contains(&preset.path.as_str()),
+            "aws_s3 preset {:?} routes on `{}`, which Vector never emits. \
+             Observed fields: {:?}. A rule built from this preset matches nothing.",
+            preset.label,
+            preset.path,
+            AWS_S3_EMITTED_FIELDS,
+        );
+    }
+}
+
+#[test]
+fn aws_sqs_match_presets_name_fields_vector_actually_emits() {
+    use crate::source_configs::types::SourceConfigType;
+    for preset in SourceConfigType::AwsSqs.match_field_presets() {
+        if preset.path.contains('.') {
+            continue;
+        }
+        assert!(
+            AWS_SQS_EMITTED_FIELDS.contains(&preset.path.as_str()),
+            "aws_sqs preset {:?} routes on `{}`, which Vector never emits. Observed: {:?}",
+            preset.label,
+            preset.path,
+            AWS_SQS_EMITTED_FIELDS,
+        );
+    }
+}
+
+#[test]
+fn aws_sqs_offers_no_message_attribute_routing() {
+    // The original NAN-2187 preset recommended `message_attributes.source_type`.
+    // Vector never emits it and no option enables it, so offering it sent users
+    // straight into a rule that silently matches nothing.
+    use crate::source_configs::types::SourceConfigType;
+    for preset in SourceConfigType::AwsSqs.match_field_presets() {
+        assert!(
+            !preset.path.starts_with("message_attributes"),
+            "aws_sqs cannot route on message attributes — Vector does not surface them",
+        );
+    }
+}
+
+#[test]
+fn aws_sqs_default_match_field_can_actually_discriminate() {
+    // `source_type` is emitted, but Vector stamps it with the literal "aws_sqs"
+    // for every message — so defaulting to it would produce a routing rule that
+    // matches everything or nothing, never one log type versus another.
+    use crate::source_configs::types::SourceConfigType;
+    assert_ne!(
+        SourceConfigType::AwsSqs.default_match_field(),
+        "source_type",
+        "Vector sets .source_type to the driver name, not the producer's label",
+    );
+    assert_eq!(SourceConfigType::AwsSqs.default_match_field(), "message");
+}
+
+#[test]
+fn aws_s3_object_key_preset_is_object_not_key() {
+    // The specific regression, named so a future edit back to `key` is loud.
+    use crate::source_configs::types::SourceConfigType;
+    let presets = SourceConfigType::AwsS3.match_field_presets();
+    let object_key = presets
+        .iter()
+        .find(|p| p.label.contains("Object key"))
+        .expect("aws_s3 must offer an object-key routing preset");
+    assert_eq!(
+        object_key.path, "object",
+        "Vector's aws_s3 source emits the object path as `object`; `key` matches nothing",
+    );
+}
+
+#[test]
+fn every_driver_preset_has_a_usable_path() {
+    // Cheap breadth guard: no preset may carry an empty or whitespace path,
+    // which would generate a routing expression of bare `.` and abort the VRL.
+    use crate::source_configs::types::SourceConfigType;
+    for ty in SourceConfigType::all_types() {
+        for preset in ty.match_field_presets() {
+            assert!(
+                !preset.path.trim().is_empty(),
+                "{:?} preset {:?} has an empty path",
+                ty.as_str(),
+                preset.label,
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NAN-2194: the RoleSessionName lands in the CUSTOMER's CloudTrail. It must
+// identify the source, and it must never violate AWS's charset — an invalid
+// RoleSessionName makes sts:AssumeRole fail outright, so a bad name here is an
+// ingest outage rather than a cosmetic logging problem.
+// ---------------------------------------------------------------------------
+
+/// AWS's constraint on `RoleSessionName`: `[\w+=,.@-]{2,64}`.
+fn is_valid_session_name(s: &str) -> bool {
+    (2..=64).contains(&s.len())
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '=' | ',' | '.' | '@' | '-')
+        })
+}
+
+#[test]
+fn session_name_is_emitted_with_a_role_and_identifies_the_source() {
+    let creds = serde_json::json!({
+        "assume_role_arn": "arn:aws:iam::210987654321:role/nano-ingest",
+        "external_id": "nano-abc",
+    });
+    let out = SourceConfigService::generate_aws_s3_source("acme_alb", &s3_conn(), Some(&creds));
+    let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+    let name = parsed["sources"]["acme_alb"]["auth"]["session_name"]
+        .as_str()
+        .expect("session_name must be emitted alongside a role");
+    assert!(name.contains("acme_alb"), "should name the source, got {name:?}");
+    assert!(is_valid_session_name(name), "invalid RoleSessionName: {name:?}");
+}
+
+#[test]
+fn session_name_is_absent_without_a_role() {
+    // Static keys and ambient identity make no AssumeRole call, so a session
+    // name would be meaningless config noise.
+    let keys = serde_json::json!({
+        "access_key_id": "AKIAEXAMPLE",
+        "secret_access_key": "secret",
+    });
+    let out = SourceConfigService::generate_aws_s3_source("t", &s3_conn(), Some(&keys));
+    let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+    assert!(parsed["sources"]["t"]["auth"].get("session_name").is_none());
+
+    let out = SourceConfigService::generate_aws_s3_source("t", &s3_conn(), None);
+    let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+    assert!(parsed["sources"]["t"].get("auth").is_none());
+}
+
+#[test]
+fn session_name_survives_hostile_source_names() {
+    // A source name is operator-supplied. Anything outside AWS's charset must
+    // be folded, or the resulting AssumeRole is rejected and ingest stops.
+    let creds = serde_json::json!({ "assume_role_arn": "arn:aws:iam::2:role/r" });
+    for hostile in [
+        "acme prod/alb",                       // spaces and a slash
+        "тест-кириллица",                      // non-ASCII
+        "a\"b\nc",                             // quote + newline (also a TOML risk)
+        "!!!",                                 // sanitizes to nothing
+        &"x".repeat(200),                      // far over the 64-char cap
+        "",                                    // empty
+    ] {
+        let out = SourceConfigService::generate_aws_s3_source(hostile, &s3_conn(), Some(&creds));
+        let parsed: toml::Value = toml::from_str(&out).expect("generated TOML must parse");
+        assert!(
+            !parsed_has_unexpected_top_level_tables(&parsed),
+            "source name {hostile:?} broke out of its table"
+        );
+        // Find the emitted session name wherever the source landed.
+        let sources = parsed["sources"].as_table().expect("sources table");
+        let (_, src) = sources.iter().next().expect("one source");
+        let name = src["auth"]["session_name"].as_str().expect("session_name");
+        assert!(
+            is_valid_session_name(name),
+            "source {hostile:?} produced an invalid RoleSessionName {name:?} — \
+             AssumeRole would be rejected and ingest would stop",
+        );
+    }
+}
+
+#[test]
+fn aws_sqs_shares_the_session_name_behaviour() {
+    let creds = serde_json::json!({ "assume_role_arn": "arn:aws:iam::2:role/r" });
+    let out = SourceConfigService::generate_aws_sqs_source("acme_queue", &sqs_conn(serde_json::json!({})), Some(&creds));
+    let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+    let name = parsed["sources"]["acme_queue"]["auth"]["session_name"]
+        .as_str()
+        .expect("aws_sqs must set a session name too");
+    assert!(is_valid_session_name(name), "{name:?}");
+    assert!(name.contains("acme_queue"));
+}

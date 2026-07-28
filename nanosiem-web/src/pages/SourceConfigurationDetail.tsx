@@ -145,7 +145,7 @@ const CANONICAL_MATCH_FIELD: Partial<Record<SourceConfigType, { field: string; h
 // `splunk_hec_ingest` listener (:8088) with `sourcetype` in the JSON
 // envelope. A user `splunk_hec` source config is a routing profile, not a
 // new socket, so it shares HTTP's "one config, N rules" model.
-const PULL_SOURCE_TYPES: SourceConfigType[] = ['kafka', 'aws_s3', 'gcp_pubsub'];
+const PULL_SOURCE_TYPES: SourceConfigType[] = ['kafka', 'aws_s3', 'aws_sqs', 'gcp_pubsub'];
 const isPullSource = (t: string): boolean =>
   PULL_SOURCE_TYPES.includes(t as SourceConfigType);
 

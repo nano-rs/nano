@@ -16,7 +16,9 @@ export interface MarketplaceCatalogEntry {
   slug: string;
   name: string;
   description?: string;
-  category: 'data' | 'agent' | 'identity';
+  /** NAN-2189 added 'collector': a scheduled SaaS event pull, managed on
+   *  /integrations rather than here. */
+  category: 'data' | 'agent' | 'identity' | 'collector';
   tags: string[];
   icon?: string;
   author?: string;
@@ -24,7 +26,7 @@ export interface MarketplaceCatalogEntry {
   repository_id?: string;
   repository_file_path?: string;
   manifest_version: number;
-  execution_backend: 'deno' | 'native' | 'identity';
+  execution_backend: 'deno' | 'native' | 'identity' | 'collector';
   custom_enrichment_id?: string;
   native_source_id?: string;
   identity_provider_id?: string;

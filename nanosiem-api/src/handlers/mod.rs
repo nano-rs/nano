@@ -67,6 +67,10 @@ pub mod identity;
 // and ship with cases.
 #[cfg(feature = "enterprise")]
 pub use nanosiem_enterprise::handlers::incidents;
+// Integration collectors (NAN-2189) — enterprise only, like the sandbox
+// runtime they drive.
+#[cfg(feature = "enterprise")]
+pub mod integrations;
 pub mod ip_allowlist;
 #[cfg(feature = "enterprise")]
 pub mod license;

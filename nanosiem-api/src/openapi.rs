@@ -168,6 +168,8 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
         handlers::playbooks::PlaybooksApiDoc::openapi(),
         handlers::playbook_repositories::PlaybookRepositoriesApiDoc::openapi(),
         handlers::marketplace::MarketplaceApiDoc::openapi(),
+        #[cfg(feature = "enterprise")]
+        handlers::integrations::IntegrationsApiDoc::openapi(),
         handlers::upload::UploadApiDoc::openapi(),
         handlers::gdpr::GdprApiDoc::openapi(),
         handlers::ip_allowlist::IpAllowlistApiDoc::openapi(),
@@ -403,8 +405,13 @@ mod tests {
         // NAN-1981 added 1 ENTERPRISE path: GET /api/risk/notable-count (count of
         // entities at/above the risk-notable thresholds — the Home "matter"
         // number). Enterprise floor 520 + 1 = 521; open edition has no risk page.
+        // NAN-2189 added 3 ENTERPRISE path templates for integration collectors:
+        // /api/integrations/instances (GET, POST), /api/integrations/instances/{id}
+        // (GET, PUT, DELETE) and /api/integrations/instances/{id}/run (POST).
+        // Enterprise-only — collectors need egress and the Deno runtime, neither
+        // of which the open edition ships. Enterprise floor 521 + 3 = 524.
         #[cfg(feature = "enterprise")]
-        let min_paths = 521;
+        let min_paths = 524;
         #[cfg(not(feature = "enterprise"))]
         let min_paths = 410;
 

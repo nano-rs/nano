@@ -14,6 +14,7 @@ export const SOURCE_TYPE_LABELS: Record<string, string> = {
   vector: 'Vector',
   kafka: 'Kafka',
   aws_s3: 'AWS S3',
+  aws_sqs: 'AWS SQS',
   gcp_pubsub: 'GCP Pub/Sub',
   splunk_hec: 'Splunk HEC',
 };

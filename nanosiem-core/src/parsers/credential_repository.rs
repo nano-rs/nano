@@ -39,7 +39,7 @@ pub struct CredentialRepository {
     crypto: EncryptionService,
 }
 
-const CRED_SELECT: &str = "id, name, provider, description, region, environment, expires_at, last_used_at, active_version, created_at, updated_at";
+const CRED_SELECT: &str = "id, name, provider, description, region, external_id, environment, expires_at, last_used_at, active_version, created_at, updated_at";
 
 impl CredentialRepository {
     pub fn new(pool: PgPool) -> Self {
@@ -58,6 +58,7 @@ impl CredentialRepository {
             provider: row.get("provider"),
             description: row.get("description"),
             region: row.get("region"),
+            external_id: row.get("external_id"),
             environment: row.get("environment"),
             expires_at: row.get("expires_at"),
             last_used_at: row.get("last_used_at"),
@@ -162,8 +163,8 @@ impl CredentialRepository {
             r#"
             INSERT INTO cloud_credentials
                 (name, provider, credentials_encrypted, nonce, description, region,
-                 environment, expires_at, active_version, created_by)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9)
+                 external_id, environment, expires_at, active_version, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10)
             RETURNING {CRED_SELECT}
             "#
         );
@@ -174,6 +175,7 @@ impl CredentialRepository {
             .bind(&nonce)
             .bind(&req.description)
             .bind(&req.region)
+            .bind(&req.external_id)
             .bind(&req.environment)
             .bind(req.expires_at)
             .bind(created_by)
@@ -185,8 +187,8 @@ impl CredentialRepository {
         sqlx::query(
             r#"
             INSERT INTO cloud_credential_versions
-                (credential_id, version_number, credentials_encrypted, nonce, created_by, note, is_active)
-            VALUES ($1, 1, $2, $3, $4, $5, true)
+                (credential_id, version_number, credentials_encrypted, nonce, created_by, note, is_active, external_id)
+            VALUES ($1, 1, $2, $3, $4, $5, true, $6)
             "#,
         )
         .bind(credential.id)
@@ -194,6 +196,7 @@ impl CredentialRepository {
         .bind(&nonce)
         .bind(created_by)
         .bind(Some("Initial version"))
+        .bind(&req.external_id)
         .execute(&mut *tx)
         .await?;
 
@@ -311,8 +314,8 @@ impl CredentialRepository {
         let version_row = sqlx::query(
             r#"
             INSERT INTO cloud_credential_versions
-                (credential_id, version_number, credentials_encrypted, nonce, created_by, note, is_active)
-            VALUES ($1, $2, $3, $4, $5, $6, true)
+                (credential_id, version_number, credentials_encrypted, nonce, created_by, note, is_active, external_id)
+            VALUES ($1, $2, $3, $4, $5, $6, true, $7)
             RETURNING id, credential_id, version_number, created_at, created_by, note, is_active, reverted_from_version
             "#,
         )
@@ -322,6 +325,7 @@ impl CredentialRepository {
         .bind(&nonce)
         .bind(rotated_by)
         .bind(&req.note)
+        .bind(&req.external_id)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -330,7 +334,8 @@ impl CredentialRepository {
             UPDATE cloud_credentials SET
                 credentials_encrypted = $2,
                 nonce = $3,
-                active_version = $4
+                active_version = $4,
+                external_id = $5
             WHERE id = $1
             RETURNING {CRED_SELECT}
             "#
@@ -340,6 +345,7 @@ impl CredentialRepository {
             .bind(&ciphertext_bytes)
             .bind(&nonce)
             .bind(next_version)
+            .bind(&req.external_id)
             .fetch_one(&mut *tx)
             .await?;
 
@@ -380,7 +386,8 @@ impl CredentialRepository {
 
         // Fetch the target version's payload
         let target = sqlx::query(
-            "SELECT credentials_encrypted, nonce FROM cloud_credential_versions WHERE credential_id = $1 AND version_number = $2",
+            "SELECT credentials_encrypted, nonce, external_id FROM cloud_credential_versions \
+             WHERE credential_id = $1 AND version_number = $2",
         )
         .bind(id)
         .bind(req.version)
@@ -392,6 +399,11 @@ impl CredentialRepository {
         })?;
         let target_ciphertext: Vec<u8> = target.get("credentials_encrypted");
         let target_nonce: String = target.get("nonce");
+        // NAN-2186: restore the ExternalId that belonged to THIS payload. The
+        // id is a trust-policy condition on the role ARN inside the payload, so
+        // carrying the current one backwards would pair a restored role with an
+        // id its trust policy never referenced.
+        let target_external_id: Option<String> = target.get("external_id");
 
         let next_version: i32 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(version_number), 0) + 1 FROM cloud_credential_versions WHERE credential_id = $1",
@@ -415,8 +427,8 @@ impl CredentialRepository {
         let version_row = sqlx::query(
             r#"
             INSERT INTO cloud_credential_versions
-                (credential_id, version_number, credentials_encrypted, nonce, created_by, note, is_active, reverted_from_version)
-            VALUES ($1, $2, $3, $4, $5, $6, true, $7)
+                (credential_id, version_number, credentials_encrypted, nonce, created_by, note, is_active, reverted_from_version, external_id)
+            VALUES ($1, $2, $3, $4, $5, $6, true, $7, $8)
             RETURNING id, credential_id, version_number, created_at, created_by, note, is_active, reverted_from_version
             "#,
         )
@@ -427,6 +439,7 @@ impl CredentialRepository {
         .bind(rolled_back_by)
         .bind(&note)
         .bind(req.version)
+        .bind(&target_external_id)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -435,7 +448,8 @@ impl CredentialRepository {
             UPDATE cloud_credentials SET
                 credentials_encrypted = $2,
                 nonce = $3,
-                active_version = $4
+                active_version = $4,
+                external_id = $5
             WHERE id = $1
             RETURNING {CRED_SELECT}
             "#
@@ -445,6 +459,7 @@ impl CredentialRepository {
             .bind(&target_ciphertext)
             .bind(&target_nonce)
             .bind(next_version)
+            .bind(&target_external_id)
             .fetch_one(&mut *tx)
             .await?;
 
@@ -501,7 +516,9 @@ impl CredentialRepository {
         id: Uuid,
     ) -> Result<serde_json::Value, CredentialRepositoryError> {
         let row =
-            sqlx::query("SELECT credentials_encrypted, nonce FROM cloud_credentials WHERE id = $1")
+            sqlx::query(
+                "SELECT credentials_encrypted, nonce, external_id FROM cloud_credentials WHERE id = $1",
+            )
                 .bind(id)
                 .fetch_optional(&self.pool)
                 .await?
@@ -523,8 +540,27 @@ impl CredentialRepository {
             .decrypt(&encrypted)
             .map_err(|e| CredentialRepositoryError::EncryptionError(e.to_string()))?;
 
-        serde_json::from_slice(&plaintext)
-            .map_err(|e| CredentialRepositoryError::EncryptionError(e.to_string()))
+        let mut value: serde_json::Value = serde_json::from_slice(&plaintext)
+            .map_err(|e| CredentialRepositoryError::EncryptionError(e.to_string()))?;
+
+        // NAN-2186: `external_id` lives in its own unencrypted column (it is an
+        // identifier the account owner must be able to read back, not a
+        // secret), but every config generator consumes ONE credential JSON.
+        // Merge it in here — the single funnel every deploy path already goes
+        // through — so the column stays the sole source of truth and the
+        // generators need no second lookup.
+        if let Some(external_id) = row.get::<Option<String>, _>("external_id") {
+            if !external_id.trim().is_empty() {
+                if let Some(map) = value.as_object_mut() {
+                    map.insert(
+                        "external_id".to_string(),
+                        serde_json::Value::String(external_id),
+                    );
+                }
+            }
+        }
+
+        Ok(value)
     }
 
     /// Best-effort timestamp of the most recent authorized credential use.

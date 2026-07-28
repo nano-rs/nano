@@ -27,8 +27,9 @@ use nanosiem_core::audit::{
 use nanosiem_core::audit::MARKETPLACE_PREVIEW_EXECUTED;
 use nanosiem_core::auth::permissions;
 use nanosiem_core::marketplace::{
-    ArtifactCoverage, CatalogFilter, CatalogStats, ConfigureRequest, CoverageState,
-    CreateMarketplaceRepo, CredentialFieldDef, EnrichmentMarketplaceRepo, EnrichmentStatus,
+    ArtifactCoverage, CatalogFilter, CatalogStats, CollectorManifestFields, ConfigureRequest,
+    CoverageState, CreateMarketplaceRepo, CredentialFieldDef, EnrichmentMarketplaceRepo,
+    EnrichmentStatus,
     InstallRequest, MarketplaceCatalogEntry, MarketplaceCoverage, MarketplaceCoverageService,
     MarketplaceInstallService, MarketplaceManifest, MarketplaceRepository,
     MarketplaceSyncService, RepoBrowseEntry, UpdateMarketplaceRepo,
@@ -612,6 +613,13 @@ pub async fn export_enrichment(
     let credential_fields: Vec<CredentialFieldDef> =
         serde_json::from_value(entry.credential_fields.0.clone()).unwrap_or_default();
 
+    // NAN-2189: repo sync folds a collector's manifest-level fields (streams,
+    // config_fields, auth, suffixes) into the catalog row's `config` JSONB.
+    // Lift them back to the top level here, and drop them from the emitted
+    // `config` — leaving them nested would produce a manifest that re-imports
+    // as an enrichment with no streams.
+    let collector = CollectorManifestFields::take_from(&entry.config.0);
+
     // Build manifest struct
     let manifest = MarketplaceManifest {
         name: entry.name.clone(),
@@ -638,19 +646,30 @@ pub async fn export_enrichment(
         // authenticates with the literal `***REDACTED***`. Omitting the keys
         // yields an honest manifest — the importer supplies their own secret.
         config: {
-            let mut config = entry.config.0.clone();
+            let mut config = collector.remainder.clone();
             nanosiem_core::config_secrets::strip_config_secrets(&mut config);
             config
         },
         tags: entry.tags.clone(),
         output_mapping: None,
         changelog: entry.changelog.clone(),
+        auth_type: collector.auth_type,
+        auth: collector.auth,
+        config_fields: collector.config_fields,
+        allowed_domain_suffixes: collector.allowed_domain_suffixes,
+        streams: collector.streams,
     };
 
     let manifest_yaml = serde_yaml::to_string(&manifest)
         .map_err(|e| ApiError::InternalError(format!("Failed to serialize manifest: {}", e)))?;
 
-    let directory = format!("enrichments/{}/{}/", entry.category, entry.slug);
+    // Collectors live in the nano-integrations repo layout, which is flat —
+    // `integrations/<slug>/` — while enrichments are grouped by category.
+    let directory = if entry.execution_backend == "collector" {
+        format!("integrations/{}/", entry.slug)
+    } else {
+        format!("enrichments/{}/{}/", entry.category, entry.slug)
+    };
 
     Ok(Json(ExportResponse {
         slug: entry.slug,

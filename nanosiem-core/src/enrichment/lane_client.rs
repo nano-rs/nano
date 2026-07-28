@@ -20,14 +20,11 @@
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::ingestion::{VectorIngestClient, VectorIngestError};
+
 /// `.source_type` value the enrichment lane router claims — keeps these records
 /// out of the logs pipeline (`source_router.generic` excludes `nano_enrich`).
 pub const ENRICH_SOURCE_TYPE: &str = "nano_enrich";
-
-/// Default ingest endpoint when `VECTOR_INGEST_URL` is unset. Matches the
-/// in-cluster Vector service (a separate pod — never loopback); dev overrides
-/// to `http://localhost:8080/` via the env var.
-const DEFAULT_INGEST_URL: &str = "http://vector:8080/";
 
 #[derive(Debug, Error)]
 pub enum EnrichmentLaneError {
@@ -37,34 +34,31 @@ pub enum EnrichmentLaneError {
     Serialize(#[from] serde_json::Error),
 }
 
+impl From<VectorIngestError> for EnrichmentLaneError {
+    fn from(e: VectorIngestError) -> Self {
+        match e {
+            VectorIngestError::Http(e) => EnrichmentLaneError::Http(e),
+            VectorIngestError::Serialize(e) => EnrichmentLaneError::Serialize(e),
+        }
+    }
+}
+
 /// Pushes pre-shaped enrichment records onto the Vector `nano_enrich` lane.
 ///
 /// Cheap to clone (wraps a connection-pooling `reqwest::Client`). Construct once
 /// (e.g. at app startup via [`EnrichmentLaneClient::from_env`]) and share.
 #[derive(Clone)]
 pub struct EnrichmentLaneClient {
-    http: reqwest::Client,
-    ingest_url: String,
-    /// Bearer token for the Vector ingest source. `None` posts unauthenticated,
-    /// which only succeeds against a Vector that is *also* tokenless **and** has
-    /// explicitly opted into unauthenticated ingest
-    /// (`VECTOR_ALLOW_UNAUTHENTICATED_INGEST=true`); otherwise `auth_check` fails
-    /// closed and aborts the push (NAN-1351). A token-protected Vector validates
-    /// the bearer normally.
-    auth_token: Option<String>,
+    /// The shared Vector ingest envelope. This type exists to pin the
+    /// `source_type` to [`ENRICH_SOURCE_TYPE`] so no caller can accidentally
+    /// route enrichment records into the logs pipeline.
+    inner: VectorIngestClient,
 }
 
 impl EnrichmentLaneClient {
     pub fn new(ingest_url: impl Into<String>, auth_token: Option<String>) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .unwrap_or_default(),
-            ingest_url: ingest_url.into(),
-            // Treat an empty token the same as unset so a blank env var doesn't
-            // send `Authorization: Bearer ` (which Vector would reject).
-            auth_token: auth_token.filter(|t| !t.is_empty()),
+            inner: VectorIngestClient::new(ingest_url, auth_token),
         }
     }
 
@@ -75,19 +69,16 @@ impl EnrichmentLaneClient {
     /// on [`is_configured`](Self::is_configured) and surface that rather than
     /// drop enrichment data silently.
     pub fn from_env() -> Self {
-        let url = std::env::var("VECTOR_INGEST_URL")
-            .ok()
-            .filter(|u| !u.is_empty())
-            .unwrap_or_else(|| DEFAULT_INGEST_URL.to_string());
-        let token = std::env::var("VECTOR_AUTH_TOKEN").ok();
-        Self::new(url, token)
+        Self {
+            inner: VectorIngestClient::from_env(),
+        }
     }
 
     /// Whether a bearer token is present. A token-protected Vector rejects
     /// unauthenticated pushes, so callers should check this before relying on
     /// the lane in a deployment where Vector enforces auth.
     pub fn is_configured(&self) -> bool {
-        self.auth_token.is_some()
+        self.inner.is_configured()
     }
 
     /// POST a batch of pre-shaped enrichment records as NDJSON.
@@ -100,40 +91,16 @@ impl EnrichmentLaneClient {
         &self,
         records: &[T],
     ) -> Result<(), EnrichmentLaneError> {
-        if records.is_empty() {
-            return Ok(());
-        }
-        let body = to_ndjson(records)?;
-        let mut req = self
-            .http
-            .post(&self.ingest_url)
-            .header("Content-Type", "application/x-ndjson")
-            .header("X-Source-Type", ENRICH_SOURCE_TYPE)
-            .body(body);
-        if let Some(token) = &self.auth_token {
-            req = req.bearer_auth(token);
-        }
-        req.send().await?.error_for_status()?;
+        self.inner.push(ENRICH_SOURCE_TYPE, records).await?;
         Ok(())
     }
 }
 
-/// Frame records as newline-delimited JSON (one compact JSON object per line).
-/// Pure helper so the envelope shape is unit-testable without a live Vector.
-fn to_ndjson<T: Serialize>(records: &[T]) -> Result<String, serde_json::Error> {
-    let mut out = String::new();
-    for (i, rec) in records.iter().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        out.push_str(&serde_json::to_string(rec)?);
-    }
-    Ok(out)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ingestion::to_ndjson;
     use serde_json::json;
 
     #[test]

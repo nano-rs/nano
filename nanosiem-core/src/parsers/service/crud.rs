@@ -66,7 +66,7 @@ impl ParserService {
 
         if matches!(
             new_parser.source_type.as_str(),
-            "kafka" | "aws_s3" | "gcp_pubsub"
+            "kafka" | "aws_s3" | "aws_sqs" | "gcp_pubsub"
         ) && new_parser.dispatch_source_config_id.is_none()
         {
             return Err(ParserServiceError::InvalidSourceType(
@@ -130,7 +130,7 @@ impl ParserService {
                 return Err(ParserServiceError::InvalidSourceType(source_type.clone()));
             }
 
-            if matches!(source_type.as_str(), "kafka" | "aws_s3" | "gcp_pubsub")
+            if matches!(source_type.as_str(), "kafka" | "aws_s3" | "aws_sqs" | "gcp_pubsub")
                 && update.dispatch_source_config_id.is_none()
             {
                 let existing = self.get(id).await?;

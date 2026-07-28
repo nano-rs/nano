@@ -394,7 +394,7 @@ async fn run_sync(
             repository_id: Some(repo.id),
             repository_file_path: Some(rel_path),
             manifest_version: manifest.version,
-            execution_backend: "deno".to_string(),
+            execution_backend: execution_backend_for(manifest).to_string(),
             custom_enrichment_id: existing.as_ref().and_then(|e| e.custom_enrichment_id),
             native_source_id: None,
             identity_provider_id: None,
@@ -412,7 +412,7 @@ async fn run_sync(
             has_credentials: false, // computed field, set by hydrate()
             code,
             allowed_domains: manifest.allowed_domains.clone(),
-            config: sqlx::types::Json(manifest.config.clone()),
+            config: sqlx::types::Json(effective_config(manifest)),
             enabled: existing.as_ref().map(|e| e.enabled).unwrap_or(false),
             last_sync_at: existing.as_ref().and_then(|e| e.last_sync_at),
             last_sync_status: existing.as_ref().and_then(|e| e.last_sync_status.clone()),
@@ -546,6 +546,74 @@ async fn get_head_commit(repo_dir: &PathBuf) -> Result<String, MarketplaceError>
         .map_err(|e| MarketplaceError::GitError(format!("Failed to get HEAD commit: {}", e)))?;
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// NAN-2189: a manifest declaring streams is a collector; everything else is a
+/// Deno enrichment.
+///
+/// Keyed off `streams` rather than `category` deliberately — the category
+/// string comes from user-authored YAML in an external repo, so a typo there
+/// would otherwise route a collector through the enrichment executor, which
+/// would run it once and throw its output away.
+fn is_collector_manifest(manifest: &MarketplaceManifest) -> bool {
+    !manifest.streams.is_empty()
+}
+
+fn execution_backend_for(manifest: &MarketplaceManifest) -> &'static str {
+    if is_collector_manifest(manifest) {
+        "collector"
+    } else {
+        "deno"
+    }
+}
+
+/// Fold the collector-only manifest fields into the catalog row's `config`
+/// JSONB.
+///
+/// The alternative — adding five columns to `marketplace_catalog` — would put
+/// enterprise-only collector schema on an open-tier table for no gain: nothing
+/// queries these fields relationally, they are read as a unit when a run
+/// starts. Enrichment manifests are untouched, so their stored config stays
+/// byte-identical to what pre-NAN-2189 sync wrote.
+fn effective_config(manifest: &MarketplaceManifest) -> serde_json::Value {
+    if !is_collector_manifest(manifest) {
+        return manifest.config.clone();
+    }
+
+    let mut config = match manifest.config.clone() {
+        serde_json::Value::Object(map) => map,
+        // A collector whose `config:` block is absent or malformed still needs
+        // its streams persisted, so fall back to an empty object rather than
+        // dropping the collector metadata on the floor.
+        _ => serde_json::Map::new(),
+    };
+
+    config.insert(
+        "streams".to_string(),
+        serde_json::to_value(&manifest.streams).unwrap_or(serde_json::Value::Null),
+    );
+    config.insert(
+        "config_fields".to_string(),
+        serde_json::to_value(&manifest.config_fields).unwrap_or(serde_json::Value::Null),
+    );
+    config.insert(
+        "allowed_domain_suffixes".to_string(),
+        serde_json::to_value(&manifest.allowed_domain_suffixes).unwrap_or(serde_json::Value::Null),
+    );
+    if let Some(auth_type) = &manifest.auth_type {
+        config.insert(
+            "auth_type".to_string(),
+            serde_json::Value::String(auth_type.clone()),
+        );
+    }
+    if let Some(auth) = &manifest.auth {
+        config.insert(
+            "auth".to_string(),
+            serde_json::to_value(auth).unwrap_or(serde_json::Value::Null),
+        );
+    }
+
+    serde_json::Value::Object(config)
 }
 
 /// Find all manifest.yaml files in a directory tree

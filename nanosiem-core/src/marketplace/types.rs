@@ -23,6 +23,13 @@ pub enum MarketplaceCategory {
     Agent,
     /// Identity provider sync (Entra ID, Google Workspace, AD)
     Identity,
+    /// Scheduled event pull from a SaaS API onto the ingest lane (Netskope).
+    ///
+    /// NAN-2189. Unlike the other three, a collector produces *log events*, not
+    /// enrichment rows — it is configured per vendor tenant via
+    /// `integration_instances` and its output is parsed by the parsers repo
+    /// like any other source.
+    Collector,
 }
 
 impl std::fmt::Display for MarketplaceCategory {
@@ -31,6 +38,7 @@ impl std::fmt::Display for MarketplaceCategory {
             MarketplaceCategory::Data => write!(f, "data"),
             MarketplaceCategory::Agent => write!(f, "agent"),
             MarketplaceCategory::Identity => write!(f, "identity"),
+            MarketplaceCategory::Collector => write!(f, "collector"),
         }
     }
 }
@@ -43,6 +51,7 @@ impl std::str::FromStr for MarketplaceCategory {
             "data" => Ok(MarketplaceCategory::Data),
             "agent" => Ok(MarketplaceCategory::Agent),
             "identity" => Ok(MarketplaceCategory::Identity),
+            "collector" => Ok(MarketplaceCategory::Collector),
             _ => Err(format!("Invalid marketplace category: {}", s)),
         }
     }
@@ -58,6 +67,8 @@ pub enum ExecutionBackend {
     Native,
     /// Identity provider sync engine
     Identity,
+    /// Sandboxed pull collector streaming events onto the ingest lane (NAN-2189)
+    Collector,
 }
 
 impl std::fmt::Display for ExecutionBackend {
@@ -66,6 +77,7 @@ impl std::fmt::Display for ExecutionBackend {
             ExecutionBackend::Deno => write!(f, "deno"),
             ExecutionBackend::Native => write!(f, "native"),
             ExecutionBackend::Identity => write!(f, "identity"),
+            ExecutionBackend::Collector => write!(f, "collector"),
         }
     }
 }
@@ -78,6 +90,7 @@ impl std::str::FromStr for ExecutionBackend {
             "deno" => Ok(ExecutionBackend::Deno),
             "native" => Ok(ExecutionBackend::Native),
             "identity" => Ok(ExecutionBackend::Identity),
+            "collector" => Ok(ExecutionBackend::Collector),
             _ => Err(format!("Invalid execution backend: {}", s)),
         }
     }
@@ -490,6 +503,185 @@ pub struct MarketplaceManifest {
     pub output_mapping: Option<serde_json::Value>,
     #[serde(default)]
     pub changelog: Option<String>,
+
+    // -------------------------------------------------------------------------
+    // Collector fields (NAN-2189)
+    //
+    // All optional so the existing enrichment manifests in `nano-enrichments`
+    // keep parsing byte-for-byte unchanged. A manifest that sets none of these
+    // is an enrichment; one that sets `streams` is a collector.
+    // -------------------------------------------------------------------------
+    /// How nano injects credentials into the sandbox's outbound requests.
+    /// Values match `custom_enrichment::AuthType` (`api_key_header`, `bearer`,
+    /// `basic_auth`, `oauth2_client_credentials`, `none`).
+    #[serde(default)]
+    pub auth_type: Option<String>,
+
+    /// Which credential fields feed the chosen `auth_type`, plus any static
+    /// parameters it needs (header name, OAuth token URL, scope).
+    #[serde(default)]
+    pub auth: Option<ManifestAuth>,
+
+    /// Non-secret operator config (tenant hostname, region, org id). Distinct
+    /// from `credential_fields`: these are readable through the API and appear
+    /// in logs, so nothing sensitive belongs here.
+    #[serde(default)]
+    pub config_fields: Vec<ConfigFieldDef>,
+
+    /// Suffix allowlist admitting per-tenant hostnames supplied via
+    /// `config_fields` (e.g. `.goskope.com`). Needed because a collector's host
+    /// is not knowable at authoring time, unlike an enrichment's fixed API
+    /// endpoint. Validated to at least two labels so `.com` can never be
+    /// declared.
+    #[serde(default)]
+    pub allowed_domain_suffixes: Vec<String>,
+
+    /// Independently toggleable feeds this collector can pull. Presence of a
+    /// non-empty `streams` list is what makes a manifest a collector.
+    #[serde(default)]
+    pub streams: Vec<StreamDef>,
+}
+
+/// The inverse of `sync_service::effective_config`: pulls a collector's
+/// manifest-level fields back out of a catalog row's `config` JSONB.
+///
+/// Sync flattens `streams` / `config_fields` / `allowed_domain_suffixes` /
+/// `auth*` into `config` so no catalog columns were needed. Anything
+/// reconstructing a manifest (export, round-trip tests) has to undo that, and
+/// must also remove them from the leftover config — emitting them in both
+/// places produces a manifest that re-imports as an enrichment with no streams.
+#[derive(Debug, Clone, Default)]
+pub struct CollectorManifestFields {
+    pub auth_type: Option<String>,
+    pub auth: Option<ManifestAuth>,
+    pub config_fields: Vec<ConfigFieldDef>,
+    pub allowed_domain_suffixes: Vec<String>,
+    pub streams: Vec<StreamDef>,
+    /// `config` with the lifted keys removed — what belongs under `config:` in
+    /// the emitted manifest.
+    pub remainder: serde_json::Value,
+}
+
+impl CollectorManifestFields {
+    /// Keys sync writes into `config`. Kept in one place so lifting and
+    /// stripping can never disagree about the set.
+    const LIFTED_KEYS: [&'static str; 5] = [
+        "streams",
+        "config_fields",
+        "allowed_domain_suffixes",
+        "auth_type",
+        "auth",
+    ];
+
+    pub fn take_from(config: &serde_json::Value) -> Self {
+        let Some(map) = config.as_object() else {
+            return Self {
+                remainder: config.clone(),
+                ..Default::default()
+            };
+        };
+
+        let get = |key: &str| map.get(key).cloned();
+        let mut remainder = map.clone();
+        for key in Self::LIFTED_KEYS {
+            remainder.remove(key);
+        }
+
+        Self {
+            // Malformed values degrade to the default rather than failing the
+            // export: a half-readable manifest is more useful to an operator
+            // than a 500.
+            auth_type: get("auth_type").and_then(|v| v.as_str().map(str::to_string)),
+            auth: get("auth").and_then(|v| serde_json::from_value(v).ok()),
+            config_fields: get("config_fields")
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
+            allowed_domain_suffixes: get("allowed_domain_suffixes")
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
+            streams: get("streams")
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
+            remainder: serde_json::Value::Object(remainder),
+        }
+    }
+}
+
+/// Auth parameters referenced from a collector manifest.
+///
+/// Field *names* rather than values — the secrets live in `credential_fields`
+/// and are only ever materialized inside the sandbox process.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ManifestAuth {
+    /// Header to carry the key, for `api_key_header`.
+    #[serde(default)]
+    pub header_name: Option<String>,
+    /// Credential field holding the token/key, for `api_key_header` / `bearer`.
+    #[serde(default)]
+    pub credential_field: Option<String>,
+    /// Credential fields for `basic_auth`.
+    #[serde(default)]
+    pub username_field: Option<String>,
+    #[serde(default)]
+    pub password_field: Option<String>,
+    /// OAuth2 client-credentials parameters. `token_url` is shared with
+    /// `service_account_jwt`, which posts its assertion to the same endpoint.
+    #[serde(default)]
+    pub token_url: Option<String>,
+    #[serde(default)]
+    pub client_id_field: Option<String>,
+    #[serde(default)]
+    pub client_secret_field: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+
+    // Service-account JWT (NAN-2198). Field *names*, resolved against the
+    // instance's credentials/config at run time — a manifest never carries a key.
+    /// Credential field holding the PEM-encoded PKCS#8 private key.
+    #[serde(default)]
+    pub private_key_field: Option<String>,
+    /// Credential field holding the service account's address.
+    #[serde(default)]
+    pub client_email_field: Option<String>,
+    /// Config field naming the user to impersonate. A config field rather than
+    /// a credential because the admin's address is not a secret, and asking for
+    /// it as one makes it unreadable in the UI for no benefit.
+    #[serde(default)]
+    pub subject_field: Option<String>,
+}
+
+/// A non-secret, operator-supplied configuration input.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ConfigFieldDef {
+    pub name: String,
+    pub label: String,
+    #[serde(default = "default_config_field_type")]
+    pub field_type: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub help: Option<String>,
+    #[serde(default)]
+    pub placeholder: Option<String>,
+}
+
+fn default_config_field_type() -> String {
+    "string".to_string()
+}
+
+/// One independently toggleable feed within a collector.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct StreamDef {
+    /// Stable id. Doubles as the cursor key — renaming resets the cursor.
+    pub id: String,
+    pub label: String,
+    /// Routes emitted events to a parser. Must match a parser's `match_values`.
+    pub source_type: String,
+    /// Pre-checked at install time.
+    #[serde(default)]
+    pub default: bool,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 fn default_author() -> String {

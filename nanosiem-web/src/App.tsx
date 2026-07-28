@@ -779,6 +779,7 @@ function ProtectedAppRoutes() {
             } />
           } />
 
+
           {/* Marketplace (top-level) */}
           <Route path="/marketplace" element={
             <PermissionRoute permission="enrichments:view" element={

@@ -21,6 +21,8 @@ pub enum SourceConfigType {
     Kafka,
     /// AWS S3 via SQS notifications
     AwsS3,
+    /// AWS SQS consumed directly — the log payload IS the message body
+    AwsSqs,
     /// GCP Pub/Sub subscription
     GcpPubSub,
     /// Splunk HTTP Event Collector endpoint
@@ -37,6 +39,7 @@ impl SourceConfigType {
             Self::Http => "http",
             Self::Kafka => "kafka",
             Self::AwsS3 => "aws_s3",
+            Self::AwsSqs => "aws_sqs",
             Self::GcpPubSub => "gcp_pubsub",
             Self::SplunkHec => "splunk_hec",
             Self::Vector => "vector",
@@ -49,6 +52,7 @@ impl SourceConfigType {
             "http" => Some(Self::Http),
             "kafka" => Some(Self::Kafka),
             "aws_s3" | "s3" => Some(Self::AwsS3),
+            "aws_sqs" | "sqs" => Some(Self::AwsSqs),
             "gcp_pubsub" | "pubsub" => Some(Self::GcpPubSub),
             "splunk_hec" | "splunk" | "hec" => Some(Self::SplunkHec),
             "vector" => Some(Self::Vector),
@@ -59,7 +63,10 @@ impl SourceConfigType {
 
     /// Whether this source type requires cloud credentials
     pub fn requires_credentials(&self) -> bool {
-        matches!(self, Self::AwsS3 | Self::GcpPubSub | Self::Kafka)
+        matches!(
+            self,
+            Self::AwsS3 | Self::AwsSqs | Self::GcpPubSub | Self::Kafka
+        )
     }
 
     /// Get display label for UI
@@ -68,6 +75,7 @@ impl SourceConfigType {
             Self::Http => "HTTP",
             Self::Kafka => "Kafka",
             Self::AwsS3 => "AWS S3",
+            Self::AwsSqs => "AWS SQS",
             Self::GcpPubSub => "GCP Pub/Sub",
             Self::SplunkHec => "Splunk HEC",
             Self::Vector => "Vector",
@@ -81,6 +89,10 @@ impl SourceConfigType {
             Self::Http => "Native HTTP ingestion with X-Source-Type header routing (system-level)",
             Self::Kafka => "Consume logs from Kafka topics with topic-based routing",
             Self::AwsS3 => "Ingest logs from AWS S3 via SQS with bucket/key-based routing",
+            Self::AwsSqs => {
+                "Ingest logs directly from an SQS queue, where the message body is the log \
+                 itself rather than an S3 notification"
+            }
             Self::GcpPubSub => "Subscribe to GCP Pub/Sub with attribute-based routing",
             Self::SplunkHec => "Receive logs via Splunk HEC with sourcetype-based routing",
             Self::Vector => "Receive from on-prem Vector aggregator (system-level)",
@@ -96,6 +108,7 @@ impl SourceConfigType {
             Self::Http,
             Self::Kafka,
             Self::AwsS3,
+            Self::AwsSqs,
             Self::GcpPubSub,
             Self::SplunkHec,
             Self::Vector,
@@ -109,6 +122,10 @@ impl SourceConfigType {
             Self::Http => "source_type",
             Self::Kafka => "topic",
             Self::AwsS3 => "bucket",
+            // NAN-2193: NOT `source_type` — Vector stamps that with the
+            // literal "aws_sqs" on every message, so it cannot discriminate
+            // between log types. Content sniffing is the only option here.
+            Self::AwsSqs => "message",
             Self::GcpPubSub => "subscription",
             Self::SplunkHec => "sourcetype",
             Self::Vector => "source_type",
@@ -128,7 +145,7 @@ impl SourceConfigType {
     pub fn is_pull_source(&self) -> bool {
         matches!(
             self,
-            Self::Kafka | Self::AwsS3 | Self::GcpPubSub | Self::SplunkHec
+            Self::Kafka | Self::AwsS3 | Self::AwsSqs | Self::GcpPubSub | Self::SplunkHec
         )
     }
 
@@ -180,6 +197,23 @@ impl SourceConfigType {
                             .to_string(),
                 },
             ],
+            // NAN-2193: only ONE option, deliberately. Vector 0.56's aws_sqs
+            // source emits nothing but `message`, `source_type` (its own tag,
+            // always the literal "aws_sqs") and `timestamp` — SQS message
+            // attributes are not surfaced, and no config option exposes them
+            // (`message_attributes`, `include_message_attributes`,
+            // `message_attribute_names` and `attributes_key` are all rejected).
+            // An attribute-based preset was offered here first and was
+            // unusable: it named a field that never arrives.
+            Self::AwsSqs => vec![MatchFieldPreset {
+                label: "Message body field".to_string(),
+                path: "message".to_string(),
+                description:
+                    "Content sniffing — match on a JSON field inside the message body. The only \
+                     routing option for SQS: Vector does not surface message attributes, so a \
+                     producer cannot label events out-of-band the way Kafka headers allow."
+                        .to_string(),
+            }],
             Self::Kafka => vec![
                 MatchFieldPreset {
                     label: "Header (recommended)".to_string(),
@@ -210,9 +244,15 @@ impl SourceConfigType {
                 },
                 MatchFieldPreset {
                     label: "Object key".to_string(),
-                    path: "key".to_string(),
+                    // NAN-2193: Vector's aws_s3 source emits the object path as
+                    // `object`, NOT `key`. This preset offered `key` for as long
+                    // as it has existed, so every prefix-based routing rule built
+                    // from it matched nothing — silently, since a source that
+                    // receives no events looks identical to a quiet one.
+                    path: "object".to_string(),
                     description:
-                        "Match on the S3 object key — useful for prefix-based routing within a single bucket."
+                        "Match on the S3 object path (Vector emits it as `object`) — useful for \
+                         prefix-based routing within a single bucket."
                             .to_string(),
                 },
             ],

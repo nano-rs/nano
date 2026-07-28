@@ -54,13 +54,27 @@ impl MarketplaceInstallService {
             return Err(MarketplaceError::AlreadyInstalled(slug.to_string()));
         }
 
+        // Backend-specific install logic
+        let backend: ExecutionBackend = entry
+            .execution_backend
+            .parse()
+            .map_err(|e: String| MarketplaceError::Internal(e))?;
+
         // Check credential requirements
         let req: CredentialRequirement = entry
             .requires_credential
             .parse()
             .unwrap_or(CredentialRequirement::None);
 
-        if req == CredentialRequirement::Required && request.credentials.is_none() {
+        // NAN-2189: a collector's credentials belong to an *instance*, not to
+        // the catalog row — one operator can connect several vendor tenants,
+        // each with its own token. Installing a collector only makes it
+        // available to configure, so demanding credentials here would block the
+        // install of every collector that needs them.
+        if backend != ExecutionBackend::Collector
+            && req == CredentialRequirement::Required
+            && request.credentials.is_none()
+        {
             return Err(MarketplaceError::CredentialRequired);
         }
 
@@ -72,12 +86,6 @@ impl MarketplaceInstallService {
             (None, None)
         };
 
-        // Backend-specific install logic
-        let backend: ExecutionBackend = entry
-            .execution_backend
-            .parse()
-            .map_err(|e: String| MarketplaceError::Internal(e))?;
-
         match backend {
             ExecutionBackend::Deno => {
                 self.install_deno_enrichment(&entry, request, user_id)
@@ -88,6 +96,12 @@ impl MarketplaceInstallService {
             }
             ExecutionBackend::Identity => {
                 self.install_identity_enrichment(&entry).await?;
+            }
+            ExecutionBackend::Collector => {
+                // Nothing to provision. Unlike the other backends, a collector
+                // has no shadow row in a subsystem table — the catalog row
+                // already carries its code and manifest config, and the
+                // operator creates `integration_instances` rows afterwards.
             }
         }
 
@@ -153,6 +167,19 @@ impl MarketplaceInstallService {
                         .await?;
                 }
             }
+            ExecutionBackend::Collector => {
+                // Disable every configured instance rather than deleting it:
+                // an uninstall is reversible, and the instances hold the
+                // operator's tenant hostnames, stream selection, and cursors.
+                // Dropping those would silently restart collection from "now"
+                // on reinstall, losing everything in between.
+                sqlx::query(
+                    "UPDATE integration_instances SET enabled = false, updated_at = NOW() WHERE catalog_id = $1",
+                )
+                .bind(entry.id)
+                .execute(&self.pool)
+                .await?;
+            }
         }
 
         let updated = self
@@ -215,6 +242,23 @@ impl MarketplaceInstallService {
                     .await?;
                 }
             }
+            ExecutionBackend::Collector => {
+                // Clearing `last_run_at` makes every enabled instance due on
+                // the scheduler's next tick. Deliberately not spawning runs
+                // here: a collector run is long-lived and must go through the
+                // scheduler's single-flight lease, or two consumers end up on
+                // the same cursor.
+                sqlx::query(
+                    r#"
+                    UPDATE integration_instances
+                       SET last_run_at = NULL, updated_at = NOW()
+                     WHERE catalog_id = $1 AND enabled = true
+                    "#,
+                )
+                .bind(entry.id)
+                .execute(&self.pool)
+                .await?;
+            }
         }
 
         Ok(())
@@ -258,6 +302,13 @@ impl MarketplaceInstallService {
             }
             ExecutionBackend::Native | ExecutionBackend::Identity => {
                 // Native/identity enrichments don't have deployable code to update
+            }
+            ExecutionBackend::Collector => {
+                // The runtime reads code and manifest config straight off the
+                // catalog row at run time, so repo sync has already applied the
+                // update. Instances keep their credentials, config and cursors
+                // across a version bump — which is the point of storing them
+                // separately.
             }
         }
 
