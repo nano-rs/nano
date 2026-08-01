@@ -2,43 +2,84 @@
 
 //! Helper functions for pretty-printing.
 
-/// Strip the only characters that can break out of an nPL double-quoted string
-/// literal when serializing an AST back to query text.
+/// Serialize `s` as a COMPLETE nPL string literal — delimiters included —
+/// choosing the quote style that carries the value without altering it.
 ///
 /// Every attacker-controlled string the pretty-printer emits (keyword, field
-/// name, filter value, `rex` pattern, eval literal) is written inside `"…"`.
-/// The parser's `double_quoted_string` is `take_while(|c| c != '"')` with NO
-/// working backslash escape (deliberate — NAN-1157): the FIRST `"` always
-/// terminates the literal and every other character (`|`, `(`, `)`, backtick,
-/// `[`, `]`, …) is inert *inside* the quotes. The lone breakout character is
-/// therefore `"`; removing it (plus newlines, so the serialized query stays a
-/// single line) makes `parse(pretty_print(x))` structure-preserving and closes
-/// the source-scope round-trip bypass (NAN-2006 / F1,F2,F4,F5,F6,F7,F9).
+/// name, filter value, `rex` pattern, eval literal) is written as a quoted
+/// literal. nPL has TWO interchangeable literal forms and the parser accepts
+/// either everywhere it accepts a quoted string (`values::quoted_string` is
+/// `alt((double_quoted_string, single_quoted_string))`):
 ///
-/// This deliberately KEEPS `|`, backtick and parentheses — unlike the
-/// unquoted-context [`crate::query::sanitize_npl_quoted_value`] — so legitimate
-/// values (`cmd|powershell`) and `rex` regexes (`(foo|bar)`) round-trip
-/// faithfully. `enforce_source_scope`'s fail-closed structural re-check is the
-/// backstop for anything this leaves.
+///  * `"…"` — `take_while(|c| c != '"')`, so `"` is the ONLY terminator;
+///  * `'…'` — `take_while(|c| c != '\'')`, so `'` is the ONLY terminator.
+///
+/// Neither has a working backslash escape (deliberate — NAN-1157: `\"` is not
+/// an escape, which is what lets `"C:\Windows\System32\"` parse). Every other
+/// character (`|`, `(`, `)`, backtick, `[`, `]`, newline, and the *other* quote
+/// character) is inert INSIDE the literal.
+///
+/// So the delimiter is picked from the content:
+///
+///  * no `"` in the value → `"…"`. This is the overwhelmingly common case and
+///    is byte-identical to what this helper has always emitted.
+///  * value contains `"` but no `'` → `'…'`. The `"` is inert inside a
+///    single-quoted literal, so it survives VERBATIM and still cannot break
+///    out. This is NAN-2241: the previous unconditional `"`-strip silently
+///    rewrote a user's `rex` pattern — `[^"]+` became `[^]+`, a different
+///    regex that matches nothing — and the query then ran and returned empty
+///    results with no error.
+///  * value contains BOTH `"` and `'` → not representable in nPL at all.
+///    UNREACHABLE from a parsed query: every string in the AST comes from
+///    `quoted_string` (one delimiter, so the other quote can appear but never
+///    the delimiter itself), `unquoted_string` / `unquoted_keyword` /
+///    `field_name` (no quote characters at all), or codegen. See the
+///    `both_quote_kinds_*` tests. Handled as the pre-NAN-2241 behaviour —
+///    double-quote and drop the `"` — which is safe (no breakout) though
+///    lossy; it cannot be reached by user input.
+///
+/// Keeping `|`, backtick and parentheses — unlike the unquoted-context
+/// [`crate::query::sanitize_npl_quoted_value`] — is what lets legitimate values
+/// (`cmd|powershell`) and `rex` regexes (`(foo|bar)`) round-trip faithfully.
+/// Structure preservation across `parse(pretty_print(x))` is the property that
+/// closes the source-scope round-trip bypass (NAN-2006 / F1,F2,F4,F5,F6,F7,F9);
+/// `enforce_source_scope`'s fail-closed structural re-check is the backstop.
+///
+/// Newlines are dropped so the serialized query stays a single line (they are
+/// inert inside a literal, so this is presentational, not a security measure).
 ///
 /// Backslashes are doubled (NAN-2184). The parser collapses `\\` → `\` after
 /// taking the literal, so a value carrying CONSECUTIVE backslashes otherwise
 /// loses one on the way back in: `\\fileserver\share` re-parsed as
 /// `\fileserver\share`, and a `rex` pattern matching a literal backslash
 /// (`\\.`) re-parsed as `\.`. A lone backslash is unaffected either way —
-/// which is why Windows paths looked fine and this went unnoticed. Doubling
-/// must happen BEFORE the `"` filter so the two passes cannot interact.
+/// which is why Windows paths looked fine and this went unnoticed.
 ///
-/// Callers MUST wrap the result in double quotes.
-pub(crate) fn npl_quoted_body(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+/// Callers must NOT add their own quotes — the result already carries them.
+pub(crate) fn npl_quoted_literal(s: &str) -> String {
+    let delimiter = if !s.contains('"') {
+        '"'
+    } else if !s.contains('\'') {
+        '\''
+    } else {
+        // Unrepresentable (see the doc comment) — keep the historical shape.
+        '"'
+    };
+
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push(delimiter);
     for c in s.chars() {
         match c {
-            '"' | '\n' | '\r' => {}
+            // The chosen delimiter is absent from `s` except in the
+            // unrepresentable both-quote-kinds case, where dropping it is the
+            // pre-existing behaviour and keeps the literal un-breakable-out-of.
+            c if c == delimiter => {}
+            '\n' | '\r' => {}
             '\\' => out.push_str("\\\\"),
             _ => out.push(c),
         }
     }
+    out.push(delimiter);
     out
 }
 

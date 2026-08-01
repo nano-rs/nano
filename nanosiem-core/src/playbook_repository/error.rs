@@ -31,6 +31,19 @@ pub enum PlaybookRepositoryError {
     #[error("Playbook parse error: {0}")]
     Parse(String),
 
+    /// The file declares a kind this repository is not allowed to produce
+    /// (NAN-2238). A runbook is a document a human follows; a hunt is a process
+    /// that executes on a cadence — `playbook_repositories.allowed_kinds` lets
+    /// an operator gate the two separately instead of having one merge gate
+    /// stand for both.
+    #[error("Repository does not accept playbooks of kind `{kind}` (allowed: {allowed})")]
+    KindNotAllowed { kind: String, allowed: String },
+
+    /// The file declares `kind: hunt` but its frontmatter or step vocabulary
+    /// does not satisfy the hunt contract.
+    #[error("Invalid hunt definition: {0}")]
+    HuntSpec(String),
+
     #[error("Playbook already imported as {import_type}")]
     AlreadyImported { import_type: String },
 
@@ -72,6 +85,10 @@ impl PlaybookRepositoryError {
             PlaybookRepositoryError::InvalidUrl(_) => 400,
             PlaybookRepositoryError::RepositoryNotAllowed(_) => 403,
             PlaybookRepositoryError::Parse(_) => 400,
+            // 403, not 400: the file is well-formed, the repository is not
+            // authorized to produce that kind. Mirrors `RepositoryNotAllowed`.
+            PlaybookRepositoryError::KindNotAllowed { .. } => 403,
+            PlaybookRepositoryError::HuntSpec(_) => 400,
             PlaybookRepositoryError::RateLimited(_) => 429,
             PlaybookRepositoryError::SyncInProgress(_) => 409,
             PlaybookRepositoryError::RepositoryDisabled => 403,

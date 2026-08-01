@@ -365,6 +365,31 @@ impl AppState {
         scheduler.start(poll_interval)
     }
 
+    /// Start the hunt scheduler (NAN-2238).
+    ///
+    /// Reads `hunt_specs.schedule_cron` — which nothing did before this: the
+    /// columns were written by import and the toggle, and only the manual
+    /// trigger ever produced a sweep.
+    ///
+    /// Leader-only, and unlike most of the loops around it that is a
+    /// CORRECTNESS requirement rather than a de-duplication nicety. Issuing a
+    /// slot advances a durable watermark (`next_due_slot`) and, on catch-up,
+    /// a second one (`coalesced_through_slot`); two replicas racing that pair
+    /// is how a "one sweep per outage" guarantee turns into one per replica.
+    /// The issuance write is additionally guarded on the watermark it planned
+    /// against, so a race loses its transaction rather than double-advancing —
+    /// leadership is the design, the guard is the proof.
+    ///
+    /// NOT egress-gated: every read and write is PostgreSQL-local, so hunts
+    /// keep sweeping in an air-gapped install. `HUNT_SCHEDULER_ENABLED=false`
+    /// leaves hunts manual-only without disabling each one, and the loop exits
+    /// on its own in an open deployment where enterprise migration 9000054
+    /// never created the tables.
+    pub fn start_hunt_scheduler(&self) -> tokio::task::JoinHandle<()> {
+        nanosiem_core::hunts::HuntScheduler::from_env(self.pool.clone())
+            .start(self.shutdown_token())
+    }
+
     /// Start the identity sync scheduler
     pub fn start_identity_sync_scheduler(&self) -> tokio::task::JoinHandle<()> {
         let scheduler = IdentitySyncScheduler::with_defaults(self.identity_service.clone());

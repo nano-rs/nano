@@ -20,6 +20,7 @@
 //! - AI-powered agent enrichment for alert triage
 //! - Unified audit logging to ClickHouse
 
+pub mod ai_provider;
 // Air-gapped signed bundle format + Ed25519 verification (NAN-1201) — enterprise
 // only. Gated to match the api-side `#[cfg(feature = "enterprise")] pub mod airgap;`
 // so the open edition excludes the source, and the open-core mirror can strip the
@@ -42,6 +43,7 @@ pub mod extensions;
 pub mod feeds;
 pub mod gdpr;
 pub mod health;
+pub mod hunts;
 pub mod identity;
 pub mod ingestion;
 pub mod inputlookup;

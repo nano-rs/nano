@@ -81,6 +81,27 @@ prompt_tty() {
 
 gen_secret() { openssl rand -hex 32; }
 
+# NAN-2252: size the ClickHouse container memory limit from host RAM — MemTotal
+# rounded to the nearest GiB minus a fixed 4G reserve for the rest of the stack
+# (api/search/jobs/vector/postgres/dragonfly limits total ~3.7G and do NOT
+# scale with RAM), floored at the historical 2G. ClickHouse 26.x sizes its
+# usable memory ceiling to the container cgroup limit, so the old flat 2G gave
+# every host a 1.6 GiB ceiling that permanently wedges ingest around 300 eps
+# (NAN-2251) while leaving bigger hosts mostly idle. 8G host → 4G, 16G → 12G,
+# 32G → 28G. Falls back to 2G when MemTotal is unreadable (non-Linux /
+# restricted /proc).
+ch_mem_limit() {
+    local kb g
+    kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
+    if [[ ! "$kb" =~ ^[0-9]+$ ]]; then
+        echo "2G"
+        return
+    fi
+    g=$(( (kb + 524288) / 1048576 - 4 ))  # round(MemTotal to GiB) − 4G reserve
+    (( g < 2 )) && g=2
+    echo "${g}G"
+}
+
 # Escape a string for safe embedding inside a JSON string literal.
 # Handles backslash, double-quote, and the C0 controls that JSON forbids.
 json_escape() {
@@ -355,6 +376,14 @@ if [[ -f .env ]]; then
     # summary reflects the live value. Default udm for .env files predating it.
     SCHEMA_PROFILE=$(grep -E '^NANO_SCHEMA_PROFILE=' .env | head -1 | cut -d= -f2- || true)
     SCHEMA_PROFILE="${SCHEMA_PROFILE:-udm}"
+    # NAN-2252: .env files predating host-sized ClickHouse memory pinned every
+    # host to the compose fallback (2G). Append the sized value so this run's
+    # `up -d` lifts the cap; existing entries are left alone.
+    if ! grep -qE '^CLICKHOUSE_MEM_LIMIT=' .env; then
+        CH_MEM_LIMIT=$(ch_mem_limit)
+        echo "CLICKHOUSE_MEM_LIMIT=$CH_MEM_LIMIT" >> .env
+        log "Sized ClickHouse memory limit to $CH_MEM_LIMIT (host RAM − 4G reserve, 2G floor)"
+    fi
     # NAN-1604: did the first install bundle the Tenzir node? (COMPOSE_PROFILES=tenzir)
     BUNDLE_TENZIR=0
     grep -qE '^COMPOSE_PROFILES=.*tenzir' .env 2>/dev/null && BUNDLE_TENZIR=1
@@ -429,11 +458,15 @@ else
     # NAN-1604: bind to a shell var (like VECTOR_AUTH_TOKEN) so the direct-OCSF
     # block in the success summary can surface it.
     CLICKHOUSE_INGEST_PASSWORD=$(gen_secret)
+    # NAN-2252: host-sized ClickHouse memory limit (half of RAM, 2G floor).
+    CH_MEM_LIMIT=$(ch_mem_limit)
+    log "Sized ClickHouse memory limit to $CH_MEM_LIMIT (host RAM − 4G reserve, 2G floor)"
     cat > .env <<EOF
 NANO_VERSION=$NANO_VERSION
 BASE_URL=$BASE_URL
 NANOSIEM_DEV_MODE=$DEV_MODE
 NANO_SCHEMA_PROFILE=$SCHEMA_PROFILE
+CLICKHOUSE_MEM_LIMIT=$CH_MEM_LIMIT
 POSTGRES_PASSWORD=$(gen_secret)
 CLICKHOUSE_PASSWORD=$(gen_secret)
 CLICKHOUSE_ADMIN_PASSWORD=$(gen_secret)

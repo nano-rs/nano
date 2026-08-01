@@ -312,12 +312,12 @@ pub fn enforce_source_scope(
         return Ok(query.to_string());
     }
 
-    let parsed = parse_query(query).map_err(|e| {
-        crate::SearchError::ParseError(format!(
-            "Query parsing failed for access control enforcement: {}",
-            e
-        ))
-    })?;
+    // NAN-2241: this is the FIRST parse a scoped caller's query hits, so an
+    // ordinary syntax error surfaces from here. Lead with the syntax error
+    // itself — the old "Query parsing failed for access control enforcement"
+    // prefix read as a permissions problem and buried the actual diagnosis.
+    let parsed = parse_query(query)
+        .map_err(|e| crate::SearchError::ParseError(format!("Invalid query: {}", e)))?;
     let injected = inject_source_type_exclusion_recursive(&parsed, deny_set);
     let mut enforced = injected.pretty_print();
 

@@ -11,16 +11,16 @@ impl PrettyPrint for SearchExpr {
             SearchExpr::Keyword(kw) => {
                 // NAN-2006: emit a keyword bare ONLY when it re-parses verbatim
                 // as an `unquoted_keyword`. Anything else (space, quote, paren,
-                // pipe, `=`, a reserved AND/OR/NOT, …) MUST be a double-quoted
-                // string with breakout chars stripped, so the source-scope
-                // gate's pretty_print -> re-parse round-trip cannot be broken
-                // out of. The old code only quoted on a space, leaving e.g.
+                // pipe, `=`, a reserved AND/OR/NOT, …) MUST be a quoted literal
+                // the keyword cannot terminate, so the source-scope gate's
+                // pretty_print -> re-parse round-trip cannot be broken out of.
+                // The old code only quoted on a space, leaving e.g.
                 // `x") OR source_type=audit OR ("y` to re-tokenize into an
                 // ungated top-level OR arm (F1/F2/F6/F7).
                 if is_bare_keyword(kw) {
                     kw.clone()
                 } else {
-                    format!("\"{}\"", super::helpers::npl_quoted_body(kw))
+                    super::helpers::npl_quoted_literal(kw)
                 }
             }
             SearchExpr::FieldFilter { field, op, value } => {
@@ -89,16 +89,33 @@ impl PrettyPrint for SearchExpr {
                 format!("({})", expr.pretty_print())
             }
             SearchExpr::LiteralComparison { left, op, right } => {
-                format!("\"{}\"{}\"{}\"", left, op.as_str(), right)
+                // `quoted_string_comparison` requires BOTH sides quoted, so both
+                // go through the literal serializer — the old raw `"{}"`
+                // interpolation let a `"`-bearing side re-tokenize into query
+                // structure. Non-string values keep their quoted shape (the
+                // parser only ever builds `Value::String` here).
+                let right = match right {
+                    Value::String(s) => super::helpers::npl_quoted_literal(s),
+                    other => super::helpers::npl_quoted_literal(&other.to_string()),
+                };
+                format!(
+                    "{}{}{}",
+                    super::helpers::npl_quoted_literal(left),
+                    op.as_str(),
+                    right
+                )
             }
             // NAN-1580 / NAN-1581: render the `ioc` surface forms back out.
             SearchExpr::IocMatch { values, feed, lookup } => {
+                let lit = super::helpers::npl_quoted_literal;
                 if let Some(f) = feed {
-                    format!("ioc in {}(\"{}\")", f.name, f.arg)
+                    format!("ioc in {}({})", f.name, lit(&f.arg))
                 } else if let Some(l) = lookup {
                     match &l.column {
-                        Some(col) => format!("ioc in lookup(\"{}\", \"{}\")", l.table, col),
-                        None => format!("ioc in lookup(\"{}\")", l.table),
+                        Some(col) => {
+                            format!("ioc in lookup({}, {})", lit(&l.table), lit(col))
+                        }
+                        None => format!("ioc in lookup({})", lit(&l.table)),
                     }
                 } else if values.len() == 1 {
                     format!("ioc={}", format_value_for_filter(&values[0]))
@@ -144,8 +161,9 @@ pub(super) fn format_value_for_filter(value: &Value) -> String {
             // Always quote strings in field filters. NAN-2006: the parser has no
             // working backslash escape (NAN-1157), so the old `s.replace('"',
             // "\\\"")` was a no-op that let a `"`-bearing value break out of the
-            // source-scope gate (F1/F4). Strip the breakout `"`/newlines instead.
-            format!("\"{}\"", super::helpers::npl_quoted_body(s))
+            // source-scope gate (F1/F4). `npl_quoted_literal` picks the
+            // delimiter the value cannot terminate (NAN-2241).
+            super::helpers::npl_quoted_literal(s)
         }
         // For other value types, use their Display impl
         _ => value.to_string(),
@@ -155,14 +173,14 @@ pub(super) fn format_value_for_filter(value: &Value) -> String {
 /// Emit a field-filter LHS. A field that re-parses verbatim via `field_name`
 /// is emitted bare; anything else came from a quoted-string field (the parser
 /// accepts `alt((quoted_string, field_name))` for the LHS — NAN-2006/F4, e.g.
-/// `'src_ip=1) OR source_type=audit OR (user'=1`) and is emitted as a
-/// double-quoted string with breakout chars stripped so it cannot re-tokenize
+/// `'src_ip=1) OR source_type=audit OR (user'=1`) and is emitted as a quoted
+/// literal whose delimiter the name does not contain, so it cannot re-tokenize
 /// into query structure.
 fn emit_field(field: &str) -> String {
     if is_bare_field(field) {
         field.to_string()
     } else {
-        format!("\"{}\"", super::helpers::npl_quoted_body(field))
+        super::helpers::npl_quoted_literal(field)
     }
 }
 

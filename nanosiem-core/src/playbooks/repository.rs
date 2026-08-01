@@ -19,6 +19,27 @@ use super::models::{
     UpdatePlaybookRequest,
 };
 
+/// Restricts every query in this repository to RESPONSE playbooks.
+///
+/// NAN-2238 made `playbooks` a SHARED definition table: a hunt is a `playbooks`
+/// row of `kind = 'hunt'`, extended by `hunt_specs`. The two kinds deliberately
+/// do not share a runtime, an audience, or a permission set — `playbooks:*`
+/// grants authority over case-response procedure, `hunts:*` over what runs
+/// unattended against the whole log estate on a schedule.
+///
+/// Without this predicate on every read, a `playbooks:view` holder would fetch
+/// hunt definitions through the playbook API and bypass `hunts:view` outright,
+/// a `playbooks:run` holder could attach a hunt to a case, and hunts would
+/// render in the Playbooks library as malformed response playbooks. The
+/// database enforces the other direction — `playbooks_id_kind_key` plus the
+/// constant-kind composite FKs stop a hunt spec, sweep or rule idea attaching
+/// to a response playbook — but it cannot infer which kind a *reader* meant.
+///
+/// Hunts are reached only through the hunts facade, which enforces `hunts:*`.
+/// A new query in this file that omits this predicate is an authorization bug;
+/// `response_repository_queries_are_kind_scoped` is the regression guard.
+const RESPONSE_KIND: &str = "playbooks.kind = 'response'";
+
 /// NAN-469 — bundle of inputs required to build a manual-attach
 /// `run_context` snapshot. Returned by
 /// [`PlaybookRepository::fetch_case_snapshot_inputs`] and consumed by
@@ -112,11 +133,12 @@ impl ApprovalOutcome {
     const fn playbook_status_sql(self) -> &'static str {
         match self {
             ApprovalOutcome::Approved => {
-                "UPDATE playbooks SET status = 'live', updated_at = NOW() WHERE id = $1"
+                "UPDATE playbooks SET status = 'live', updated_at = NOW() \
+                  WHERE id = $1 AND kind = 'response'"
             }
             ApprovalOutcome::Rejected => {
                 "UPDATE playbooks SET status = 'draft', updated_at = NOW() \
-                  WHERE id = $1 AND status = 'pending_review'"
+                  WHERE id = $1 AND kind = 'response' AND status = 'pending_review'"
             }
         }
     }
@@ -154,6 +176,7 @@ impl PlaybookRepository {
     ) -> Result<Vec<Playbook>, PlaybookError> {
         let mut qb: QueryBuilder<sqlx::Postgres> =
             QueryBuilder::new("SELECT * FROM playbooks WHERE ");
+        qb.push(RESPONSE_KIND).push(" AND ");
         push_acl(&mut qb, "playbooks.id", PlaybookAction::View, principal);
 
         if let Some(cat) = query.category {
@@ -223,6 +246,7 @@ impl PlaybookRepository {
     ) -> Result<i64, PlaybookError> {
         let mut qb: QueryBuilder<sqlx::Postgres> =
             QueryBuilder::new("SELECT COUNT(*) FROM playbooks WHERE ");
+        qb.push(RESPONSE_KIND).push(" AND ");
         push_acl(&mut qb, "playbooks.id", PlaybookAction::View, principal);
         if let Some(cat) = query.category {
             qb.push(" AND category = ").push_bind(cat.as_str().to_string());
@@ -259,7 +283,7 @@ impl PlaybookRepository {
         principal: &PlaybookPrincipal,
     ) -> Result<Playbook, PlaybookError> {
         let sql = format!(
-            "SELECT * FROM playbooks WHERE id = $1 AND {}",
+            "SELECT * FROM playbooks WHERE id = $1 AND {RESPONSE_KIND} AND {}",
             acl_sql("playbooks.id", PlaybookAction::View, "$2", "$3", "$4")
         );
         let pb = sqlx::query_as::<_, Playbook>(&sql)
@@ -285,7 +309,7 @@ impl PlaybookRepository {
         }
         let sql = format!(
             "SELECT * FROM playbooks \
-              WHERE status = 'live' AND match_signals && $1 AND {} \
+              WHERE status = 'live' AND {RESPONSE_KIND} AND match_signals && $1 AND {} \
               ORDER BY updated_at DESC",
             acl_sql("playbooks.id", PlaybookAction::View, "$2", "$3", "$4")
         );
@@ -401,7 +425,7 @@ impl PlaybookRepository {
     ) -> Result<(), PlaybookError> {
         let mut tx = self.pool.begin().await?;
         Self::lock_playbook_for_action(&mut tx, id, PlaybookAction::Edit, principal).await?;
-        sqlx::query("DELETE FROM playbooks WHERE id = $1")
+        sqlx::query("DELETE FROM playbooks WHERE id = $1 AND kind = 'response'")
             .bind(id)
             .execute(&mut *tx)
             .await?;
@@ -557,7 +581,7 @@ impl PlaybookRepository {
                 status = $13,
                 current_version = $14,
                 updated_at = NOW()
-            WHERE id = $1
+            WHERE id = $1 AND kind = 'response'
             RETURNING *
             "#,
         )
@@ -638,7 +662,10 @@ impl PlaybookRepository {
     ) -> Result<(), PlaybookError> {
         let mut tx = self.pool.begin().await?;
         Self::lock_playbook_for_action(&mut tx, id, PlaybookAction::Edit, principal).await?;
-        sqlx::query("UPDATE playbooks SET status = 'archived', updated_at = NOW() WHERE id = $1")
+        sqlx::query(
+            "UPDATE playbooks SET status = 'archived', updated_at = NOW() \
+              WHERE id = $1 AND kind = 'response'",
+        )
             .bind(id)
             .execute(&mut *tx)
             .await?;
@@ -1021,6 +1048,7 @@ impl PlaybookRepository {
                       ), '{{}}') AS matched_signals_out
                FROM playbooks p
                WHERE p.status = 'live'
+                 AND p.kind = 'response'
                  AND (
                       p.match_signals && $1::text[]
                       OR ($2::text IS NOT NULL AND p.category = $2::text)
@@ -1111,7 +1139,11 @@ impl PlaybookRepository {
                            ))
                        )
                 ))
-                  AND EXISTS (SELECT 1 FROM playbooks WHERE playbooks.id = $1)
+                  AND EXISTS (
+                      SELECT 1 FROM playbooks
+                       WHERE playbooks.id = $1
+                         AND playbooks.kind = 'response'
+                  )
                RETURNING *"#;
         let run: Option<PlaybookRun> = sqlx::query_as(&insert_sql)
             .bind(playbook_id)
@@ -1730,7 +1762,8 @@ impl PlaybookRepository {
 
         if current.status != "pending_review" && current.status != "live" {
             sqlx::query(
-                "UPDATE playbooks SET status = 'pending_review', updated_at = NOW() WHERE id = $1",
+                "UPDATE playbooks SET status = 'pending_review', updated_at = NOW() \
+              WHERE id = $1 AND kind = 'response'",
             )
             .bind(playbook_id)
             .execute(&mut *tx)
@@ -1849,7 +1882,7 @@ impl PlaybookRepository {
         let owning: Option<(Uuid,)> = sqlx::query_as(
             "SELECT p.id FROM playbooks p \
               JOIN playbook_approvals a ON a.playbook_id = p.id \
-             WHERE a.id = $1 FOR UPDATE OF p",
+             WHERE a.id = $1 AND p.kind = 'response' FOR UPDATE OF p",
         )
         .bind(approval_id)
         .fetch_optional(&mut *tx)
@@ -1890,6 +1923,7 @@ impl PlaybookRepository {
                      SELECT 1
                        FROM playbooks approval_playbook
                       WHERE approval_playbook.id = a.playbook_id
+                        AND approval_playbook.kind = 'response'
                         AND approval_playbook.current_version = a.version
                  )
                  AND (
@@ -2259,7 +2293,8 @@ impl PlaybookRepository {
             PlaybookRowLock::Exclusive => "FOR UPDATE",
             PlaybookRowLock::Shared => "FOR SHARE",
         };
-        let lock_sql = format!("SELECT * FROM playbooks WHERE id = $1 {lock_clause}");
+        let lock_sql =
+            format!("SELECT * FROM playbooks WHERE id = $1 AND {RESPONSE_KIND} {lock_clause}");
         let current: Option<Playbook> = sqlx::query_as(&lock_sql)
             .bind(playbook_id)
             .fetch_optional(&mut **tx)
@@ -2267,7 +2302,7 @@ impl PlaybookRepository {
         let current = current.ok_or(PlaybookError::NotFound(playbook_id))?;
 
         let sql = format!(
-            "SELECT EXISTS (SELECT 1 FROM playbooks WHERE id = $1 AND {})",
+            "SELECT EXISTS (SELECT 1 FROM playbooks WHERE id = $1 AND {RESPONSE_KIND} AND {})",
             acl_sql("playbooks.id", action, "$2", "$3", "$4")
         );
         let authorized: bool = sqlx::query_scalar(&sql)
@@ -2351,7 +2386,7 @@ impl PlaybookRepository {
         }
 
         let sql = format!(
-            "SELECT EXISTS (SELECT 1 FROM playbooks WHERE id = $1 AND {})",
+            "SELECT EXISTS (SELECT 1 FROM playbooks WHERE id = $1 AND {RESPONSE_KIND} AND {})",
             acl_sql("playbooks.id", PlaybookAction::Edit, "$2", "$3", "$4")
         );
         let still_allowed: bool = sqlx::query_scalar(&sql)
@@ -2431,7 +2466,7 @@ impl PlaybookRepository {
                      status          = 'pending_review',
                      current_version = $2,
                      updated_at      = NOW()
-               WHERE id = $1
+               WHERE id = $1 AND kind = 'response'
                RETURNING *"#,
         )
         .bind(playbook_id)
@@ -2492,5 +2527,159 @@ impl PlaybookRepository {
 
         tx.commit().await?;
         Ok(promoted)
+    }
+}
+
+#[cfg(test)]
+mod kind_scope_tests {
+    /// This module's own source, read at compile time.
+    ///
+    /// Self-referential on purpose: a path-relative `include_str!` travels with
+    /// the file, so if the open-core mirror strips this module the test is
+    /// stripped with it. An absolute `CARGO_MANIFEST_DIR` path would survive
+    /// the strip and break the mirror build (NAN-2169).
+    const SOURCE: &str = include_str!("repository.rs");
+
+    /// Every query against the shared `playbooks` table must restrict itself to
+    /// `kind = 'response'`.
+    ///
+    /// NAN-2238 made `playbooks` hold two kinds of row. A query here that omits
+    /// the predicate lets a `playbooks:*` holder read, attach, or delete a HUNT
+    /// through the response-playbook API, bypassing `hunts:*` entirely. That is
+    /// an authorization bug rather than a cosmetic one, and it is invisible in
+    /// review because the query looks exactly like it always did.
+    ///
+    /// Matching is deliberately crude — the predicate must appear within a few
+    /// lines of the table reference. A guard that is easy to satisfy correctly
+    /// and hard to satisfy accidentally beats a parser.
+    #[test]
+    fn response_repository_queries_are_kind_scoped() {
+        // Scan PRODUCTION source only. An earlier revision scanned the whole
+        // file, so the guard matched its own `line.contains("FROM playbooks")`
+        // and found `kind = 'response'` in the assertion text a few lines
+        // below — passing on its own body regardless of the code above it.
+        let production = SOURCE
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(SOURCE);
+        let lines: Vec<&str> = production.lines().collect();
+        let mut unscoped = Vec::new();
+        let mut sites = 0usize;
+
+        for (idx, line) in lines.iter().enumerate() {
+            // Every DML form, not just SELECT: an unscoped UPDATE or DELETE
+            // mutates a hunt through the response API just as effectively as a
+            // SELECT reads one.
+            // INSERT is deliberately excluded. An insert cannot REACH an
+            // existing hunt — the risk it carries is creating one through the
+            // response API, and `playbooks.kind` defaults to 'response' so a
+            // repository that never names the column cannot produce a hunt.
+            // Including inserts here would flag three sites that are correct
+            // and train the next reader to silence the guard.
+            let touches_playbooks =
+                line.contains("FROM playbooks") || line.contains("UPDATE playbooks");
+            if !touches_playbooks || line.trim_start().starts_with("//") {
+                continue;
+            }
+            sites += 1;
+            // Follow the STATEMENT rather than a fixed line count. A fixed
+            // window is wrong in both directions: too small and it misses the
+            // predicate on a long multi-line UPDATE (the 14-column update in
+            // `update` is 15 lines from `UPDATE playbooks` to its WHERE); too
+            // large and it starts accepting an unrelated predicate from the
+            // next query along. Stopping at the end of the SQL literal is the
+            // boundary that actually matters.
+            //
+            // The floor of 7 lines covers the other shape in this file: a
+            // `QueryBuilder` whose literal ends on its own line and whose
+            // predicate arrives on the next `qb.push(...)`. Statement-end alone
+            // would close the window before reaching it.
+            let statement_end = lines[idx..]
+                .iter()
+                .position(|l| l.contains("\"#,") || l.contains("\");") || l.contains("\","))
+                .map(|offset| idx + offset + 1)
+                .unwrap_or(idx + 20);
+            let window_end = statement_end.max(idx + 7).min(lines.len());
+            let window = lines[idx..window_end].join("\n");
+            let scoped = window.contains("kind = 'response'")
+                || window.contains("RESPONSE_KIND")
+                || window.contains("{RESPONSE_KIND}");
+            if !scoped {
+                unscoped.push(format!("line {}: {}", idx + 1, line.trim()));
+            }
+        }
+
+        assert!(
+            unscoped.is_empty(),
+            "these `playbooks` queries are not restricted to kind = 'response', so a \
+             playbooks:* holder could reach a HUNT through the response-playbook API \
+             (NAN-2238). Add the predicate, or move the query to the hunts repository:\n{}",
+            unscoped.join("\n")
+        );
+
+        // A scanner that silently matches nothing is indistinguishable from a
+        // clean file. Pin the count so both a new unscoped query AND a refactor
+        // that moves queries out of this file's reach have to be acknowledged.
+        assert!(
+            sites >= 12,
+            "expected at least 12 `playbooks` query sites, found {sites} — either queries \
+             moved somewhere this guard cannot see, or the matcher stopped working"
+        );
+    }
+
+    /// The predicate names the column explicitly rather than relying on a join
+    /// alias, so it keeps working if a query gains a second table.
+    #[test]
+    fn response_kind_predicate_is_column_qualified() {
+        assert_eq!(super::RESPONSE_KIND, "playbooks.kind = 'response'");
+    }
+
+    /// The child tables are NOT this guard's job.
+    ///
+    /// `playbook_versions`, `playbook_runs`, `playbook_approvals` and
+    /// `playbook_permissions` are keyed on `playbook_id` alone and are read by
+    /// roughly eighteen queries that never mention `playbooks`. Rather than
+    /// scope each one — and re-scope the nineteenth somebody adds — migration
+    /// 9000055 pins all four to `kind = 'response'` with constant-kind
+    /// composite FKs, so a hunt cannot have a row in them at all and those
+    /// queries have nothing of a hunt's to leak however they are written.
+    ///
+    /// This test documents the division of responsibility so a future reader
+    /// does not "fix" the child tables here and conclude the migration is
+    /// redundant.
+    ///
+    /// Read at RUNTIME, not via `include_str!`.
+    ///
+    /// `tools/sync-to-nano-mirror.sh` strips `migrations/postgres-enterprise/`
+    /// but keeps this file, so a compile-time include of that path makes the
+    /// public mirror fail to build — the NAN-2169 shape. The script's existing
+    /// answer is to delete whole test FILES that read stripped paths, which is
+    /// not available here because this module lives inside core source. A
+    /// runtime read compiles everywhere and simply skips where the migration is
+    /// absent, keeping the coverage in the private repo without breaking the
+    /// public one. Its own guidance applies: prefer keeping a test compilable
+    /// over stripping it.
+    #[test]
+    fn child_tables_are_pinned_in_schema_not_scoped_in_sql() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../migrations/postgres-enterprise/9000055_pin_playbook_children_to_response.sql",
+        );
+        let Ok(migration) = std::fs::read_to_string(&path) else {
+            // Stripped mirror. The invariant this guards is enterprise-only, so
+            // there is nothing to assert where the schema does not ship.
+            return;
+        };
+        for child in [
+            "playbook_versions",
+            "playbook_runs",
+            "playbook_approvals",
+            "playbook_permissions",
+        ] {
+            assert!(
+                migration.contains(&format!("ALTER TABLE {child}")),
+                "{child} is not pinned to kind='response' by 9000055; its queries would then \
+                 need explicit scoping in this file"
+            );
+        }
     }
 }

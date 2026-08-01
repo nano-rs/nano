@@ -347,6 +347,19 @@ impl VectorConfigManager {
             .cloned()
             .collect();
 
+        // NAN-2247: refuse before touching disk. Two enabled parsers claiming
+        // one source_type on the same lane double-write every matching event,
+        // silently — the class NAN-857/930/1442 each fixed from the wiring side,
+        // reachable here from the data side because nothing validated the claims
+        // themselves. Failing the deploy leaves the running config untouched, so
+        // an operator is never worse off than before they tried.
+        let collisions = super::router::find_source_type_collisions(&log_parsers);
+        if !collisions.is_empty() {
+            let detail = super::router::describe_collisions(&collisions);
+            tracing::error!(collisions = collisions.len(), "{}", detail);
+            return Err(VectorConfigError::ValidationFailed(detail));
+        }
+
         for parser in &log_parsers {
             let filename = format!("{}.toml", Self::safe_name(&parser.name));
             let filepath = self.parsers_dir.join(&filename);
@@ -537,9 +550,12 @@ impl VectorConfigManager {
              [sinks.clickhouse_ocsf_logs.query_settings.async_insert_settings]\n\
              deduplicate = true\n\
              \n\
+             # NAN-2253: disk + drop_newest — the OCSF event lane gets the\n\
+             # same durable buffer as clickhouse_logs (see that sink's\n\
+             # comment; NAN-1114 forbids block on shared-source sinks).\n\
              [sinks.clickhouse_ocsf_logs.buffer]\n\
-             type = \"memory\"\n\
-             max_events = 100000\n\
+             type = \"disk\"\n\
+             max_size = 2147483648\n\
              when_full = \"drop_newest\"\n\
              \n\
              [sinks.clickhouse_ocsf_logs.acknowledgements]\n\
@@ -1042,8 +1058,16 @@ for_each(keys(.)) -> |_idx, key| {
 # FLUSH succeeded (rows durably written), not merely buffered. A flush failure
 # (e.g. FAILED enrichment dict, NAN-1404) comes back as a sink error Vector
 # retries and surfaces in metrics, instead of a silently discarded pre-ACKed
-# batch. Measured: zero throughput cost at 5k eps; sustained-overload shedding
-# unchanged (the drop_newest buffer below sheds either way, now visibly).
+# batch. Measured: zero throughput cost at 5k eps.
+#
+# NAN-2253: the event sink buffer is DISK (was memory, max_events=100000 —
+# which silently shed everything past ~100k events during a ClickHouse memory
+# wedge (NAN-2251) while sources ACKed 200, and a Vector restart evaporated
+# the rest; only ~4k of ~180k survived a real wedge). Disk survives restarts
+# under VECTOR_DATA_DIR and holds a bounded 2 GiB backlog. when_full stays
+# drop_newest, NOT block — this sink reaches the shared ingest sources, and
+# a blocking sink would stall every other lane through them (NAN-1114
+# invariant, enforced by shared_ingest_source_sinks_must_not_backpressure).
 #
 # Cluster routing contract (NAN-1728, C4/W1) — kept byte-for-byte in sync with
 # config/vector/sources/parsers/_pipeline.toml. `table` is env-driven and
@@ -1083,8 +1107,8 @@ skip_unknown_fields = true
 deduplicate = true
 
 [sinks.clickhouse_logs.buffer]
-type = "memory"
-max_events = 100000
+type = "disk"
+max_size = 2147483648
 when_full = "drop_newest"
 
 [sinks.clickhouse_logs.acknowledgements]

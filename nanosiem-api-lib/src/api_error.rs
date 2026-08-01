@@ -138,9 +138,44 @@ impl ApiError {
     }
 }
 
+/// Render an error with its full `source()` chain, so a 5xx log line carries
+/// the underlying cause (the PG constraint, the ClickHouse exception, the IO
+/// error inside the driver error) rather than only the top frame.
+pub fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = err.to_string();
+    let mut current = err.source();
+    while let Some(next) = current {
+        rendered.push_str(": ");
+        rendered.push_str(&next.to_string());
+        current = next.source();
+    }
+    rendered
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status_code();
+        // NAN-2266: every 5xx must name its cause in the server log. Before
+        // this, an internal error became a bare `500` status line and nothing
+        // else — the sweep-report failure this ticket fixes had to be diagnosed
+        // from the ClickHouse query log because the API recorded no reason.
+        //
+        // The response body stays exactly as it was (generic code + message);
+        // the detail this line carries — plus the request id already on the
+        // enclosing tracing span — goes to the log and only to the log.
+        //
+        // Expected 4xx (validation, not-found, forbidden, conflict, rate
+        // limits) are deliberately NOT logged here: they are the caller's
+        // mistake, not ours, and logging them at ERROR would bury the real
+        // faults under noise.
+        if status.is_server_error() {
+            tracing::error!(
+                status = status.as_u16(),
+                code = self.code(),
+                error = %self,
+                "request failed with a server error"
+            );
+        }
         let details = match &self {
             ApiError::TierLimitExceeded(info) => {
                 Some(serde_json::to_value(info).unwrap_or_default())
@@ -297,8 +332,11 @@ impl From<nanosiem_core::TierError> for ApiError {
 
 impl From<sqlx::Error> for ApiError {
     fn from(err: sqlx::Error) -> Self {
-        // Log the actual error server-side for debugging, but return generic message to client
-        tracing::error!(error = %err, "Database error occurred");
+        // Log the actual error server-side for debugging, but return a generic
+        // message to the client. `error_chain` walks `source()` so the line
+        // names the database's own error (constraint, column, SQLSTATE context)
+        // rather than sqlx's top frame alone.
+        tracing::error!(error = %error_chain(&err), "Database error occurred");
         ApiError::DatabaseError("A database error occurred".to_string())
     }
 }
@@ -584,7 +622,9 @@ impl From<nanosiem_core::settings::OrganizationalContextError> for ApiError {
         use nanosiem_core::settings::OrganizationalContextError;
         match &err {
             OrganizationalContextError::Database(e) => {
-                ApiError::InternalError(format!("Database error: {}", e))
+                // NAN-2266: log the driver detail, keep it out of the body.
+                tracing::error!(error = %e, "Organizational context database error");
+                ApiError::DatabaseError("A database error occurred".to_string())
             }
         }
     }
@@ -635,7 +675,9 @@ impl From<nanosiem_core::identity::IdentityServiceError> for ApiError {
                 ApiError::InternalError(format!("Encryption error: {}", e))
             }
             IdentityServiceError::Repository(IdentityRepositoryError::DatabaseError(e)) => {
-                ApiError::DatabaseError(e.to_string())
+                // NAN-2266: log the driver detail, keep it out of the body.
+                tracing::error!(error = %e, "Identity repository database error");
+                ApiError::DatabaseError("A database error occurred".to_string())
             }
             IdentityServiceError::Repository(IdentityRepositoryError::ClickHouse(e)) => {
                 ApiError::DatabaseError(format!("ClickHouse error: {}", e))
@@ -669,7 +711,11 @@ impl From<nanosiem_core::DashboardRepositoryError> for ApiError {
                 "Dashboard {} was modified by another update. Please reload and try again.",
                 dash_typeid(&id)
             )),
-            DashboardRepositoryError::DatabaseError(e) => ApiError::DatabaseError(e.to_string()),
+            DashboardRepositoryError::DatabaseError(e) => {
+                // NAN-2266: log the driver detail, keep it out of the body.
+                tracing::error!(error = %error_chain(&e), "Dashboard repository database error");
+                ApiError::DatabaseError("A database error occurred".to_string())
+            }
         }
     }
 }
@@ -808,6 +854,45 @@ impl From<nanosiem_core::PlaybookRepositoryError> for ApiError {
             // direct call.
             PlaybookRepositoryError::Forbidden(msg) => ApiError::Forbidden(msg),
             _ => ApiError::InternalError(err.to_string()),
+        }
+    }
+}
+
+/// NAN-2238. `LeaseLost` maps to 409 rather than 403 on purpose: the runner WAS
+/// authorized, its work simply belongs to a generation that no longer exists.
+/// A 403 would read as "fix your credentials" and invite a retry loop; a 409
+/// tells the runner to stop.
+impl From<nanosiem_core::hunts::HuntError> for ApiError {
+    fn from(err: nanosiem_core::hunts::HuntError) -> Self {
+        use nanosiem_core::hunts::HuntError;
+        match err {
+            HuntError::NotFound(id) => ApiError::NotFound(format!("Hunt not found: {id}")),
+            HuntError::SweepNotFound(id) => ApiError::NotFound(format!("Sweep not found: {id}")),
+            HuntError::LeadNotFound(id) => ApiError::NotFound(format!("Lead not found: {id}")),
+            HuntError::RunnerNotFound(id) => ApiError::NotFound(format!("Runner not found: {id}")),
+            HuntError::RuleIdeaNotFound(id) => {
+                ApiError::NotFound(format!("Rule idea not found: {id}"))
+            }
+            HuntError::Validation(msg) => ApiError::BadRequest(msg),
+            HuntError::Forbidden(msg) => ApiError::Forbidden(msg),
+            HuntError::LeaseLost(msg) | HuntError::Conflict(msg) => ApiError::Conflict(msg),
+            // NAN-2266: the 5xx variants used to flow their raw detail —
+            // including sqlx's rendering of the database error — straight into
+            // the response body. The detail goes to the log (with the request
+            // id on the span); the client gets the same generic envelope every
+            // other database fault produces.
+            HuntError::Database(e) => {
+                tracing::error!(error = %error_chain(&e), "Hunt database error");
+                ApiError::DatabaseError("A database error occurred".to_string())
+            }
+            HuntError::LogStore(msg) => {
+                tracing::error!(error = %msg, "Hunt log-store error");
+                ApiError::InternalError("A log store error occurred".to_string())
+            }
+            HuntError::Internal(msg) => {
+                tracing::error!(error = %msg, "Hunt internal error");
+                ApiError::InternalError("An internal error occurred".to_string())
+            }
         }
     }
 }
@@ -975,5 +1060,129 @@ mod tests {
             error.to_string(),
             "Forbidden: Missing permission: credentials:use"
         );
+    }
+
+    // NAN-2266: the hunts 5xx variants used to flow their raw detail — sqlx's
+    // rendering of the database error, the ClickHouse exception text — into the
+    // response body. The detail belongs in the server log; the client gets the
+    // same generic envelope every other database fault produces.
+
+    #[test]
+    fn hunt_database_errors_keep_the_driver_detail_out_of_the_body() {
+        let error = ApiError::from(nanosiem_core::hunts::HuntError::Database(
+            sqlx::Error::PoolTimedOut,
+        ));
+        assert_eq!(error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.code(), "DATABASE_ERROR");
+        assert_eq!(error.to_string(), "Database error: A database error occurred");
+    }
+
+    #[test]
+    fn hunt_log_store_errors_keep_the_exception_text_out_of_the_body() {
+        let error = ApiError::from(nanosiem_core::hunts::HuntError::LogStore(
+            "Code: 47. DB::Exception: Unknown expression or function identifier `email_sender`"
+                .to_string(),
+        ));
+        assert_eq!(error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.code(), "INTERNAL_ERROR");
+        assert!(
+            !error.to_string().contains("email_sender"),
+            "the log-store exception leaked into the client-facing message: {error}"
+        );
+    }
+
+    #[test]
+    fn hunt_lease_and_validation_outcomes_keep_their_specific_bodies() {
+        // The 4xx paths carry operator-facing detail on purpose; the NAN-2266
+        // genericisation must not have swallowed them.
+        let lease = ApiError::from(nanosiem_core::hunts::HuntError::LeaseLost(
+            "sweep x was reassigned".to_string(),
+        ));
+        assert_eq!(lease.status_code(), StatusCode::CONFLICT);
+        assert!(lease.to_string().contains("sweep x was reassigned"));
+
+        let validation =
+            ApiError::from(nanosiem_core::hunts::HuntError::Validation("bad turns".to_string()));
+        assert_eq!(validation.status_code(), StatusCode::BAD_REQUEST);
+        assert!(validation.to_string().contains("bad turns"));
+    }
+
+    /// Render everything the given closure logs, so a test can assert on it.
+    fn captured_log(run: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let bytes = buffer.0.lock().unwrap().clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[test]
+    fn a_server_error_logs_its_cause_at_error_level() {
+        // NAN-2266 (bug 2): a 500 used to leave nothing but the status line in
+        // the log — the sweep-report failure had to be diagnosed from the
+        // ClickHouse query log. Every 5xx now records its code and message.
+        let log = captured_log(|| {
+            let _ = ApiError::InternalError("the actual cause of the failure".to_string())
+                .into_response();
+        });
+        assert!(log.contains("ERROR"), "no ERROR event was emitted: {log}");
+        assert!(
+            log.contains("the actual cause of the failure"),
+            "the 5xx log line lost the error detail: {log}"
+        );
+        assert!(log.contains("INTERNAL_ERROR"), "the code is missing: {log}");
+    }
+
+    #[test]
+    fn expected_client_errors_stay_out_of_the_error_log() {
+        // Validation, not-found, forbidden, conflict are the caller's mistake.
+        // Logging them at ERROR would bury real faults under noise.
+        let log = captured_log(|| {
+            let _ = ApiError::NotFound("dashboard x".to_string()).into_response();
+            let _ = ApiError::ValidationError("bad cron".to_string()).into_response();
+            let _ = ApiError::Forbidden("missing permission".to_string()).into_response();
+            let _ = ApiError::Conflict("stale version".to_string()).into_response();
+        });
+        assert!(
+            log.is_empty(),
+            "an expected 4xx produced ERROR log noise: {log}"
+        );
+    }
+
+    #[test]
+    fn error_chain_walks_every_source() {
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "outer failed")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let err = Outer(std::io::Error::other("inner cause"));
+        assert_eq!(error_chain(&err), "outer failed: inner cause");
     }
 }

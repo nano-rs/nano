@@ -52,6 +52,42 @@ impl PlaybookCategory {
     }
 }
 
+/// Which kind of row a `playbooks` record is (NAN-2238).
+///
+/// `response` is case-attached and human-stepped; `hunt` is scheduled,
+/// agent-executed and case-less. They share the definition layer and split at
+/// runtime — see migration 9000054 and [`crate::hunts`].
+///
+/// The default is deliberately `Response`: every pre-NAN-2238 file, and every
+/// file that says nothing, is a document a human follows. Becoming a process
+/// that executes has to be written down.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum PlaybookKind {
+    #[default]
+    Response,
+    Hunt,
+}
+
+impl PlaybookKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PlaybookKind::Response => "response",
+            PlaybookKind::Hunt => "hunt",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "response" => Some(PlaybookKind::Response),
+            "hunt" => Some(PlaybookKind::Hunt),
+            _ => None,
+        }
+    }
+}
+
 /// Playbook status / lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -401,7 +437,9 @@ pub struct PlaybookPhase {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PlaybookStep {
     pub id: String,
-    /// Slash command kind: `query` | `pivot` | `enrichment` | `decision` | `action` | `review` | `note`.
+    /// Slash command kind: `query` | `pivot` | `enrichment` | `baseline` |
+    /// `lead` | `decision` | `action` | `review` | `note`. The last three are
+    /// response-only; `baseline` and `lead` are the hunt additions (NAN-2238).
     pub kind: String,
     pub label: String,
     #[serde(default)]
@@ -463,8 +501,36 @@ impl WhenOp {
 // =============================================================================
 
 /// YAML frontmatter pulled from the top of a playbook doc.
+///
+/// # There is no `enabled` field, and there must never be one (NAN-2238)
+///
+/// A hunt is an autonomous process that reads production telemetry on a cron.
+/// If frontmatter could switch one on, merge access to a content repository
+/// would silently become equivalent to the `hunts:run` permission — granted by
+/// approving a markdown file, with the reviewer reading prose rather than a
+/// privilege grant. `schedule:` below is therefore a *suggested cadence* that
+/// import records and never applies.
+///
+/// serde ignores unknown keys, so an author who writes `enabled: true` gets it
+/// silently dropped here rather than rejected. That is the intended shape: the
+/// guarantee is "there is no field to populate", enforced from this struct all
+/// the way down to the INSERT, which never names the column.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct PlaybookFrontmatter {
+    /// Which kind of document this file is.
+    ///
+    /// Read from frontmatter, NEVER inferred from the directory the file was
+    /// synced from: `playbook_repositories.playbooks_path` is
+    /// operator-configurable, so a `hunts/` prefix says something about
+    /// configuration and nothing about the file. Absent means `response`, which
+    /// is what every pre-NAN-2238 playbook is.
+    ///
+    /// An unrecognised value fails the whole frontmatter parse (this is a typed
+    /// enum, not a string) — the file lands in the catalog with
+    /// `parse_status = 'failed'` and cannot be imported, which is the correct
+    /// outcome for `kind: hnut`.
+    #[serde(default)]
+    pub kind: PlaybookKind,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
@@ -485,6 +551,49 @@ pub struct PlaybookFrontmatter {
     pub scope: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+
+    // ---- hunt-only (ignored when `kind` is response) ------------------------
+    /// SUGGESTED cadence, 5- or 6-field cron. Recorded in
+    /// `hunt_specs.schedule_cron`; a human enables the hunt in the product.
+    #[serde(default)]
+    pub schedule: Option<String>,
+    /// Timezone the cadence is expressed in. Defaults to UTC.
+    #[serde(default)]
+    pub timezone: Option<String>,
+    /// How far back a sweep looks, e.g. `24h`. Defaults to 24h.
+    #[serde(default)]
+    pub lookback_window: Option<String>,
+    /// nano source types the hunt needs. A hunt whose required source is
+    /// unhealthy is HELD rather than run partial, so yield stays comparable
+    /// across sweeps.
+    #[serde(default)]
+    pub required_source_types: Vec<String>,
+    #[serde(default)]
+    pub mitre_tactic: Option<String>,
+    #[serde(default)]
+    pub mitre_technique: Option<String>,
+    /// Ceiling on what one sweep may spend. Not a prescribed method.
+    #[serde(default)]
+    pub budget: Option<HuntBudgetFrontmatter>,
+}
+
+/// The `budget:` block of hunt frontmatter — the ceiling a sweep may spend,
+/// deliberately not a description of how it should spend it.
+///
+/// Every field is optional; the defaults in `hunt_specs` apply to whatever is
+/// omitted. Values are validated against per-dimension ceilings on import
+/// (see [`crate::hunts::spec`]) so a merged file cannot hand an unattended
+/// process an eight-hour wall clock over production telemetry.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
+pub struct HuntBudgetFrontmatter {
+    #[serde(default)]
+    pub max_turns: Option<i64>,
+    #[serde(default)]
+    pub max_tool_calls: Option<i64>,
+    #[serde(default)]
+    pub max_rows: Option<i64>,
+    #[serde(default)]
+    pub max_wall_seconds: Option<i64>,
 }
 
 /// Helper: accept either a NaiveDate or a string (empty → None).

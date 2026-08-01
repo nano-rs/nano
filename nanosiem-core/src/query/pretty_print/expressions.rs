@@ -11,14 +11,13 @@ impl PrettyPrint for EvalExpression {
             EvalExpression::Field(name) => name.clone(),
             EvalExpression::Literal(value) => {
                 // Always quote string literals to distinguish from field names.
-                // NAN-2006: strip the breakout `"`/newlines rather than emit the
-                // no-op `\"` escape (the parser has no working backslash escape,
-                // NAN-1157), so an eval literal cannot break out of the gate's
-                // pretty_print -> re-parse round-trip.
+                // NAN-2006: never emit the no-op `\"` escape (the parser has no
+                // working backslash escape, NAN-1157) — `npl_quoted_literal`
+                // picks a delimiter the literal cannot terminate, so an eval
+                // literal cannot break out of the gate's pretty_print ->
+                // re-parse round-trip.
                 match value {
-                    Value::String(s) => {
-                        format!("\"{}\"", super::helpers::npl_quoted_body(s))
-                    }
+                    Value::String(s) => super::helpers::npl_quoted_literal(s),
                     _ => value.to_string(),
                 }
             }

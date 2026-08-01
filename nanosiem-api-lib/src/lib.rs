@@ -26,7 +26,7 @@ pub mod headers;
 pub mod pagination;
 pub mod source_inventory;
 
-pub use api_error::{ApiError, ErrorDetail, ErrorResponse};
+pub use api_error::{error_chain, ApiError, ErrorDetail, ErrorResponse};
 pub use audit_ext::AuditExt;
 pub use auth_context::{
     check_all_permissions, check_any_permission, check_permission, ensure_interactive_session,

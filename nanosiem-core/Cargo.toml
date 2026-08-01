@@ -54,6 +54,10 @@ urlencoding = "2.1"
 utoipa.workspace = true
 # Cron scheduling
 cron = "0.16"
+# IANA timezone database. Hunt schedules (NAN-2238) are WALL-CLOCK in the
+# hunt's own `schedule_timezone`, so the slot arithmetic has to know about DST
+# transitions rather than pretending every day is 24 hours long.
+chrono-tz = "0.10"
 # Authentication
 bcrypt = "0.19"
 totp-rs = { version = "5.7", features = ["gen_secret", "otpauth", "qr", "serde_support"] }

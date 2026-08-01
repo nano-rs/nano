@@ -227,6 +227,61 @@ pub const PLAYBOOK_REPOSITORIES_MANAGE: &str = "playbook_repositories:manage";
 pub const PLAYBOOK_REPOSITORIES_SYNC: &str = "playbook_repositories:sync";
 pub const PLAYBOOK_REPOSITORIES_IMPORT: &str = "playbook_repositories:import";
 
+// Hunt permissions (NAN-2238 Active Hunter).
+//
+// Separate from `playbooks:*` even though a hunt definition lives in the
+// `playbooks` table: the two have different audiences and different blast
+// radii. `playbooks:manage` grants authority over case-response procedure;
+// `hunts:manage` grants authority over what runs unattended against the whole
+// log estate on a schedule.
+pub const HUNTS_VIEW: &str = "hunts:view";
+pub const HUNTS_MANAGE: &str = "hunts:manage";
+/// Enable/disable a hunt's schedule and trigger a manual sweep. Deliberately
+/// distinct from `HUNTS_MANAGE`: authoring a hunt and putting it on a cron
+/// against production telemetry are different decisions.
+pub const HUNTS_RUN: &str = "hunts:run";
+/// Promote a lead to a case, and dismiss a lead into a tenant-wide
+/// suppression. Both are analyst-only by design — the hunter agent has no
+/// path to either, because a suppression it could write would let it blind
+/// its own successors.
+pub const HUNTS_TRIAGE: &str = "hunts:triage";
+/// The ONLY scope minted into a hunt runner's key: append a sweep result and
+/// its leads. Not `hunts:manage`, not `cases:edit`, not the parser writes pivt's
+/// interactive key carries. The agent submits evidence and narrative; the server
+/// computes the score, the fingerprint and the notebook target.
+///
+/// **Held by Admin** (9000059). An earlier revision withheld it from every role
+/// on the theory that a scope meant for a minted key should not be assignable to
+/// a human — which was self-defeating: every minted key in this product is
+/// `requested set ∩ the minting user's own permissions`, so a scope no principal
+/// holds intersects to nothing and the key can never be created. The narrowness
+/// of a minted key comes from the short REQUEST list, not from hiding scopes;
+/// pivt's key carries `cases:edit`, which analysts hold too.
+///
+/// Withholding it also bought nothing. `POST /api/hunts/sweeps/{id}/report`
+/// reasserts sweep + runner + fence + unexpired lease + active status under
+/// `FOR UPDATE`, so a principal holding this scope with no claimed lease can
+/// post nothing. The fence is the control; this is a coarse gate in front of it.
+pub const HUNTS_REPORT: &str = "hunts:report";
+/// Write a deployment profile and create DISABLED draft hunts — the whole
+/// write surface of agent-driven recon, and nothing else.
+///
+/// Exists because `HUNTS_MANAGE` was the narrowest scope that could save a
+/// profile, and it also EDITS and ARCHIVES hunts. A key minted to write one
+/// profile could therefore delete the hunt library. Every minted key is
+/// `requested set ∩ the minting user's own permissions`, so the narrowness has
+/// to come from a scope that exists — asking for a subset of `hunts:manage`
+/// gets you `hunts:manage`.
+///
+/// **Held by Admin** (9000060), for the reason 9000059 had to be written at
+/// all: a scope no principal holds intersects to nothing and can never be
+/// minted, which makes the feature unusable rather than safe.
+///
+/// `HUNTS_MANAGE` remains sufficient everywhere this is accepted — this only
+/// ever widens who may call recon, never narrows it, so nothing that worked
+/// before stops working.
+pub const HUNTS_PROFILE_WRITE: &str = "hunts:profile_write";
+
 // GDPR permissions
 pub const GDPR_ANONYMIZE: &str = "gdpr:anonymize";
 
@@ -392,6 +447,13 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     PLAYBOOK_REPOSITORIES_MANAGE,
     PLAYBOOK_REPOSITORIES_SYNC,
     PLAYBOOK_REPOSITORIES_IMPORT,
+    // Hunts
+    HUNTS_VIEW,
+    HUNTS_MANAGE,
+    HUNTS_RUN,
+    HUNTS_TRIAGE,
+    HUNTS_REPORT,
+    HUNTS_PROFILE_WRITE,
     // GDPR
     GDPR_ANONYMIZE,
 ];
@@ -505,6 +567,7 @@ pub const CATEGORIES: &[&str] = &[
     "mitre",
     "rule_repositories",
     "parser_repositories",
+    "hunts",
     "gdpr",
 ];
 

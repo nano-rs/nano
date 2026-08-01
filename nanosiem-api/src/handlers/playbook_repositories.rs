@@ -11,7 +11,7 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
-use nanosiem_core::auth::{permissions, TargetEffect};
+use nanosiem_core::auth::permissions;
 use nanosiem_core::playbook_repository::{
     NewPlaybookRepository, PlaybookImportRequest, PlaybookImportResponse, PlaybookImportType,
     PlaybookRepository, PlaybookRepositoryError, PlaybookRepositoryService, RepositoryPlaybook,
@@ -26,12 +26,20 @@ use crate::handlers::repository_target_authz::{ensure_target_effects, held_targe
 use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
-/// Target-resource effects every playbook-import route consumes (NAN-2119).
-///
-/// Import always CREATES (`AlreadyImported` is a 409, never an update), so the
-/// set is a single effect. Declared once so single-import, import-all and
-/// sync-and-import cannot drift apart.
-const PLAYBOOK_IMPORT_EFFECTS: &[TargetEffect] = &[TargetEffect::PlaybookCreate];
+// NAN-2119 declared one constant here — `[TargetEffect::PlaybookCreate]` — for
+// every import route, because import always CREATES and always created the same
+// thing. NAN-2238 made the second half false: the same endpoint now
+// materializes a response playbook OR a hunt, and which one is decided by the
+// imported file's frontmatter. A hunt is an autonomous process that reads
+// production telemetry, gated on `hunts:manage`; `playbooks:manage` must not
+// reach it.
+//
+// So the effect set is now computed per operation and the constant is gone
+// deliberately — a constant would be the shape that hides the distinction.
+// `plan_import_effects` answers it for one path; `plan_bulk_import_effects`
+// answers it for a whole repository from its declared `allowed_kinds`. Both are
+// preflight only: the service re-checks at the write branch, from the file
+// itself.
 
 // NAN-845: hardcoded URL allowlist for the only repo we sync from. The
 // frontend reshape (drop add/edit dialogs) makes this unreachable via the UI,
@@ -73,6 +81,10 @@ pub struct CreatePlaybookRepositoryRequest {
     pub auto_sync_enabled: Option<bool>,
     #[serde(default)]
     pub sync_interval_hours: Option<i32>,
+    /// Which `playbooks.kind` values this repository may produce (NAN-2238).
+    /// Omitted means both, matching the column default.
+    #[serde(default)]
+    pub allowed_kinds: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -84,6 +96,10 @@ pub struct UpdatePlaybookRepositoryRequest {
     pub auto_sync_enabled: Option<bool>,
     pub sync_interval_hours: Option<i32>,
     pub enabled: Option<bool>,
+    /// Narrowing this is how an operator gives hunts and runbooks separate
+    /// merge gates — a runbook is a document a human follows, a hunt is a
+    /// process that executes.
+    pub allowed_kinds: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -236,6 +252,7 @@ pub async fn create_playbook_repository(
         playbooks_path: req.playbooks_path,
         auto_sync_enabled: req.auto_sync_enabled,
         sync_interval_hours: req.sync_interval_hours,
+        allowed_kinds: req.allowed_kinds,
     };
     let repo = service
         .create_repository(new_repo, Some(auth.user_id()))
@@ -273,6 +290,7 @@ pub async fn update_playbook_repository(
         auto_sync_enabled: req.auto_sync_enabled,
         sync_interval_hours: req.sync_interval_hours,
         enabled: req.enabled,
+        allowed_kinds: req.allowed_kinds,
     };
     let repo = service.update_repository(*id, update).await?;
     Ok(Json(repo))
@@ -437,9 +455,13 @@ pub async fn import_repository_playbook(
     // initial version — the same rows `POST /api/playbooks` creates behind
     // `playbooks:manage`. Preflight the target capability BEFORE any write, and
     // hand the grant set to the service so it re-checks at the create branch.
-    ensure_target_effects(&auth, PLAYBOOK_IMPORT_EFFECTS)?;
-    let grants = held_target_grants(&auth);
+    //
+    // NAN-2238: which capability that is depends on what the file declares
+    // itself to be, so ask before enforcing.
     let service = get_service(&state);
+    let effects = service.plan_import_effects(*id, &path).await?;
+    ensure_target_effects(&auth, &effects)?;
+    let grants = held_target_grants(&auth);
     let response = service
         .import_playbook(*id, &path, req, Some(auth.user_id()), &grants)
         .await?;
@@ -475,12 +497,14 @@ pub async fn import_all_repository_playbooks(
     ensure_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_IMPORT)?;
     // NAN-2119: bulk import creates up to `max_playbooks_per_repo` library
     // playbooks. Preflighted here so authorization cannot fail PART-WAY through
-    // and leave a partially-populated library.
-    ensure_target_effects(&auth, PLAYBOOK_IMPORT_EFFECTS)?;
-    let grants = held_target_grants(&auth);
+    // and leave a partially-populated library. NAN-2238: over every kind the
+    // repository is allowed to produce, for the same reason — a caller who
+    // cannot author hunts must be refused before the loop, not halfway down it.
     let service = get_service(&state);
-    // Confirm the repo exists (404 if not) before doing any work.
-    service.get_repository(*id).await?;
+    // Confirms the repo exists (404 if not) before doing any work, as well.
+    let effects = service.plan_bulk_import_effects(*id).await?;
+    ensure_target_effects(&auth, &effects)?;
+    let grants = held_target_grants(&auth);
 
     let import_type = req.import_type.unwrap_or(PlaybookImportType::Linked);
 
@@ -596,10 +620,10 @@ pub async fn sync_and_import_repository(
     ensure_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_IMPORT)?;
     // NAN-2119: enforced BEFORE the sync so an under-scoped caller cannot even
     // trigger the network fetch, let alone reach the library-creating loop.
-    ensure_target_effects(&auth, PLAYBOOK_IMPORT_EFFECTS)?;
-    let grants = held_target_grants(&auth);
     let service = get_service(&state);
-    service.get_repository(*id).await?;
+    let effects = service.plan_bulk_import_effects(*id).await?;
+    ensure_target_effects(&auth, &effects)?;
+    let grants = held_target_grants(&auth);
 
     let sync_result = service.sync_repository(*id).await?;
 

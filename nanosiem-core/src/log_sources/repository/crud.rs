@@ -303,6 +303,45 @@ impl LogSourceRepository {
     }
 
     /// Update a log source
+    /// NAN-2256: atomically add one value to `match_values`, if absent.
+    /// Returns whether it was added.
+    ///
+    /// Deliberately NOT expressed as a read-modify-write through [`Self::update`],
+    /// whose `match_values = COALESCE($n, match_values)` replaces the whole
+    /// array. Collector streams sharing one log source are provisioned from two
+    /// HTTP handlers, and two instances can share a log source, so two callers
+    /// can interleave: both read `[x]`, one writes `[x, a]`, the other writes
+    /// `[x, b]`, and the first addition is lost. The symptom would be a stream
+    /// quietly collecting unparsed until the next reconcile happened to re-add
+    /// it — the same silent-and-eventually-self-healing shape that made the
+    /// underlying bug hard to see in the first place.
+    ///
+    /// `array_append` guarded by a `NOT (… = ANY(…))` predicate does the whole
+    /// thing in one statement, so concurrent callers serialize on the row and
+    /// neither loses a value. Idempotent: a value already present affects zero
+    /// rows and reports `false`.
+    pub async fn add_match_value(
+        &self,
+        id: Uuid,
+        value: &str,
+    ) -> Result<bool, LogSourceRepositoryError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE log_sources
+            SET match_values = array_append(COALESCE(match_values, ARRAY[]::TEXT[]), $2),
+                updated_at = NOW()
+            WHERE id = $1
+              AND NOT ($2 = ANY(COALESCE(match_values, ARRAY[]::TEXT[])))
+            "#,
+        )
+        .bind(id)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn update(
         &self,
         id: Uuid,

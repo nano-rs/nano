@@ -25,3 +25,4 @@ utoipa.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+tracing-subscriber.workspace = true

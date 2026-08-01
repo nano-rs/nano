@@ -70,6 +70,7 @@ use crate::handlers;
         (name = "rule_repositories", description = "External Sigma rule repository syncing"),
         (name = "parser_repositories", description = "External parser repository syncing and import"),
         (name = "playbooks", description = "SOC investigation playbook library (markdown + slash-command format)"),
+        (name = "hunts", description = "Active Hunter: scheduled autonomous threat hunts, sweeps, scored leads, and triage"),
         (name = "playbook_repositories", description = "External playbook repository syncing and import"),
         (name = "upload", description = "File upload and preview"),
         (name = "marketplace", description = "Enrichment marketplace (unified catalog, repos, install/uninstall)"),
@@ -166,6 +167,9 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
         handlers::detection_code_targets::DetectionCodeTargetsApiDoc::openapi(),
         handlers::parser_repositories::ParserRepositoriesApiDoc::openapi(),
         handlers::playbooks::PlaybooksApiDoc::openapi(),
+        // NAN-2238 Active Hunter. Registered alongside playbooks because a hunt
+        // definition IS a playbooks row; the runtime is what splits.
+        handlers::hunts::HuntsApiDoc::openapi(),
         handlers::playbook_repositories::PlaybookRepositoriesApiDoc::openapi(),
         handlers::marketplace::MarketplaceApiDoc::openapi(),
         #[cfg(feature = "enterprise")]
@@ -410,10 +414,48 @@ mod tests {
         // (GET, PUT, DELETE) and /api/integrations/instances/{id}/run (POST).
         // Enterprise-only — collectors need egress and the Deno runtime, neither
         // of which the open edition ships. Enterprise floor 521 + 3 = 524.
+        // NAN-2238 added 20 shared path templates (Active Hunter), counted in
+        // both editions. A hunt definition is a `playbooks` row and the whole
+        // surface is registered ungated, matching how playbooks itself ships:
+        //   /api/hunts/summary, /api/hunts, /api/hunts/{id},
+        //   /api/hunts/{id}/sweeps, /api/hunts/{id}/toggle,
+        //   /api/hunts/runners, /api/hunts/runners/{id}/heartbeat,
+        //   /api/hunts/runners/{id}/claim,
+        //   /api/hunts/sweeps/{id}, /api/hunts/sweeps/{id}/report,
+        //   /api/hunts/leads, /api/hunts/leads/{id},
+        //   /api/hunts/leads/{id}/promote, /api/hunts/leads/{id}/dismiss,
+        //   /api/hunts/suppressions, /api/hunts/suppressions/{id},
+        //   /api/hunts/profile, /api/hunts/rule-ideas,
+        //   /api/hunts/rule-ideas/{id}/send, /api/hunts/rule-ideas/{id}/reject.
+        // Enterprise floor 524 + 20 = 544; open floor 410 + 20 = 430.
+        //
+        // Recon generation added 1 more shared path template:
+        //   /api/hunts/profile/run.
+        // Enterprise floor 544 + 1 = 545; open floor 430 + 1 = 431.
+        //
+        // Reworking recon from a closed job into agent-driven primitives added
+        // 3 more shared path TEMPLATES:
+        //   /api/hunts/profile/census (POST), /api/hunts/profile/surface (POST)
+        //   and /api/hunts/drafts (POST).
+        // `POST /api/hunts/profile` is a fourth new OPERATION but reuses the
+        // template `GET /api/hunts/profile` already contributes, and this
+        // assertion counts templates — so the floor moves by 3, not 4.
+        // Enterprise floor 545 + 3 = 548; open floor 431 + 3 = 434.
+        //
+        // NAN-2239 then added 2 shared path templates (hunt knowledge), counted
+        // in both editions alongside the rest of the hunts surface:
+        //   /api/hunts/knowledge (GET recall + POST record — one template, two
+        //   operations) and /api/hunts/knowledge/{id}/revoke (POST).
+        // Enterprise floor 548 + 2 = 550; open floor 434 + 2 = 436.
+        //
+        // NAN-2264 then added 1 shared path template, the Antigravity sweep
+        // waiver: /api/hunts/runners/{id}/agy-waiver (POST grant + DELETE
+        // revoke — one template, two operations, so the floor moves by 1).
+        // Enterprise floor 550 + 1 = 551; open floor 436 + 1 = 437.
         #[cfg(feature = "enterprise")]
-        let min_paths = 524;
+        let min_paths = 551;
         #[cfg(not(feature = "enterprise"))]
-        let min_paths = 410;
+        let min_paths = 437;
 
         assert!(
             path_count >= min_paths,
@@ -496,5 +538,54 @@ mod tests {
                 "{method} {path} must document the credentials:use requirement"
             );
         }
+    }
+
+    /// NAN-2243 — the recon contract that keeps an agent's context intact.
+    ///
+    /// Both halves of this are spec-level facts a generated MCP client reads,
+    /// and both regressed into a 371 KB tool result the last time they were
+    /// only documented in prose:
+    ///
+    ///   1. `profile/surface` takes a `detail` parameter and its DEFAULT is the
+    ///      bounded summary. A caller that says nothing must not get the matrix.
+    ///   2. `census` and `huntable_surface` are not required on a save. They are
+    ///      the deterministic halves; the agent authors neither, and requiring
+    ///      them is what made it shuttle them back through its own context.
+    #[test]
+    fn verify_recon_surface_is_bounded_by_default_and_the_save_needs_no_echo() {
+        let spec = serde_json::to_value(build_openapi()).expect("serialize OpenAPI");
+
+        let parameters = spec["paths"]["/api/hunts/profile/surface"]["post"]["parameters"]
+            .as_array()
+            .expect("profile/surface must document its query parameters");
+        let detail = parameters
+            .iter()
+            .find(|parameter| parameter["name"] == "detail")
+            .expect("profile/surface must expose a `detail` parameter");
+        assert_eq!(detail["in"], "query", "{detail}");
+        assert_ne!(
+            detail["required"], serde_json::json!(true),
+            "`detail` must be optional — its default is the whole point: {detail}"
+        );
+
+        // The save's two deterministic halves are optional. `required` is either
+        // absent entirely or names neither.
+        let required = spec["components"]["schemas"]["SaveProfileRequest"]["required"].clone();
+        let required: Vec<&str> = required
+            .as_array()
+            .map(|names| names.iter().filter_map(|n| n.as_str()).collect())
+            .unwrap_or_default();
+        for half in ["census", "huntable_surface"] {
+            assert!(
+                !required.contains(&half),
+                "SaveProfileRequest must not require `{half}` — the server recomputes it.                  required = {required:?}"
+            );
+        }
+        // And the judgement half it DOES author is still required, so an empty
+        // body is not a valid profile.
+        assert!(
+            required.contains(&"fingerprint"),
+            "SaveProfileRequest must still require the fingerprint: {required:?}"
+        );
     }
 }

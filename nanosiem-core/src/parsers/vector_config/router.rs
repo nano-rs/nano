@@ -225,6 +225,115 @@ pub(super) fn parser_claimed_route(parser: &Parser) -> Option<&str> {
     }
 }
 
+/// NAN-2247: which shared input stream this parser consumes.
+///
+/// Two parsers double-write an event only if they read the SAME stream and both
+/// claim its `source_type`. A routed parser and a Splunk HEC parser may both
+/// claim `apache_access` quite safely — one sees HTTP-ingested events off
+/// `source_router`, the other sees HEC events off `splunk_hec_route`, and no
+/// single event reaches both. So collisions are scoped per lane, not globally.
+///
+/// `None` means the parser owns a private Vector source (an unbound
+/// kafka/s3/gcp fetch parser). Nothing else reads it, so it cannot collide.
+pub(super) fn parser_lane(parser: &Parser) -> Option<&str> {
+    match parser.source_type.as_str() {
+        // Both consume `source_router`, which routes by `.source_type`.
+        "routed" | "vector" => Some("source_router"),
+        "splunk_hec" | "splunk" | "hec" => Some("splunk_hec_route"),
+        "opentelemetry" | "otlp" => Some("otlp_logs_prep"),
+        // Bound to a source-config via DISPATCH FROM: shares that route with
+        // any other parser bound to the same one. Unbound: private source.
+        "kafka" | "aws_s3" | "aws_sqs" | "gcp_pubsub" => parser.dispatch_route_name.as_deref(),
+        // Unknown source types fall through to the router (see
+        // `generate_source_config`), so they share `source_router`.
+        _ => Some("source_router"),
+    }
+}
+
+/// NAN-2247: one contested `source_type` — the lane it is contested on, and
+/// every parser laying claim to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SourceTypeCollision {
+    pub lane: String,
+    pub source_type: String,
+    /// Parser names, sorted, so the error message is stable across runs.
+    pub parsers: Vec<String>,
+}
+
+/// NAN-2247: find `source_type` values claimed by more than one enabled parser
+/// on the same input lane.
+///
+/// Such a claim is always a bug, never a configuration choice. Vector's `route`
+/// transform emits to EVERY matching output and the per-parser HEC/OTLP filters
+/// each pass independently, so both parsers run; `_combiner.toml` then unions
+/// their outputs and the event lands in ClickHouse twice. It is silent —
+/// nothing errors, the data is simply doubled, which corrupts counts,
+/// prevalence and dedup rather than announcing itself.
+///
+/// Sharing a `source_type` *in the parsers repo* is legitimate and expected —
+/// that is how format variants (`windows_sysmon` JSON and XML) and UDM/OCSF
+/// counterparts are expressed. The invariant is on what is DEPLOYED: of the
+/// parsers claiming a value, exactly one may be enabled on a given lane.
+///
+/// Disabled parsers are ignored: they generate no config, so they cannot
+/// double-write, and disabling one is the documented way to resolve this.
+pub(super) fn find_source_type_collisions(parsers: &[Parser]) -> Vec<SourceTypeCollision> {
+    use std::collections::BTreeMap;
+
+    // (lane, source_type) -> claiming parser names.
+    let mut claims: BTreeMap<(&str, String), Vec<String>> = BTreeMap::new();
+    for parser in parsers.iter().filter(|p| p.enabled) {
+        let Some(lane) = parser_lane(parser) else {
+            continue;
+        };
+        for value in VectorConfigManager::parser_source_types(parser) {
+            claims
+                .entry((lane, value))
+                .or_default()
+                .push(parser.name.clone());
+        }
+    }
+
+    claims
+        .into_iter()
+        .filter(|(_, names)| names.len() > 1)
+        .map(|((lane, source_type), mut parsers)| {
+            parsers.sort();
+            parsers.dedup();
+            SourceTypeCollision {
+                lane: lane.to_string(),
+                source_type,
+                parsers,
+            }
+        })
+        // A single parser listed twice for one value is not a collision.
+        .filter(|c| c.parsers.len() > 1)
+        .collect()
+}
+
+/// NAN-2247: render collisions as an operator-facing error.
+///
+/// Names both the contested value and every parser claiming it, because the
+/// remedy is a choice between them that only the operator can make — the two
+/// parsers usually differ in wire format or output schema, and picking one
+/// automatically would silently parse their logs with the wrong mapping.
+pub(super) fn describe_collisions(collisions: &[SourceTypeCollision]) -> String {
+    let mut out = String::from(
+        "refusing to deploy: more than one enabled log source claims the same source_type, \
+         which would parse every matching event twice and write it to ClickHouse twice. \
+         Disable all but one of the log sources listed for each source_type.",
+    );
+    for c in collisions {
+        out.push_str(&format!(
+            "\n  source_type '{}' is claimed by: {} (on {})",
+            c.source_type,
+            c.parsers.join(", "),
+            c.lane,
+        ));
+    }
+    out
+}
+
 /// NAN-930: build the `<route>_unclaimed` filter condition — an event passes
 /// only when its `.source_type` is NOT in any claiming parser's match_values.
 /// Mirrors `build_hec_filter_condition` (sources.rs) but with the leading `!`
@@ -1142,5 +1251,168 @@ source = ".source_type = \"foo\""
         p.name = "lone_parser".to_string();
         let cond = build_unclaimed_filter_condition(&[&p]);
         assert!(cond.contains(r#"["lone_parser"]"#), "got: {cond}");
+    }
+
+    // ------------------------------------------------------------------
+    // NAN-2247: source_type collision detection
+    // ------------------------------------------------------------------
+
+    fn parser_named(name: &str, source_type: &str, values: &[&str]) -> Parser {
+        Parser {
+            name: name.to_string(),
+            source_type: source_type.to_string(),
+            match_values: Some(values.iter().map(|v| v.to_string()).collect()),
+            ..parser_for_claim_tests("routed", None)
+        }
+    }
+
+    /// The sysmon bug that started NAN-2246: two enabled parsers on the same
+    /// lane claiming one value. Every matching event would be parsed twice and
+    /// written to ClickHouse twice.
+    #[test]
+    fn collision_detected_when_two_routed_parsers_claim_one_value() {
+        let a = parser_named("Microsoft Sysmon", "routed", &["windows_sysmon"]);
+        let b = parser_named("Microsoft Sysmon (XML)", "routed", &["windows_sysmon"]);
+
+        let found = find_source_type_collisions(&[a, b]);
+
+        assert_eq!(found.len(), 1, "got: {found:?}");
+        assert_eq!(found[0].source_type, "windows_sysmon");
+        assert_eq!(
+            found[0].parsers,
+            vec!["Microsoft Sysmon", "Microsoft Sysmon (XML)"],
+            "both claimants must be named — the operator has to choose between them"
+        );
+    }
+
+    /// Distinct values on the same lane are the normal case.
+    #[test]
+    fn no_collision_for_distinct_values() {
+        let a = parser_named("Sysmon", "routed", &["windows_sysmon"]);
+        let b = parser_named("Windows Event Log", "routed", &["windows_event"]);
+        assert!(find_source_type_collisions(&[a, b]).is_empty());
+    }
+
+    /// The correction to this issue's original scoping. A routed parser and a
+    /// HEC parser read different streams — `source_router` vs
+    /// `splunk_hec_route` — so no single event reaches both. Flagging this
+    /// would block a legitimate setup: the same log type arriving over two
+    /// transports.
+    #[test]
+    fn no_collision_across_different_lanes() {
+        let routed = parser_named("Apache", "routed", &["apache_access"]);
+        let hec = parser_named("Apache via HEC", "splunk_hec", &["apache_access"]);
+
+        assert!(
+            find_source_type_collisions(&[routed, hec]).is_empty(),
+            "different input lanes cannot double-write the same event"
+        );
+    }
+
+    /// ...but two parsers on the SAME non-routed lane still collide: each HEC
+    /// parser gets its own `filter` transform and both pass independently.
+    #[test]
+    fn collision_detected_within_the_hec_lane() {
+        let a = parser_named("Apache HEC A", "splunk_hec", &["apache_access"]);
+        let b = parser_named("Apache HEC B", "hec", &["apache_access"]);
+
+        let found = find_source_type_collisions(&[a, b]);
+        assert_eq!(found.len(), 1, "got: {found:?}");
+        assert_eq!(found[0].lane, "splunk_hec_route");
+    }
+
+    /// Unbound fetch parsers own a private Vector source that nothing else
+    /// reads, so they cannot double-write even claiming identical values.
+    #[test]
+    fn no_collision_between_unbound_fetch_parsers() {
+        let a = Parser {
+            name: "Kafka A".into(),
+            source_type: "kafka".into(),
+            dispatch_route_name: None,
+            dispatch_source_config_id: None,
+            match_values: Some(vec!["shared".into()]),
+            ..parser_for_claim_tests("kafka", None)
+        };
+        let b = Parser { name: "Kafka B".into(), ..a.clone() };
+        assert!(find_source_type_collisions(&[a, b]).is_empty());
+    }
+
+    /// Two fetch parsers bound to the SAME source-config route do share a
+    /// stream, so they collide.
+    #[test]
+    fn collision_detected_between_fetch_parsers_on_one_dispatch_route() {
+        let a = Parser {
+            name: "Kafka A".into(),
+            match_values: Some(vec!["shared".into()]),
+            ..parser_for_claim_tests("kafka", Some("orders_route"))
+        };
+        let b = Parser { name: "Kafka B".into(), ..a.clone() };
+
+        let found = find_source_type_collisions(&[a, b]);
+        assert_eq!(found.len(), 1, "got: {found:?}");
+        assert_eq!(found[0].lane, "orders_route");
+    }
+
+    /// Disabled parsers generate no config, so they cannot double-write —
+    /// and disabling one is the documented way to resolve a collision. If the
+    /// check counted them, following that advice would not clear the error.
+    #[test]
+    fn disabled_parser_does_not_collide() {
+        let a = parser_named("Sysmon JSON", "routed", &["windows_sysmon"]);
+        let b = Parser {
+            enabled: false,
+            ..parser_named("Sysmon XML", "routed", &["windows_sysmon"])
+        };
+        assert!(find_source_type_collisions(&[a, b]).is_empty());
+    }
+
+    /// A parser is not in conflict with itself when one value repeats.
+    #[test]
+    fn duplicate_value_within_one_parser_is_not_a_collision() {
+        let p = parser_named("Sysmon", "routed", &["windows_sysmon", "windows_sysmon"]);
+        assert!(find_source_type_collisions(&[p]).is_empty());
+    }
+
+    /// With no explicit match_values a parser is activated by its own name, so
+    /// two parsers whose names collapse to the same safe_name contend for it.
+    #[test]
+    fn collision_detected_via_the_safe_name_fallback() {
+        let a = Parser { match_values: None, ..parser_named("My Source", "routed", &[]) };
+        let b = Parser { match_values: None, ..parser_named("my-source", "routed", &[]) };
+
+        let found = find_source_type_collisions(&[a, b]);
+        assert_eq!(found.len(), 1, "safe_name collapses both to my_source: {found:?}");
+    }
+
+    /// The message must name the value AND every claimant — resolving this is
+    /// a choice only the operator can make.
+    #[test]
+    fn describe_collisions_names_value_and_all_claimants() {
+        let found = find_source_type_collisions(&[
+            parser_named("Microsoft Sysmon", "routed", &["windows_sysmon"]),
+            parser_named("Microsoft Sysmon (XML)", "routed", &["windows_sysmon"]),
+        ]);
+        let msg = describe_collisions(&found);
+
+        assert!(msg.contains("windows_sysmon"), "{msg}");
+        assert!(msg.contains("Microsoft Sysmon (XML)"), "{msg}");
+        assert!(msg.contains("Disable all but one"), "{msg}");
+    }
+
+    /// Output is stable across runs so the error does not churn.
+    #[test]
+    fn collisions_are_deterministically_ordered() {
+        let mk = || vec![
+            parser_named("Z parser", "routed", &["b_type"]),
+            parser_named("A parser", "routed", &["b_type"]),
+            parser_named("M parser", "routed", &["a_type"]),
+            parser_named("N parser", "routed", &["a_type"]),
+        ];
+        let first = find_source_type_collisions(&mk());
+        for _ in 0..8 {
+            assert_eq!(find_source_type_collisions(&mk()), first);
+        }
+        assert_eq!(first[0].source_type, "a_type", "sorted by value");
+        assert_eq!(first[1].parsers, vec!["A parser", "Z parser"]);
     }
 }

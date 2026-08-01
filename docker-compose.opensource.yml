@@ -127,7 +127,13 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2G
+          # NAN-2252: install.sh sizes this from host RAM (RAM − 4G reserve for
+          # the rest of the stack, 2G floor) via CLICKHOUSE_MEM_LIMIT in .env.
+          # CH 26.x auto-sizes its usable ceiling to this cgroup limit
+          # (max_server_memory_usage_to_ram_ratio 0.8), so a flat 2G gave every
+          # host a 1.6 GiB ceiling that wedges ingest around 300 eps (NAN-2251).
+          # Pre-existing .env files without the var keep the old 2G.
+          memory: ${CLICKHOUSE_MEM_LIMIT:-2G}
 
   dragonfly:
     # Was `:latest` (NAN-1258): a floating tag on a security product is the

@@ -357,6 +357,14 @@ impl AppState {
         handles.push(self.start_slo_scheduler());
         tracing::info!("SLO burn-rate evaluator started (leader-only, 60s tick)");
 
+        // Hunt scheduler (NAN-2238) — issues scheduled hunt sweeps, collapses a
+        // missed backlog into ONE catch-up sweep, and reclaims sweeps from
+        // runners that died holding a lease. PostgreSQL-only, so it is NOT
+        // egress-gated and keeps working air-gapped; see
+        // `start_hunt_scheduler` for why leadership is load-bearing here.
+        handles.push(self.start_hunt_scheduler());
+        tracing::info!("Hunt scheduler started (leader-only, 60s tick)");
+
         // Cleanup tasks (leader-only to avoid duplicate work across nodes).
         // Job store / wizard session / melod session cleanups are enterprise-only —
         // the underlying repos live in nanosiem-enterprise::melod.

@@ -37,6 +37,25 @@ impl VectorConfigManager {
     /// This copies all base config files to staging along with the parser configs,
     /// ensuring that `vector validate` runs against a complete configuration.
     pub async fn stage_parsers(&self, parsers: &[Parser]) -> Result<(), VectorConfigError> {
+        // NAN-2247: the same claim check the active writer runs
+        // (deploy.rs::deploy_parsers). Staging exists to catch a bad config
+        // before it is promoted on top of the live one, and `promote_staged`
+        // copies these files over the active ones — so a collision that only
+        // the active path rejected would still reach disk by this route.
+        // Enrichment parsers route via the enrichment lane and claim no
+        // source_type, matching how the active path splits them out.
+        let log_parsers: Vec<Parser> = parsers
+            .iter()
+            .filter(|p| p.kind != "enrichment")
+            .cloned()
+            .collect();
+        let collisions = super::router::find_source_type_collisions(&log_parsers);
+        if !collisions.is_empty() {
+            let detail = super::router::describe_collisions(&collisions);
+            tracing::error!(collisions = collisions.len(), "{}", detail);
+            return Err(VectorConfigError::ValidationFailed(detail));
+        }
+
         // Ensure staging directory exists and is clean
         self.cleanup_staging().await?;
         fs::create_dir_all(&self.staging_dir).await?;

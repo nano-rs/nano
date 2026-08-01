@@ -439,6 +439,19 @@ pub async fn explain(
         if matches!(e, nanosiem_core::SearchError::FieldNotFound { .. }) {
             return e.into();
         }
+        // NAN-2241: a syntax error is the author's own query coming back at
+        // them — /api/search surfaces it (structured, with position and
+        // suggestions) via the From impl in error.rs, and explain masked it as
+        // "Query processing failed", stranding anyone iterating on a `rex`
+        // pattern in Inspect SQL with no idea what was wrong. Echoes only the
+        // caller's own input.
+        if matches!(
+            e,
+            nanosiem_core::SearchError::ParseError(_)
+                | nanosiem_core::SearchError::StructuredParseError { .. }
+        ) {
+            return e.into();
+        }
         if let nanosiem_core::SearchError::SqlGenError(ref msg) = e {
             if msg.starts_with("Invalid query:")
                 || msg.starts_with("Unsupported operation:")

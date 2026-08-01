@@ -205,26 +205,55 @@ impl PrettyPrint for Command {
                 pattern,
                 mode,
             } => {
+                // NAN-2006 (F5/F9): the rex pattern is re-emitted as a quoted
+                // literal and re-parsed downstream, so it must not be able to
+                // close the string and inject an ungated subsearch
+                // (`x" | append [ source_type="audit" ]`).
+                //
+                // NAN-2241: a regex is not prose — characters must not be
+                // silently removed from it. `npl_quoted_literal` picks the
+                // delimiter the pattern cannot terminate instead of deleting
+                // the pattern's own quotes, so `'"name":"(?<v>[^"]+)"'` reaches
+                // ClickHouse intact rather than degrading to `[^]+` (which
+                // matches nothing, silently returning zero rows).
                 let mut result = "rex".to_string();
-                if let Some(f) = field {
-                    result.push_str(&format!(" field={}", f));
-                }
-                // NAN-2006 (F5/F9): the rex pattern is re-emitted inside `"…"`
-                // and re-parsed downstream. Strip the breakout `"`/newlines
-                // (keeping regex `|`/parens, which are inert inside the quotes)
-                // so a pattern like `x" | append [ source_type="audit" ]` cannot
-                // close the string and inject an ungated subsearch.
-                result.push_str(&format!(" \"{}\"", super::helpers::npl_quoted_body(pattern)));
-                if let RexMode::Sed {
-                    pattern: sed_pat,
-                    replacement,
-                } = mode
-                {
-                    result.push_str(&format!(
-                        " mode=sed \"s/{}/{}/\"",
-                        super::helpers::npl_quoted_body(sed_pat),
-                        super::helpers::npl_quoted_body(replacement)
-                    ));
+                match mode {
+                    RexMode::Extract => {
+                        if let Some(f) = field {
+                            result.push_str(&format!(" field={}", f));
+                        }
+                        result.push(' ');
+                        result.push_str(&super::helpers::npl_quoted_literal(pattern));
+                    }
+                    RexMode::Sed {
+                        pattern: sed_pat,
+                        replacement,
+                    } => {
+                        // Canonical INLINE form: `rex mode=sed [field=…] 's/…/…/'`.
+                        // The previous shape (`<pattern> mode=sed "s/<pat>/<repl>/"`)
+                        // used the trailing-replacement syntax, so re-parsing put
+                        // the WHOLE sed expression in the replacement slot — the
+                        // pattern/replacement split was destroyed on every
+                        // round-trip, silently (NAN-2241).
+                        result.push_str(" mode=sed");
+                        if let Some(f) = field {
+                            result.push_str(&format!(" field={}", f));
+                        }
+                        // Pick a delimiter neither half contains so the
+                        // `s<d>pat<d>repl<d>` split re-parses exactly
+                        // (`parse_sed_expression` accepts any delimiter).
+                        let delimiter = ['/', '|', '#', '@', '%', '!', ',', '~', '^']
+                            .into_iter()
+                            .find(|d| !sed_pat.contains(*d) && !replacement.contains(*d))
+                            .unwrap_or('/');
+                        result.push(' ');
+                        result.push_str(&super::helpers::npl_quoted_literal(&format!(
+                            "s{d}{p}{d}{r}{d}",
+                            d = delimiter,
+                            p = sed_pat,
+                            r = replacement
+                        )));
+                    }
                 }
                 result
             }

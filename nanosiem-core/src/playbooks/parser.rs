@@ -12,7 +12,7 @@
 //! # Title                   → doc title
 //! ## Phase heading          → starts a new phase
 //! /kind: label              → starts a new step; kind ∈ {query,pivot,enrichment,
-//!                             decision,action,review,note}
+//!                             baseline,lead,decision,action,review,note}
 //!   key: value              → YAML-ish indented block becomes step.params
 //!   key:
 //!     - item                → list value
@@ -167,8 +167,21 @@ pub fn parse_playbook(src: &str) -> ParsedStepTree {
     let mut cur_step: Option<PendingStep> = None;
     let mut step_body: Vec<String> = Vec::new();
 
-    let slash_re =
-        Regex::new(r"^/(query|pivot|enrichment|decision|action|review|note):\s*(.*)$").unwrap();
+    // `baseline` and `lead` are the two step kinds hunts add (NAN-2238). They
+    // are parsed by the shared parser rather than a second one: a hunt is the
+    // same authoring language, and a separate parser would drift the moment
+    // either side gained a feature.
+    //
+    // The narrowing runs the other way — hunts may not use `decision`,
+    // `review` or `action` (nobody is present to decide or review, and an
+    // unattended process on a cron must not change the world). That is enforced
+    // at import by `crate::hunts::spec`, not here, because this parser is also
+    // how the UI renders a doc and refusing to parse a step would hide the
+    // very thing the reviewer needs to see.
+    let slash_re = Regex::new(
+        r"^/(query|pivot|enrichment|baseline|lead|decision|action|review|note):\s*(.*)$",
+    )
+    .unwrap();
     let h1_re = Regex::new(r"^#\s+(.*)$").unwrap();
     let h2_re = Regex::new(r"^##\s+(.*)$").unwrap();
 

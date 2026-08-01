@@ -63,6 +63,20 @@ pub enum TargetEffect {
     /// creates the same first-class rows (`playbooks` + `playbook_versions`),
     /// so the repository alias must demand the same capability.
     PlaybookCreate,
+    /// Materializes a repository file that declares `kind: hunt` into a hunt —
+    /// a `playbooks` row of `kind = 'hunt'` plus its `hunt_specs` extension
+    /// (NAN-2238).
+    ///
+    /// Deliberately NOT [`TargetEffect::PlaybookCreate`]. A response playbook is
+    /// a document a human follows; a hunt is an autonomous process that reads
+    /// production telemetry, and authoring one is gated on `hunts:manage`.
+    /// Folding the two into one effect would let `playbooks:manage` author
+    /// hunts, which is exactly the kind-boundary erosion the rest of NAN-2238
+    /// spends a schema on preventing.
+    ///
+    /// It is not `hunts:run`: an imported hunt lands DISABLED, so creating one
+    /// is not the same act as putting it on a cron.
+    HuntCreate,
 }
 
 impl TargetEffect {
@@ -81,13 +95,14 @@ impl TargetEffect {
             TargetEffect::SourceConfigEdit => permissions::SOURCE_CONFIGS_EDIT,
             TargetEffect::ParserEdit => permissions::PARSERS_EDIT,
             TargetEffect::PlaybookCreate => permissions::PLAYBOOKS_MANAGE,
+            TargetEffect::HuntCreate => permissions::HUNTS_MANAGE,
         }
     }
 
     /// Every effect this policy knows about. Used to snapshot which target
     /// capabilities a principal actually holds before entering a service that
     /// may branch between create and update.
-    pub const ALL: [TargetEffect; 12] = [
+    pub const ALL: [TargetEffect; 13] = [
         TargetEffect::DetectionView,
         TargetEffect::DetectionCreate,
         TargetEffect::DetectionEdit,
@@ -100,6 +115,7 @@ impl TargetEffect {
         TargetEffect::SourceConfigEdit,
         TargetEffect::ParserEdit,
         TargetEffect::PlaybookCreate,
+        TargetEffect::HuntCreate,
     ];
 }
 
@@ -183,6 +199,21 @@ mod tests {
         assert_eq!(
             TargetEffect::PlaybookCreate.permission(),
             "playbooks:manage"
+        );
+        assert_eq!(TargetEffect::HuntCreate.permission(), "hunts:manage");
+    }
+
+    /// Importing a hunt must not be reachable with the response-playbook
+    /// capability. They share a definition table and an import endpoint; the
+    /// capabilities are where they stay apart (NAN-2238).
+    #[test]
+    fn playbook_manage_does_not_grant_hunt_authoring() {
+        let grants = TargetGrants::from_effects([TargetEffect::PlaybookCreate]);
+        assert!(grants.allows(TargetEffect::PlaybookCreate));
+        assert!(!grants.allows(TargetEffect::HuntCreate));
+        assert_eq!(
+            grants.ensure(TargetEffect::HuntCreate),
+            Err(TargetEffect::HuntCreate)
         );
     }
 

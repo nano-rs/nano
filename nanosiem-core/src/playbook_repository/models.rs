@@ -30,11 +30,26 @@ pub struct PlaybookRepository {
     pub last_sync_error: Option<String>,
     pub playbook_count: Option<i32>,
     pub enabled: Option<bool>,
+    /// Which `playbooks.kind` values this repository may produce (NAN-2238).
+    ///
+    /// A runbook is a document a human follows; a hunt is a process that
+    /// executes on a cadence against production telemetry. Before this, both
+    /// arrived through one merge gate and an operator had no way to review them
+    /// differently — point a tightly-reviewed repository at hunts and a looser
+    /// one at runbooks, and import refuses anything outside the declaration.
+    #[serde(default = "default_allowed_kinds")]
+    pub allowed_kinds: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(default, with = "typeid::user::opt")]
     #[schema(value_type = Option<String>)]
     pub created_by: Option<Uuid>,
+}
+
+/// Both kinds — the column default in migration 9000057, repeated here for
+/// deserialization of payloads written before it existed.
+fn default_allowed_kinds() -> Vec<String> {
+    vec!["response".to_string(), "hunt".to_string()]
 }
 
 /// Request to create a new playbook repository.
@@ -54,6 +69,9 @@ pub struct NewPlaybookRepository {
     pub auto_sync_enabled: Option<bool>,
     #[serde(default)]
     pub sync_interval_hours: Option<i32>,
+    /// Omitted means both kinds, matching the column default.
+    #[serde(default)]
+    pub allowed_kinds: Option<Vec<String>>,
 }
 
 /// Request to update a playbook repository.
@@ -66,6 +84,10 @@ pub struct UpdatePlaybookRepository {
     pub auto_sync_enabled: Option<bool>,
     pub sync_interval_hours: Option<i32>,
     pub enabled: Option<bool>,
+    /// Narrowing this is how an operator separates the two merge gates. It
+    /// takes effect on the next sync and on every import — including imports of
+    /// rows catalogued while the repository was wider.
+    pub allowed_kinds: Option<Vec<String>>,
 }
 
 /// A cached playbook from a repository.
@@ -80,6 +102,15 @@ pub struct RepositoryPlaybook {
     pub file_path: String,
     pub file_sha: Option<String>,
     pub raw_content: String,
+    /// Kind declared by the file's own frontmatter at sync time — never
+    /// inferred from `file_path`, because the path a repository syncs from is
+    /// operator-configurable and retargeting it would silently reclassify every
+    /// file under it.
+    ///
+    /// A browse/filter cache. Import re-reads `kind` from `raw_content` so a
+    /// stale row cannot decide what gets created.
+    #[serde(default = "default_repository_playbook_kind")]
+    pub kind: String,
     pub title: Option<String>,
     pub subtitle: Option<String>,
     pub category: Option<String>,
@@ -95,6 +126,11 @@ pub struct RepositoryPlaybook {
     pub step_count: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Every pre-NAN-2238 catalog row is a response playbook.
+fn default_repository_playbook_kind() -> String {
+    "response".to_string()
 }
 
 /// Filter for listing repository playbooks.
@@ -166,6 +202,10 @@ pub struct PlaybookImportResponse {
     #[schema(value_type = String)]
     pub playbook_id: Uuid,
     pub import_type: String,
+    /// What was actually created — `response` or `hunt`. Reported because the
+    /// caller asked to import a file path and the file's frontmatter decided
+    /// which of two quite different objects it became.
+    pub kind: String,
 }
 
 /// Status of a sync operation.

@@ -118,6 +118,10 @@ pub enum AuditSource {
     SourceScope,
     /// Artifact-analysis store events (create, update, delete) — NAN-1977.
     Artifact,
+    /// Active Hunter events (NAN-2238): enabling what runs unattended,
+    /// promoting a lead into a case, and writing or revoking the tenant-wide
+    /// dismissal memory. All four decide what the SOC does and does not see.
+    Hunt,
 }
 
 impl std::fmt::Display for AuditSource {
@@ -160,6 +164,7 @@ impl std::fmt::Display for AuditSource {
             Self::Report => write!(f, "report"),
             Self::SourceScope => write!(f, "source_scope"),
             Self::Artifact => write!(f, "artifact"),
+            Self::Hunt => write!(f, "hunt"),
         }
     }
 }

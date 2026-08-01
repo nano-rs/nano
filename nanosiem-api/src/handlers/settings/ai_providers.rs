@@ -11,6 +11,7 @@ use nanosiem_core::audit::{
     AI_PROVIDER_VALIDATED, AVAILABLE_MODEL_CREATED, AVAILABLE_MODEL_DELETED,
     AVAILABLE_MODEL_UPDATED, MODEL_CATALOG_SYNCED,
 };
+use nanosiem_core::ai_provider::{direct_endpoint, DirectApiStyle};
 use nanosiem_core::auth::permissions;
 use nanosiem_core::crypto::EncryptionService;
 use nanosiem_core::inputlookup::ai_base_url_validator;
@@ -23,6 +24,15 @@ use crate::error::{ApiError, ErrorResponse};
 use crate::handlers::AuditExt;
 use crate::middleware::{ensure_permission, AuthContext};
 use crate::state::AppState;
+
+/// Version pin sent as `anthropic-version` on every Anthropic Messages probe,
+/// whether that is Anthropic's public API or an operator's own endpoint.
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Cheapest Claude model to prove reachability + auth with. Overridable per
+/// provider via `config.test_model` — an operator's own endpoint may serve a
+/// different model set.
+const ANTHROPIC_TEST_MODEL: &str = "claude-haiku-4-5-20251001";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AiSettingsSurface {
@@ -688,6 +698,13 @@ pub async fn validate_ai_provider(
     use nanosiem_core::crypto::EncryptedData;
 
     require_ai_settings_surface(&auth, AiSettingsSurface::Providers)?;
+    // Defence in depth (NAN-2231): a managed tenant can't persist a `base_url`
+    // — `update_ai_provider` rejects the write — so the probe can't be aimed at
+    // an arbitrary host today. Gate the probe on the same condition anyway, so
+    // that stays true if provider config ever becomes settable another way.
+    // Health monitoring is unaffected: it calls `test_provider_connection`
+    // directly through `ApiAiProviderChecker`, not this handler.
+    check_not_managed(&state)?;
 
     // Get credentials for this provider
     use sqlx::Row;
@@ -879,20 +896,18 @@ async fn test_provider_connection(
         .build()
         .unwrap_or_default();
 
-    // NAN-1207: air-gapped direct path. When the provider config carries a
-    // non-empty `base_url`, the operator is pointing nano at an on-prem
-    // OpenAI-compatible server (vLLM, Ollama, LocalAI, …). Test that endpoint
-    // directly with a minimal `/chat/completions` probe instead of the
-    // vendor's public API. The API key is optional — many on-prem servers run
-    // open behind a network boundary — so we only attach the bearer header
-    // when a key is configured.
-    let direct_base_url = config
-        .and_then(|c| c["base_url"].as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.trim_end_matches('/').to_string());
-
-    if let Some(base_url) = direct_base_url {
+    // NAN-1207 / NAN-2231: direct path. When the provider config carries a
+    // non-empty `base_url`, the operator is pointing nano at their own
+    // endpoint rather than the managed Cloudflare gateway — an on-prem
+    // OpenAI-compatible server (vLLM, Ollama, LocalAI, …), or their own
+    // Anthropic account for data-residency reasons. Probe that endpoint in
+    // whatever wire format it speaks instead of the vendor's public API.
+    //
+    // Style resolution is shared with the request path (`AiGatewayClient`), so
+    // a passing test proves the same URL and auth shape inference will
+    // actually use.
+    if let Some(endpoint) = config.and_then(|c| direct_endpoint(provider, c)) {
+        let base_url = endpoint.base_url.clone();
         // SSRF guard (NAN-1368): base_url is admin-configurable and was posted
         // to directly. Reject loopback / private / link-local / cloud-metadata
         // targets before any outbound request. On-prem / air-gapped operators
@@ -909,33 +924,61 @@ async fn test_provider_connection(
             .await
             .map_err(|e| format!("base_url rejected: {}", e))?;
 
+        // `test_model` is the explicit override; `model` is what the
+        // direct-endpoint card writes, and before NAN-2231 the probe ignored
+        // it — so an operator who filled in "Model id" was silently tested
+        // against a placeholder instead. Prefer the override, fall back to the
+        // configured model, and only then to a placeholder.
         let model = config
-            .and_then(|c| c["test_model"].as_str())
-            .filter(|s| !s.is_empty())
+            .and_then(|c| {
+                c["test_model"]
+                    .as_str()
+                    .or_else(|| c["model"].as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
             .map(str::to_string);
 
         let mut req = pinned_client
-            .post(format!("{}/chat/completions", base_url))
+            .post(endpoint.chat_url())
             .header("content-type", "application/json");
-        if !api_key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", api_key));
-        }
 
-        // `model` is required by the OpenAI schema; on-prem servers ignore an
-        // unknown id but still answer, which is enough to prove reachability +
-        // auth. Default to a common placeholder when the operator hasn't
-        // pinned a test model in config.
-        let body = serde_json::json!({
-            "model": model.as_deref().unwrap_or("default"),
-            "max_tokens": 10,
-            "messages": [{"role": "user", "content": "Hi"}]
-        });
+        // `model` is required by both schemas; endpoints ignore an unknown id
+        // but still answer, which is enough to prove reachability + auth.
+        // Default to a placeholder when the operator hasn't pinned a
+        // `test_model` in config.
+        //
+        // The API key stays optional on both shapes — many on-prem servers run
+        // open behind a network boundary.
+        let body = match endpoint.style {
+            DirectApiStyle::Anthropic => {
+                req = req.header("anthropic-version", ANTHROPIC_VERSION);
+                if !api_key.is_empty() {
+                    req = req.header("x-api-key", api_key);
+                }
+                serde_json::json!({
+                    "model": model.as_deref().unwrap_or(ANTHROPIC_TEST_MODEL),
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "Hi"}]
+                })
+            }
+            DirectApiStyle::OpenAi => {
+                if !api_key.is_empty() {
+                    req = req.header("Authorization", format!("Bearer {}", api_key));
+                }
+                serde_json::json!({
+                    "model": model.as_deref().unwrap_or("default"),
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "Hi"}]
+                })
+            }
+        };
 
         let resp = req
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("Request to on-prem endpoint failed: {}", e))?;
+            .map_err(|e| format!("Request to direct endpoint failed: {}", e))?;
 
         // 2xx is a clean success. A 4xx that is NOT an auth failure (e.g. 404
         // unknown model, 422 bad model id) still proves the endpoint is
@@ -955,7 +998,7 @@ async fn test_provider_connection(
             return Ok(());
         }
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("On-prem endpoint error ({}): {}", status, body));
+        return Err(format!("Direct endpoint error ({}): {}", status, body));
     }
 
     match provider {
@@ -963,10 +1006,10 @@ async fn test_provider_connection(
             let resp = client
                 .post("https://api.anthropic.com/v1/messages")
                 .header("x-api-key", api_key)
-                .header("anthropic-version", "2023-06-01")
+                .header("anthropic-version", ANTHROPIC_VERSION)
                 .header("content-type", "application/json")
                 .json(&serde_json::json!({
-                    "model": "claude-haiku-4-5-20251001",
+                    "model": ANTHROPIC_TEST_MODEL,
                     "max_tokens": 10,
                     "messages": [{"role": "user", "content": "Hi"}]
                 }))

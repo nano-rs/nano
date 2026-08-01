@@ -44,7 +44,11 @@ export type StreamProvisionReport = {
   source_type: string;
 } & (
   | { status: 'linked'; log_source_id: string; created: boolean }
-  | { status: 'no_parser'; source_type: string }
+  // `declared_parser` is present when the collector manifest named the parser
+  // it needs (NAN-2248) and no synced repository provides it. The remedy is to
+  // sync that repository — not to look for a parser claiming `source_type`,
+  // which by design nothing may claim.
+  | { status: 'no_parser'; source_type: string; declared_parser?: string }
   | { status: 'not_permitted'; missing: string }
   | { status: 'failed'; error: string }
 );

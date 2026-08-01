@@ -675,8 +675,25 @@ pub struct StreamDef {
     /// Stable id. Doubles as the cursor key — renaming resets the cursor.
     pub id: String,
     pub label: String,
-    /// Routes emitted events to a parser. Must match a parser's `match_values`.
+    /// The `source_type` this stream's events are ingested under. Becomes the
+    /// provisioned log source's match value.
     pub source_type: String,
+    /// Repository parser (by its YAML `name`) that parses this stream.
+    ///
+    /// NAN-2248: when set, provisioning resolves the parser by name and the
+    /// parser's `match_values` play no part in resolution. Before this field,
+    /// the only way to find a stream's parser was a reverse lookup — index every
+    /// repository parser's `match_values` and look up `source_type` — which
+    /// forced a parser to claim one alias per stream (netskope carried nine)
+    /// purely so collectors could find it. It also meant an unrelated edit in
+    /// the parsers repo could silently unlink a collector, and
+    /// `StreamProvisionOutcome::NoParser` is deliberately non-fatal, so the
+    /// breakage surfaced only as events landing unparsed.
+    ///
+    /// Left optional: manifests written before this field, and third-party ones
+    /// that never adopt it, keep resolving through the `match_values` fallback.
+    #[serde(default)]
+    pub parser: Option<String>,
     /// Pre-checked at install time.
     #[serde(default)]
     pub default: bool,

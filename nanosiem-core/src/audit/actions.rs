@@ -358,6 +358,78 @@ pub const INTEGRATION_INSTANCE_DELETED: &str = "integration_instance_deleted";
 pub const INTEGRATION_RUN_TRIGGERED: &str = "integration_run_triggered";
 
 // =============================================================================
+// Hunt Actions (NAN-2238)
+// =============================================================================
+//
+// Deliberately NOT added to `SECURITY_CRITICAL_ACTIONS`. That set is the
+// durable-insert list and it is attacker-floodable by construction: an
+// unattended sweep reports on its own schedule, so a synchronous audit write
+// per lead decision would let a misbehaving runner amplify a flood into a
+// self-inflicted DoS on the audit path. These ride the bounded async path like
+// every other routine mutation.
+
+/// A hunt's schedule was enabled — an agent now runs unattended against the estate.
+pub const HUNT_SCHEDULE_ENABLED: &str = "hunt_schedule_enabled";
+/// A hunt's schedule was disabled.
+pub const HUNT_SCHEDULE_DISABLED: &str = "hunt_schedule_disabled";
+/// An analyst set or cleared a hunt's cadence (NAN-2252). Distinct from
+/// enable/disable: the two are independent halves of "does this run by itself",
+/// and an incident review asks about both.
+pub const HUNT_SCHEDULE_SET: &str = "hunt_schedule_set";
+/// A lead was promoted into a case.
+pub const HUNT_LEAD_PROMOTED: &str = "hunt_lead_promoted";
+/// A lead was dismissed, writing a tenant-wide suppression.
+pub const HUNT_LEAD_DISMISSED: &str = "hunt_lead_dismissed";
+/// A suppression was revoked; its shape reaches the bench again.
+pub const HUNT_SUPPRESSION_REVOKED: &str = "hunt_suppression_revoked";
+/// A SWEEP decided an analyst does not need to look at something (NAN-2240).
+/// Audited because that is a security-relevant decision made by a machine, and
+/// the audit log is the only record that survives the suppression expiring.
+pub const HUNT_SUPPRESSION_RECORDED: &str = "hunt_suppression_recorded";
+/// A rule idea was marked sent to detection-as-code.
+pub const HUNT_RULE_IDEA_SENT: &str = "hunt_rule_idea_sent";
+/// A rule idea was rejected.
+pub const HUNT_RULE_IDEA_REJECTED: &str = "hunt_rule_idea_rejected";
+/// Recon ran: it read the whole estate's telemetry, sent aggregates to a model,
+/// and created draft hunts. Audited even though every draft it writes is inert,
+/// because "who pointed the profiler at production and when" is the question
+/// asked after an unexpected ClickHouse load spike.
+pub const HUNT_RECON_RAN: &str = "hunt_recon_ran";
+/// An agent-authored deployment profile was stored. Distinct from
+/// `hunt_recon_ran` because the judgement in it came from somewhere else: the
+/// question after a profile that reads wrong is which pipeline wrote it, and
+/// the census/surface half is deterministic on both.
+pub const HUNT_PROFILE_SAVED: &str = "hunt_profile_saved";
+/// Draft hunts were created from proposals. Audited for the same reason recon
+/// is — the drafts are inert, but "who added 25 hunts to the library" is asked
+/// after somebody finds 25 hunts in the library.
+pub const HUNT_DRAFTS_CREATED: &str = "hunt_drafts_created";
+/// An analyst revoked something the hunter had learned (NAN-2239).
+///
+/// Audited because the revocation is PERMANENT and `hunt_knowledge.revoked_by`
+/// is `ON DELETE SET NULL` — a departing employee's attribution vanishes from
+/// the row, so the audit log is the only durable record of who decided a fact
+/// the agent believed was wrong, and why.
+pub const HUNT_KNOWLEDGE_REVOKED: &str = "hunt_knowledge_revoked";
+/// An analyst authorised one machine to run unattended sweeps on Antigravity
+/// (NAN-2264).
+///
+/// The single most consequential thing on this list, and the reason the waiver
+/// is a server-side row rather than a click. Antigravity cannot be given a
+/// per-run tool config, so a sweep on it can reach pivt's write-capable key —
+/// `log_sources:deploy` among it, which is live VRL in the ingestion pipeline
+/// and an undeploy that blinds it. The grant is standing and covers every
+/// scheduled run until it is withdrawn, so the question after a sweep does
+/// something surprising is "who accepted this, on which machine, and when",
+/// and this event is the only place that survives `agy_waiver_granted_by`
+/// being `ON DELETE SET NULL`.
+pub const HUNT_RUNNER_AGY_WAIVER_GRANTED: &str = "hunt_runner_agy_waiver_granted";
+/// That authorisation was withdrawn (NAN-2264). Audited as its own event
+/// because "when did this stop being true" is half of the question above, and a
+/// grant with no matching revocation is what makes a stale waiver visible.
+pub const HUNT_RUNNER_AGY_WAIVER_REVOKED: &str = "hunt_runner_agy_waiver_revoked";
+
+// =============================================================================
 // Source Config Actions
 // =============================================================================
 

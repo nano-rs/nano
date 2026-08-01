@@ -1,0 +1,650 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! NAN-2238 — the hunt service.
+//!
+//! This is where the narrow report contract is turned into facts. Everything
+//! load-bearing happens here or below it, and none of it is reachable from the
+//! wire type:
+//!
+//! ```text
+//!   SweepReport ─► resolve evidence (server reads ClickHouse)
+//!               ─► corroborate the claimed entity against what was READ
+//!               ─► validate signals against the server's known set
+//!               ─► accumulate provenance from what resolved
+//!               ─► measure prevalence / prior history
+//!               ─► [repository tx: reassert fence, derive fingerprint,
+//!                   measure suppression + recurrence, score, persist]
+//! ```
+//!
+//! # Why a candidate is dropped rather than the report
+//!
+//! A sweep that produced ten candidates, one of which names an entity that
+//! appears in none of its evidence, has still done nine useful things. Rejecting
+//! the whole report would mean one hallucinated entity discards a sweep's work
+//! and — worse — that the failure is invisible, because the runner just sees a
+//! 400. So bad candidates are counted into
+//! [`SweepReportAccepted::candidates_rejected`] and the rest are committed. A
+//! sweep whose candidates are ALL being rejected shows up as a run that reported
+//! ten and created none, which is the signal an operator actually needs.
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use chrono::{Duration, Utc};
+use uuid::Uuid;
+
+use crate::auth::{ArtifactScope, ScopeSet};
+use crate::hunts::error::HuntError;
+use crate::hunts::evidence::{EvidenceResolver, ResolvedEvidence};
+use crate::hunts::fingerprint::{CanonicalEntity, ValidatedSignal};
+use crate::hunts::models::*;
+use crate::hunts::report::{BudgetUsage, LeadCandidate, SweepReport};
+use crate::hunts::repository::{
+    CommitInputs, HuntRepository, PreparedLead, RuleIdeaVerdict,
+};
+
+/// Entity types `hunt_leads_entity_type_check` accepts.
+///
+/// Checked in the service so an unknown type rejects ONE candidate with a
+/// countable reason, instead of the constraint rejecting the whole transaction
+/// and losing every good lead beside it.
+const ALLOWED_ENTITY_TYPES: &[&str] = &[
+    "ip", "user", "host", "domain", "hash", "process", "url", "email", "file",
+];
+
+/// Hard ceiling on candidates per report. The report is attacker-influenceable
+/// through the model's context; without this, one sweep could enqueue an
+/// unbounded number of ClickHouse round trips.
+pub const MAX_CANDIDATES_PER_REPORT: usize = 50;
+
+#[derive(Clone)]
+pub struct HuntService {
+    repo: HuntRepository,
+    resolver: Arc<dyn EvidenceResolver>,
+}
+
+impl HuntService {
+    pub fn new(repo: HuntRepository, resolver: Arc<dyn EvidenceResolver>) -> Self {
+        Self { repo, resolver }
+    }
+
+    pub fn repository(&self) -> &HuntRepository {
+        &self.repo
+    }
+
+    // =========================================================================
+    // Definitions / runners — thin pass-throughs, authorization lives in the
+    // handler and provenance filtering in the repository.
+    // =========================================================================
+
+    pub async fn list_hunts(
+        &self,
+        enabled_only: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Hunt>, HuntError> {
+        self.repo.list_hunts(enabled_only, limit, offset).await
+    }
+
+    pub async fn get_hunt(&self, playbook_id: Uuid) -> Result<Hunt, HuntError> {
+        self.repo.get_hunt(playbook_id).await
+    }
+
+    pub async fn create_hunt(
+        &self,
+        req: &CreateHuntRequest,
+        created_by: Option<Uuid>,
+    ) -> Result<Hunt, HuntError> {
+        self.repo.create_hunt(req, created_by).await
+    }
+
+    pub async fn update_hunt(
+        &self,
+        playbook_id: Uuid,
+        req: &UpdateHuntRequest,
+    ) -> Result<Hunt, HuntError> {
+        self.repo.update_hunt(playbook_id, req).await
+    }
+
+    pub async fn archive_hunt(&self, playbook_id: Uuid) -> Result<(), HuntError> {
+        self.repo.archive_hunt(playbook_id).await
+    }
+
+    pub async fn list_runners(&self) -> Result<Vec<HuntRunner>, HuntError> {
+        self.repo.list_runners().await
+    }
+
+    pub async fn register_runner(
+        &self,
+        req: &RegisterRunnerRequest,
+        registered_by: Option<Uuid>,
+    ) -> Result<HuntRunner, HuntError> {
+        self.repo.register_runner(req, registered_by).await
+    }
+
+    pub async fn heartbeat_runner(&self, runner_id: Uuid) -> Result<HuntRunner, HuntError> {
+        self.repo.heartbeat_runner(runner_id).await
+    }
+
+    /// Grant or withdraw a runner's Antigravity sweep waiver (NAN-2264).
+    pub async fn set_runner_agy_waiver(
+        &self,
+        runner_id: Uuid,
+        granted: bool,
+        actor: Option<Uuid>,
+    ) -> Result<HuntRunner, HuntError> {
+        self.repo.set_runner_agy_waiver(runner_id, granted, actor).await
+    }
+
+    // =========================================================================
+    // Sweeps
+    // =========================================================================
+
+    /// Trigger a manual sweep over the hunt's own lookback window.
+    ///
+    /// The window is computed from `hunt_specs.lookback_window` — a
+    /// server-owned value — rather than accepted from the caller. A
+    /// caller-supplied window would let a `hunts:run` holder aim an autonomous
+    /// agent at an arbitrary slice of history, which is a different authority
+    /// from "run this hunt".
+    pub async fn trigger_manual_sweep(&self, playbook_id: Uuid) -> Result<HuntSweep, HuntError> {
+        let hunt = self.repo.get_hunt(playbook_id).await?;
+        let window_end = Utc::now();
+        let window_start = window_end - parse_lookback(&hunt.lookback_window);
+        self.repo
+            .enqueue_manual_sweep(playbook_id, window_start, window_end)
+            .await
+    }
+
+    pub async fn claim_sweep(
+        &self,
+        runner_id: Uuid,
+        lease_seconds: Option<i64>,
+    ) -> Result<Option<ClaimedSweep>, HuntError> {
+        self.repo.claim_next_sweep(runner_id, lease_seconds).await
+    }
+
+    pub async fn list_sweeps(
+        &self,
+        query: &ListSweepsQuery,
+        scope: &ArtifactScope,
+    ) -> Result<Vec<HuntSweep>, HuntError> {
+        self.repo.list_sweeps(query, scope).await
+    }
+
+    pub async fn get_sweep(
+        &self,
+        sweep_id: Uuid,
+        scope: &ArtifactScope,
+    ) -> Result<HuntSweep, HuntError> {
+        self.repo.get_sweep(sweep_id, scope).await
+    }
+
+    /// Turn a sweep report into scored leads.
+    ///
+    /// `scope` is the SWEEP PRINCIPAL's live-data scope, used when reading
+    /// evidence out of ClickHouse. It is not the later reader's authorization —
+    /// each lead is re-evaluated against whoever reads it, against the manifest
+    /// this call stamps.
+    pub async fn submit_sweep_report(
+        &self,
+        sweep_id: Uuid,
+        runner_id: Uuid,
+        runner_fence: i64,
+        usage: BudgetUsage,
+        report: SweepReport,
+        scope: &ScopeSet,
+    ) -> Result<SweepReportAccepted, HuntError> {
+        // Preflight: cheap rejection of a stale runner BEFORE we spend a
+        // ClickHouse round trip per candidate on work that cannot be committed.
+        // Not authoritative — the fence reassertion inside the commit
+        // transaction is.
+        let context = self
+            .repo
+            .sweep_report_context(sweep_id, runner_id, runner_fence)
+            .await?;
+
+        let known_signals = self.repo.known_signals().await?;
+        let window_start = context
+            .window_start
+            .unwrap_or_else(|| Utc::now() - Duration::days(1));
+        let window_end = context.window_end.unwrap_or_else(Utc::now);
+
+        let mut prepared = Vec::new();
+        let mut rejected = 0usize;
+
+        for candidate in report.candidates.iter().take(MAX_CANDIDATES_PER_REPORT) {
+            match self
+                .prepare_candidate(
+                    candidate,
+                    &known_signals,
+                    window_start,
+                    window_end,
+                    scope,
+                )
+                .await?
+            {
+                Some(lead) => prepared.push(lead),
+                None => rejected += 1,
+            }
+        }
+        // Anything past the cap is a refusal, not an omission, and must be
+        // counted so a sweep spraying candidates is visible.
+        rejected += report.candidates.len().saturating_sub(MAX_CANDIDATES_PER_REPORT);
+
+        self.repo
+            .commit_sweep_report(CommitInputs {
+                sweep_id,
+                runner_id,
+                runner_fence,
+                usage,
+                trail: report.trail,
+                claimed_outcome: report.claimed_outcome,
+                note: report.note,
+                leads: prepared,
+                rejected,
+            })
+            .await
+    }
+
+    /// Resolve one candidate into something the repository can persist, or
+    /// `None` if the server declines to believe it.
+    ///
+    /// Three ways a candidate is refused, all of them silent-by-design failures
+    /// if they were not checked:
+    ///
+    /// 1. **Unknown entity type** — would violate `hunt_leads_entity_type_check`
+    ///    and abort the whole transaction, taking every good lead with it.
+    /// 2. **Uncorroborated entity** — the agent named something that appears in
+    ///    none of the evidence it attached. Either a hallucination or an attempt
+    ///    to aim a lead at a fingerprint of its choosing; both get the same
+    ///    answer.
+    /// 3. **Nothing readable behind it** — every cited event resolved to
+    ///    nothing the sweep principal could read. A lead with no evidence has a
+    ///    narrative and no way to check it.
+    async fn prepare_candidate(
+        &self,
+        candidate: &LeadCandidate,
+        known_signals: &BTreeSet<String>,
+        window_start: chrono::DateTime<Utc>,
+        window_end: chrono::DateTime<Utc>,
+        scope: &ScopeSet,
+    ) -> Result<Option<PreparedLead>, HuntError> {
+        let entity_type = candidate.entity_type.trim().to_lowercase();
+        if !ALLOWED_ENTITY_TYPES.contains(&entity_type.as_str()) {
+            return Ok(None);
+        }
+
+        let resolved: ResolvedEvidence = self
+            .resolver
+            .resolve(&candidate.evidence_event_ids, scope)
+            .await?;
+        if resolved.events.is_empty() {
+            return Ok(None);
+        }
+
+        // `resolve`, NOT `trusted`. `trusted` skips corroboration and exists for
+        // server-originated entities (recon, backfills); reaching for it here
+        // would let the agent choose its own fingerprint input, which is the
+        // whole attack the corroboration check closes.
+        let Some(entity) = CanonicalEntity::resolve(
+            &entity_type,
+            &candidate.entity_value,
+            &resolved.observed_entities,
+        ) else {
+            return Ok(None);
+        };
+
+        // Unrecognised signals are DROPPED, not rejected. Rejecting the
+        // candidate would let one junk signal remove a finding; dropping means a
+        // suppressed lead resubmitted with a nonce still hashes the same.
+        let signals: Vec<ValidatedSignal> = candidate
+            .signals
+            .iter()
+            .filter_map(|s| ValidatedSignal::validate(s, known_signals))
+            .collect();
+
+        let prevalence = self
+            .resolver
+            .asset_prevalence(
+                entity.entity_type(),
+                entity.value(),
+                window_start,
+                window_end,
+                scope,
+            )
+            .await?;
+        let first_seen_in_window = !self
+            .resolver
+            .had_prior_history(entity.entity_type(), entity.value(), window_start, scope)
+            .await?;
+
+        // Keep only the events that actually mention the corroborated entity.
+        //
+        // Corroboration proves the entity appears SOMEWHERE in the batch; it
+        // does not make every event in the batch evidence FOR it. Without this
+        // filter the agent picks the batch, and the batch drives
+        // `evidence_count`, `distinct_source_types` and the provenance manifest
+        // — so attaching twenty unrelated but readable events from three source
+        // types manufactures cross-source corroboration, which is the single
+        // heaviest term in the score. That is the same defeat as the fingerprint
+        // nonce: excluding the literal field is worthless while the agent still
+        // chooses the inputs.
+        //
+        // It also tightens provenance. Stamping the manifest from unrelated
+        // events marks a lead as derived from sources it never actually drew on,
+        // which over-restricts honest readers and muddies the audit trail.
+        // Completeness is read BEFORE the events are consumed: an unresolvable
+        // cited id already made the batch incomplete, and filtering to the
+        // corroborating subset must not launder that away.
+        let batch_complete = resolved.provenance().is_complete();
+        let corroborating: Vec<_> = resolved
+            .events
+            .into_iter()
+            .filter(|event| {
+                event.entities.iter().any(|(found_type, found_value)| {
+                    found_type.trim().eq_ignore_ascii_case(entity.entity_type())
+                        && CanonicalEntity::trusted(entity.entity_type(), found_value)
+                            .is_some_and(|c| c.value() == entity.value())
+                })
+            })
+            .collect();
+
+        // Every candidate reaches here with a corroborated entity, so an empty
+        // result means the extractor and the corroboration set disagree — fail
+        // the candidate rather than emit a lead with no evidence behind it.
+        if corroborating.is_empty() {
+            return Ok(None);
+        }
+
+        let provenance = crate::auth::SourceProvenance::from_parts(
+            corroborating.iter().map(|e| e.source_type.clone()),
+            batch_complete,
+        );
+
+        Ok(Some(PreparedLead {
+            provenance,
+            evidence: corroborating,
+            entity,
+            signals,
+            mitre_technique: candidate
+                .mitre_technique
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string),
+            narrative: candidate.narrative.clone(),
+            prevalence,
+            first_seen_in_window,
+        }))
+    }
+
+    // =========================================================================
+    // Leads / triage
+    // =========================================================================
+
+    pub async fn list_leads(
+        &self,
+        query: &ListLeadsQuery,
+        scope: &ArtifactScope,
+    ) -> Result<Vec<HuntLead>, HuntError> {
+        self.repo.list_leads(query, scope).await
+    }
+
+    /// The filter-matched total behind a page of leads — same filters, same
+    /// scope, no page window.
+    pub async fn count_leads(
+        &self,
+        query: &ListLeadsQuery,
+        scope: &ArtifactScope,
+    ) -> Result<i64, HuntError> {
+        self.repo.count_leads(query, scope).await
+    }
+
+    pub async fn get_lead(
+        &self,
+        lead_id: Uuid,
+        scope: &ArtifactScope,
+    ) -> Result<HuntLeadDetail, HuntError> {
+        self.repo.get_lead(lead_id, scope).await
+    }
+
+    pub async fn promote_lead(
+        &self,
+        lead_id: Uuid,
+        req: &PromoteLeadRequest,
+        actor: Uuid,
+        scope: &ArtifactScope,
+    ) -> Result<PromoteLeadResponse, HuntError> {
+        self.repo.promote_lead(lead_id, req, actor, scope).await
+    }
+
+    pub async fn dismiss_lead(
+        &self,
+        lead_id: Uuid,
+        req: &DismissLeadRequest,
+        actor: Uuid,
+        scope: &ArtifactScope,
+    ) -> Result<DismissLeadResponse, HuntError> {
+        self.repo.dismiss_lead(lead_id, req, actor, scope).await
+    }
+
+    pub async fn list_suppressions(
+        &self,
+        include_revoked: bool,
+        scope: &ArtifactScope,
+    ) -> Result<Vec<HuntSuppression>, HuntError> {
+        self.repo.list_suppressions(include_revoked, scope).await
+    }
+
+    /// Author a suppression from a sweep (NAN-2240).
+    ///
+    /// A thin pass-through ON PURPOSE. Every bound that makes this safe —
+    /// literal `'agent'` origin, clamped mandatory expiry, no broad forms, and
+    /// the requirement that the fingerprint belong to a lead this sweep filed —
+    /// lives in the repository, in the statement itself. Re-implementing any of
+    /// it here would create a second place to get it right and a first place to
+    /// get it wrong.
+    pub async fn record_agent_suppression(
+        &self,
+        sweep_id: Uuid,
+        entity_type: &str,
+        entity_value: &str,
+        reason: &str,
+        ttl_days: i64,
+    ) -> Result<Option<HuntSuppression>, HuntError> {
+        self.repo
+            .record_agent_suppression(sweep_id, entity_type, entity_value, reason, ttl_days)
+            .await
+    }
+
+    pub async fn revoke_suppression(
+        &self,
+        suppression_id: Uuid,
+        actor: Uuid,
+        scope: &ArtifactScope,
+    ) -> Result<bool, HuntError> {
+        self.repo
+            .revoke_suppression(suppression_id, actor, scope)
+            .await
+    }
+
+    pub async fn latest_profile(
+        &self,
+        scope: &ArtifactScope,
+    ) -> Result<Option<HuntProfile>, HuntError> {
+        self.repo.latest_profile(scope).await
+    }
+
+    pub async fn list_rule_ideas(
+        &self,
+        playbook_id: Option<Uuid>,
+        scope: &ArtifactScope,
+    ) -> Result<Vec<HuntRuleIdea>, HuntError> {
+        self.repo.list_rule_ideas(playbook_id, scope).await
+    }
+
+    /// Ship or reject a rule idea. The gate is re-derived from the basis rows
+    /// inside the same transaction — see
+    /// [`HuntRepository::decide_rule_idea`].
+    pub async fn decide_rule_idea(
+        &self,
+        idea_id: Uuid,
+        decision: RuleIdeaVerdict,
+        note: Option<&str>,
+        scope: &ArtifactScope,
+    ) -> Result<RuleIdeaDecision, HuntError> {
+        self.repo
+            .decide_rule_idea(idea_id, decision, note, scope)
+            .await
+    }
+
+    /// Enable or disable a hunt's schedule.
+    ///
+    /// Its own method so the one write that decides what runs unattended is not
+    /// buried inside a generic patch. `hunts:run` gates the handler.
+    pub async fn set_hunt_enabled(
+        &self,
+        playbook_id: Uuid,
+        enabled: bool,
+    ) -> Result<Hunt, HuntError> {
+        self.repo
+            .update_hunt(
+                playbook_id,
+                &UpdateHuntRequest {
+                    enabled: Some(enabled),
+                    ..Default::default()
+                },
+            )
+            .await
+    }
+
+    /// Set or clear a hunt's cadence. `None` is manual-only, not "unchanged".
+    pub async fn set_hunt_schedule(
+        &self,
+        playbook_id: Uuid,
+        schedule_cron: Option<&str>,
+        schedule_timezone: Option<&str>,
+    ) -> Result<Hunt, HuntError> {
+        self.repo
+            .set_hunt_schedule(playbook_id, schedule_cron, schedule_timezone)
+            .await
+    }
+
+    /// Compose the rail summary.
+    ///
+    /// Three sources, deliberately: Postgres counts, the latest recon profile
+    /// (itself provenance-gated), and a log-store health probe for the sources
+    /// enabled hunts actually require. Everything the UI needs to distinguish
+    /// "nothing found" from "nothing ran" from "we could not look".
+    pub async fn summary(&self, scope: &ArtifactScope) -> Result<HuntSummary, HuntError> {
+        let counts = self.repo.summary_counts(scope).await?;
+        let profile = self.repo.latest_profile(scope).await?;
+
+        let required = self.repo.required_source_types().await?;
+        let unhealthy_source_types = if required.is_empty() {
+            Vec::new()
+        } else {
+            self.resolver
+                .silent_source_types(&required, Utc::now() - Duration::hours(24))
+                .await?
+        };
+
+        let (hunt_gaps, blind_techniques) = profile
+            .as_ref()
+            .map(|p| count_surface(&p.huntable_surface))
+            .unwrap_or((0, 0));
+
+        Ok(HuntSummary {
+            open_leads: counts.open_leads,
+            hunts_total: counts.hunts_total,
+            hunts_enabled: counts.hunts_enabled,
+            sweeps_24h: counts.sweeps_24h,
+            never_swept: counts.never_swept,
+            rule_idea_candidates: counts.rule_idea_candidates,
+            last_recon_at: profile.as_ref().map(|p| p.created_at),
+            recon_degraded: profile.as_ref().is_some_and(|p| p.degraded),
+            recon_degraded_detail: profile.as_ref().and_then(|p| p.degraded_detail.clone()),
+            unhealthy_source_types,
+            hunt_gaps,
+            blind_techniques,
+        })
+    }
+}
+
+/// Count `gap` and `blind` techniques in a recon profile's huntable surface.
+///
+/// The surface is an OBJECT mapping a technique id to `covered` | `gap` |
+/// `blind`, which is the shape migration 9000054 documents. Anything else
+/// counts as zero rather than being guessed at: a rail badge that invents a
+/// number from a shape it does not recognise is worse than one that shows none.
+pub(crate) fn count_surface(surface: &serde_json::Value) -> (i64, i64) {
+    let mut gaps = 0;
+    let mut blind = 0;
+    let mut tally = |status: &str| match status.trim().to_ascii_lowercase().as_str() {
+        "gap" => gaps += 1,
+        "blind" => blind += 1,
+        _ => {}
+    };
+
+    // Canonical shape: tactic columns, each holding its techniques. This is what
+    // the Profile screen renders — a 12-column matrix keyed to TELEMETRY rather
+    // than to rules, answering "could we even look" as distinct from "do we
+    // have a rule". Counting it here rather than storing separate totals keeps
+    // the badge and the matrix from disagreeing, which is the failure mode
+    // where a rail says 22 gaps and the page draws 25.
+    if let Some(tactics) = surface.get("tactics").and_then(|t| t.as_array()) {
+        for technique in tactics
+            .iter()
+            .filter_map(|tactic| tactic.get("techniques").and_then(|t| t.as_array()))
+            .flatten()
+        {
+            if let Some(status) = technique.get("state").and_then(|s| s.as_str()) {
+                tally(status);
+            }
+        }
+        return (gaps, blind);
+    }
+
+    // Flat `technique_id -> state` map. Retained because it is the obvious shape
+    // for a backfill or an external producer to emit, and silently counting zero
+    // for it would show an empty rail beside a populated page.
+    if let Some(map) = surface.as_object() {
+        for status in map.values().filter_map(|v| v.as_str()) {
+            tally(status);
+        }
+    }
+    (gaps, blind)
+}
+
+/// Parse a `hunt_specs.lookback_window` value (`24h`, `7d`, `90m`).
+///
+/// Falls back to 24 hours rather than erroring: a malformed lookback should not
+/// make a hunt permanently unrunnable, and 24h is the schema default so the
+/// fallback matches what an operator who never set one would get.
+pub fn parse_lookback(raw: &str) -> Duration {
+    let trimmed = raw.trim();
+    let (digits, unit) = trimmed.split_at(
+        trimmed
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(trimmed.len()),
+    );
+    let value: i64 = digits.parse().unwrap_or(0);
+    if value <= 0 {
+        return Duration::hours(24);
+    }
+    // Clamped: a hunt configured with `3650d` would open with a decade-wide
+    // window, which is neither a hunt nor survivable.
+    let duration = match unit.trim().to_ascii_lowercase().as_str() {
+        "m" | "min" | "minutes" => Duration::minutes(value),
+        "h" | "hr" | "hours" => Duration::hours(value),
+        "d" | "days" => Duration::days(value),
+        "w" | "weeks" => Duration::weeks(value),
+        _ => Duration::hours(24),
+    };
+    duration.clamp(Duration::minutes(1), Duration::days(90))
+}
+
+#[cfg(test)]
+#[path = "service_tests.rs"]
+mod service_tests;

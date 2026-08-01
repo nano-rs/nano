@@ -30,9 +30,10 @@ pub use error::PlaybookError;
 pub use frontmatter::split_frontmatter;
 pub use models::{
     AdaptiveSource, ApprovalResponseRequest, AttachToCaseRequest, CreatePlaybookRequest,
-    DangerPolicy, FinishRunRequest, ForkPlaybookRequest, ListPlaybooksQuery, ParsedStepTree,
-    Playbook, PlaybookAnalytics, PlaybookApproval, PlaybookCategory, PlaybookFrontmatter,
-    PlaybookListResponse, PlaybookPermission, PlaybookPhase, PlaybookRun, PlaybookScope,
+    DangerPolicy, FinishRunRequest, ForkPlaybookRequest, HuntBudgetFrontmatter, ListPlaybooksQuery,
+    ParsedStepTree, Playbook, PlaybookAnalytics, PlaybookApproval, PlaybookCategory,
+    PlaybookFrontmatter, PlaybookKind, PlaybookListResponse, PlaybookPermission, PlaybookPhase,
+    PlaybookRun, PlaybookScope,
     PlaybookStatus, PlaybookStep, PlaybookSuggestion, PlaybookVersion, ResolvedRunResponse,
     SetPermissionRequest, SubmitForReviewRequest, UpdatePlaybookRequest,
     UpdateStepCompletionRequest, WhenClause, WhenOp,

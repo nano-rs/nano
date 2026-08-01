@@ -140,12 +140,12 @@ impl AiMonitor {
     ) -> Option<AiProviderStatus> {
         let checked_at = Utc::now();
 
-        // Air-gap guard: a provider with no on-prem `base_url` would have its
+        // Air-gap guard: a provider with no direct `base_url` would have its
         // connectivity test fall through to the vendor's public host. In
         // AIRGAP_MODE that's an outbound beacon, so skip it — only
-        // on-prem-configured providers are probed. (NAN-1231; mirrors the
+        // directly-configured providers are probed. (NAN-1231; mirrors the
         // NAN-1228 egress gating.)
-        if self.airgap && !config_has_base_url(&provider.config) {
+        if self.airgap && !crate::ai_provider::has_direct_base_url(&provider.config) {
             debug!(
                 provider = %provider.provider,
                 "Airgap mode: skipping AI provider health check (no on-prem base_url)"
@@ -232,18 +232,6 @@ impl AiMonitor {
             .map(|s| s.to_string())
             .ok_or_else(|| "No api_key in credentials".to_string())
     }
-}
-
-/// Whether a provider's JSONB config carries a non-empty `base_url` — i.e. the
-/// operator pointed it at an on-prem OpenAI-compatible endpoint (vLLM, Ollama,
-/// LocalAI, …). Used to decide whether a provider is safe to probe in
-/// AIRGAP_MODE. (NAN-1231)
-fn config_has_base_url(config: &serde_json::Value) -> bool {
-    config
-        .get("base_url")
-        .and_then(|v| v.as_str())
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
 }
 
 struct ProviderInfo {

@@ -49,6 +49,7 @@ use crate::{
 };
 #[cfg(feature = "enterprise")]
 use crate::middleware::rate_limit::marketplace_preview_rate_limit_middleware;
+use nanosiem_core::hunts::recon::PROFILE_BODY_LIMIT_BYTES;
 use nanosiem_core::ip_allowlist::IpAllowlistScope;
 
 /// Create the API router with all routes
@@ -2223,6 +2224,129 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/cases/{case_id}/compose-adaptive-playbook",
             post(handlers::playbooks::compose_adaptive_from_case),
+        )
+        // NAN-2238 Active Hunter.
+        //
+        // The static collections (`runners`, `sweeps`, `leads`, `suppressions`,
+        // `profile`, `rule-ideas`, `summary`) sit beside the `{id}` parameter at
+        // the same position. matchit gives a static segment priority, which is
+        // the same shape `/api/playbooks/suggest-for-rule/{rule_id}` already
+        // relies on — but it does mean a hunt whose TypeID rendered as one of
+        // those words would be unreachable, and TypeIDs are prefixed base32 so
+        // that cannot happen.
+        .route("/api/hunts/summary", get(handlers::hunts::hunts_summary))
+        .route("/api/hunts", get(handlers::hunts::list_hunts))
+        .route("/api/hunts", post(handlers::hunts::create_hunt))
+        .route("/api/hunts/runners", get(handlers::hunts::list_runners))
+        .route("/api/hunts/runners", post(handlers::hunts::register_runner))
+        .route(
+            "/api/hunts/runners/{id}/heartbeat",
+            post(handlers::hunts::runner_heartbeat),
+        )
+        .route(
+            "/api/hunts/runners/{id}/claim",
+            post(handlers::hunts::claim_sweep),
+        )
+        // The Antigravity sweep waiver (NAN-2264). `hunts:manage` on both
+        // verbs — a runner cannot widen its own authority.
+        .route(
+            "/api/hunts/runners/{id}/agy-waiver",
+            post(handlers::hunts::grant_runner_agy_waiver)
+                .delete(handlers::hunts::revoke_runner_agy_waiver),
+        )
+        .route("/api/hunts/sweeps/{id}", get(handlers::hunts::get_sweep))
+        // The only endpoint `hunts:report` reaches that writes leads.
+        .route(
+            "/api/hunts/sweeps/{id}/report",
+            post(handlers::hunts::report_sweep),
+        )
+        .route("/api/hunts/leads", get(handlers::hunts::list_leads))
+        .route("/api/hunts/leads/{id}", get(handlers::hunts::get_lead))
+        .route(
+            "/api/hunts/leads/{id}/promote",
+            post(handlers::hunts::promote_lead),
+        )
+        .route(
+            "/api/hunts/leads/{id}/dismiss",
+            post(handlers::hunts::dismiss_lead),
+        )
+        // NAN-2239 knowledge. Recall is `hunts:view`; recording is the one
+        // write a sweep key can make besides its report; revocation is
+        // `hunts:triage`. Nothing here suppresses — see handlers/hunts/knowledge.rs.
+        .route(
+            "/api/hunts/knowledge",
+            get(handlers::hunts::list_knowledge).post(handlers::hunts::record_knowledge),
+        )
+        .route(
+            "/api/hunts/knowledge/{id}/revoke",
+            post(handlers::hunts::revoke_knowledge),
+        )
+        .route(
+            "/api/hunts/suppressions",
+            get(handlers::hunts::list_suppressions)
+                // POST is the RUNNER's (`hunts:report`), not the analyst's and
+                // not the agent's. Sharing the path with the list keeps the two
+                // halves of the suppression story in one place.
+                .post(handlers::hunts::record_suppression),
+        )
+        .route(
+            "/api/hunts/suppressions/{id}",
+            delete(handlers::hunts::revoke_suppression),
+        )
+        .route("/api/hunts/profile", get(handlers::hunts::get_latest_profile))
+        // Recon's whole write surface is `hunts:manage` rather than
+        // `hunts:run`: it creates hunt DEFINITIONS. See handlers/hunts/recon.rs.
+        //
+        // The save carries a census, a full ATT&CK surface and model-written
+        // prose, so its body limit is stated rather than inherited — a change
+        // to axum's 2 MB default must not silently widen what a model may push
+        // into a shared JSONB column. Layered on this one route so the rest of
+        // the hunts surface keeps the global limit.
+        .route(
+            "/api/hunts/profile",
+            post(handlers::hunts::save_recon_profile)
+                .layer(DefaultBodyLimit::max(PROFILE_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/hunts/profile/census",
+            post(handlers::hunts::recon_census),
+        )
+        .route(
+            "/api/hunts/profile/surface",
+            post(handlers::hunts::recon_surface),
+        )
+        .route(
+            "/api/hunts/profile/run",
+            post(handlers::hunts::run_recon_profile),
+        )
+        .route("/api/hunts/drafts", post(handlers::hunts::create_hunt_drafts))
+        .route("/api/hunts/rule-ideas", get(handlers::hunts::list_rule_ideas))
+        .route(
+            "/api/hunts/rule-ideas/{id}/send",
+            post(handlers::hunts::send_rule_idea),
+        )
+        .route(
+            "/api/hunts/rule-ideas/{id}/reject",
+            post(handlers::hunts::reject_rule_idea),
+        )
+        .route("/api/hunts/{id}", get(handlers::hunts::get_hunt))
+        .route("/api/hunts/{id}", patch(handlers::hunts::update_hunt))
+        .route("/api/hunts/{id}", delete(handlers::hunts::archive_hunt))
+        .route(
+            "/api/hunts/{id}/sweeps",
+            get(handlers::hunts::list_hunt_sweeps),
+        )
+        .route(
+            "/api/hunts/{id}/sweeps",
+            post(handlers::hunts::trigger_sweep),
+        )
+        .route("/api/hunts/{id}/toggle", post(handlers::hunts::toggle_hunt))
+        // Its own route rather than a PATCH field, like the toggle beside it:
+        // `update_hunt` COALESCEs every column, so "manual only" — a real choice
+        // — is inexpressible there and clearing a cadence was a silent no-op.
+        .route(
+            "/api/hunts/{id}/schedule",
+            post(handlers::hunts::set_hunt_schedule),
         )
         // Playbook repositories (external sync)
         .route(

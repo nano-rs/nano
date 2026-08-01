@@ -9,7 +9,7 @@ use std::time::Instant;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::playbooks::{parse_playbook, split_frontmatter};
+use crate::playbooks::{parse_playbook, split_frontmatter, PlaybookFrontmatter, PlaybookKind};
 use crate::rule_repository::GitHubClient;
 
 use super::super::error::PlaybookRepositoryError;
@@ -222,28 +222,8 @@ impl PlaybookRepositoryService {
         let files: Vec<_> = tree
             .into_iter()
             .filter(|e| {
-                if e.entry_type != "blob" {
-                    return false;
-                }
-                // NAN-453 / NAN-456: skip repo docs like README.md /
-                // CONTRIBUTING.md / CHANGELOG.md at ANY depth — not just
-                // the repo root. Some repos ship a README.md inside each
-                // category folder (e.g. identity/README.md) and those
-                // aren't playbooks either.
-                let filename = e.path.rsplit('/').next().unwrap_or("");
-                let is_doc = filename.eq_ignore_ascii_case("README.md")
-                    || filename.eq_ignore_ascii_case("CONTRIBUTING.md")
-                    || filename.eq_ignore_ascii_case("CHANGELOG.md")
-                    || filename.eq_ignore_ascii_case("CODE_OF_CONDUCT.md")
-                    || filename.eq_ignore_ascii_case("SECURITY.md")
-                    || filename.eq_ignore_ascii_case("LICENSE.md");
-                if is_doc {
-                    return false;
-                }
-                config
-                    .playbook_extensions
-                    .iter()
-                    .any(|ext| e.path.ends_with(&format!(".{}", ext)))
+                e.entry_type == "blob"
+                    && is_syncable_playbook_file(&e.path, &config.playbook_extensions)
             })
             .take(config.max_playbooks_per_repo)
             .collect();
@@ -251,14 +231,31 @@ impl PlaybookRepositoryService {
         let mut added = 0i32;
         let mut updated = 0i32;
         let mut synced_paths = Vec::new();
+        let mut kind_refused = 0i32;
 
         for entry in &files {
+            // Presence in `synced_paths` is what protects a cached row from
+            // `delete_not_in_paths` below — and deleting one cascades to its
+            // `playbook_imports` provenance. So a path is recorded as soon as
+            // it is seen in the tree, and only a DELIBERATE refusal removes it:
+            // a transient fetch error or an unparseable file must leave the
+            // existing catalog row (and its import history) alone.
             synced_paths.push(entry.path.clone());
 
             // Skip unchanged files
             let existing = playbooks_repository.find_by_path(id, &entry.path).await.ok();
             if let Some(ref e) = existing {
                 if e.file_sha.as_deref() == Some(entry.sha.as_str()) {
+                    // Re-apply the kind gate to unchanged rows too, using the
+                    // kind recorded at their own sync. Narrowing
+                    // `allowed_kinds` and re-syncing then actually clears the
+                    // catalog of what the repository no longer carries — an
+                    // out-of-contract row left behind would still be visible to
+                    // browse even though import refuses it.
+                    if !repo_accepts_kind(&repo, &e.kind) {
+                        drop_from_catalog(&mut synced_paths, &entry.path);
+                        kind_refused += 1;
+                    }
                     continue;
                 }
             }
@@ -288,6 +285,23 @@ impl PlaybookRepositoryService {
                 Err(e) => (None, content.clone(), "failed", Some(e.to_string()), None),
             };
 
+            // The kind comes from the file's own frontmatter — NEVER from the
+            // directory it was found in. `playbooks_path` is operator-
+            // configurable and a repository can be retargeted at any time, so
+            // path inference would silently reclassify a folder of documents
+            // into scheduled processes with no diff to review.
+            let kind = catalog_kind(fm.as_ref());
+
+            if !repo_accepts_kind(&repo, kind.as_str()) {
+                // Not catalogued at all: the repository has declared it does
+                // not carry this kind, so the file is outside its contract.
+                // Leaving it browsable-but-unimportable would only invite the
+                // question of why it cannot be imported.
+                drop_from_catalog(&mut synced_paths, &entry.path);
+                kind_refused += 1;
+                continue;
+            }
+
             let title = fm.as_ref().and_then(|f| f.title.clone());
             let subtitle = fm.as_ref().and_then(|f| f.subtitle.clone());
             let category = fm.as_ref().and_then(|f| f.category.clone());
@@ -309,6 +323,7 @@ impl PlaybookRepositoryService {
                     &entry.path,
                     Some(&entry.sha),
                     &content,
+                    kind.as_str(),
                     title.as_deref(),
                     subtitle.as_deref(),
                     category.as_deref(),
@@ -343,6 +358,14 @@ impl PlaybookRepositoryService {
 
         let total = synced_paths.len() as i32;
 
+        if kind_refused > 0 {
+            info!(
+                "Playbook repo {} declares allowed_kinds={:?}; {} file(s) of another kind were \
+                 not catalogued",
+                repo.name, repo.allowed_kinds, kind_refused
+            );
+        }
+
         Ok(PlaybookSyncResult {
             repository_id: id,
             status: PlaybookSyncStatus::Success,
@@ -356,3 +379,71 @@ impl PlaybookRepositoryService {
         })
     }
 }
+
+/// Repository documentation that is never a playbook, at ANY depth.
+///
+/// NAN-453 / NAN-456 established the list for repo-root docs; the depth matters
+/// because some repos ship a README.md inside each category folder. NAN-2238
+/// makes it load-bearing rather than cosmetic: `hunts/README.md` documents the
+/// hunt authoring contract, and a naive `*.md` walk would hand that
+/// documentation to the hunt parser and either fail it noisily or — worse, if
+/// the doc ever gained a fenced frontmatter example — catalog prose as a
+/// definition. The existing category folders have no READMEs, so this case has
+/// simply never arisen before.
+fn is_repo_documentation(path: &str) -> bool {
+    const DOC_FILENAMES: &[&str] = &[
+        "README.md",
+        "CONTRIBUTING.md",
+        "CHANGELOG.md",
+        "CODE_OF_CONDUCT.md",
+        "SECURITY.md",
+        "LICENSE.md",
+    ];
+    let filename = path.rsplit('/').next().unwrap_or("");
+    DOC_FILENAMES
+        .iter()
+        .any(|doc| filename.eq_ignore_ascii_case(doc))
+}
+
+/// Whether a repository tree entry should be pulled into the catalog at all.
+pub(crate) fn is_syncable_playbook_file(path: &str, extensions: &[String]) -> bool {
+    !is_repo_documentation(path)
+        && extensions
+            .iter()
+            .any(|ext| path.ends_with(&format!(".{}", ext)))
+}
+
+/// Withdraw a path from the keep-list, so the prune at the end of the sync
+/// removes its cached row.
+///
+/// Deliberately a removal from a list everything starts in, rather than an
+/// addition to one everything must earn its way into: the failure modes are not
+/// symmetric. Forgetting to add a path silently deletes a catalog row and
+/// cascades its import provenance; forgetting to remove one leaves a row that
+/// import refuses anyway.
+fn drop_from_catalog(synced_paths: &mut Vec<String>, path: &str) {
+    synced_paths.retain(|p| p != path);
+}
+
+/// Whether this repository is permitted to produce rows of `kind`.
+///
+/// A repository row that predates migration 9000057 deserializes with both
+/// kinds (the column default), so this cannot fail closed on old data — but an
+/// empty list would, which is why the column is `NOT NULL` with a
+/// `cardinality > 0` CHECK rather than nullable.
+pub(crate) fn repo_accepts_kind(repo: &PlaybookRepository, kind: &str) -> bool {
+    repo.allowed_kinds.iter().any(|k| k == kind)
+}
+
+/// Pull the metadata the catalog stores out of a parsed file.
+///
+/// Shared by the GitHub sync and the air-gapped bundle sync so the two cannot
+/// disagree about what a file is — in particular about its `kind`, which
+/// decides whether importing it creates a document or a scheduled process.
+pub(crate) fn catalog_kind(fm: Option<&PlaybookFrontmatter>) -> PlaybookKind {
+    fm.map(|f| f.kind).unwrap_or(PlaybookKind::Response)
+}
+
+#[cfg(test)]
+#[path = "sync_tests.rs"]
+mod tests;

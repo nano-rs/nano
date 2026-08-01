@@ -4157,3 +4157,55 @@ mod nan2230_cte_binding {
         );
     }
 }
+
+/// NAN-2241: a `rex` pattern must reach the emitted ClickHouse SQL with its own
+/// characters intact. `extractGroups` takes a RE2 pattern — deleting the `"`
+/// from `[^"]+` yields `[^]+`, which compiles fine and matches nothing, so the
+/// query returns empty results with no error anywhere in the stack.
+mod nan2244_rex_pattern_fidelity {
+    use super::*;
+
+    /// Full user path: nPL text (single-quoted pattern) → SQL.
+    fn sql_for(npl: &str) -> String {
+        ClickHouseSqlGenerator::new()
+            .generate(&parse_query(npl).unwrap(), &time_range())
+            .unwrap()
+    }
+
+    #[test]
+    fn double_quotes_inside_a_single_quoted_pattern_reach_extract_groups() {
+        let sql = sql_for(
+            r#"source_type=gws_token | rex field=message '"name":"app_name","value":"(?<app>[^"]+)"' | head 1"#,
+        );
+        // Named groups are numbered for ClickHouse (NAN-1340) — that part is
+        // correct and expected — but nothing else may change.
+        assert!(
+            sql.contains(r#"extractGroups(message::String, '"name":"app_name","value":"([^"]+)"')"#),
+            "rex pattern reached SQL altered: {sql}"
+        );
+        assert!(
+            !sql.contains("[^]+"),
+            "emitted the never-matching character class: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_pattern_without_named_groups_keeps_its_quotes_too() {
+        let sql = sql_for(r#"* | rex field=message '"status":"[0-9]+"'"#);
+        assert!(
+            sql.contains(r#"extractAll(message::String, '"status":"[0-9]+"')"#),
+            "extractAll pattern altered: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_quote_bearing_pattern_is_still_escaped_for_the_sql_literal() {
+        // The SQL string literal is single-quoted, so a `'` in the pattern must
+        // still be doubled — quoting fidelity in nPL must not weaken SQL hygiene.
+        let sql = sql_for(r#"* | rex field=message "it's (?<x>[0-9]+)""#);
+        assert!(
+            sql.contains("it''s"),
+            "single quote not escaped for the SQL literal: {sql}"
+        );
+    }
+}

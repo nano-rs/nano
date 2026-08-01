@@ -12,6 +12,12 @@ use super::models::{
     RepositoryPlaybookFilter, UpdatePlaybookRepository,
 };
 
+/// Both kinds — mirrors the `playbook_repositories.allowed_kinds` column
+/// default from migration 9000057, for the create path that names the column.
+fn default_allowed_kinds() -> Vec<String> {
+    vec!["response".to_string(), "hunt".to_string()]
+}
+
 // =============================================================================
 // Playbook Repository (the repositories table)
 // =============================================================================
@@ -41,9 +47,9 @@ impl PlaybookRepoRepository {
             r#"
             INSERT INTO playbook_repositories (
                 name, slug, description, url, branch, playbooks_path,
-                auto_sync_enabled, sync_interval_hours, created_by
+                auto_sync_enabled, sync_interval_hours, allowed_kinds, created_by
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING *
             "#,
         )
@@ -55,6 +61,11 @@ impl PlaybookRepoRepository {
         .bind(repo.playbooks_path.as_deref().unwrap_or(""))
         .bind(repo.auto_sync_enabled.unwrap_or(false))
         .bind(repo.sync_interval_hours.unwrap_or(24))
+        .bind(
+            repo.allowed_kinds
+                .clone()
+                .unwrap_or_else(default_allowed_kinds),
+        )
         .bind(created_by)
         .fetch_one(&self.pool)
         .await
@@ -100,6 +111,7 @@ impl PlaybookRepoRepository {
                 auto_sync_enabled = COALESCE($6, auto_sync_enabled),
                 sync_interval_hours = COALESCE($7, sync_interval_hours),
                 enabled = COALESCE($8, enabled),
+                allowed_kinds = COALESCE($9, allowed_kinds),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -113,6 +125,7 @@ impl PlaybookRepoRepository {
         .bind(update.auto_sync_enabled.or(repo.auto_sync_enabled))
         .bind(update.sync_interval_hours.or(repo.sync_interval_hours))
         .bind(update.enabled.or(repo.enabled))
+        .bind(update.allowed_kinds.clone())
         .fetch_one(&self.pool)
         .await?;
 
@@ -175,6 +188,8 @@ impl RepositoryPlaybooksRepository {
         file_path: &str,
         file_sha: Option<&str>,
         raw_content: &str,
+        // From the file's own frontmatter. Never derived from `file_path`.
+        kind: &str,
         title: Option<&str>,
         subtitle: Option<&str>,
         category: Option<&str>,
@@ -192,15 +207,16 @@ impl RepositoryPlaybooksRepository {
         let result = sqlx::query_as::<_, RepositoryPlaybook>(
             r#"
             INSERT INTO repository_playbooks (
-                repository_id, file_path, file_sha, raw_content,
+                repository_id, file_path, file_sha, raw_content, kind,
                 title, subtitle, category, match_signals, tags,
                 owner_team, authored_date, danger_policy, review_cadence, scope,
                 parse_status, parse_error, step_count
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
             ON CONFLICT (repository_id, file_path) DO UPDATE SET
                 file_sha = EXCLUDED.file_sha,
                 raw_content = EXCLUDED.raw_content,
+                kind = EXCLUDED.kind,
                 title = EXCLUDED.title,
                 subtitle = EXCLUDED.subtitle,
                 category = EXCLUDED.category,
@@ -222,6 +238,7 @@ impl RepositoryPlaybooksRepository {
         .bind(file_path)
         .bind(file_sha)
         .bind(raw_content)
+        .bind(kind)
         .bind(title)
         .bind(subtitle)
         .bind(category)

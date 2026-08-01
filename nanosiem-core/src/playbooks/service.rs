@@ -646,7 +646,11 @@ impl PlaybookService {
 /// Parse the doc into a `ParsedStepTree` and serialize it as a JSON Value
 /// for storage in the `parsed_steps` column. Returns `None` if serialization
 /// fails (unexpected — the parser's output is always serializable).
-fn parse_and_serialize(doc: &str) -> Option<Value> {
+///
+/// `pub(crate)` because hunts populate the same column through their own write
+/// path (`crate::hunts::repository`) — the step-tree cache is a property of the
+/// shared definition layer, not of response playbooks.
+pub(crate) fn parse_and_serialize(doc: &str) -> Option<Value> {
     let tree = parse_playbook(doc);
     match serde_json::to_value(&tree) {
         Ok(v) => Some(v),

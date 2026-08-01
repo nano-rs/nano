@@ -369,6 +369,20 @@ typeid_prefix!(metric_monitor, "mon");
 typeid_prefix!(report, "report");
 typeid_prefix!(report_run, "reprun");
 typeid_prefix!(report_artifact, "repart");
+// NAN-2238 Active Hunter. A hunt DEFINITION reuses the `playbook` prefix — it is
+// a `playbooks` row of kind='hunt' — so only the runtime and output objects get
+// prefixes of their own.
+typeid_prefix!(hunt_runner, "hrun");
+typeid_prefix!(hunt_sweep, "swp");
+typeid_prefix!(hunt_lead, "lead");
+typeid_prefix!(hunt_lead_evidence, "levid");
+typeid_prefix!(hunt_suppression, "hsup");
+typeid_prefix!(hunt_profile, "hprof");
+typeid_prefix!(hunt_rule_idea, "ridea");
+// NAN-2239 hunt knowledge. Its own prefix rather than reusing a hunt's: a
+// knowledge row is tenant-wide estate learning shared by every hunt, not a
+// child of the one that happened to learn it.
+typeid_prefix!(hunt_knowledge, "hknow");
 
 // ============================================================================
 // Tests

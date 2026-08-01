@@ -40,6 +40,18 @@
  * Characters such as `|`, backtick, `(`, `)`, `[`, `]` are deliberately KEPT —
  * they are inert inside the quotes, and preserving them lets legitimate values
  * (`cmd|powershell`) survive the round-trip.
+ *
+ * ## Divergence from the Rust helper (NAN-2241)
+ *
+ * The Rust side no longer strips: `query::pretty_print::helpers::npl_quoted_literal`
+ * emits a COMPLETE literal and picks `'…'` when the value contains a `"`, so
+ * the value survives byte-for-byte (a `rex` pattern's `[^"]+` was silently
+ * becoming `[^]+`, a regex that matches nothing). These helpers still strip,
+ * because every caller below wraps the BODY in its own `"…"` and the delimiter
+ * choice has to be made where the quotes are written. Pivots built from a
+ * `"`-bearing value are therefore still lossy — a drilldown concern, not a
+ * correctness-of-the-executed-query one. Fixing it means moving callers onto
+ * `nplQuoted`/`nplFieldEquals` (which own their delimiters) first.
  */
 export function nplQuotedBody(value: string): string {
   let out = '';

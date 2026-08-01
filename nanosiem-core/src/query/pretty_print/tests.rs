@@ -549,17 +549,142 @@ fn regex_escapes_survive_round_trip() {
     assert_eq!(round_trip_value(r"\\."), r"\\.");
 }
 
+// ---------------------------------------------------------------------------
+// NAN-2241: a `"`-bearing value is re-quoted with `'`, not stripped.
+//
+// The pre-NAN-2241 helper deleted every `"` unconditionally. That was safe but
+// LOSSY, and the loss was silent: a `rex` pattern's `[^"]+` reached ClickHouse
+// as `[^]+` — a different, never-matching regex — and the query returned zero
+// rows with no error. nPL has two interchangeable literal forms and only the
+// delimiter can terminate one, so the fix is to pick the delimiter the value
+// does not contain. Nothing about the breakout guarantee changes: the emitted
+// literal still cannot be closed from within.
+// ---------------------------------------------------------------------------
+
+/// Round-trip a filter value and hand back BOTH the emitted nPL and what the
+/// parser reconstructed, so a test can assert on the wire form as well.
+fn round_trip_value_with_text(raw: &str) -> (String, String) {
+    use crate::query::parse_query;
+    let q = Query::Search(SearchExpr::FieldFilter {
+        field: "file_path".to_string(),
+        op: Comparator::Eq,
+        value: Value::String(raw.to_string()),
+    });
+    let printed = q.pretty_print();
+    let reparsed = parse_query(&printed)
+        .unwrap_or_else(|e| panic!("pretty_print produced unparseable nPL {printed:?}: {e:?}"));
+    match reparsed {
+        Query::Search(SearchExpr::FieldFilter { value: Value::String(s), .. }) => (printed, s),
+        other => panic!("round trip changed structure for {raw:?}: {other:?}"),
+    }
+}
+
 #[test]
-fn embedded_quote_is_still_stripped_not_escaped() {
-    // NAN-2006: `"` is the lone breakout character and must not survive.
-    assert_eq!(round_trip_value(r#"a" OR src_ip=10.0.0.9"#), "a OR src_ip=10.0.0.9");
+fn embedded_quote_survives_by_switching_the_delimiter() {
+    // Before NAN-2241 this came back as `a OR src_ip=10.0.0.9` — the `"` was
+    // deleted. The value must now survive byte-for-byte...
+    let (printed, back) = round_trip_value_with_text(r#"a" OR src_ip=10.0.0.9"#);
+    assert_eq!(back, r#"a" OR src_ip=10.0.0.9"#);
+    // ...as ONE single-quoted literal, not as query structure. The
+    // `round_trip_value_with_text` match arm already proves the AST shape is a
+    // single FieldFilter; this pins the wire form that makes that true.
+    assert_eq!(printed, r#"file_path='a" OR src_ip=10.0.0.9'"#);
 }
 
 #[test]
 fn quote_after_backslash_cannot_reopen_the_literal() {
-    // The doubling pass must run BEFORE the quote filter, or the stripped quote
-    // could leave a dangling escape.
-    assert_eq!(round_trip_value(r#"trail\"next"#), r"trail\next");
+    // The backslash-doubling pass and the delimiter choice must not interact:
+    // `\"` inside a single-quoted literal is an ordinary backslash followed by
+    // an ordinary quote, and both survive.
+    assert_eq!(round_trip_value(r#"trail\"next"#), r#"trail\"next"#);
+}
+
+#[test]
+fn values_without_double_quotes_keep_the_double_quoted_form() {
+    // Byte-identical to pre-NAN-2241 output for the overwhelmingly common case
+    // — a single quote in the value is inert inside `"…"` and must not flip the
+    // delimiter (that would gratuitously churn every serialized query).
+    let (printed, back) = round_trip_value_with_text("O'Connor");
+    assert_eq!(printed, r#"file_path="O'Connor""#);
+    assert_eq!(back, "O'Connor");
+}
+
+#[test]
+fn both_quote_kinds_are_unrepresentable_and_fall_back_to_the_old_strip() {
+    // nPL cannot express a literal containing BOTH quote characters: each form
+    // is terminated by its own delimiter and neither has an escape (NAN-1157).
+    // This is unreachable from `parse_query` — see the next test — so the
+    // pre-NAN-2241 behaviour is kept for it: double-quote, drop the `"`. Still
+    // no breakout (the `'` is inert inside `"…"`), just lossy.
+    let (printed, back) = round_trip_value_with_text(r#"a"b'c"#);
+    assert_eq!(printed, r#"file_path="ab'c""#);
+    assert_eq!(back, "ab'c");
+}
+
+#[test]
+fn both_quote_kinds_cannot_come_out_of_the_parser() {
+    // The reachability claim behind the fallback above: every string the parser
+    // can put in the AST comes from a quoted literal (which stops at its own
+    // delimiter) or from an unquoted token (no quotes at all), so no parsed
+    // value can carry both `"` and `'`.
+    use crate::query::parse_query;
+    for npl in [
+        r#"file_path='has " and no apostrophe'"#,
+        r#"file_path="has ' and no double quote""#,
+        r#"* | rex field=message '"k":"(?<v>[^"]+)"'"#,
+        r#"* | eval x='say "hi"'"#,
+        r#"'a" OR source_type=audit'"#,
+    ] {
+        let parsed = parse_query(npl).unwrap_or_else(|e| panic!("{npl} must parse: {e:?}"));
+        let printed = parsed.pretty_print();
+        assert_eq!(
+            parse_query(&printed).unwrap_or_else(|e| panic!("{printed} must re-parse: {e:?}")),
+            parsed,
+            "pretty_print must round-trip {npl} to an identical AST (printed: {printed})"
+        );
+    }
+}
+
+#[test]
+fn rex_pattern_with_double_quotes_round_trips_intact() {
+    // The reported NAN-2241 repro, at the AST level: a Google Workspace token
+    // hunt pulling `app_name` out of a JSON message.
+    use crate::query::parse_query;
+    let pattern = r#""name":"app_name","value":"(?<app>[^"]+)""#;
+    let npl = format!("source_type=gws_token | rex field=message '{pattern}' | head 1");
+    let parsed = parse_query(&npl).unwrap_or_else(|e| panic!("repro must parse: {e:?}"));
+    let printed = parsed.pretty_print();
+    assert!(
+        printed.contains(pattern),
+        "the pattern must appear verbatim in the serialized query: {printed}"
+    );
+    match parse_query(&printed).unwrap_or_else(|e| panic!("{printed} must re-parse: {e:?}")) {
+        Query::Piped { source, .. } => match *source {
+            Query::Piped { command: Command::Rex { pattern: p, .. }, .. } => {
+                assert_eq!(p, pattern, "the character class `[^\"]+` must not be mangled");
+            }
+            other => panic!("expected a rex stage, got {other:?}"),
+        },
+        other => panic!("expected a piped query, got {other:?}"),
+    }
+}
+
+#[test]
+fn sed_mode_rex_round_trips_with_a_quote_bearing_pattern() {
+    // The sed expression is ONE literal (`"s/pat/repl/"`), so the delimiter has
+    // to be chosen for the whole thing, not per part.
+    use crate::query::parse_query;
+    let npl = r#"* | rex mode=sed field=message 's/pass="[^"]*"/REDACTED/'"#;
+    let parsed = parse_query(npl).unwrap_or_else(|e| panic!("{npl} must parse: {e:?}"));
+    let printed = parsed.pretty_print();
+    assert!(
+        printed.contains(r#"pass="[^"]*""#),
+        "sed pattern lost its quotes: {printed}"
+    );
+    assert_eq!(
+        parse_query(&printed).unwrap_or_else(|e| panic!("{printed} must re-parse: {e:?}")),
+        parsed
+    );
 }
 
 #[test]

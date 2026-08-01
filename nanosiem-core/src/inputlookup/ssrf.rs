@@ -617,20 +617,35 @@ impl SsrfValidator {
 /// Env var that opts an operator into private/loopback AI provider endpoints.
 pub const ALLOW_PRIVATE_AI_ENDPOINTS_ENV: &str = "NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS";
 
-/// Whether the operator has opted into letting AI provider `base_url`s point at
-/// private/loopback/internal addresses (on-prem / air-gapped LLM deployments,
-/// NAN-1207). Off by default. Cloud-metadata endpoints stay blocked regardless.
-///
-/// This is read from the environment — deliberately NOT from per-provider config
-/// — so that an admin who can set `base_url` through the API cannot also flip the
-/// allowance and reach internal services.
-pub fn private_ai_endpoints_allowed() -> bool {
+/// Air-gap mode. Read here (rather than threaded through from the API's
+/// `Config`) because this validator is constructed deep in call stacks that
+/// have no access to it, and the API reads the same variable.
+const AIRGAP_MODE_ENV: &str = "AIRGAP_MODE";
+
+fn env_flag_enabled(var: &str) -> bool {
     matches!(
-        std::env::var(ALLOW_PRIVATE_AI_ENDPOINTS_ENV)
-            .map(|v| v.to_ascii_lowercase())
-            .as_deref(),
+        std::env::var(var).map(|v| v.to_ascii_lowercase()).as_deref(),
         Ok("1" | "true" | "on" | "yes")
     )
+}
+
+/// Whether AI provider `base_url`s may point at private/loopback/internal
+/// addresses (on-prem LLM deployments, NAN-1207). Cloud-metadata endpoints stay
+/// blocked regardless.
+///
+/// Two ways to enable, both read from the environment — deliberately NOT from
+/// per-provider config — so that an admin who can set `base_url` through the API
+/// cannot also flip the allowance and reach internal services:
+///
+/// - `NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS`, the explicit opt-in for a connected
+///   deployment that runs its own inference box. Off by default, because there
+///   an admin-settable URL aimed at the internal network is a real SSRF pivot.
+/// - `AIRGAP_MODE` implies it (NAN-2231). In an air-gapped deployment a private
+///   endpoint is the *only* kind that exists and there is no egress to pivot
+///   to, so requiring a second flag was friction that bought nothing — the
+///   operator had already declared the deployment air-gapped.
+pub fn private_ai_endpoints_allowed() -> bool {
+    env_flag_enabled(ALLOW_PRIVATE_AI_ENDPOINTS_ENV) || env_flag_enabled(AIRGAP_MODE_ENV)
 }
 
 /// SSRF validator for an admin-configured AI provider `base_url`.

@@ -19,6 +19,18 @@
     <max_server_memory_usage>0</max_server_memory_usage>
     <max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio>
 
+    <!-- NAN-2253: do NOT feed cgroup memory.current into the memory tracker.
+         It includes kernel page cache from insert/merge writes, so on a small
+         mem_limit the tracked "RSS" ratchets to the ceiling and never comes
+         back down (page cache is only reclaimed under cgroup pressure, which
+         tracked-allocation limits prevent from ever building). Result was a
+         permanent ingest wedge: every WaitForAsyncInsert died with
+         MEMORY_LIMIT_EXCEEDED while actual usage sat far below the limit
+         (observed 1.39 GiB tracked vs 755 MiB real on a 2G box, NAN-2251).
+         With 0 the worker corrects from process RSS/jemalloc, which excludes
+         page cache; the cgroup limit itself remains the hard stop. -->
+    <memory_worker_use_cgroup>0</memory_worker_use_cgroup>
+
     <!-- Shrink caches from 28GB total to ~512MB total -->
     <mark_cache_size>134217728</mark_cache_size>                 <!-- 128MB (was 10GB) -->
     <uncompressed_cache_size>134217728</uncompressed_cache_size>  <!-- 128MB (was 8GB) -->

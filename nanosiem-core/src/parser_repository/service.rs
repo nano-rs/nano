@@ -1336,8 +1336,21 @@ impl ParserRepositoryService {
                 &yaml_match_values,
                 parsed_yaml.as_ref().map(|y| y.name.as_str()),
             );
-            if !resolved.is_empty() && log_source.match_values.as_ref() != Some(&resolved) {
-                update.match_values = Some(resolved);
+            // NAN-2249: union, never narrow. `resolve_match_values` builds a
+            // fresh list from the primary plus whatever upstream still lists,
+            // so an alias upstream has since dropped would just vanish here.
+            // That is a silent routing loss: events tagged with the dropped
+            // alias stop matching this parser, fall through to
+            // `source_router.generic`, and land raw — no error, and the update
+            // reports success. Accepting a new parser version is consent to a
+            // better VRL, not to routing less traffic. Pruning stays an
+            // explicit edit on the log source.
+            let merged = Self::union_match_values(
+                log_source.match_values.as_deref().unwrap_or(&[]),
+                &resolved,
+            );
+            if !merged.is_empty() && log_source.match_values.as_ref() != Some(&merged) {
+                update.match_values = Some(merged);
             }
         }
 
@@ -1619,6 +1632,103 @@ impl ParserRepositoryService {
         }
         if out.is_empty() {
             out.push("unknown".to_string());
+        }
+        out
+    }
+
+    /// NAN-2249: merge an upstream-resolved match_value list into what a log
+    /// source already routes on, keeping every existing value.
+    ///
+    /// `resolved` leads so its first element stays the primary — routing rules
+    /// point at that, and reordering would orphan them. Existing values upstream
+    /// no longer lists follow in their original relative order rather than being
+    /// dropped.
+    ///
+    /// Deliberately does NOT drop existing values that fail
+    /// `is_safe_source_type`: they are already persisted and already routing
+    /// traffic, and discarding one here because it fails a validator added
+    /// after it was stored would be the exact silent narrowing this function
+    /// exists to prevent. New values arrive via `resolved`, which is
+    /// allow-listed at resolve time.
+    ///
+    /// It does warn on them. Before this function, rebuilding the list from
+    /// `resolved` incidentally sanitized such a value away on the next update;
+    /// keeping it means that no longer happens, so the value has to become
+    /// visible some other way or it simply persists unnoticed. Values reaching
+    /// the router and per-parser filters are escaped at emit
+    /// (`escape_vrl_string_for_router`), so this is defence in depth, not a
+    /// live hole.
+    /// NAN-2256: make sure a log source routes the given `source_type`, adding
+    /// it if absent. Returns whether anything changed.
+    ///
+    /// Collector streams share one log source: the first to provision creates
+    /// it, the rest link to the existing one. Only the creating stream's
+    /// `source_type` ever reached `match_values`, so every later stream's
+    /// events matched nothing and landed unparsed — silently, since the streams
+    /// still report as linked. It went unnoticed because the community parsers
+    /// happen to enumerate one alias per stream, which `resolve_match_values`
+    /// folded in as a side effect. Coverage belongs to the manifest that
+    /// declares the streams, not to a parsers-repo alias list nobody links to
+    /// it (the NAN-2248 argument, applied to the second job those aliases were
+    /// quietly doing).
+    ///
+    /// Additive only, per NAN-2249 — a stream is never a reason to stop routing
+    /// something. `LogSourceEdit` is demanded only when a write is actually
+    /// needed, so a correctly-covered log source costs the caller no permission.
+    pub async fn ensure_log_source_claims_source_type(
+        &self,
+        log_source_id: Uuid,
+        source_type: &str,
+        grants: &TargetGrants,
+    ) -> Result<bool, ParserRepositoryError> {
+        let ls_repo = self.log_source_repository.as_ref().ok_or_else(|| {
+            ParserRepositoryError::Internal("Log source repository not available".to_string())
+        })?;
+
+        let log_source = ls_repo
+            .find_by_id(log_source_id)
+            .await
+            .map_err(|e| ParserRepositoryError::LogSourceService(e.to_string()))?;
+
+        let existing = log_source.match_values.clone().unwrap_or_default();
+        if existing.iter().any(|v| v == source_type) {
+            return Ok(false);
+        }
+
+        grants
+            .ensure(TargetEffect::LogSourceEdit)
+            .map_err(|effect| ParserRepositoryError::Forbidden(effect.permission().to_string()))?;
+
+        // `add_match_value`, not a read-modify-write through `update`: two
+        // callers provisioning streams onto the same log source would otherwise
+        // interleave and lose one of the additions. It appends (never
+        // reorders), so the operator's primary keeps its place — routing rules
+        // point at `match_values.first()`.
+        //
+        // The read above is only to decide whether a grant is owed. The append
+        // re-checks under the row lock, so a value another caller added between
+        // the two is a no-op here rather than a duplicate.
+        ls_repo
+            .add_match_value(log_source_id, source_type)
+            .await
+            .map_err(|e| ParserRepositoryError::LogSourceService(e.to_string()))
+    }
+
+    pub(super) fn union_match_values(existing: &[String], resolved: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::with_capacity(existing.len() + resolved.len());
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for value in resolved.iter().chain(existing.iter()) {
+            if seen.insert(value.as_str()) {
+                if !crate::log_telemetry::repository::is_safe_source_type(value) {
+                    tracing::warn!(
+                        match_value = %value,
+                        "union_match_values: keeping a stored match_value that fails the \
+                         source_type allow-list — it is already routing traffic, so it is not \
+                         dropped here, but it should be pruned from the log source",
+                    );
+                }
+                out.push(value.clone());
+            }
         }
         out
     }
@@ -2137,5 +2247,89 @@ mod tests {
             matches!(err, ParserRepositoryError::InvalidRequest(ref m) if m.contains("target_table")),
             "expected target_table rejection, got {err:?}"
         );
+    }
+
+    // =====================================================================
+    // NAN-2249: accepting an update must never narrow match_values
+    // =====================================================================
+
+    /// The NAN-2246 case: upstream collapsed to one canonical value. The
+    /// operator's aliases — which their forwarders are actively tagging with —
+    /// must survive. Dropping them stops routing silently.
+    #[test]
+    fn union_keeps_aliases_upstream_has_dropped() {
+        let existing = vec![
+            "apache_access".to_string(),
+            "apache".to_string(),
+            "apache_error".to_string(),
+        ];
+        let resolved = vec!["apache_access".to_string()];
+
+        let merged = ParserRepositoryService::union_match_values(&existing, &resolved);
+
+        assert_eq!(
+            merged,
+            vec!["apache_access", "apache", "apache_error"],
+            "an update that narrows upstream must not narrow the log source"
+        );
+    }
+
+    /// Widening still works — that is the whole point of re-syncing.
+    #[test]
+    fn union_applies_values_upstream_added() {
+        let existing = vec!["fortinet".to_string()];
+        let resolved = vec!["fortinet".to_string(), "fortigate".to_string()];
+
+        let merged = ParserRepositoryService::union_match_values(&existing, &resolved);
+
+        assert_eq!(merged, vec!["fortinet", "fortigate"]);
+    }
+
+    /// `resolved` leads, so its first element stays the primary. Routing rules
+    /// point at the primary; reordering it would orphan them.
+    #[test]
+    fn union_keeps_resolved_primary_first() {
+        let existing = vec!["cloudtrail".to_string(), "aws_ct".to_string()];
+        // resolve_match_values feeds the existing primary back in first.
+        let resolved = vec!["cloudtrail".to_string(), "aws_cloudtrail".to_string()];
+
+        let merged = ParserRepositoryService::union_match_values(&existing, &resolved);
+
+        assert_eq!(merged[0], "cloudtrail", "primary must not move");
+        assert!(merged.contains(&"aws_ct".to_string()), "alias must survive");
+        assert!(merged.contains(&"aws_cloudtrail".to_string()), "new value applied");
+    }
+
+    /// No duplicates when the two lists overlap.
+    #[test]
+    fn union_dedupes() {
+        let existing = vec!["okta".to_string(), "okta_system".to_string()];
+        let resolved = vec!["okta".to_string()];
+
+        let merged = ParserRepositoryService::union_match_values(&existing, &resolved);
+
+        assert_eq!(merged, vec!["okta", "okta_system"]);
+    }
+
+    /// A fresh import has nothing to merge with — the canonical single value
+    /// passes through unchanged, so new installs get the clean model.
+    #[test]
+    fn union_on_empty_existing_is_just_resolved() {
+        let merged =
+            ParserRepositoryService::union_match_values(&[], &["windows_sysmon".to_string()]);
+        assert_eq!(merged, vec!["windows_sysmon"]);
+    }
+
+    /// An existing value that would fail today's `is_safe_source_type` is still
+    /// kept. It is already persisted and already routing; dropping it here
+    /// would be the silent narrowing this guard exists to prevent.
+    #[test]
+    fn union_does_not_revalidate_already_persisted_values() {
+        let existing = vec!["legacy value with spaces".to_string()];
+        let resolved = vec!["clean_value".to_string()];
+
+        let merged = ParserRepositoryService::union_match_values(&existing, &resolved);
+
+        assert_eq!(merged, vec!["clean_value", "legacy value with spaces"]);
     }
 }

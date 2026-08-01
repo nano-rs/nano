@@ -812,3 +812,135 @@ fn test_scope_gate_preserves_query_semantics() {
     assert!(out.contains("windows_event"), "subsearch predicate dropped: {out}");
     assert!(out.contains("by src_ip"), "pipeline dropped: {out}");
 }
+
+// ---------------------------------------------------------------------------
+// NAN-2241: the scope gate must not corrupt what it re-serializes.
+//
+// `enforce_source_scope` is the one production caller of `pretty_print`, so its
+// round-trip is where a lossy serializer turns into wrong SEARCH RESULTS. The
+// old `"`-strip rewrote a `rex` pattern's `[^"]+` into `[^]+` — a valid regex
+// that matches nothing — and the query then ran to completion, gated and
+// correct-looking, returning zero rows with no error at any layer.
+//
+// Both properties are asserted together on purpose: fidelity is only acceptable
+// if the NAN-2006 breakout guarantee still holds (the payload cases live in
+// `test_nan2006_breakout_payloads_cannot_leak_denied_sources` above and are
+// unchanged), and the gate is only useful if it does not silently rewrite the
+// analyst's query.
+// ---------------------------------------------------------------------------
+
+/// The reported repro: a Google Workspace token hunt pulling `app_name` out of
+/// a JSON message with a single-quoted pattern full of double quotes.
+#[test]
+fn test_rex_pattern_double_quotes_survive_the_scope_gate() {
+    let pattern = r#""name":"app_name","value":"(?<app>[^"]+)""#;
+    let npl = format!("source_type=gws_token | rex field=message '{pattern}' | head 1");
+
+    for deny_set in [deny(&["audit"]), deny(&["audit", "insider"])] {
+        let enforced = enforce_source_scope(&npl, &deny_set)
+            .unwrap_or_else(|e| panic!("repro must survive enforcement: {e:?}"));
+        assert!(
+            enforced.contains(pattern),
+            "the scope gate rewrote the analyst's regex (was `{pattern}`): {enforced}"
+        );
+        // ...and the gate itself is still on every scan.
+        let reparsed = parse_query(&enforced)
+            .unwrap_or_else(|e| panic!("enforced query must re-parse: {enforced} -> {e:?}"));
+        assert_scope_gate_on_every_scan(&reparsed, &deny_set, &npl);
+    }
+}
+
+/// The specific corruption that made the bug silent rather than loud:
+/// a negated character class losing its only member is still a legal regex.
+#[test]
+fn test_negated_character_class_is_not_emptied_by_the_scope_gate() {
+    let enforced = enforce_source_scope(
+        r#"* | rex field=message '"(?<v>[^"]+)"'"#,
+        &deny(&["audit"]),
+    )
+    .expect("must survive enforcement");
+    assert!(
+        enforced.contains(r#"[^"]+"#),
+        "`[^\"]+` must not degrade to `[^]+` (matches nothing): {enforced}"
+    );
+    assert!(
+        !enforced.contains("[^]+"),
+        "emitted the never-matching class: {enforced}"
+    );
+}
+
+/// Filter values and eval literals go through the same serializer and were
+/// corrupted the same way — a JSON fragment hunt lost every quote.
+#[test]
+fn test_quote_bearing_values_survive_the_scope_gate() {
+    let deny_set = deny(&["audit"]);
+    for (npl, needle) in [
+        (r#"message='{"action":"delete"}'"#, r#"{"action":"delete"}"#),
+        (r#"* | eval tag='say "hi"' | stats count"#, r#"say "hi""#),
+        (r#"* | where message='has a " quote'"#, r#"has a " quote"#),
+        // sed mode: the pattern/replacement split must survive the gate's
+        // serialize -> re-parse, quotes and all.
+        (
+            r#"* | rex mode=sed field=message 's/pass="[^"]*"/REDACTED/'"#,
+            r#"pass="[^"]*""#,
+        ),
+    ] {
+        let enforced = enforce_source_scope(npl, &deny_set)
+            .unwrap_or_else(|e| panic!("{npl} must survive enforcement: {e:?}"));
+        assert!(
+            enforced.contains(needle),
+            "value corrupted by the gate (wanted `{needle}`): {enforced}"
+        );
+        assert_npl_is_scope_gated(npl, &deny_set);
+    }
+}
+
+/// NAN-1157 regression guard: the DOUBLE-quoted behaviour is deliberate and must
+/// not change. A Windows path with a trailing backslash still parses, and still
+/// survives the gate byte-for-byte.
+#[test]
+fn test_nan1157_windows_paths_unchanged_by_the_scope_gate() {
+    let deny_set = deny(&["audit"]);
+    for (npl, needle) in [
+        (r#"file_path="C:\Windows\System32\""#, r"C:\Windows\System32\"),
+        (r#"file_path="C:\Windows\System32""#, r"C:\Windows\System32"),
+        // `\\` collapses to `\` on the way in (NAN-1157), so a UNC path is
+        // written with four leading backslashes and must come back with two.
+        (r#"file_path="\\\\fileserver\share""#, r"\\fileserver\share"),
+    ] {
+        let parsed = parse_query(npl).unwrap_or_else(|e| panic!("{npl} must parse: {e:?}"));
+        let enforced = enforce_source_scope(npl, &deny_set)
+            .unwrap_or_else(|e| panic!("{npl} must survive enforcement: {e:?}"));
+        let reparsed = parse_query(&enforced)
+            .unwrap_or_else(|e| panic!("enforced must re-parse: {enforced} -> {e:?}"));
+        // The gate adds a conjunct, so compare the VALUE the parser rebuilt.
+        let original_value = first_string_value(&parsed);
+        assert_eq!(
+            first_string_value(&reparsed),
+            original_value,
+            "gate altered the path value: {enforced}"
+        );
+        assert_eq!(original_value.as_deref(), Some(needle));
+        assert_scope_gate_on_every_scan(&reparsed, &deny_set, npl);
+    }
+}
+
+/// First `Value::String` reachable in the expression tree — enough to pin the
+/// single filter value the NAN-1157 cases carry.
+fn first_string_value(query: &Query) -> Option<String> {
+    fn walk(expr: &SearchExpr) -> Option<String> {
+        match expr {
+            SearchExpr::FieldFilter {
+                value: Value::String(s),
+                ..
+            } => Some(s.clone()),
+            SearchExpr::And(l, r) | SearchExpr::Or(l, r) => walk(l).or_else(|| walk(r)),
+            SearchExpr::Not(inner) | SearchExpr::Group(inner) => walk(inner),
+            _ => None,
+        }
+    }
+    match query {
+        Query::Search(expr) => walk(expr),
+        Query::Piped { source, .. } => first_string_value(source),
+    }
+}

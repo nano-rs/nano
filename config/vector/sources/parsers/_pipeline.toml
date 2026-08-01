@@ -418,9 +418,20 @@ skip_unknown_fields = true
 [sinks.clickhouse_logs.query_settings.async_insert_settings]
 deduplicate = true
 
+# NAN-2253: disk buffer. The previous memory buffer (max_events=100000)
+# silently discarded everything past ~100k events whenever ClickHouse
+# rejected inserts (NAN-2251 memory wedge) while sources kept ACKing 200,
+# and a Vector restart evaporated the rest — only ~4k of ~180k events
+# survived a real wedge. Disk survives restarts and holds a bounded 2 GiB
+# backlog under VECTOR_DATA_DIR (the nano-vector-data volume). when_full
+# stays drop_newest, NOT block: this sink's input chain reaches the shared
+# ingest sources, and a blocking sink would stall every other lane through
+# them (NAN-1114 invariant, enforced by the backpressure lint at cargo test
+# time). Shedding now starts after ~2 GiB of durable backlog instead of
+# ~100k in-memory events.
 [sinks.clickhouse_logs.buffer]
-type = "memory"
-max_events = 100000
+type = "disk"
+max_size = 2147483648
 when_full = "drop_newest"
 
 [sinks.clickhouse_logs.acknowledgements]

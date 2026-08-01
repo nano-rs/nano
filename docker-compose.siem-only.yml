@@ -134,7 +134,9 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2G
+          # NAN-2252: host-sized via CLICKHOUSE_MEM_LIMIT in .env (see
+          # docker-compose.opensource.yml for the rationale); unset → 2G.
+          memory: ${CLICKHOUSE_MEM_LIMIT:-2G}
 
   dragonfly:
     # Was `:latest` (NAN-1258): a floating tag on a security product is the

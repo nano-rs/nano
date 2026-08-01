@@ -184,6 +184,68 @@ fn extract_context_before(input: &str, position: usize) -> Option<String> {
     }
 }
 
+/// NAN-2241: detect the `\"`-inside-a-double-quoted-string trap and explain it.
+///
+/// `values::double_quoted_string` is `take_while(|c| c != '"')` — the FIRST `"`
+/// always terminates and a preceding backslash is an ordinary character. That
+/// is deliberate (NAN-1157) so Windows paths like `"C:\Windows\System32\"`
+/// parse. The cost is that a regex author reaching for the familiar
+/// `"\"name\":\"app_name\""` gets a literal that ends after the backslash, with
+/// the rest of the pattern re-tokenized as query syntax — and, before this,
+/// an error message that named a symptom miles from the cause.
+///
+/// Returns `Some((message, suggestions))` only when the parse died IMMEDIATELY
+/// after a `\"`-terminated literal AND more `"` remain further along. Both
+/// conditions are needed: a query that merely CONTAINS `\"` may be a perfectly
+/// valid trailing-backslash path (`file_path="C:\Windows\"`) that failed later
+/// for an unrelated reason, and must not be mislabelled.
+fn escaped_double_quote_diagnostic(
+    input: &str,
+    position: usize,
+) -> Option<(String, Vec<ErrorSuggestion>)> {
+    let consumed = input.get(..position)?;
+    if !consumed.trim_end().ends_with("\\\"") || !input.get(position..)?.contains('"') {
+        return None;
+    }
+
+    let message = "`\\\"` is not an escape sequence in nPL: a double-quoted string ends at the \
+                   FIRST `\"`, so everything after it is read as query syntax (NAN-1157 — this \
+                   is what lets Windows paths like \"C:\\Windows\\System32\\\" parse). Use a \
+                   SINGLE-quoted string for a pattern containing double quotes; `\"` is an \
+                   ordinary character inside `'…'`."
+        .to_string();
+
+    let mut suggestions = Vec::new();
+
+    // Reconstruct what the author meant: the span from the `"` that opened the
+    // literal to the last `"` in the query, with `\"` unescaped and the whole
+    // thing re-quoted with `'`.
+    let escape_at = consumed.rfind("\\\"");
+    if let (Some(escape_at), Some(close)) = (escape_at, input.rfind('"')) {
+        if let Some(open) = consumed.get(..escape_at).and_then(|s| s.rfind('"')) {
+            if close > open + 1 {
+                let inner = input[open + 1..close].replace("\\\"", "\"");
+                if !inner.contains('\'') {
+                    suggestions.push(ErrorSuggestion {
+                        description: "single-quote the pattern so its double quotes stay literal"
+                            .to_string(),
+                        replacement: format!("'{}'", inner),
+                    });
+                }
+            }
+        }
+    }
+
+    if suggestions.is_empty() {
+        suggestions.push(ErrorSuggestion {
+            description: "single-quote patterns that contain double quotes".to_string(),
+            replacement: r#"rex field=message '"key":"(?<value>[^"]+)"'"#.to_string(),
+        });
+    }
+
+    Some((message, suggestions))
+}
+
 /// Analyze error context and generate helpful messages and suggestions
 fn analyze_error_context(
     input: &str,
@@ -193,6 +255,18 @@ fn analyze_error_context(
 ) -> (String, Vec<String>, Vec<ErrorSuggestion>) {
     let mut expected = Vec::new();
     let mut suggestions = Vec::new();
+
+    // NAN-2241: name the `\"` trap before any generic guess. It reads like an
+    // escape but isn't one, so the generic analyzers below produce actively
+    // misleading advice (the canonical `rex field=message "\"name\":\"app\""`
+    // came back as "Unknown command 'name'. Did you mean 'rename'?").
+    if let Some((message, escape_suggestions)) = escaped_double_quote_diagnostic(input, position) {
+        return (
+            message,
+            vec!["a single-quoted string: '…'".to_string()],
+            escape_suggestions,
+        );
+    }
 
     // Default message
     let mut message = if position >= input.len() {

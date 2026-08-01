@@ -50,8 +50,19 @@ impl ApiKeyApiError {
     }
 
     pub fn from_service_error(err: &ApiKeyServiceError) -> (StatusCode, Self) {
+        use nanosiem_core::auth::ApiKeyRepositoryError;
+
         let (status, error_type) = match err {
-            ApiKeyServiceError::NotFound => (StatusCode::NOT_FOUND, "api_key_not_found"),
+            ApiKeyServiceError::NotFound
+            // NAN-2266: a repository "no such row" that a service method
+            // propagated wholesale (delete/enable/disable/update all do) is
+            // still a 404, not a database fault. Before this arm, deleting an
+            // already-deleted key answered 500 — which is exactly what the
+            // desktop hunt runner's best-effort re-revoke of a sweep key hits
+            // on every tick after a successful revoke.
+            | ApiKeyServiceError::RepositoryError(ApiKeyRepositoryError::NotFound(_)) => {
+                (StatusCode::NOT_FOUND, "api_key_not_found")
+            }
             ApiKeyServiceError::Disabled => (StatusCode::BAD_REQUEST, "api_key_disabled"),
             ApiKeyServiceError::Expired => (StatusCode::BAD_REQUEST, "api_key_expired"),
             ApiKeyServiceError::ValidationFailed => (StatusCode::UNAUTHORIZED, "validation_failed"),
@@ -69,6 +80,21 @@ impl ApiKeyApiError {
                 (StatusCode::INTERNAL_SERVER_ERROR, "database_error")
             }
         };
+
+        // NAN-2266: 5xx detail goes to the log (the request id is on the
+        // enclosing tracing span), never into the response body — the previous
+        // form echoed the raw repository/driver rendering to the client.
+        if status.is_server_error() {
+            tracing::error!(error = %nanosiem_api_lib::error_chain(err), "API key service error");
+            return (status, Self::new(error_type, "An internal error occurred"));
+        }
+
+        // Both 404 arms mean the same thing to the caller; the repository
+        // rendering ("Repository error: API key not found: <uuid>") is an
+        // internal shape that should not become the response contract.
+        if status == StatusCode::NOT_FOUND {
+            return (status, Self::new(error_type, "API key not found"));
+        }
 
         (status, Self::new(error_type, &err.to_string()))
     }
@@ -821,5 +847,36 @@ mod tests {
         assert_eq!(req.description, Some(Some("ci robot".to_string())));
         assert_eq!(req.rate_limit, Some(Some(600)));
         assert!(req.expires_at.is_none(), "omitted expires_at stays unchanged");
+    }
+
+    // NAN-2266: deleting an already-deleted key answered 500. The repository's
+    // NotFound rode inside `ServiceError::RepositoryError` (delete/enable/
+    // disable/update all propagate it wholesale), and every RepositoryError was
+    // rendered as `500 database_error` — so the desktop hunt runner's
+    // best-effort re-revoke of a sweep key failed loudly on every tick.
+
+    #[test]
+    fn a_repository_not_found_is_a_404_not_a_database_fault() {
+        let err = ApiKeyServiceError::RepositoryError(
+            nanosiem_core::auth::ApiKeyRepositoryError::NotFound(Uuid::nil()),
+        );
+        let (status, body) = ApiKeyApiError::from_service_error(&err);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.error, "api_key_not_found");
+        // The repository's internal rendering must not become the contract.
+        assert_eq!(body.message, "API key not found");
+    }
+
+    #[test]
+    fn a_real_database_fault_stays_500_with_a_generic_body() {
+        let err = ApiKeyServiceError::RepositoryError(
+            nanosiem_core::auth::ApiKeyRepositoryError::DatabaseError(sqlx::Error::PoolTimedOut),
+        );
+        let (status, body) = ApiKeyApiError::from_service_error(&err);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.error, "database_error");
+        // The driver's rendering goes to the log, never into the response.
+        assert_eq!(body.message, "An internal error occurred");
+        assert!(!body.message.to_lowercase().contains("pool"));
     }
 }

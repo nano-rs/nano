@@ -418,7 +418,17 @@ function ProvisioningNotice({ reports }: { reports: StreamProvisionReport[] }) {
         {problems.map((p) => (
           <li key={p.stream_id} className="text-[11.5px] text-muted-foreground">
             <span className="font-mono text-foreground">{p.source_type}</span>
-            {p.status === 'no_parser' && (
+            {p.status === 'no_parser' && p.declared_parser && (
+              <>
+                {' — needs parser '}
+                <span className="font-mono text-foreground">{p.declared_parser}</span>
+                {', which no synced repository provides. Events will arrive unparsed. '}
+                <Link to="/ingestion/log-sources/repositories" className="text-primary hover:underline">
+                  Sync a repository
+                </Link>
+              </>
+            )}
+            {p.status === 'no_parser' && !p.declared_parser && (
               <>
                 {' — no parser claims this source type. Events will arrive unparsed. '}
                 <Link to="/ingestion/log-sources/repositories" className="text-primary hover:underline">
