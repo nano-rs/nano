@@ -553,6 +553,9 @@ pub struct CoverageCount {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+// Schema renamed for the spec only (NAN-2270): mitre::types has its own, and the
+// OpenAPI component registry is flat. The Rust name stays.
+#[schema(as = RuleRepositoryTacticCoverage)]
 pub struct TacticCoverage {
     pub tactic: String,
     pub tactic_name: String,

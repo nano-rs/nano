@@ -507,6 +507,9 @@ fn default_page_size() -> i64 {
 
 /// Paginated user list response
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+// Schema renamed for the spec only (NAN-2270): handlers::users has its own
+// UserListResponse, and the OpenAPI component registry is flat. The Rust name stays.
+#[schema(as = IdentityUserListResponse)]
 pub struct UserListResponse {
     pub users: Vec<UserRecord>,
     pub total: i64,

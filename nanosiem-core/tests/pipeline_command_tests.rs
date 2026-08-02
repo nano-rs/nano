@@ -32,8 +32,17 @@ fn npl(query_str: &str) -> String {
 fn resolve_identity_basic() {
     let sql = npl("* | resolve_identity field=src_ip");
     assert!(
-        sql.contains("ASOF LEFT JOIN identity_observations"),
+        sql.contains("ASOF LEFT JOIN"),
         "Missing ASOF JOIN"
+    );
+    // NAN-1638: the build side is a subquery bounded to the query window, not
+    // the bare table — ASOF JOINing all of identity_observations read the whole
+    // table on every resolve. Assert the bound, not just the join: an unbounded
+    // `ASOF LEFT JOIN identity_observations` would still satisfy the line above.
+    assert!(
+        sql.contains("FROM identity_observations")
+            && sql.contains("WHERE observed_at BETWEEN"),
+        "ASOF build side must stay window-bounded (NAN-1638), got:\n{sql}"
     );
     assert!(
         sql.contains("main.src_ip = i.ip"),
@@ -77,8 +86,17 @@ fn resolve_identity_after_table_no_src_host() {
     // | table prunes columns → resolve_identity must NOT reference main.src_host
     let sql = npl("* | table timestamp, dest_ip, process_name | resolve_identity field=dest_ip");
     assert!(
-        sql.contains("ASOF LEFT JOIN identity_observations"),
+        sql.contains("ASOF LEFT JOIN"),
         "Missing ASOF JOIN"
+    );
+    // NAN-1638: the build side is a subquery bounded to the query window, not
+    // the bare table — ASOF JOINing all of identity_observations read the whole
+    // table on every resolve. Assert the bound, not just the join: an unbounded
+    // `ASOF LEFT JOIN identity_observations` would still satisfy the line above.
+    assert!(
+        sql.contains("FROM identity_observations")
+            && sql.contains("WHERE observed_at BETWEEN"),
+        "ASOF build side must stay window-bounded (NAN-1638), got:\n{sql}"
     );
     assert!(
         !sql.contains("main.src_host"),
@@ -146,8 +164,17 @@ fn resolve_identity_field_user() {
         "Should join on i.user for user field"
     );
     assert!(
-        sql.contains("ASOF LEFT JOIN identity_observations"),
+        sql.contains("ASOF LEFT JOIN"),
         "Missing ASOF JOIN"
+    );
+    // NAN-1638: the build side is a subquery bounded to the query window, not
+    // the bare table — ASOF JOINing all of identity_observations read the whole
+    // table on every resolve. Assert the bound, not just the join: an unbounded
+    // `ASOF LEFT JOIN identity_observations` would still satisfy the line above.
+    assert!(
+        sql.contains("FROM identity_observations")
+            && sql.contains("WHERE observed_at BETWEEN"),
+        "ASOF build side must stay window-bounded (NAN-1638), got:\n{sql}"
     );
     assert!(
         sql.contains("identity_confidence"),
@@ -179,8 +206,17 @@ fn resolve_identity_field_src_host() {
         "Should join on i.hostname for src_host field"
     );
     assert!(
-        sql.contains("ASOF LEFT JOIN identity_observations"),
+        sql.contains("ASOF LEFT JOIN"),
         "Missing ASOF JOIN"
+    );
+    // NAN-1638: the build side is a subquery bounded to the query window, not
+    // the bare table — ASOF JOINing all of identity_observations read the whole
+    // table on every resolve. Assert the bound, not just the join: an unbounded
+    // `ASOF LEFT JOIN identity_observations` would still satisfy the line above.
+    assert!(
+        sql.contains("FROM identity_observations")
+            && sql.contains("WHERE observed_at BETWEEN"),
+        "ASOF build side must stay window-bounded (NAN-1638), got:\n{sql}"
     );
 }
 
@@ -384,15 +420,24 @@ fn eval_len_function() {
 }
 
 // ============================================================================
-// dedup — ClickHouse uses LIMIT 1 BY, not ROW_NUMBER
+// dedup — survivor-id selection via argMin (NAN-1636), not a full row sort
 // ============================================================================
 
 #[test]
 fn dedup_single_field() {
     let sql = npl("* | dedup src_ip");
+    // NAN-1636: survivor-id selection replaced `ORDER BY <keys>, timestamp
+    // LIMIT 1 BY <keys>`, which full-sorted every ~200-column row and hit
+    // Code 241 (MergeSortingTransform OOM) at >=~15min windows. Assert the
+    // absence of the sort as well as the presence of argMin — a check for
+    // argMin alone would pass on a query that did both.
     assert!(
-        sql.contains("LIMIT 1 BY"),
-        "Dedup should use LIMIT 1 BY (ClickHouse native dedup)"
+        sql.contains("argMin(id, timestamp)") && sql.contains("GROUP BY src_ip"),
+        "dedup should select survivor ids with argMin (NAN-1636), got:\n{sql}"
+    );
+    assert!(
+        !sql.contains("LIMIT 1 BY"),
+        "dedup must not full-sort rows (NAN-1636), got:\n{sql}"
     );
 }
 
@@ -403,7 +448,15 @@ fn dedup_multiple_fields() {
         sql.contains("src_ip") && sql.contains("dest_ip"),
         "Should dedup by both fields"
     );
-    assert!(sql.contains("LIMIT 1 BY"), "Should use LIMIT 1 BY");
+    assert!(
+        sql.contains("argMin(id, timestamp)")
+            && sql.contains("GROUP BY src_ip, dest_ip"),
+        "dedup should select survivor ids with argMin (NAN-1636), got:\n{sql}"
+    );
+    assert!(
+        !sql.contains("LIMIT 1 BY"),
+        "dedup must not full-sort rows (NAN-1636), got:\n{sql}"
+    );
 }
 
 // ============================================================================
@@ -1146,15 +1199,32 @@ fn timechart_estdc_uses_uniq_combined64() {
 #[test]
 fn eventstats_estdc_uses_uniq_combined64() {
     let sql = npl("* | eventstats estdc(src_ip) by source_type");
+    // NAN-1642: the grouped form is no longer a whole-partition window. Those
+    // materialised every row of the partition per row and were the OOM class
+    // this replaced; the group->value map is built once and looked up per row.
+    // Assert both halves — the aggregate still being uniqCombined64 AND the
+    // absence of the window — since checking only the former would pass on a
+    // reverted implementation.
     assert!(
-        sql.contains("uniqCombined64(src_ip) OVER (PARTITION BY"),
-        "eventstats estdc should be a uniqCombined64 window; got: {sql}"
+        sql.contains("uniqCombined64(src_ip)") && sql.contains("mapFromArrays"),
+        "eventstats estdc should be a uniqCombined64 map attach (NAN-1642); got: {sql}"
     );
-    // Whole-set form uses a scalar subquery, mirroring dc().
+    assert!(
+        !sql.contains("OVER (PARTITION BY"),
+        "eventstats must not use whole-partition windows (NAN-1642); got: {sql}"
+    );
+    // Whole-set form stays a scalar subquery, mirroring dc(). The aggregate is
+    // wrapped in toFloat64 so the attached column has one numeric type across
+    // both the grouped (map value) and whole-set shapes, so match on the
+    // subquery and the aggregate rather than an exact `(SELECT <agg> FROM`.
     let sql2 = npl("* | eventstats estdc(src_ip)");
     assert!(
-        sql2.contains("(SELECT uniqCombined64(src_ip) FROM"),
+        sql2.contains("(SELECT toFloat64(uniqCombined64(src_ip)) FROM"),
         "whole-set eventstats estdc should use a scalar subquery; got: {sql2}"
+    );
+    assert!(
+        !sql2.contains("OVER ("),
+        "whole-set eventstats must not use a window (NAN-1642); got: {sql2}"
     );
 }
 
@@ -1184,9 +1254,27 @@ fn dc_emission_stays_uniq_exact_everywhere() {
     assert!(timechart.contains("uniqExact(src_ip)"), "got: {timechart}");
     assert!(!timechart.contains("uniqCombined64"), "got: {timechart}");
 
+    // NAN-1642: grouped eventstats is a map attach, not a window (see
+    // eventstats_estdc_uses_uniq_combined64). dc() staying uniqExact is what
+    // this test is about, so assert the aggregate and let the shape be pinned
+    // there rather than duplicating a brittle window expectation here.
     let eventstats = npl("* | eventstats dc(src_ip) by source_type");
-    assert!(eventstats.contains("uniqExact(src_ip) OVER (PARTITION BY"), "got: {eventstats}");
+    assert!(eventstats.contains("uniqExact(src_ip)"), "got: {eventstats}");
+    assert!(!eventstats.contains("uniqCombined64"), "dc must stay exact; got: {eventstats}");
+    // The dc arm is emitted separately from estdc, so the estdc test cannot
+    // protect it: a dc-only regression to `uniqExact(src_ip) OVER (PARTITION
+    // BY ...)` would satisfy both lines above while restoring exactly the
+    // whole-partition window NAN-1642 removed. Pin the shape here too.
+    assert!(
+        eventstats.contains("mapFromArrays"),
+        "grouped eventstats dc must use the map attach (NAN-1642); got: {eventstats}"
+    );
+    assert!(
+        !eventstats.contains("OVER (PARTITION BY"),
+        "grouped eventstats dc must not use a whole-partition window (NAN-1642); got: {eventstats}"
+    );
 
     let streamstats = npl("* | streamstats dc(src_ip) by source_type");
     assert!(streamstats.contains("uniqExact(src_ip) OVER ("), "got: {streamstats}");
 }
+

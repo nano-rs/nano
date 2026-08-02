@@ -206,9 +206,14 @@ pub(super) fn dedupe_routes_by_upstream(mut routes: Vec<(String, Option<String>)
 /// (routed, vector, or non-dispatch fetch parsers that emit their own
 /// owned Vector source — those don't share an input with source_router).
 pub(super) fn parser_claimed_route(parser: &Parser) -> Option<&str> {
-    match parser.source_type.as_str() {
+    // NAN-2267: classified through `transport_of` so the alias set cannot drift
+    // from `generate_source_config`. This arm previously omitted `s3`/`pubsub`,
+    // so an alias parser never got the `<route>_unclaimed` substitution and its
+    // claimed events also fell through `source_router.generic` — a raw
+    // double-write of the NAN-930 class.
+    match transport_of(&parser.source_type) {
         // HEC parsers always read from the OOTB/source-config splunk_hec_route.
-        "splunk_hec" | "splunk" | "hec" => Some("splunk_hec_route"),
+        Transport::SplunkHec => Some("splunk_hec_route"),
         // NAN-1528: OTLP log parsers fan out from the OOTB `otlp_logs_prep`
         // output (config/vector/03-otlp-source.toml). Since `otlp_logs_prep`
         // also feeds `source_router` directly as a base input
@@ -216,12 +221,48 @@ pub(super) fn parser_claimed_route(parser: &Parser) -> Option<&str> {
         // `<route>_unclaimed` substitution as HEC so an otlp_log event reaching
         // a parser filter does NOT also fall through to `source_router.generic`
         // and double-write (the NAN-930 class).
-        "opentelemetry" | "otlp" => Some("otlp_logs_prep"),
+        Transport::Otlp => Some("otlp_logs_prep"),
         // Kafka/S3/GCP parsers only claim a route when bound to a source-config
-        // via the DISPATCH FROM picker (NAN-928); otherwise they spin their own
-        // owned source and don't intersect with source_router.
-        "kafka" | "aws_s3" | "aws_sqs" | "gcp_pubsub" => parser.dispatch_route_name.as_deref(),
-        _ => None,
+        // via the DISPATCH FROM picker (NAN-928); otherwise they intersect with
+        // nothing.
+        Transport::Fetch => parser.dispatch_route_name.as_deref(),
+        Transport::Routed => None,
+    }
+}
+
+/// NAN-2267: the transport a `source_type` names, resolved in ONE place.
+///
+/// `source_type` is stored verbatim — nothing canonicalizes it on write — and
+/// several spellings reach the same transport (`aws_s3` / `aws_sqs` / `s3`;
+/// `gcp_pubsub` / `pubsub`; `splunk_hec` / `splunk` / `hec`). Three call sites
+/// used to spell these lists out independently: `generate_source_config`
+/// (sources.rs), `parser_claimed_route`, and `parser_lane`. Two of them omitted
+/// `s3` and `pubsub`, so an alias parser was emitted as a dispatch filter by the
+/// first and classified as a plain routed parser by the other two — its
+/// collisions went undetected and its route never got the `_unclaimed`
+/// substitution, which is the NAN-930 double-write.
+///
+/// One function, so a new alias cannot be half-taught to the codebase again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Transport {
+    /// HTTP ingest and Vector-native, plus anything unrecognized — all of which
+    /// `generate_source_config` funnels through `source_router`.
+    Routed,
+    SplunkHec,
+    Otlp,
+    /// kafka / s3 / sqs / pubsub — shares a lane only when bound to a
+    /// source-config via DISPATCH FROM.
+    Fetch,
+}
+
+pub(super) fn transport_of(source_type: &str) -> Transport {
+    match source_type {
+        "splunk_hec" | "splunk" | "hec" => Transport::SplunkHec,
+        "opentelemetry" | "otlp" => Transport::Otlp,
+        "kafka" | "aws_s3" | "aws_sqs" | "s3" | "gcp_pubsub" | "pubsub" => Transport::Fetch,
+        // "routed", "vector", and unknown labels alike: `generate_source_config`
+        // defaults unrecognized source types to the router, so they share it.
+        _ => Transport::Routed,
     }
 }
 
@@ -236,17 +277,14 @@ pub(super) fn parser_claimed_route(parser: &Parser) -> Option<&str> {
 /// `None` means the parser owns a private Vector source (an unbound
 /// kafka/s3/gcp fetch parser). Nothing else reads it, so it cannot collide.
 pub(super) fn parser_lane(parser: &Parser) -> Option<&str> {
-    match parser.source_type.as_str() {
-        // Both consume `source_router`, which routes by `.source_type`.
-        "routed" | "vector" => Some("source_router"),
-        "splunk_hec" | "splunk" | "hec" => Some("splunk_hec_route"),
-        "opentelemetry" | "otlp" => Some("otlp_logs_prep"),
-        // Bound to a source-config via DISPATCH FROM: shares that route with
-        // any other parser bound to the same one. Unbound: private source.
-        "kafka" | "aws_s3" | "aws_sqs" | "gcp_pubsub" => parser.dispatch_route_name.as_deref(),
-        // Unknown source types fall through to the router (see
-        // `generate_source_config`), so they share `source_router`.
-        _ => Some("source_router"),
+    match transport_of(&parser.source_type) {
+        // routed / vector / unknown all funnel through source_router.
+        Transport::Routed => Some("source_router"),
+        Transport::SplunkHec => Some("splunk_hec_route"),
+        Transport::Otlp => Some("otlp_logs_prep"),
+        // Bound via DISPATCH FROM: shares that route with any other parser
+        // bound to the same one. Unbound: no shared stream, no collision.
+        Transport::Fetch => parser.dispatch_route_name.as_deref(),
     }
 }
 
@@ -1414,5 +1452,80 @@ source = ".source_type = \"foo\""
         }
         assert_eq!(first[0].source_type, "a_type", "sorted by value");
         assert_eq!(first[1].parsers, vec!["A parser", "Z parser"]);
+    }
+
+    /// NAN-2267: `s3` and `pubsub` are accepted aliases that nothing
+    /// canonicalizes on write. Before the shared classifier, `parser_lane`
+    /// omitted them, so an alias parser and its canonical twin bound to the
+    /// SAME dispatch route landed on different lanes and their collision went
+    /// undetected — the double-write NAN-2247 exists to catch.
+    #[test]
+    fn fetch_aliases_share_a_lane_with_their_canonical_form() {
+        for (alias, canonical) in [("s3", "aws_s3"), ("pubsub", "gcp_pubsub")] {
+            let a = Parser {
+                name: format!("{alias} parser"),
+                match_values: Some(vec!["shared_type".into()]),
+                ..parser_for_claim_tests(alias, Some("orders_route"))
+            };
+            let b = Parser {
+                name: format!("{canonical} parser"),
+                match_values: Some(vec!["shared_type".into()]),
+                ..parser_for_claim_tests(canonical, Some("orders_route"))
+            };
+
+            assert_eq!(
+                parser_lane(&a),
+                parser_lane(&b),
+                "{alias} must share a lane with {canonical}"
+            );
+
+            let found = find_source_type_collisions(&[a, b]);
+            assert_eq!(
+                found.len(),
+                1,
+                "{alias} vs {canonical} on one route must collide: {found:?}"
+            );
+            assert_eq!(found[0].lane, "orders_route");
+        }
+    }
+
+    /// The same omission in `parser_claimed_route` meant an alias parser never
+    /// got the `<route>_unclaimed` substitution, so its claimed events also fell
+    /// through `source_router.generic` and were written raw (the NAN-930 class).
+    #[test]
+    fn fetch_aliases_claim_their_dispatch_route() {
+        for alias in ["s3", "pubsub"] {
+            let p = parser_for_claim_tests(alias, Some("orders_route"));
+            assert_eq!(
+                parser_claimed_route(&p),
+                Some("orders_route"),
+                "{alias} must claim its dispatch route"
+            );
+        }
+    }
+
+    /// Every accepted spelling of one transport must classify identically —
+    /// this is the invariant that keeps the three call sites from drifting.
+    #[test]
+    fn transport_of_groups_every_accepted_alias() {
+        use Transport::*;
+        for (st, want) in [
+            ("routed", Routed),
+            ("vector", Routed),
+            ("something_unknown", Routed),
+            ("splunk_hec", SplunkHec),
+            ("splunk", SplunkHec),
+            ("hec", SplunkHec),
+            ("opentelemetry", Otlp),
+            ("otlp", Otlp),
+            ("kafka", Fetch),
+            ("aws_s3", Fetch),
+            ("aws_sqs", Fetch),
+            ("s3", Fetch),
+            ("gcp_pubsub", Fetch),
+            ("pubsub", Fetch),
+        ] {
+            assert_eq!(transport_of(st), want, "transport_of({st})");
+        }
     }
 }

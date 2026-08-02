@@ -137,6 +137,9 @@ pub struct BulkPrevalenceResponse {
 
 /// Response for rare/new artifacts
 #[derive(Debug, Serialize, utoipa::ToSchema)]
+// Schema renamed for the spec only (NAN-2270): handlers::artifacts has its own, and the
+// OpenAPI component registry is flat. The Rust name stays.
+#[schema(as = PrevalenceArtifactListResponse)]
 pub struct ArtifactListResponse {
     pub artifacts: Vec<PrevalenceData>,
     pub total: usize,

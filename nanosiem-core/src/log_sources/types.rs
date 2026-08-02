@@ -712,6 +712,9 @@ pub struct LogSourceDeployment {
 
 /// Result of a deployment operation
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+// Schema renamed for the spec only (NAN-2270): parsers + source_configs each have one, and the
+// OpenAPI component registry is flat. The Rust name stays.
+#[schema(as = LogSourceDeploymentResult)]
 pub struct DeploymentResult {
     pub success: bool,
     #[serde(with = "typeid::log_source")]
@@ -743,6 +746,9 @@ pub struct VrlDiagnostic {
 
 /// VRL validation result
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+// Schema renamed for the spec only (NAN-2270): parsers::types is canonical, and the
+// OpenAPI component registry is flat. The Rust name stays.
+#[schema(as = LogSourceVrlValidationResult)]
 pub struct VrlValidationResult {
     pub valid: bool,
     /// Free-form error strings, kept for backward compatibility with existing
@@ -755,6 +761,9 @@ pub struct VrlValidationResult {
 
 /// Result of testing VRL against a sample log
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+// Schema renamed for the spec only (NAN-2270): parsers::types is canonical, and the
+// OpenAPI component registry is flat. The Rust name stays.
+#[schema(as = LogSourceParserTestResult)]
 pub struct ParserTestResult {
     pub input: String,
     pub success: bool,

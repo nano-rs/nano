@@ -125,7 +125,7 @@ pub struct ListLeadsResponse {
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct ListSuppressionsResponse {
+pub struct ListHuntSuppressionsResponse {
     pub suppressions: Vec<HuntSuppression>,
 }
 

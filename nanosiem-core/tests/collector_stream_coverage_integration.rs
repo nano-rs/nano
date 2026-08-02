@@ -52,6 +52,19 @@ fn log_source_named(name: &str, match_values: Vec<String>) -> NewLogSource {
     }
 }
 
+/// Delete the fixture. These suites run against a long-lived developer
+/// database, and an earlier version of the sibling enterprise suite left
+/// ENABLED rows behind that claimed real source_types — which the NAN-2247
+/// collision guard then correctly refused to deploy, wedging Vector
+/// reconciliation until they were removed by hand. Rows created here are
+/// disabled, so they were only clutter, but clutter is how that started.
+async fn cleanup(pool: &sqlx::PgPool, id: Uuid) {
+    let _ = sqlx::query("DELETE FROM log_sources WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await;
+}
+
 /// A unique name per test run so parallel `#[tokio::test]`s in this binary
 /// don't collide on the log_sources name.
 fn unique(prefix: &str) -> String {
@@ -98,6 +111,8 @@ async fn linking_a_second_stream_widens_the_shared_log_source() {
         values.iter().any(|v| v == "google_workspace"),
         "widening must never drop an existing value (NAN-2249): {values:?}"
     );
+
+    cleanup(&pool, created.id).await;
 }
 
 /// Idempotent: a stream re-enabled, or a reconcile that runs again, must not
@@ -134,6 +149,8 @@ async fn widening_is_idempotent() {
         1,
         "no duplicate appends: {values:?}"
     );
+
+    cleanup(&pool, created.id).await;
 }
 
 /// An already-covered log source costs the caller no permission. Provisioning
@@ -162,6 +179,8 @@ async fn no_grant_required_when_already_covered() {
         .expect("a no-op must not require a grant");
 
     assert!(!added);
+
+    cleanup(&pool, created.id).await;
 }
 
 /// ...but an actual write does. Silently widening someone's log source without
@@ -195,6 +214,8 @@ async fn widening_requires_log_source_edit() {
         !values.iter().any(|v| v == "gws_drive"),
         "a refused widen must write nothing: {values:?}"
     );
+
+    cleanup(&pool, created.id).await;
 }
 
 /// The reason this is one SQL statement rather than a read-modify-write.
@@ -254,4 +275,202 @@ async fn concurrent_widens_do_not_lose_values() {
         expected.len() + 1,
         "no duplicates and nothing dropped: {values:?}"
     );
+
+    cleanup(&pool, created.id).await;
+}
+
+// =============================================================================
+// NAN-2268: the whole-list union must not lose a concurrent single append
+// =============================================================================
+
+/// `apply_upstream_update` used to read match_values, merge in Rust, and write
+/// the array back wholesale. Interleaved with `add_match_value` from collector
+/// provisioning, the stale merge simply overwrote the append and that stream
+/// silently stopped routing — the narrowing NAN-2249 exists to prevent, arriving
+/// by a different door.
+///
+/// Both writers now do their work in one statement, so they serialize on the row
+/// instead of racing through a read.
+#[tokio::test]
+#[ignore]
+async fn union_and_append_cannot_lose_each_other() {
+    let pool = common::migrated_pool().await;
+    let repo = LogSourceRepository::new(pool.clone());
+
+    let created = repo
+        .create(&log_source_named(&unique("union-race"), vec!["primary".into()]))
+        .await
+        .expect("create log source");
+
+    // 4 whole-list unions (the upstream-update writer) interleaved with 4 single
+    // appends (the collector-provisioning writer), all against one row.
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        let (p1, p2) = (pool.clone(), pool.clone());
+        let id = created.id;
+        handles.push(tokio::spawn(async move {
+            LogSourceRepository::new(p1)
+                .union_match_values(id, &[format!("upstream_{i}"), "shared_alias".into()])
+                .await
+                .map(|_| ())
+        }));
+        handles.push(tokio::spawn(async move {
+            LogSourceRepository::new(p2)
+                .add_match_value(id, &format!("stream_{i}"))
+                .await
+                .map(|_| ())
+        }));
+    }
+    for h in handles {
+        h.await.expect("task").expect("write");
+    }
+
+    let after = repo.find_by_id(created.id).await.expect("refetch");
+    let values = after.match_values.expect("match_values");
+
+    for i in 0..4 {
+        assert!(
+            values.contains(&format!("upstream_{i}")),
+            "upstream_{i} lost to a concurrent write: {values:?}"
+        );
+        assert!(
+            values.contains(&format!("stream_{i}")),
+            "stream_{i} lost to a concurrent write: {values:?}"
+        );
+    }
+    assert_eq!(
+        values.first().map(String::as_str),
+        Some("primary"),
+        "the primary must not move — routing rules point at match_values.first()"
+    );
+    assert_eq!(
+        values.iter().filter(|v| *v == "shared_alias").count(),
+        1,
+        "a value four unions all wanted must appear once: {values:?}"
+    );
+
+    cleanup(&pool, created.id).await;
+}
+
+/// The union appends to the STORED array, so the primary is untouched by
+/// construction — including when the stored primary would not survive today's
+/// source_type allow-list, which is where the old Rust merge could reorder.
+#[tokio::test]
+#[ignore]
+async fn union_preserves_a_legacy_primary() {
+    let pool = common::migrated_pool().await;
+    let repo = LogSourceRepository::new(pool.clone());
+
+    let created = repo
+        .create(&log_source_named(
+            &unique("legacy-primary"),
+            vec!["legacy value with spaces".into(), "apache".into()],
+        ))
+        .await
+        .expect("create log source");
+
+    repo.union_match_values(created.id, &["apache".into(), "apache_access".into()])
+        .await
+        .expect("union");
+
+    let values = repo
+        .find_by_id(created.id)
+        .await
+        .expect("refetch")
+        .match_values
+        .expect("match_values");
+
+    assert_eq!(
+        values.first().map(String::as_str),
+        Some("legacy value with spaces"),
+        "an allow-list-failing primary still holds position 0: {values:?}"
+    );
+    assert_eq!(
+        values.iter().filter(|v| *v == "apache").count(),
+        1,
+        "an already-present value is not re-appended: {values:?}"
+    );
+    assert!(values.contains(&"apache_access".to_string()));
+
+    cleanup(&pool, created.id).await;
+}
+
+/// The NAN-2249 guarantee itself, through the SQL path that now implements it.
+///
+/// Six unit tests used to assert this against a Rust merge helper that the
+/// update path no longer calls; deleting them without this would have left the
+/// headline promise — "accepting a parser update never stops your logs
+/// routing" — asserted nowhere. The union only ever appends, so narrowing is
+/// structurally impossible rather than merely untested, but the property is the
+/// point of the change and deserves to fail loudly if the shape regresses.
+#[tokio::test]
+#[ignore]
+async fn an_upstream_update_cannot_drop_an_alias_a_sender_still_uses() {
+    let pool = common::migrated_pool().await;
+    let repo = LogSourceRepository::new(pool.clone());
+
+    // What an operator is actually routing on today.
+    let created = repo
+        .create(&log_source_named(
+            &unique("no-narrow"),
+            vec!["apache".into(), "apache_access".into(), "apache_error".into()],
+        ))
+        .await
+        .expect("create log source");
+
+    // What upstream now says after the parsers repo collapsed to one canonical
+    // value — note it does NOT list apache or apache_error.
+    repo.union_match_values(created.id, &["apache_access".into()])
+        .await
+        .expect("union");
+
+    let values = repo
+        .find_by_id(created.id)
+        .await
+        .expect("refetch")
+        .match_values
+        .expect("match_values");
+
+    for kept in ["apache", "apache_access", "apache_error"] {
+        assert!(
+            values.iter().any(|v| v == kept),
+            "{kept} was dropped by an upstream update (NAN-2249): {values:?}"
+        );
+    }
+    assert_eq!(values.len(), 3, "nothing added, nothing removed: {values:?}");
+
+    cleanup(&pool, created.id).await;
+}
+
+/// A log source with no match_values at all — the array is NULL rather than
+/// empty, which is a different code path in the COALESCE chain.
+#[tokio::test]
+#[ignore]
+async fn union_onto_a_null_array_seeds_it() {
+    let pool = common::migrated_pool().await;
+    let repo = LogSourceRepository::new(pool.clone());
+
+    let created = repo
+        .create(&log_source_named(&unique("null-mv"), vec![]))
+        .await
+        .expect("create log source");
+    sqlx::query("UPDATE log_sources SET match_values = NULL WHERE id = $1")
+        .bind(created.id)
+        .execute(&pool)
+        .await
+        .expect("null the array");
+
+    repo.union_match_values(created.id, &["seeded".into()])
+        .await
+        .expect("union");
+
+    let values = repo
+        .find_by_id(created.id)
+        .await
+        .expect("refetch")
+        .match_values
+        .expect("match_values");
+    assert_eq!(values, vec!["seeded".to_string()]);
+
+    cleanup(&pool, created.id).await;
 }

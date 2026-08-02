@@ -16,6 +16,13 @@ impl VectorConfigManager {
     pub(super) fn generate_source_config(&self, parser: &Parser) -> (String, String) {
         let safe_name = Self::safe_name(&parser.name);
 
+        // NAN-2267: `routed` is still matched by name because it is the only
+        // arm that needs to be distinguished from "unknown label" for the
+        // debug log below; everything else classifies through `transport_of`
+        // so this list cannot drift from `parser_lane` / `parser_claimed_route`
+        // again. It already did: those two omitted `s3` and `pubsub`, which are
+        // accepted aliases, so a parser emitted here as a dispatch filter was
+        // classified there as plain routed.
         match parser.source_type.as_str() {
             "routed" => {
                 // Routed parsers take input from the HTTP source router
@@ -23,7 +30,7 @@ impl VectorConfigManager {
                 let router_input = format!("source_router.{}", safe_name);
                 (String::new(), router_input)
             }
-            "kafka" | "aws_s3" | "aws_sqs" | "s3" | "gcp_pubsub" | "pubsub" => {
+            st if matches!(super::router::transport_of(st), super::router::Transport::Fetch) => {
                 // NAN-928: fetch-source parser bound to a deployed source
                 // configuration via the "DISPATCH FROM" picker. Mirror the
                 // HEC shape — `filter` on the source-config's routing
@@ -52,7 +59,7 @@ impl VectorConfigManager {
                 );
                 (config, filter_name)
             }
-            "splunk_hec" | "splunk" | "hec" => {
+            st if matches!(super::router::transport_of(st), super::router::Transport::SplunkHec) => {
                 // NAN-921: HEC events arrive on the OOTB splunk_hec_ingest
                 // source (`:8088`) declared in `config/vector/02-hec-source.toml`.
                 // Per-parser HEC source declarations collided on the port and
@@ -66,7 +73,7 @@ impl VectorConfigManager {
                     self.generate_splunk_hec_filter(&filter_name, match_values, &parser.name);
                 (config, filter_name)
             }
-            "opentelemetry" | "otlp" => {
+            st if matches!(super::router::transport_of(st), super::router::Transport::Otlp) => {
                 // NAN-1528: OTLP events arrive on the OOTB `otlp_ingest` source
                 // (gRPC :4317 / HTTP :4318) declared in
                 // `config/vector/03-otlp-source.toml`. Like Splunk HEC (:8088),

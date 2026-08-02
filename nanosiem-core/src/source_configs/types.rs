@@ -602,6 +602,9 @@ pub struct SourceConfigDeployment {
 
 /// Result of a deployment operation
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+// Schema renamed for the spec only (NAN-2270): parsers + log_sources each have one, and the
+// OpenAPI component registry is flat. The Rust name stays.
+#[schema(as = SourceConfigDeploymentResult)]
 pub struct DeploymentResult {
     pub success: bool,
     #[serde(with = "typeid::source_config")]

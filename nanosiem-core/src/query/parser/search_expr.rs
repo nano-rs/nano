@@ -1232,7 +1232,32 @@ fn url_keyword_string(input: &str) -> ParseResult<'_, String> {
 /// Excludes reserved words: AND, OR, NOT
 pub(super) fn unquoted_keyword(input: &str) -> ParseResult<'_, String> {
     let (remaining, s) = take_while1(|c: char| {
-        c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '*' || c == '?'
+        // This charset is the answer to "what does an analyst type bare?", and it
+        // accreted one character at a time without anyone asking that question —
+        // `.` for domains, then `@` for emails (NAN-2271). Each addition below is
+        // a term type that was simply unsearchable without quotes:
+        //
+        //   `:`  IPv6 (`2605:d580:…`), `host:port`, `C:\` — the expensive one. A
+        //        hunt agent hit it, got a parse error, and fell back to quoting.
+        //   `\`  UNC (`\\server\share`), `DOMAIN\user`, registry paths.
+        //   `+`  plus-addressed mail (`dan+alerts@nano.rs`).
+        //   `/`  CIDR (`10.0.0.0/8`) and paths. Safe despite regex literals
+        //        (`/pattern/`) because `regex_filter` is registered AHEAD of
+        //        `keyword_search`, so a LEADING `/` is still a regex; a `/` mid-
+        //        token can only be a keyword.
+        //
+        // None of `:`, `\` or `+` is claimed anywhere in the grammar (NAN-2272).
+        c.is_alphanumeric()
+            || c == '_'
+            || c == '-'
+            || c == '.'
+            || c == '*'
+            || c == '?'
+            || c == '@'
+            || c == ':'
+            || c == '\\'
+            || c == '+'
+            || c == '/'
     })
     .parse(input)?;
 

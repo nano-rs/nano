@@ -26,7 +26,7 @@ use nanosiem_core::ClientContext;
 
 use super::types::{
     optional_typeid, page_size, ListLeadsParams, ListLeadsResponse, ListSuppressionsParams,
-    ListSuppressionsResponse, ProfileResponse,
+    ListHuntSuppressionsResponse, ProfileResponse,
 };
 use super::{artifact_scope, service};
 use crate::handlers::AuditExt;
@@ -239,7 +239,7 @@ pub async fn dismiss_lead(
     tag = "hunts",
     params(ListSuppressionsParams),
     responses(
-        (status = 200, description = "Suppressions retrieved", body = ListSuppressionsResponse),
+        (status = 200, description = "Suppressions retrieved", body = ListHuntSuppressionsResponse),
         (status = 403, description = "Forbidden"),
     ),
     security(("api_key" = []))
@@ -248,12 +248,12 @@ pub async fn list_suppressions(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Query(params): Query<ListSuppressionsParams>,
-) -> Result<Json<ListSuppressionsResponse>, ApiError> {
+) -> Result<Json<ListHuntSuppressionsResponse>, ApiError> {
     ensure_permission(&auth, permissions::HUNTS_VIEW)?;
     let suppressions = service(&state)
         .list_suppressions(params.include_revoked, &artifact_scope(&auth))
         .await?;
-    Ok(Json(ListSuppressionsResponse { suppressions }))
+    Ok(Json(ListHuntSuppressionsResponse { suppressions }))
 }
 
 /// What a runner submits on a sweep's behalf.

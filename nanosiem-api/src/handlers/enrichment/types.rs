@@ -36,6 +36,9 @@ pub struct ConfigureEnrichmentRequest {
 
 /// Response for sync operation (synchronous - legacy)
 #[derive(Debug, Serialize, utoipa::ToSchema)]
+// Schema renamed for the spec only (NAN-2270): handlers::mitre has its own SyncResponse, and the
+// OpenAPI component registry is flat. The Rust name stays.
+#[schema(as = EnrichmentSyncResponse)]
 pub struct SyncResponse {
     pub success: bool,
     pub records_loaded: u64,

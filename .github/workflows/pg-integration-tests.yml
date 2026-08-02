@@ -14,6 +14,11 @@ on:
   pull_request:
     paths:
       - "**/*.rs"
+      # A dependency bump, feature flip, workspace-membership change or a new
+      # test target changes what compiles and what runs without touching a
+      # single .rs file, and would otherwise skip this gate entirely.
+      - "**/Cargo.toml"
+      - "Cargo.lock"
       - "migrations/**"
       - ".github/workflows/pg-integration-tests.yml"
   workflow_dispatch:
@@ -118,6 +123,47 @@ jobs:
           # in 0.02s, and the wider net costs nothing. Needs no database, same as
           # case_route_authz_guard, so it takes no --ignored flag.
           #
+          # NAN-2262: the first line below now runs the WHOLE non-DB suite, which
+          # subsumes the two entries above (kept for their comments, and because
+          # naming a guard is how it survives a future edit to this list).
+          #
+          # Rationale for the wider net: an allowlist of targets is why 9 tests
+          # across 2 binaries sat red on main for a month. Of 79 test binaries
+          # under nanosiem-core/tests, 3 were listed here; nanosiem-core --lib
+          # (3,165 tests) was not run at all. Anything not named simply never
+          # gated a PR, so a deliberate SQL rewrite in July silently stranded the
+          # assertions that tracked it.
+          #
+          # --workspace --lib --tests is 5,616 tests across 116 suites. Test
+          # EXECUTION is seconds; the real cost is COMPILING ~116 test binaries
+          # where this job previously built ~14. CARGO_TARGET_DIR is inside the
+          # container and is not persisted between runs, so that is paid every
+          # time. The 45-minute job timeout has the headroom, but if this job
+          # starts timing out, that is the reason — persist a target-dir volume
+          # (as the registry already is) before trimming what gets tested.
+          #
+          # --no-fail-fast so one red binary does not mask the rest, which is
+          # exactly how the second and third failing binaries stayed hidden
+          # behind the first when this was found. It still exits non-zero, so
+          # `set -e` fails the job.
+          #
+          # --test-threads=1 is REQUIRED, not tidiness. This job exports
+          # TEST_DATABASE_URL, and --tests pulls in binaries whose non-ignored
+          # tests hit that database directly. migration_fresh_init is the sharp
+          # one: five non-ignored tests that drop and recreate a shared database
+          # and whose own header says single-threaded, because the scenarios
+          # share process env. Run in parallel they range from false-green early
+          # returns after a CREATE DATABASE collision to one test killing
+          # another connection.
+          #
+          # They passed the first CI run of this change, which is the trap — a
+          # race that wins once looks identical to no race, and a flaky required
+          # check is worse than an absent one. Serialising costs ~1 minute of
+          # execution against a compile that dominates the job anyway.
+          #
+          # DB-backed suites stay listed explicitly below: they are #[ignore]d,
+          # so this line does not run them, and several need --test-threads=1.
+          #
           # IMPORTANT: the `bash -c '...'` body below MUST stay apostrophe-free.
           # An apostrophe closes the single-quoted -c string, so everything after
           # it runs on the bare host instead of in the container (cargo: command
@@ -133,8 +179,7 @@ jobs:
             -e NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1 \
             "$RUST_IMAGE" \
             bash -euo pipefail -c '
-              cargo test -p nanosiem-enterprise --test case_route_authz_guard
-              cargo test -p nanosiem-search --lib
+              cargo test --workspace --lib --tests --no-fail-fast -- --test-threads=1
               cargo test -p nanosiem-core --test api_key_rate_limit_integration -- --ignored
               cargo test -p nanosiem-api-lib --test grant_authority_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-core --test source_scope_integration -- --ignored

@@ -21,15 +21,38 @@ use crate::query::ast::{Comparator, IntervalUnit, Value};
 type ParseResult<'a, T> = IResult<&'a str, T>;
 
 /// Parse a filter value (IP, number, bool, interval, or string)
+///
+/// The typed parsers run first so `status=200` is a number rather than the
+/// string `"200"`. But each of them matches a *prefix* and reports success, and
+/// `alt` only backtracks on failure — so a typed parser that stops in the middle
+/// of a longer token wins, and the caller then chokes on the remainder:
+///
+/// ```text
+/// src_ip=2605:d580:…   number_value takes `2605`, leaves `:d580:…`  -> parse error
+/// net=10.0.0.0/8       ip_value     takes `10.0.0.0`, leaves `/8`   -> parse error
+/// user=123+a@nano.rs   number_value takes `123`,  leaves `+a@…`     -> parse error
+/// ```
+///
+/// So a typed value only counts when the token genuinely *ends* there;
+/// otherwise fall through to `unquoted_string`, which takes the whole thing.
+///
+/// The check lives here rather than inside `number_value` on purpose:
+/// `number_value` is shared with eval arithmetic, where `1+2` must keep parsing
+/// `1` even though `+` is a value character.
 pub(crate) fn filter_value(input: &str) -> ParseResult<'_, Value> {
-    alt((
-        ip_value,
-        bool_value,
-        number_value,
-        interval_value,
-        string_value,
-    ))
-    .parse(input)
+    for typed in [ip_value, bool_value, number_value, interval_value] {
+        if let Ok((rest, parsed)) = typed(input) {
+            if ends_value_token(rest) {
+                return Ok((rest, parsed));
+            }
+        }
+    }
+    string_value(input)
+}
+
+/// True when a value token ended — i.e. what follows can't extend it.
+fn ends_value_token(rest: &str) -> bool {
+    rest.chars().next().is_none_or(|c| !is_unquoted_value_char(c))
 }
 
 /// Parse IP address value
@@ -148,21 +171,38 @@ fn single_quoted_string(input: &str) -> ParseResult<'_, String> {
     .parse(input)
 }
 
+/// Characters that can appear inside an unquoted value.
+///
+/// Shared by `unquoted_string` (which consumes them) and `filter_value` (which
+/// uses it to tell whether a typed value really ended). Keep it one function —
+/// when the two drifted, `src_ip=2605:d580:…` matched the *number* `2605` and
+/// the rest of the address was left dangling.
+pub(crate) fn is_unquoted_value_char(c: char) -> bool {
+    c.is_alphanumeric()
+        || c == '_'
+        || c == '-'
+        || c == '.'
+        || c == '*'
+        || c == '?'
+        || c == '/'  // Allow forward slashes for paths
+        || c == ':' // Allow colons for URLs/protocols
+        // Emails are a first-class SIEM search term — an account name, a
+        // phishing sender, an OAuth grantee. `dan@nano.rs` bare failed to
+        // parse ("Unexpected token '@'") while `admin.reports.audit.readonly`
+        // worked, because `.` was allowed and `@` was not. `@` has no other
+        // meaning in the grammar, so allowing it costs nothing.
+        || c == '@'
+        // Same set as the bare-keyword tokenizer, so `src_ip=2605:d580:…`
+        // and `path=C:\\Windows` behave like their keyword equivalents.
+        || c == '\\'
+        || c == '+'
+}
+
 /// Parse unquoted string value (includes wildcards, paths, and common chars)
 pub(crate) fn unquoted_string(input: &str) -> ParseResult<'_, String> {
-    map(
-        take_while1(|c: char| {
-            c.is_alphanumeric() 
-            || c == '_' 
-            || c == '-' 
-            || c == '.' 
-            || c == '*' 
-            || c == '?' 
-            || c == '/'  // Allow forward slashes for paths
-            || c == ':' // Allow colons for URLs/protocols
-        }),
-        |s: &str| s.to_string(),
-    )
+    map(take_while1(is_unquoted_value_char), |s: &str| {
+        s.to_string()
+    })
     .parse(input)
 }
 

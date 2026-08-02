@@ -235,6 +235,9 @@ pub async fn sync_mitre_data(
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
+// Schema renamed for the spec only (NAN-2270): handlers::enrichment has its own SyncResponse, and the
+// OpenAPI component registry is flat. The Rust name stays.
+#[schema(as = MitreSyncResponse)]
 pub struct SyncResponse {
     pub success: bool,
     pub release: String,

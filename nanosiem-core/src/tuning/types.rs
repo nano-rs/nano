@@ -699,6 +699,9 @@ impl std::fmt::Display for NotificationType {
 
 /// Notification for tuning events
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+// Schema renamed for the spec only (NAN-2270): models::notification is the user-facing one, and the
+// OpenAPI component registry is flat. The Rust name stays.
+#[schema(as = TuningNotification)]
 pub struct Notification {
     /// Notification ID
     pub id: Uuid,

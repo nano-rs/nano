@@ -1337,16 +1337,32 @@ pub(crate) fn convert_named_groups_to_numbered(pattern: &str) -> String {
 }
 
 /// Convert wildcard pattern (* and ?) to SQL LIKE pattern (% and _)
+///
+/// Output is embedded directly in the SQL text, so this single pass has to do
+/// the work of BOTH `escape_string` and `escape_like_pattern` — the value
+/// crosses two decoders on its way to a match:
+///
+/// 1. the SQL string-literal parser, which turns `\\` into `\`
+/// 2. `iLike`, which reads `\` as its own escape character
+///
+/// So one literal backslash needs FOUR here: `\\\\` -> `\\` after the literal
+/// parser -> one literal `\` at match time. Emitting two was enough for the
+/// common case only by accident — ClickHouse leaves an unrecognised escape like
+/// `\w` alone, so `C:\Windows*` matched. `\\fileserver\share*` did not match
+/// itself: the doubled backslash collapsed to one and `iLike` ate it as an
+/// escape (NAN-2269).
 pub(crate) fn wildcard_to_like_pattern(s: &str) -> String {
     let mut result = String::with_capacity(s.len() * 2);
     for c in s.chars() {
         match c {
             '*' => result.push('%'),
             '?' => result.push('_'),
+            // `\%` survives the literal parser intact (unrecognised escape) and
+            // reaches iLike as an escaped, literal `%`.
             '%' => result.push_str("\\%"),
             '_' => result.push_str("\\_"),
             '\'' => result.push_str("''"),
-            '\\' => result.push_str("\\\\"),
+            '\\' => result.push_str("\\\\\\\\"),
             _ => result.push(c),
         }
     }

@@ -85,6 +85,42 @@ jobs:
             exit 1
           fi
 
+  desktop-web:
+    # The `web` job above runs in `nanosiem-web`. `nano-desktop` is a SECOND
+    # npm package with its own suites, and nothing ran them — the same gap this
+    # workflow was created to close, one directory over.
+    #
+    # It owns the generated-types drift gate (`api-types.gen.test.ts`), which
+    # regenerates from the committed spec and fails when the checked-in
+    # TypeScript differs. That gate was written to stop desktop↔API wire
+    # mismatches (NAN-2263, ~30 of them) and had never executed in CI.
+    #
+    # Linux + Node only: no Tauri, no webview, so this does not need the macOS
+    # runner the `desktop` job below requires.
+    runs-on: [self-hosted, X64]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install deps
+        working-directory: nano-desktop
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: nano-desktop
+        run: npm run typecheck
+
+      # `vitest run` — includes the generated-types drift gate.
+      - name: Run desktop web tests
+        working-directory: nano-desktop
+        run: npm test
+
   desktop:
     # `nano-desktop/src-tauri` is its own cargo workspace, excluded from the
     # root one, so the main `test` job never saw it.

@@ -117,12 +117,23 @@ impl Modify for SecurityAddon {
 /// than the `#[openapi(nest(...))]` macro attribute (which rejects empty paths).
 pub fn build_openapi() -> utoipa::openapi::OpenApi {
     let mut spec = ApiDoc::openapi();
+    let sub_docs = sub_docs();
+    merge_sub_docs(&mut spec, sub_docs);
+    finish_openapi(spec)
+}
 
-    // Merge each handler module's sub-doc. Since handler paths already include
-    // the full `/api/...` prefix, we nest with "/" to avoid path duplication.
+/// Every handler module's sub-doc, in merge order.
+///
+/// Split out of `build_openapi` so `verify_no_schema_name_collisions` can walk
+/// the same list. Merging is `extend`, which silently OVERWRITES a duplicate
+/// schema name with whichever sub-doc merges later — that is how
+/// `/api/hunts/suppressions` came to be documented as returning SIEM-health's
+/// `FindingSuppression` (NAN-2270). Nothing downstream can detect it: the spec
+/// is internally consistent, just wrong.
+#[cfg_attr(not(feature = "enterprise"), allow(unused_mut))]
+fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
     // The vec is mutated below only on enterprise builds (to push meloD +
     // notebooks); open builds use it read-only.
-    #[cfg_attr(not(feature = "enterprise"), allow(unused_mut))]
     let mut sub_docs: Vec<utoipa::openapi::OpenApi> = vec![
         handlers::health::HealthApiDoc::openapi(),
         handlers::capabilities::CapabilitiesApiDoc::openapi(),
@@ -224,6 +235,10 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
             .push(handlers::observability_service_signals::ObservabilityServiceSignalsApiDoc::openapi());
     }
 
+    sub_docs
+}
+
+fn merge_sub_docs(spec: &mut utoipa::openapi::OpenApi, sub_docs: Vec<utoipa::openapi::OpenApi>) {
     for sub in sub_docs {
         // Merge paths
         spec.paths.paths.extend(sub.paths.paths);
@@ -237,6 +252,9 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
             }
         }
     }
+}
+
+fn finish_openapi(mut spec: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenApi {
 
     // Merge search service endpoints (nanosiem-search, port 3002)
     let search_spec = nanosiem_search::openapi::build_openapi();
@@ -255,6 +273,119 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
 /// Build the Swagger UI service that serves the interactive docs.
 pub fn swagger_ui() -> utoipa_swagger_ui::SwaggerUi {
     utoipa_swagger_ui::SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", build_openapi())
+}
+
+/// The path prefix that defines the desktop's hunting wire seam (NAN-2263).
+const DESKTOP_WIRE_PREFIX: &str = "/api/hunts";
+
+/// Schemas included even though no `/api/hunts` path references them directly.
+///
+/// Both are the READ shapes behind columns the models declare as untyped
+/// `serde_json::Value`, so the `$ref` walk alone can never reach them:
+///
+/// * `Hunt.steps` serializes `playbooks.parsed_steps`, which the playbook
+///   parser writes as a `ParsedStepTree`.
+/// * `HuntProfile.fingerprint` serializes the stored org fingerprint, which
+///   recon writes as an `OrgFingerprint` (NOT `ProfileFingerprint` — that is
+///   the agent's submission shape and never comes back on a read).
+///
+/// They are pulled in explicitly so the desktop can type those fields against
+/// the shapes the server actually stores and serves.
+const DESKTOP_WIRE_EXTRA_SCHEMAS: &[&str] = &["ParsedStepTree", "OrgFingerprint"];
+
+/// The scoped OpenAPI document the desktop's generated TypeScript wire types
+/// are built from (NAN-2263): every `/api/hunts` path plus the schemas
+/// transitively reachable from them.
+///
+/// # Why a scoped spec rather than the whole thing
+///
+/// * The full spec differs between the open and enterprise editions (meloD,
+///   notebooks, cases…), so a committed copy of it could never be asserted
+///   from both test matrices. The hunts surface is registered ungated and its
+///   models live in `nanosiem-core`, so this subtree is identical in both —
+///   which is what lets the drift test run under either feature set.
+/// * The committed `docs/api/openapi.json` is refreshed on a different cadence
+///   and for a different consumer (the docs RAG); coupling the desktop's
+///   compile-time guarantee to it would make that refresh a breaking change.
+///
+/// Paths and schemas are emitted through `BTreeMap` so the output is sorted
+/// and byte-stable regardless of `serde_json`'s `preserve_order` feature.
+pub fn desktop_wire_spec() -> serde_json::Value {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn collect_refs(value: &serde_json::Value, into: &mut BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::String(reference)) = map.get("$ref") {
+                    if let Some(name) = reference.strip_prefix("#/components/schemas/") {
+                        into.insert(name.to_string());
+                    }
+                }
+                for nested in map.values() {
+                    collect_refs(nested, into);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect_refs(item, into);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let full = serde_json::to_value(build_openapi()).expect("serialize OpenAPI spec");
+    let all_schemas = full["components"]["schemas"]
+        .as_object()
+        .expect("spec has components.schemas");
+
+    let paths: BTreeMap<String, serde_json::Value> = full["paths"]
+        .as_object()
+        .expect("spec has paths")
+        .iter()
+        .filter(|(path, _)| path.starts_with(DESKTOP_WIRE_PREFIX))
+        .map(|(path, item)| (path.clone(), item.clone()))
+        .collect();
+
+    let mut needed: BTreeSet<String> = DESKTOP_WIRE_EXTRA_SCHEMAS
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    for item in paths.values() {
+        collect_refs(item, &mut needed);
+    }
+
+    // Transitive closure over `$ref` until no schema pulls in another.
+    let mut schemas: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    loop {
+        let pending: Vec<String> = needed
+            .iter()
+            .filter(|name| !schemas.contains_key(*name))
+            .cloned()
+            .collect();
+        if pending.is_empty() {
+            break;
+        }
+        for name in pending {
+            let schema = all_schemas
+                .get(&name)
+                .unwrap_or_else(|| panic!("desktop wire spec references unknown schema {name}"))
+                .clone();
+            collect_refs(&schema, &mut needed);
+            schemas.insert(name, schema);
+        }
+    }
+
+    serde_json::json!({
+        "openapi": full["openapi"],
+        "info": {
+            "title": "nano desktop wire seam — /api/hunts",
+            "description": "GENERATED — do not edit. The /api/hunts subtree of the nano API spec, plus transitively referenced schemas. Regenerate with: cargo run -p nanosiem-api --bin export_openapi -- --desktop-wire > nano-desktop/openapi/hunts-wire.json",
+            "version": full["info"]["version"],
+        },
+        "paths": paths,
+        "components": { "schemas": schemas },
+    })
 }
 
 #[cfg(test)]
@@ -587,5 +718,250 @@ mod tests {
             required.contains(&"fingerprint"),
             "SaveProfileRequest must still require the fingerprint: {required:?}"
         );
+    }
+
+    /// NAN-2270 — two handler modules may not name two DIFFERENT schemas the
+    /// same thing.
+    ///
+    /// `merge_sub_docs` merges with `extend`, so a duplicate name is resolved by
+    /// merge order and the loser vanishes without a word. That is not a
+    /// hypothetical: `hunts::ListSuppressionsResponse` (`Vec<HuntSuppression>`)
+    /// and `siem_health_suppressions::ListSuppressionsResponse`
+    /// (`Vec<FindingSuppression>`) collided, and because SIEM health merges
+    /// later, the spec claimed `/api/hunts/suppressions` returns
+    /// `FindingSuppression`. The generated TypeScript then repeated it.
+    ///
+    /// Nothing downstream can catch this — the spec stays internally consistent
+    /// and both drift gates pass, because the wrong contract is generated
+    /// faithfully from the wrong spec. It has to be caught at the merge.
+    ///
+    /// The baseline this test shipped with (15 more collisions, 9 of them
+    /// enterprise-only) is now empty: every one was resolved with
+    /// `#[schema(as = …)]`, which renames the SCHEMA without touching the Rust
+    /// type. Duplicate Rust names across modules are fine — it is only the
+    /// OpenAPI component registry that is flat.
+    #[test]
+    fn verify_no_schema_name_collisions() {
+        use std::collections::HashMap;
+
+        let mut seen: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut conflicts: Vec<String> = Vec::new();
+
+        for sub in sub_docs() {
+            let Some(components) = sub.components else {
+                continue;
+            };
+            for (name, schema) in components.schemas {
+                let rendered =
+                    serde_json::to_value(&schema).expect("serialize schema for comparison");
+                match seen.get(&name) {
+                    // Same name, same definition: harmless — a shared type
+                    // pulled into two sub-docs resolves to one entry.
+                    Some(existing) if *existing == rendered => {}
+                    Some(_) => conflicts.push(name.clone()),
+                    None => {
+                        seen.insert(name, rendered);
+                    }
+                }
+            }
+        }
+
+        conflicts.sort();
+        conflicts.dedup();
+
+        assert!(
+            conflicts.is_empty(),
+            "these schema names are defined DIFFERENTLY by more than one handler module, so the \
+             later merge silently overwrites the earlier one and its endpoints end up documented \
+             with the wrong body: {conflicts:?}\n\n\
+             Fix with `#[schema(as = QualifiedName)]` on the less canonical type — that renames \
+             the SCHEMA only, leaving the Rust type and every import untouched. Do NOT add an \
+             exemption list."
+        );
+    }
+
+    /// NAN-2271 — `docs/api/openapi.json` is the PUBLISHED API reference, a
+    /// committed artifact of `tools/export-openapi.sh`. Nothing regenerated it,
+    /// and nothing failed when it wasn't: it drifted to 74 paths and 174
+    /// schemas behind the code before anyone noticed. Whole product surfaces —
+    /// Active Hunter, observability, reports, source scopes, trace search —
+    /// were simply absent from the docs.
+    ///
+    /// STRUCTURAL, not byte-exact, and deliberately so. Byte-exactness would
+    /// force a 1.7 MB regeneration for a one-word description edit, and that
+    /// churn is what gets a gate switched off. Comparing the path and schema
+    /// SETS catches the failure that actually happened (endpoints missing
+    /// entirely) without punishing field-level annotation work.
+    ///
+    /// Open build only: the script exports with default features, so under
+    /// `--features enterprise` the fresh spec legitimately carries ~143 extra
+    /// paths and comparing them would be meaningless.
+    #[test]
+    #[cfg(not(feature = "enterprise"))]
+    fn verify_published_api_docs_are_current() {
+        // `tools/sync-to-nano-mirror.sh` deletes ITSELF along with docs/, so its
+        // absence is a precise "this tree was stripped" signal. Keyed on that
+        // rather than on the spec being missing — a missing spec is exactly the
+        // failure this test exists to catch, and must never be self-excusing.
+        let repo_root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+        if !std::path::Path::new(&format!("{repo_root}/tools/sync-to-nano-mirror.sh")).is_file() {
+            eprintln!("skipping published API docs check: stripped tree (mirror)");
+            return;
+        }
+
+        let committed_path = format!("{repo_root}/docs/api/openapi.json");
+        let raw = std::fs::read_to_string(&committed_path).unwrap_or_else(|err| {
+            panic!(
+                "read published API spec {committed_path}: {err}\n\n\
+                 This is a full checkout, so the file should be here. Regenerate it:\n  \
+                 bash tools/export-openapi.sh"
+            )
+        });
+        let committed: serde_json::Value =
+            serde_json::from_str(&raw).expect("parse published API spec");
+        let fresh = serde_json::to_value(build_openapi()).expect("serialize fresh spec");
+
+        /// Sorted keys of the object at `pointer`, empty when absent.
+        fn keys_at(spec: &serde_json::Value, pointer: &str) -> Vec<String> {
+            let mut v: Vec<String> = spec
+                .pointer(pointer)
+                .and_then(|n| n.as_object())
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            v.sort();
+            v
+        }
+
+        let committed_paths = keys_at(&committed, "/paths");
+        let fresh_paths = keys_at(&fresh, "/paths");
+        let committed_schemas = keys_at(&committed, "/components/schemas");
+        let fresh_schemas = keys_at(&fresh, "/components/schemas");
+
+        // An empty side would make every comparison below pass or fail
+        // vacuously; both specs must actually have content.
+        assert!(
+            !fresh_paths.is_empty() && !committed_paths.is_empty(),
+            "one side has no paths at all (committed {}, fresh {}) — the comparison would be \
+             meaningless",
+            committed_paths.len(),
+            fresh_paths.len()
+        );
+
+        let missing_paths: Vec<&String> =
+            fresh_paths.iter().filter(|p| !committed_paths.contains(p)).collect();
+        let stale_paths: Vec<&String> =
+            committed_paths.iter().filter(|p| !fresh_paths.contains(p)).collect();
+        let missing_schemas: Vec<&String> =
+            fresh_schemas.iter().filter(|s| !committed_schemas.contains(s)).collect();
+        let stale_schemas: Vec<&String> =
+            committed_schemas.iter().filter(|s| !fresh_schemas.contains(s)).collect();
+
+        assert!(
+            missing_paths.is_empty()
+                && stale_paths.is_empty()
+                && missing_schemas.is_empty()
+                && stale_schemas.is_empty(),
+            "docs/api/openapi.json is STALE — the published API reference no longer matches the \
+             code.\n\n\
+             undocumented endpoints ({}): {missing_paths:?}\n\
+             documented but gone ({}): {stale_paths:?}\n\
+             undocumented schemas ({}): {missing_schemas:?}\n\
+             documented but gone ({}): {stale_schemas:?}\n\n\
+             Regenerate:\n  bash tools/export-openapi.sh\n\n\
+             Then skim the diff — a newly appearing path is a surface you are about to publish.",
+            missing_paths.len(),
+            stale_paths.len(),
+            missing_schemas.len(),
+            stale_schemas.len(),
+        );
+    }
+
+    /// NAN-2263 — the desktop's hunting TypeScript is GENERATED from
+    /// `nano-desktop/openapi/hunts-wire.json`. If the server's wire shapes move
+    /// and that file does not, the desktop compiles against a contract the
+    /// server no longer honours — which is exactly how ~30 silent mismatches
+    /// shipped with a green suite. This test regenerates the scoped spec and
+    /// fails when the committed copy differs.
+    ///
+    /// The committed file lives in `nano-desktop/`, which the open-core strip
+    /// removes (`tools/sync-to-nano-mirror.sh`), so — like
+    /// `verify_log_source_transport_ownership_contract` (NAN-2169) — the file
+    /// is read at RUNTIME and only a genuinely absent file skips the
+    /// comparison. Any other IO error stays loud.
+    #[test]
+    fn verify_desktop_wire_spec_is_current() {
+        let generated = desktop_wire_spec();
+
+        // Sanity floors first, so an over-narrow filter cannot make the
+        // comparison below pass vacuously (an empty spec matching an empty
+        // file guarantees nothing).
+        let path_count = generated["paths"].as_object().map_or(0, |m| m.len());
+        assert!(
+            path_count >= 20,
+            "desktop wire spec collapsed to {path_count} paths — the /api/hunts filter broke"
+        );
+        for schema in [
+            "Hunt",
+            "HuntSummary",
+            "HuntLead",
+            "HuntLeadDetail",
+            "HuntSweep",
+            "HuntRuleIdea",
+            "HuntSuppression",
+            "HuntKnowledge",
+            "HuntProfile",
+            "ListLeadsResponse",
+            "ListRuleIdeasResponse",
+            "ParsedStepTree",
+            "TrailStep",
+            "Contribution",
+            "CensusRow",
+            "OrgFingerprint",
+            "HuntableSurface",
+        ] {
+            assert!(
+                generated["components"]["schemas"].get(schema).is_some(),
+                "desktop wire spec lost schema {schema}"
+            );
+        }
+
+        let committed_path =
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../nano-desktop/openapi/hunts-wire.json");
+        // Skip ONLY in the stripped mirror, which is identified by the whole
+        // `nano-desktop/` tree being gone. A missing spec file inside a tree
+        // that still HAS nano-desktop means the file was deleted or renamed —
+        // that must fail, or the gate quietly becomes a no-op (the exact way
+        // this check was already dead in CI).
+        let desktop_root = concat!(env!("CARGO_MANIFEST_DIR"), "/../nano-desktop");
+        if !std::path::Path::new(desktop_root).is_dir() {
+            eprintln!(
+                "skipping desktop wire spec drift check: {desktop_root} absent (open-core stripped tree)"
+            );
+            return;
+        }
+        let committed = std::fs::read_to_string(committed_path).unwrap_or_else(|err| {
+            panic!(
+                "read committed desktop wire spec {committed_path}: {err}\n\n\
+                 nano-desktop/ exists, so this is NOT the stripped mirror — the spec was deleted \
+                 or renamed. Regenerate it:\n  \
+                 cargo run -p nanosiem-api --bin export_openapi -- --desktop-wire > nano-desktop/openapi/hunts-wire.json"
+            )
+        });
+        let committed: serde_json::Value =
+            serde_json::from_str(&committed).expect("parse committed desktop wire spec");
+
+        // Value comparison, not text: `serde_json` map equality is
+        // order-insensitive, so a feature set that changes key ordering
+        // (preserve_order on/off) cannot fake drift.
+        if committed != generated {
+            panic!(
+                "nano-desktop/openapi/hunts-wire.json is STALE — the server's /api/hunts wire \
+                 contract moved. Regenerate the spec and the TypeScript it feeds:\n\n  \
+                 cargo run -p nanosiem-api --bin export_openapi -- --desktop-wire > nano-desktop/openapi/hunts-wire.json\n  \
+                 (cd nano-desktop && npm run generate:api-types)\n\n\
+                 then fix whatever the desktop compiler now rejects — each error is a real \
+                 client/server mismatch, not noise."
+            );
+        }
     }
 }

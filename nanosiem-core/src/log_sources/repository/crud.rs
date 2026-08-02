@@ -320,6 +320,61 @@ impl LogSourceRepository {
     /// thing in one statement, so concurrent callers serialize on the row and
     /// neither loses a value. Idempotent: a value already present affects zero
     /// rows and reports `false`.
+    /// NAN-2268: atomically union `values` into `match_values`, appending only
+    /// the ones not already present. Returns how many were added.
+    ///
+    /// The sibling of [`Self::add_match_value`], for the caller that has a whole
+    /// list rather than one value — `apply_upstream_update`. That path used to
+    /// read the array, merge in Rust, and write the result back through
+    /// [`Self::update`], whose SQL assigns the array wholesale. Interleaved with
+    /// a concurrent `add_match_value` from collector provisioning, the stale
+    /// merged array overwrote the append and the stream silently stopped
+    /// routing — precisely the narrowing NAN-2249 set out to make impossible,
+    /// reached by a different door.
+    ///
+    /// Doing the union in one statement removes the read-modify-write entirely,
+    /// so there is no window to lose a write in. It also fixes the ordering
+    /// weakness in the Rust merge: appending to the EXISTING array leaves
+    /// `match_values[0]` untouched by construction, where the old code rebuilt
+    /// the list from `resolved` first and could move the primary if the stored
+    /// one failed the current `source_type` allow-list. Routing rules point at
+    /// the primary, so that position is load-bearing.
+    ///
+    /// `WITH ORDINALITY` + `ORDER BY ord` so the appended tail is deterministic
+    /// rather than whatever order the aggregate happens to see. Caller should
+    /// dedupe `values` itself; this dedupes only against what is already stored.
+    pub async fn union_match_values(
+        &self,
+        id: Uuid,
+        values: &[String],
+    ) -> Result<u64, LogSourceRepositoryError> {
+        if values.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            r#"
+            UPDATE log_sources
+            SET match_values = COALESCE(match_values, ARRAY[]::TEXT[]) || (
+                    SELECT COALESCE(array_agg(t.v ORDER BY t.ord), ARRAY[]::TEXT[])
+                    FROM unnest($2::TEXT[]) WITH ORDINALITY AS t(v, ord)
+                    WHERE NOT (t.v = ANY(COALESCE(log_sources.match_values, ARRAY[]::TEXT[])))
+                ),
+                updated_at = NOW()
+            WHERE id = $1
+              AND EXISTS (
+                    SELECT 1 FROM unnest($2::TEXT[]) AS n(v)
+                    WHERE NOT (n.v = ANY(COALESCE(log_sources.match_values, ARRAY[]::TEXT[])))
+                )
+            "#,
+        )
+        .bind(id)
+        .bind(values)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
     pub async fn add_match_value(
         &self,
         id: Uuid,

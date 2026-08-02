@@ -131,7 +131,7 @@ pub(crate) fn artifact_scope(auth: &AuthContext) -> ArtifactScope {
         ListRunnersResponse,
         ListSweepsResponse,
         ListLeadsResponse,
-        ListSuppressionsResponse,
+        ListHuntSuppressionsResponse,
         ListRuleIdeasResponse,
         ListKnowledgeResponse,
         ClaimSweepOutcome,
