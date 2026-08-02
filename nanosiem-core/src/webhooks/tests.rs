@@ -24,6 +24,8 @@ fn webhook_with(event_types: Vec<String>) -> Webhook {
         channel_type: "generic".to_string(),
         channel_config: serde_json::json!({}),
         rule_filter: None,
+        health_category_filter: None,
+        health_resource_filter: None,
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
@@ -71,6 +73,16 @@ fn obs_only_webhook_rejects_detection_and_vice_versa() {
 
     assert!(siem.subscribes_to(alert_kind_to_event_type("detection")));
     assert!(!siem.subscribes_to(alert_kind_to_event_type("metric_monitor")));
+}
+
+#[test]
+fn system_health_delivery_is_explicitly_opt_in() {
+    let defaults = webhook_with(default_event_types());
+    let health = webhook_with(vec![EVENT_TYPE_SYSTEM_HEALTH.to_string()]);
+
+    assert!(!defaults.subscribes_to(EVENT_TYPE_SYSTEM_HEALTH));
+    assert!(health.subscribes_to(EVENT_TYPE_SYSTEM_HEALTH));
+    assert!(!health.subscribes_to(EVENT_TYPE_SIEM_ALERT));
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +134,8 @@ fn create_req(event_types: Option<Vec<String>>) -> CreateWebhookRequest {
         channel_type: None,
         channel_config: None,
         rule_filter: None,
+        health_category_filter: None,
+        health_resource_filter: None,
         enabled: None,
     }
 }
@@ -137,6 +151,8 @@ fn update_req(event_types: Option<Vec<String>>) -> UpdateWebhookRequest {
         channel_type: None,
         channel_config: None,
         rule_filter: None,
+        health_category_filter: None,
+        health_resource_filter: None,
         enabled: None,
     }
 }
@@ -162,6 +178,27 @@ fn create_rejects_unknown_event_type() {
         .validate_event_types()
         .unwrap_err();
     assert!(err.contains("not_a_stream"), "error names the bad value: {err}");
+}
+
+#[test]
+fn health_routing_filters_are_validated() {
+    let mut request = create_req(Some(vec![EVENT_TYPE_SYSTEM_HEALTH.to_string()]));
+    request.health_category_filter = Some(vec!["log_source".to_string()]);
+    request.health_resource_filter = Some(vec!["clickhouse_query".to_string()]);
+    assert!(request.validate_event_types().is_ok());
+
+    request.health_category_filter = Some(vec!["anything".to_string()]);
+    assert!(request
+        .validate_event_types()
+        .unwrap_err()
+        .contains("invalid system health category"));
+
+    request.health_category_filter = None;
+    request.health_resource_filter = Some(vec!["Not-Safe".to_string()]);
+    assert!(request
+        .validate_event_types()
+        .unwrap_err()
+        .contains("invalid system health resource type"));
 }
 
 #[test]
@@ -196,6 +233,15 @@ fn alert_payload_carries_completeness_fields_and_omits_none() {
         matched_event_count: Some(3),
         matched_events: Some(vec![]),
         created_at: chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        health_event_id: None,
+        health_status: None,
+        health_category: None,
+        health_resource_type: None,
+        health_resource_id: None,
+        health_summary: None,
+        health_diagnostic_context: None,
+        health_remediation: None,
+        idempotency_key: None,
     };
 
     let v = serde_json::to_value(&payload).unwrap();
@@ -506,6 +552,8 @@ fn channel_create_req(channel_type: Option<&str>, url: &str) -> CreateWebhookReq
         channel_type: channel_type.map(str::to_string),
         channel_config: None,
         rule_filter: None,
+        health_category_filter: None,
+        health_resource_filter: None,
         enabled: None,
     }
 }
@@ -575,6 +623,15 @@ fn payload_omits_none_optional_fields() {
         matched_event_count: None,
         matched_events: None,
         created_at: chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        health_event_id: None,
+        health_status: None,
+        health_category: None,
+        health_resource_type: None,
+        health_resource_id: None,
+        health_summary: None,
+        health_diagnostic_context: None,
+        health_remediation: None,
+        idempotency_key: None,
     };
     let v = serde_json::to_value(&payload).unwrap();
     let obj = v.as_object().unwrap();

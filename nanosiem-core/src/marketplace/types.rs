@@ -334,6 +334,10 @@ impl MarketplaceCatalogEntry {
             "identity" => true,
             "native" => true,
             "deno" => !self.allowed_domains.is_empty(),
+            // Collectors exist to pull an external API. Dynamic tenant hosts
+            // may live in config rather than `allowed_domains`, so this is
+            // always true even when the static list is empty.
+            "collector" => true,
             _ => false,
         }
     }
@@ -412,7 +416,7 @@ pub struct ConfigureRequest {
 /// Filter for listing catalog entries
 #[derive(Debug, Clone, Serialize, Deserialize, Default, utoipa::IntoParams)]
 pub struct CatalogFilter {
-    /// Filter by category (data, agent, identity)
+    /// Filter by category (data, agent, identity, collector)
     pub category: Option<String>,
     /// Filter by installed status
     pub installed: Option<bool>,
@@ -440,6 +444,7 @@ pub struct CatalogStats {
     pub data_count: i64,
     pub agent_count: i64,
     pub identity_count: i64,
+    pub collector_count: i64,
 }
 
 /// Status response for a single enrichment
@@ -798,7 +803,10 @@ mod infer_type_tests {
     #[test]
     fn artifact_types_wins_when_both_markers_present() {
         assert_eq!(
-            infer_enrichment_type("legacy", &json!({"artifact_types": ["ip"], "key_field": "x"})),
+            infer_enrichment_type(
+                "legacy",
+                &json!({"artifact_types": ["ip"], "key_field": "x"})
+            ),
             "agent"
         );
     }

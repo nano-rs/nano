@@ -41,7 +41,7 @@ jobs:
     # The cargo container joins the host network so it reaches the Postgres port
     # published on 127.0.0.1, and writes its target dir to an in-container path
     # so no root-owned build artifacts land in the workspace.
-    runs-on: [self-hosted, X64]
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 45
     env:
       PG_CONTAINER: nan1272-pgit-${{ github.run_id }}

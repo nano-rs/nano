@@ -420,24 +420,39 @@ fn eval_len_function() {
 }
 
 // ============================================================================
-// dedup — survivor-id selection via argMin (NAN-1636), not a full row sort
+// dedup — one row per key, without a full row sort
+//
+// Two properties, and both matter:
+//   - NAN-1636: no `ORDER BY <keys>, <time>` over the wide (~200-column) rows,
+//     which hit Code 241 (MergeSortingTransform OOM) at >=~15min windows;
+//   - NAN-2264: exactly one row per key. NAN-1636's `WHERE id IN (SELECT
+//     argMin(id, <time>) …)` was NOT that — `id` is a CONTENT hash, so
+//     content-identical rows share one and every row carrying the elected id
+//     passed. `LIMIT 1 BY <keys>` over each group's oldest timestamp gives the
+//     guarantee without the sort.
+//
+// The end-to-end proof (real rows, real ClickHouse) is in
+// `dedup_row_identity_tests.rs`; these stay text-level shape checks.
 // ============================================================================
 
 #[test]
 fn dedup_single_field() {
     let sql = npl("* | dedup src_ip");
-    // NAN-1636: survivor-id selection replaced `ORDER BY <keys>, timestamp
-    // LIMIT 1 BY <keys>`, which full-sorted every ~200-column row and hit
-    // Code 241 (MergeSortingTransform OOM) at >=~15min windows. Assert the
-    // absence of the sort as well as the presence of argMin — a check for
-    // argMin alone would pass on a query that did both.
     assert!(
-        sql.contains("argMin(id, timestamp)") && sql.contains("GROUP BY src_ip"),
-        "dedup should select survivor ids with argMin (NAN-1636), got:\n{sql}"
+        sql.contains("min(timestamp) FROM stage_0") && sql.contains("GROUP BY src_ip"),
+        "dedup should restrict candidates to each key's oldest row, got:\n{sql}"
     );
     assert!(
-        !sql.contains("LIMIT 1 BY"),
+        sql.contains("LIMIT 1 BY src_ip"),
+        "dedup must collapse each key with LIMIT 1 BY (NAN-2264), got:\n{sql}"
+    );
+    assert!(
+        !sql.contains("ORDER BY src_ip, timestamp"),
         "dedup must not full-sort rows (NAN-1636), got:\n{sql}"
+    );
+    assert!(
+        !sql.contains("argMin(id"),
+        "dedup must not elect survivors by content-hash id (NAN-2264), got:\n{sql}"
     );
 }
 
@@ -445,17 +460,21 @@ fn dedup_single_field() {
 fn dedup_multiple_fields() {
     let sql = npl("* | dedup src_ip, dest_ip");
     assert!(
-        sql.contains("src_ip") && sql.contains("dest_ip"),
-        "Should dedup by both fields"
-    );
-    assert!(
-        sql.contains("argMin(id, timestamp)")
+        sql.contains("min(timestamp) FROM stage_0")
             && sql.contains("GROUP BY src_ip, dest_ip"),
-        "dedup should select survivor ids with argMin (NAN-1636), got:\n{sql}"
+        "dedup should restrict candidates to each key's oldest row, got:\n{sql}"
     );
     assert!(
-        !sql.contains("LIMIT 1 BY"),
+        sql.contains("LIMIT 1 BY src_ip, dest_ip"),
+        "every dedup key must reach the LIMIT BY (NAN-2264), got:\n{sql}"
+    );
+    assert!(
+        !sql.contains("ORDER BY src_ip, timestamp"),
         "dedup must not full-sort rows (NAN-1636), got:\n{sql}"
+    );
+    assert!(
+        !sql.contains("argMin(id"),
+        "dedup must not elect survivors by content-hash id (NAN-2264), got:\n{sql}"
     );
 }
 
@@ -1278,3 +1297,364 @@ fn dc_emission_stays_uniq_exact_everywhere() {
     assert!(streamstats.contains("uniqExact(src_ip) OVER ("), "got: {streamstats}");
 }
 
+// ============================================================================
+// NAN-2265: eventstats / anomaly must aggregate the rows they annotate
+//
+// The map-scalar attach (NAN-1642) references its source CTE twice — once to
+// build the constants, once to emit the rows. Generator CTEs are ordinary,
+// non-materialized CTEs, so ClickHouse re-executes each reference; downstream
+// of an arbitrary bounded subset (`head N`, `sort N`, `sample`, …) the two
+// references see DIFFERENT rows and the attached aggregate belongs to a
+// different sample than the rows it is printed on. Measured on 18.3M local
+// rows: `head 20000 | eventstats avg(bytes_out) by dest_ip` mis-attached
+// ~13,000 of ~15,500 groups on every run. Behind an unstable source the
+// generator therefore falls back to the single-scan window shape — reachable
+// only behind a stage that already bounded the rows, so it never buffers the
+// unbounded partition NAN-1642 removed. Everywhere else the bounded map attach
+// stays, byte-identical to what it emitted before this guard existed.
+// ============================================================================
+
+/// Number of `FROM <source_cte>` references at or after the CTE that owns the
+/// attach. All the queries below put the attach in the LAST stage, so counting
+/// from its marker to the end of the SQL counts exactly its own references.
+fn source_refs_in_last_stage(sql: &str, owner_cte: &str, source_cte: &str) -> usize {
+    let body = sql
+        .split_once(&format!("{} AS (", owner_cte))
+        .unwrap_or_else(|| panic!("{owner_cte} not found in:\n{sql}"))
+        .1;
+    body.matches(&format!("FROM {}", source_cte)).count()
+}
+
+/// The closure's pinned-ids scalar for `unstable_cte` — the ONLY place the
+/// unstable CTE may be referenced. Identical scalar text is evaluated once
+/// per query (scalar-subquery cache), so however many times the closure
+/// recurs, the sample is pinned exactly once.
+fn pinned_ids_scalar(unstable_cte: &str) -> String {
+    format!("(SELECT groupArray(id) FROM {})", unstable_cte)
+}
+
+#[test]
+fn eventstats_after_head_scans_its_source_once() {
+    let sql = npl("* | head 100 | eventstats avg(bytes_out) by dest_ip");
+    // Behind a pure selector over identity-carrying rows the attach swaps the
+    // unstable source for its deterministic id-closure: the selector's ids
+    // pinned once, the rows re-read from the stable ancestor. Every textual
+    // reference to the unstable CTE must be the identical pinned-ids scalar —
+    // anything else re-executes the LIMIT and samples different rows.
+    let ids = pinned_ids_scalar("stage_1");
+    let closure =
+        format!("(SELECT * FROM stage_0 WHERE id IN (SELECT arrayJoin({ids})))");
+    assert_eq!(
+        sql.matches("FROM stage_1").count(),
+        sql.matches(ids.as_str()).count(),
+        "every reference to the unstable CTE must be the identical pinned-ids \
+         scalar (one evaluation via the scalar cache); got:\n{sql}"
+    );
+    assert!(
+        sql.matches(closure.as_str()).count() == 2 && sql.contains("mapFromArrays"),
+        "constants AND rows must both read the id-closure (`{closure}`); got:\n{sql}"
+    );
+    assert!(
+        !sql.contains("OVER (PARTITION BY"),
+        "the id-closure must not fall back to the whole-partition window; got:\n{sql}"
+    );
+    // Whole-set form has the same hazard (scalar subquery + row scan).
+    let global = npl("* | head 100 | eventstats avg(bytes_out)");
+    assert!(
+        global.contains(
+            "(SELECT toFloat64(avg(bytes_out)) FROM (SELECT * FROM stage_0 WHERE id IN"
+        ) && global.matches(closure.as_str()).count() == 2,
+        "whole-set form must take the id-closure shape too; got:\n{global}"
+    );
+}
+
+#[test]
+fn eventstats_snapshot_rewinds_selector_chains_to_the_last_stable_cte() {
+    // Chained selectors compose to a subset — pin the FINAL selector's ids,
+    // close over the last STABLE CTE (stage_0 here).
+    let chained = npl("* | head 1000 | sort 100 -bytes_out | eventstats avg(bytes_out) by dest_ip");
+    assert!(
+        chained.contains(&format!(
+            "(SELECT * FROM stage_0 WHERE id IN (SELECT arrayJoin({})))",
+            pinned_ids_scalar("stage_2")
+        )),
+        "chained selectors must pin the final sample and close over stage_0; got:\n{chained}"
+    );
+    // A stable stage BEFORE the selector run moves the closure ancestor up.
+    let filtered =
+        npl("* | where bytes_out > 0 | head 100 | eventstats avg(bytes_out) by dest_ip");
+    assert!(
+        filtered.contains(&format!(
+            "(SELECT * FROM stage_1 WHERE id IN (SELECT arrayJoin({})))",
+            pinned_ids_scalar("stage_2")
+        )),
+        "the closure must re-read the last row-stable CTE (the `where` stage); got:\n{filtered}"
+    );
+    // A stable stage AFTER a selector is not a pure selector suffix — the
+    // closed-over rows would lack its computed columns — so the window
+    // fallback stays.
+    let sandwiched =
+        npl("* | head 100 | eval x = bytes_out * 2 | eventstats avg(x) by dest_ip");
+    assert!(
+        sandwiched.contains("OVER (PARTITION BY") && !sandwiched.contains("groupArray(id)"),
+        "a non-selector stage behind the selector must keep the window fallback; got:\n{sandwiched}"
+    );
+}
+
+#[test]
+fn eventstats_snapshot_carries_every_aggregate_slot() {
+    // Multi-aggregation: the closure is a stable source, so the map build
+    // carries the SAME aggregate table as the stable shape — over the closure.
+    let sql = npl(
+        "* | head 100 | eventstats count as c, dc(src_ip) as d, avg(bytes_out) as a, \
+         earliest(user) as el by dest_ip",
+    );
+    for fragment in [
+        "toFloat64(count())",
+        "toFloat64(uniqExact(src_ip))",
+        "toFloat64(avg(bytes_out))",
+        "argMin(\"user\", timestamp)",
+    ] {
+        assert!(
+            sql.contains(fragment),
+            "the closure map build must keep every aggregate (`{fragment}`); got:\n{sql}"
+        );
+    }
+    assert!(
+        sql.contains("WHERE id IN (SELECT arrayJoin((SELECT groupArray(id) FROM stage_1)))"),
+        "multi-agg eventstats must aggregate over the id-closure; got:\n{sql}"
+    );
+}
+
+#[test]
+fn eventstats_after_stable_stages_keeps_bounded_map_attach() {
+    // The OOM property NAN-1642 bought: everything that does not select an
+    // arbitrary bounded subset keeps the map attach.
+    for query in [
+        "* | eventstats avg(bytes_out) by dest_ip",
+        "* | where bytes_out > 0 | eventstats avg(bytes_out) by dest_ip",
+        "* | eval x = bytes_out * 2 | eventstats avg(x) by dest_ip",
+        "* | sort -timestamp | eventstats avg(bytes_out) by dest_ip",
+        "* | dedup dest_ip | eventstats avg(bytes_out) by dest_ip",
+        "* | stats count by dest_ip | eventstats avg(count) by dest_ip",
+    ] {
+        let sql = npl(query);
+        assert!(
+            sql.contains("mapFromArrays") && !sql.contains("OVER (PARTITION BY"),
+            "`{query}` must keep the bounded map attach (NAN-1642); got:\n{sql}"
+        );
+    }
+}
+
+#[test]
+fn eventstats_after_every_subset_selector_takes_the_snapshot_shape() {
+    // Each of these picks an arbitrary bounded subset of identity-carrying
+    // rows — the snapshot-refetch pins the subset once instead of
+    // double-scanning (map) or re-buffering wide rows (window).
+    for query in [
+        "* | head 100 | eventstats avg(bytes_out) by dest_ip",
+        "* | tail 100 | eventstats avg(bytes_out) by dest_ip",
+        "* | sort 100 -bytes_out | eventstats avg(bytes_out) by dest_ip",
+        "* | sample 100 | eventstats avg(bytes_out) by dest_ip",
+    ] {
+        let sql = npl(query);
+        assert!(
+            sql.contains("WHERE id IN (SELECT arrayJoin((SELECT groupArray(id) FROM ")
+                && sql.contains("mapFromArrays"),
+            "`{query}` must take the id-closure shape; got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("OVER (PARTITION BY"),
+            "`{query}` must not fall back to the whole-partition window; got:\n{sql}"
+        );
+    }
+}
+
+#[test]
+fn eventstats_after_non_selector_unstable_stages_falls_back_to_window() {
+    // Unstable sources that are NOT pure row-subset selectors: aggregated
+    // subsets (top / rare emit grouped rows with no row id) and subsearch
+    // unions (append: the arm carries its own LIMIT and the union has no
+    // single stable ancestor). The id-filtered refetch cannot reproduce those
+    // rows, so the single-scan window fallback stays — over aggregated /
+    // union rows, not the raw-wide-row OOM class.
+    for query in [
+        "* | top 10 dest_ip | eventstats avg(count) by dest_ip",
+        "* | rare 10 dest_ip | eventstats avg(count) by dest_ip",
+        "* | append [search error] | eventstats avg(bytes_out) by dest_ip",
+    ] {
+        let sql = npl(query);
+        assert!(
+            !sql.contains("mapFromArrays") && !sql.contains("groupArray(id)"),
+            "`{query}` has no identity-preserving selector suffix — neither \
+             the map attach nor the id-closure may be used; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("OVER (PARTITION BY"),
+            "`{query}` must fall back to the single-scan window; got:\n{sql}"
+        );
+    }
+}
+
+#[test]
+fn eventstats_snapshot_requires_the_physical_row_identity() {
+    // An include-mode projection that pruned `id` (fields/table) or an
+    // upstream `eval id=…` reassignment invalidates the closure — the window
+    // fallback must take over.
+    for query in [
+        "* | fields dest_ip, bytes_out, timestamp | head 100 | eventstats avg(bytes_out) by dest_ip",
+        "* | eval id = dest_ip | head 100 | eventstats avg(bytes_out) by dest_ip",
+    ] {
+        let sql = npl(query);
+        assert!(
+            !sql.contains("groupArray(id)") && sql.contains("OVER (PARTITION BY"),
+            "`{query}` must not close over ids without the physical row id; got:\n{sql}"
+        );
+    }
+}
+
+#[test]
+fn eventstats_window_fallback_keeps_every_aggregate_and_alias() {
+    // The fallback shares ONE emission table with the map shape, so every
+    // aggregate keeps its function and its alias — a `_`-arm regression that
+    // silently emitted count() under the user's alias (NAN-1145) would show up
+    // here as well as in the map shape. `fields` prunes `id`, so this stays on
+    // the window path (the snapshot shape needs the physical row identity).
+    let sql = npl(
+        "* | fields dest_ip, src_ip, bytes_out, timestamp | head 100 | \
+         eventstats count as c, dc(src_ip) as d, estdc(src_ip) as e, \
+         sum(bytes_out) as s, stdev(bytes_out) as sd, range(bytes_out) as r, \
+         values(src_ip) as v, mode(src_ip) as m, earliest(src_ip) as el by dest_ip",
+    );
+    for fragment in [
+        "toFloat64(count() OVER (PARTITION BY dest_ip)) AS c",
+        "toFloat64(uniqExact(src_ip) OVER (PARTITION BY dest_ip)) AS d",
+        "toFloat64(uniqCombined64(src_ip) OVER (PARTITION BY dest_ip)) AS e",
+        "toFloat64(sum(bytes_out) OVER (PARTITION BY dest_ip)) AS s",
+        "toFloat64(stddevPop(bytes_out) OVER (PARTITION BY dest_ip)) AS sd",
+        "toFloat64(max(bytes_out) OVER (PARTITION BY dest_ip) - \
+         min(bytes_out) OVER (PARTITION BY dest_ip)) AS r",
+        "groupUniqArray(100)(toString(src_ip)) OVER (PARTITION BY dest_ip)",
+        "(topK(1)(src_ip) OVER (PARTITION BY dest_ip))[1] AS m",
+        "argMin(src_ip, timestamp) OVER (PARTITION BY dest_ip) AS el",
+    ] {
+        assert!(
+            sql.contains(fragment),
+            "window fallback must emit `{fragment}`; got:\n{sql}"
+        );
+    }
+}
+
+#[test]
+fn anomaly_after_head_scans_its_source_once() {
+    // Numeric z-score / MAD annotate RAW rows, so behind a selector run they
+    // swap the unstable source for its id-closure and keep the bounded
+    // map/scalar constants shape over it.
+    for (query, expected) in [
+        ("* | head 100 | anomaly bytes_out by dest_ip", "__nano_stats"),
+        ("* | head 100 | anomaly bytes_out", "__nano_stats"),
+        ("* | head 100 | anomaly bytes_out by dest_ip method=mad", "__nano_med[__nano_k]"),
+    ] {
+        let sql = npl(query);
+        assert!(
+            sql.contains(expected)
+                && sql
+                    .contains("WHERE id IN (SELECT arrayJoin((SELECT groupArray(id) FROM stage_1)))"),
+            "`{query}` must attach constants from the id-closure (`{expected}`); got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("avg(bytes_out) OVER") && !sql.contains("quantile(0.5)(bytes_out) OVER"),
+            "`{query}` must not buffer wide rows in a stats window; got:\n{sql}"
+        );
+    }
+    // Categorical and aggregation-first attach over AGGREGATED rows (pair /
+    // group counts) — no row id to refetch by, and their window fallback
+    // buffers narrow aggregates, not the raw-row OOM class. They keep the
+    // single-scan window shape behind an unstable source.
+    for (query, expected) in [
+        ("* | head 100 | anomaly process_name by user", "avg(_anomaly_count) OVER (PARTITION BY"),
+        ("* | head 100 | anomaly count() by user", "avg(_agg_value) OVER ()"),
+    ] {
+        let sql = npl(query);
+        assert!(
+            !sql.contains("mapFromArrays") && !sql.contains("__nano_stats") && !sql.contains("__nano_med"),
+            "`{query}` must not compute anomaly constants from a second scan; got:\n{sql}"
+        );
+        assert!(
+            sql.contains(expected),
+            "`{query}` must attach constants with `{expected}`; got:\n{sql}"
+        );
+    }
+    // The categorical path's pair-count dedup windows are unchanged — they are
+    // fine-grained partitions, not the OOM class (NAN-1642).
+    let categorical = npl("* | head 100 | anomaly process_name by user");
+    assert!(
+        categorical.contains("count() OVER (PARTITION BY \"user\", process_name) as _anomaly_count"),
+        "pair-count window must be preserved; got:\n{categorical}"
+    );
+    assert_eq!(
+        source_refs_in_last_stage(&categorical, "stage_2", "stage_1"),
+        1,
+        "categorical anomaly must scan an unstable source once; got:\n{categorical}"
+    );
+}
+
+#[test]
+fn subsearch_eventstats_follows_the_same_stability_rule() {
+    // A subsearch stage source is an inline subquery that a twice-scanning
+    // rewrite duplicates textually — same hazard, same rule. A stable
+    // subsearch body must keep the bounded map attach (it is not bounded by
+    // the subsearch LIMIT, which is applied to the finished body).
+    let stable = npl("* | join user [search error | eventstats avg(bytes_out) by user]");
+    assert!(
+        stable.contains("mapFromArrays") && !stable.contains("OVER (PARTITION BY"),
+        "eventstats over a stable subsearch body must keep the map attach; got:\n{stable}"
+    );
+    let unstable = npl("* | join user [search error | head 100 | eventstats avg(bytes_out) by user]");
+    assert!(
+        !unstable.contains("mapFromArrays") && unstable.contains("OVER (PARTITION BY"),
+        "eventstats after a head INSIDE a subsearch must not double-scan it; got:\n{unstable}"
+    );
+}
+
+#[test]
+fn anomaly_after_stable_stages_keeps_bounded_map_attach() {
+    for (query, expected) in [
+        ("* | anomaly bytes_out by dest_ip", "mapFromArrays"),
+        ("* | where bytes_out > 0 | anomaly bytes_out by dest_ip method=mad", "__nano_med"),
+        ("* | where bytes_out > 0 | anomaly process_name by user", "__nano_cnt"),
+        ("* | where bytes_out > 0 | anomaly count() by user", "__nano_stats"),
+    ] {
+        let sql = npl(query);
+        assert!(
+            sql.contains(expected),
+            "`{query}` must keep the bounded attach (NAN-1642) via `{expected}`; got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("avg(bytes_out) OVER") && !sql.contains("quantile(0.5)(bytes_out) OVER"),
+            "`{query}` must not reintroduce whole-partition stats windows; got:\n{sql}"
+        );
+    }
+}
+
+
+#[test]
+fn eventstats_snapshot_requires_an_identity_preserving_prefix() {
+    // Row-STABLE is not row-IDENTITY-preserving: `stats` output is stable but
+    // carries no `id` (a snapshot would emit `tuple(id, …)` over id-less
+    // aggregate rows — UNKNOWN_IDENTIFIER), and `mvexpand` duplicates ids
+    // (an id-filtered re-read returns every copy, not the sampled subset).
+    // Both must keep the single-scan window fallback — over aggregated /
+    // already-narrow rows, not the raw-row OOM class.
+    for query in [
+        "* | stats count by dest_ip | head 5 | eventstats avg(count)",
+        "* | stats count by dest_ip | head 5 | eventstats avg(count) by dest_ip",
+    ] {
+        let sql = npl(query);
+        assert!(
+            !sql.contains("groupArray(id)") && sql.contains("OVER ("),
+            "`{query}` has an id-less prefix — the id-closure must not \
+             be used; got:\n{sql}"
+        );
+    }
+}

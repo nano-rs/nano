@@ -78,6 +78,7 @@ pub mod search;
 pub mod settings;
 pub mod shutdown;
 pub mod siem_health;
+pub mod system_health;
 pub mod source_configs;
 pub mod sql_hygiene;
 pub mod telemetry;

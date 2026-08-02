@@ -739,11 +739,21 @@ function CodeTab({ entry, handleExport, exporting }: CodeTabProps) {
   return (
     <div className="p-0">
       <div className="px-5 py-2 border-b border-border flex items-center gap-2 bg-muted/20">
-        <span className="font-mono text-[11px] text-muted-foreground">enrich.ts</span>
+        <span className="font-mono text-[11px] text-muted-foreground">
+          {entry.execution_backend === 'collector' ? 'collector.ts' : 'enrich.ts'}
+        </span>
         <div className="flex-1" />
         {entry.execution_backend === 'deno' && entry.custom_enrichment_id && (
           <Link
             to={`/enrichments/custom/${entry.custom_enrichment_id}`}
+            className="text-[11px] text-primary hover:underline font-mono"
+          >
+            edit in wizard →
+          </Link>
+        )}
+        {entry.execution_backend === 'collector' && entry.source_type === 'custom' && (
+          <Link
+            to={`/integrations/custom/${entry.id}`}
             className="text-[11px] text-primary hover:underline font-mono"
           >
             edit in wizard →

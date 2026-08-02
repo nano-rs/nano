@@ -28,6 +28,9 @@ use crate::db::dual_pool::on_cluster_clause;
 use crate::db::NotificationRepository;
 use crate::health::{HealthIssueType, HealthRepository};
 use crate::models::notification::{NewNotification, NotificationType};
+use crate::system_health::{
+    HealthCategory, HealthSeverity, PublishHealthEvent, SystemHealthRepository,
+};
 
 // ---------------------------------------------------------------------------
 // Cluster-aware runtime helpers (NAN-1728 H1)
@@ -240,6 +243,8 @@ pub struct DiskPressureService {
     notification_repo: NotificationRepository,
     /// Health repository (issue tracking + deduplication)
     health_repo: HealthRepository,
+    /// Durable owner-facing lifecycle and external delivery bus.
+    system_health_repo: SystemHealthRepository,
     /// Configuration
     config: DiskPressureConfig,
     /// Shared flag to pause ingestion
@@ -258,12 +263,14 @@ impl DiskPressureService {
     ) -> Self {
         let notification_repo = NotificationRepository::new(pg_pool.clone());
         let health_repo = HealthRepository::new(pg_pool.clone());
+        let system_health_repo = SystemHealthRepository::new(pg_pool.clone());
         Self {
             ch_admin,
             pg_pool,
             audit_emitter,
             notification_repo,
             health_repo,
+            system_health_repo,
             config,
             ingestion_paused,
             partitions_dropped: std::sync::atomic::AtomicU64::new(0),
@@ -661,6 +668,7 @@ impl DiskPressureService {
                     usage_pct = format!("{:.1}%", usage * 100.0),
                     "Elevated disk pressure — dropping oldest partitions"
                 );
+                self.publish_pressure_health(usage, "elevated").await;
                 self.relieve_pressure(usage).await;
             }
             DiskPressureLevel::Normal => {
@@ -674,6 +682,13 @@ impl DiskPressureService {
                     .await
                 {
                     warn!("Failed to resolve disk pressure health issue: {}", e);
+                }
+                if let Err(error) = self
+                    .system_health_repo
+                    .resolve_by_dedup_key("storage:clickhouse:disk_pressure")
+                    .await
+                {
+                    warn!(%error, "Failed to resolve disk-pressure system health event");
                 }
 
                 // Un-pause ingestion if it was paused and we're back to normal
@@ -847,6 +862,8 @@ impl DiskPressureService {
     async fn track_pressure_issue(&self, usage: f64, severity: &str) {
         let issue_key = "clickhouse_disk";
 
+        self.publish_pressure_health(usage, severity).await;
+
         let existing = match self
             .health_repo
             .find_active_issue(&HealthIssueType::DiskPressure.to_string(), issue_key)
@@ -884,6 +901,42 @@ impl DiskPressureService {
                     warn!("Failed to create disk pressure health issue: {}", e);
                 }
             }
+        }
+    }
+
+    async fn publish_pressure_health(&self, usage: f64, severity: &str) {
+        let health_severity = match severity {
+            "emergency" => HealthSeverity::Critical,
+            "critical" => HealthSeverity::High,
+            _ => HealthSeverity::Medium,
+        };
+        let pct = format!("{:.1}%", usage * 100.0);
+        let mut event = PublishHealthEvent::new(
+            "storage:clickhouse:disk_pressure",
+            HealthCategory::Storage,
+            health_severity,
+            format!("ClickHouse disk pressure is {severity}"),
+            format!(
+                "ClickHouse disk usage is {pct}. Oldest partitions may be dropped automatically, and emergency pressure can pause ingestion."
+            ),
+            "clickhouse_storage",
+            "disk_pressure_service",
+        );
+        event.resource_id = Some("clickhouse_disk".to_string());
+        event.resource_name = Some("ClickHouse".to_string());
+        event.diagnostic_context = serde_json::json!({
+            "usage_fraction": usage,
+            "severity": severity,
+            "pause_ingestion_enabled": self.config.pause_ingestion,
+            "critical_threshold": self.config.critical_threshold,
+            "emergency_threshold": self.config.emergency_threshold,
+        });
+        event.remediation = Some(
+            "Check ClickHouse disk capacity, stalled tiering moves, retention settings, and ingestion volume immediately."
+                .to_string(),
+        );
+        if let Err(error) = self.system_health_repo.publish(&event).await {
+            warn!(%error, "Failed to publish disk-pressure system health event");
         }
     }
 

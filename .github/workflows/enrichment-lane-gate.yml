@@ -35,7 +35,7 @@ jobs:
     # toolchain available on the runner for the image build. Assumes a dedicated
     # runner: the compose services use fixed container_names (nanosiem-*), so
     # this must not run on a host that already has a nanosiem compose stack up.
-    runs-on: [self-hosted, X64]
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 45
     env:
       # Isolate this run's containers/network from anything else on the runner.

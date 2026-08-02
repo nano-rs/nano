@@ -4,8 +4,9 @@
  * NAN-571 — Marketplace top-level page (Phase 1 of [NAN-570](https://linear.app/nanos-sh/issue/NAN-570)).
  *
  * Source of truth: design-ref/ui_kits/search/marketplace.html (design system 13).
- * Eyebrow + 20px H1 + meta line; flat 4-tile stats strip; flat repo source row;
- * mono-monogram cards with state badges; section grouping (Popular/Security/Cloud);
+ * Eyebrow + 20px H1 + meta line; flat 4-tile stats strip; mono-monogram cards
+ * with state badges; compact repository-source menu in the
+ * filter bar; section grouping (Popular/Security/Cloud);
  * 4-tab drawer (About/Config/Code/Permissions) preserves all existing actions
  * (Sync Now, Export, Disable toggle, Edit-in-wizard, etc.).
  *
@@ -17,9 +18,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
-  Bot, Check, CheckCircle, Cloud, Database, GitBranch, Loader2,
-  Package, Plus, RefreshCw, Search as SearchIcon, Shield, Star,
-  Users, X as XIcon, Box, FileDown,
+  Bot, Check, ChevronDown, Cloud, Database, DatabaseZap, Loader2,
+  Package, Plug, Plus, RefreshCw, Search as SearchIcon, Shield, Star,
+  TableProperties, Users, X as XIcon, Box, FileDown,
 } from 'lucide-react';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
@@ -40,8 +41,17 @@ import { IntegrationCard } from '@/components/marketplace/IntegrationCard';
 import { MarketplaceDrawer } from '@/components/marketplace/MarketplaceDrawer';
 import { InstallDialog } from '@/components/marketplace/InstallDialog';
 import { CoverageHero } from '@/components/marketplace/CoverageHero';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 
-type CategoryFilter = 'all' | 'data' | 'agent' | 'identity';
+type CategoryFilter = 'all' | 'data' | 'agent' | 'identity' | 'collector';
 
 interface CategoryChip {
   id: CategoryFilter;
@@ -54,6 +64,7 @@ const CATEGORY_CHIPS: CategoryChip[] = [
   { id: 'data',     label: 'Data',     icon: Database },
   { id: 'agent',    label: 'Agent',    icon: Bot },
   { id: 'identity', label: 'Identity', icon: Users },
+  { id: 'collector', label: 'Collector', icon: Plug },
 ];
 
 interface SectionDef {
@@ -116,6 +127,7 @@ export function Marketplace() {
   const goImport = useCallback(() => navigate(AIRGAP_IMPORT_ROUTE), [navigate]);
   const [entries, setEntries] = useState<MarketplaceCatalogEntry[]>([]);
   const [stats, setStats] = useState<CatalogStats | null>(null);
+  const [collectorCount, setCollectorCount] = useState(0);
   const [repos, setRepos] = useState<EnrichmentMarketplaceRepo[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
@@ -162,6 +174,8 @@ export function Marketplace() {
   // finer-grained effective-source-scope partition.
   const COVERAGE_QUERY_KEY = ['marketplace', 'coverage', user?.id] as const;
   const canViewCoverage = hasAllPermissions(['enrichments:view', 'search:execute']);
+  const canCreateIntegration = capabilities.customEnrichment
+    && hasAllPermissions(['log_sources:create', 'enrichments:code']);
   const coverageQuery = useQuery({
     queryKey: COVERAGE_QUERY_KEY,
     queryFn: () => api.marketplace.getCoverage(),
@@ -198,6 +212,14 @@ export function Marketplace() {
       ]);
       setEntries(catalog.entries);
       setStats(catalog.stats);
+      // Keep the live page compatible with an API process that predates the
+      // collector_count field. The unfiltered response already has every
+      // collector, so HMR can populate the chip without a service restart.
+      if (typeof catalog.stats.collector_count === 'number') {
+        setCollectorCount(catalog.stats.collector_count);
+      } else if (categoryFilter === 'all') {
+        setCollectorCount(catalog.entries.filter(entry => entry.category === 'collector').length);
+      }
       setRepos(repoList);
     } catch {
       toast({ title: 'Error', description: 'Failed to load marketplace', variant: 'destructive' });
@@ -358,7 +380,7 @@ export function Marketplace() {
             <span className="tabular-nums text-foreground">{totalCount}</span> integrations from{' '}
             <span className="tabular-nums text-foreground">{repoCount}</span>{' '}
             {repoCount === 1 ? 'repository' : 'repositories'}
-            {' · '}pulls every 30 min
+            {repoCount > 0 && <> · {repoCadenceLabel(repos)}</>}
             {lastSyncedAt && (
               <>
                 {' · '}last sync <span className="font-mono text-foreground">{formatUTCCompact(lastSyncedAt)}</span>
@@ -377,8 +399,9 @@ export function Marketplace() {
               </Button>
             </Link>
           )}
-          {capabilities.customEnrichment && (
-            <Link to="/enrichments/custom/new">
+          {(capabilities.customEnrichment || canCreateIntegration) && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
               <Button
                 size="sm"
                 variant={airGap ? 'outline' : 'default'}
@@ -386,7 +409,42 @@ export function Marketplace() {
               >
                 <Plus className="w-3.5 h-3.5 mr-1" /> Create custom
               </Button>
-            </Link>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-72">
+                <DropdownMenuLabel className="text-[10px] font-mono uppercase tracking-[0.1em] text-muted-foreground">
+                  What are you building?
+                </DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                {capabilities.customEnrichment && (
+                  <DropdownMenuItem
+                    className="items-start gap-2 py-2.5"
+                    onSelect={() => navigate('/enrichments/custom/new')}
+                  >
+                    <TableProperties className="mt-0.5 h-4 w-4 text-primary" />
+                    <div>
+                      <div className="text-[12px] font-medium">Enrichment</div>
+                      <div className="mt-0.5 text-[10.5px] leading-snug text-muted-foreground">
+                        Lookup data or on-demand artifact context.
+                      </div>
+                    </div>
+                  </DropdownMenuItem>
+                )}
+                {canCreateIntegration && !airGap && (
+                  <DropdownMenuItem
+                    className="items-start gap-2 py-2.5"
+                    onSelect={() => navigate('/integrations/custom/new')}
+                  >
+                    <DatabaseZap className="mt-0.5 h-4 w-4 text-primary" />
+                    <div>
+                      <div className="text-[12px] font-medium">Scheduled API integration</div>
+                      <div className="mt-0.5 text-[10.5px] leading-snug text-muted-foreground">
+                        Harvest bounded API data into raw event streams.
+                      </div>
+                    </div>
+                  </DropdownMenuItem>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
           )}
         </div>
       </div>
@@ -419,9 +477,9 @@ export function Marketplace() {
         </div>
       )}
 
-      {/* Repo sources — hidden in air-gap mode (GitHub-backed, egress-only).
-          A side-load banner takes its place so the surface stays honest. */}
-      {airGap ? (
+      {/* Repository controls are hidden in air-gap mode (GitHub-backed,
+          egress-only). A side-load banner keeps that surface honest. */}
+      {airGap && (
         <div className="mt-4 bg-card border border-border/60 rounded-lg px-4 py-3 flex items-center gap-3 shadow-none">
           <FileDown className="w-[14px] h-[14px] text-primary shrink-0" />
           <div className="min-w-0 flex-1">
@@ -437,12 +495,6 @@ export function Marketplace() {
             </Button>
           </Link>
         </div>
-      ) : (
-        repos.length > 0 && (
-          <div className="mt-4">
-            <RepoSources repos={repos} syncingId={syncingRepo} onSync={handleSyncRepo} />
-          </div>
-        )
       )}
 
       {/* Filter bar */}
@@ -451,7 +503,7 @@ export function Marketplace() {
           {CATEGORY_CHIPS.map(c => {
             const Icon = c.icon;
             const active = categoryFilter === c.id;
-            const count = countForCategory(c.id, stats);
+            const count = countForCategory(c.id, stats, collectorCount);
             return (
               <button
                 key={c.id}
@@ -511,6 +563,12 @@ export function Marketplace() {
         >
           <Check className="w-[11px] h-[11px]" /> installed only
         </button>
+        {!airGap && (
+          <>
+            <div className="w-px h-6 bg-border mx-0.5" />
+            <SourcesMenu repos={repos} syncingId={syncingRepo} onSync={handleSyncRepo} />
+          </>
+        )}
       </div>
 
       {/* Card grid */}
@@ -565,7 +623,7 @@ export function Marketplace() {
 
       {/* Footer hint row */}
       <div className="mt-3 pt-3 border-t border-border/60 flex items-center font-mono text-[10.5px] text-muted-foreground tabular-nums">
-        repositories sync every <span className="text-foreground px-1">30m</span>
+        <span className="text-foreground">{repoCadenceLabel(repos)}</span>
         <span className="mx-2 text-muted-foreground/40">·</span>
         new integrations install in <span className="text-foreground px-1">~ 8s</span>
         <span className="flex-1" />
@@ -589,12 +647,13 @@ export function Marketplace() {
   );
 }
 
-function countForCategory(cat: CategoryFilter, stats: CatalogStats | null): number {
+function countForCategory(cat: CategoryFilter, stats: CatalogStats | null, collectorCount: number): number {
   if (!stats) return 0;
   if (cat === 'all') return stats.total_entries;
   if (cat === 'data') return stats.data_count;
   if (cat === 'agent') return stats.agent_count;
   if (cat === 'identity') return stats.identity_count;
+  if (cat === 'collector') return collectorCount;
   return 0;
 }
 
@@ -627,68 +686,242 @@ function StatsStrip({ stats }: { stats: CatalogStats }) {
   );
 }
 
-interface RepoSourcesProps {
+type RepoHealth = 'good' | 'warn' | 'danger';
+
+function getRepoHealth(repo: EnrichmentMarketplaceRepo, syncingId: string | null): RepoHealth {
+  if (repo.last_sync_status === 'failed') return 'danger';
+  if (
+    syncingId === repo.id ||
+    repo.last_sync_status === 'syncing' ||
+    repo.last_sync_status === 'pending' ||
+    repo.last_sync_status === 'stale'
+  ) {
+    return 'warn';
+  }
+  if (repo.last_sync_status !== 'success' || !repo.last_synced_at) return 'warn';
+
+  const lastSyncedAt = Date.parse(repo.last_synced_at);
+  const staleAfterMs = Math.max(repo.sync_interval_hours, 1) * 60 * 60 * 1000;
+  return Number.isNaN(lastSyncedAt) || Date.now() - lastSyncedAt > staleAfterMs ? 'warn' : 'good';
+}
+
+function repoTone(repo: EnrichmentMarketplaceRepo, syncingId: string | null): string {
+  const health = getRepoHealth(repo, syncingId);
+  if (health === 'danger') return 'var(--color-danger)';
+  if (health === 'warn') return 'var(--color-warn)';
+  return 'var(--color-good)';
+}
+
+function rollupTone(repos: EnrichmentMarketplaceRepo[], syncingId: string | null): string {
+  const health = repos.map(repo => getRepoHealth(repo, syncingId));
+  if (health.includes('danger')) return 'var(--color-danger)';
+  if (health.includes('warn') || repos.length === 0) return 'var(--color-warn)';
+  return 'var(--color-good)';
+}
+
+function rollupLabel(repos: EnrichmentMarketplaceRepo[], syncingId: string | null): string {
+  if (repos.length === 0) return 'No repository sources configured';
+  const health = repos.map(repo => getRepoHealth(repo, syncingId));
+  const failed = health.filter(value => value === 'danger').length;
+  const attention = health.filter(value => value === 'warn').length;
+  if (failed > 0) return `${failed} source${failed === 1 ? '' : 's'} failed to sync`;
+  if (attention > 0) return `${attention} source${attention === 1 ? '' : 's'} need attention`;
+  return `All ${repos.length} source${repos.length === 1 ? '' : 's'} synced`;
+}
+
+function repoStatusLabel(repo: EnrichmentMarketplaceRepo, syncingId: string | null): string {
+  if (syncingId === repo.id || repo.last_sync_status === 'syncing' || repo.last_sync_status === 'pending') {
+    return 'syncing';
+  }
+  if (repo.last_sync_status === 'failed') return 'sync failed';
+  if (getRepoHealth(repo, syncingId) === 'warn' && repo.last_synced_at) return 'behind';
+  if (repo.last_sync_status === 'success' && repo.last_synced_at) {
+    return `synced ${formatUTCCompact(repo.last_synced_at)}`;
+  }
+  return 'not synced';
+}
+
+function repoPurpose(repo: EnrichmentMarketplaceRepo): { kind: string; detail: string } {
+  const identity = `${repo.slug} ${repo.name} ${repo.url}`.toLowerCase();
+  if (identity.includes('nano-integrations') || identity.includes('nano integrations')) {
+    return {
+      kind: 'Data collection',
+      detail: 'Scheduled pull collectors that connect to external platforms and bring their primary events and logs into nano.',
+    };
+  }
+  if (identity.includes('nano-enrichments') || identity.includes('nano enrichments')) {
+    return {
+      kind: 'Data enrichment',
+      detail: 'Threat-intel, lookup, and transformation content that adds context to telemetry already in nano; it does not collect source events.',
+    };
+  }
+  return {
+    kind: 'Marketplace source',
+    detail: repo.description || 'A Git-backed source of installable marketplace content.',
+  };
+}
+
+function repoContentCount(repo: EnrichmentMarketplaceRepo): string {
+  const kind = repoPurpose(repo).kind;
+  const noun = kind === 'Data enrichment'
+    ? 'enrichments'
+    : kind === 'Data collection'
+      ? 'collectors'
+      : 'items';
+  return `${repo.enrichment_count} ${noun}`;
+}
+
+function repoCadenceLabel(repos: EnrichmentMarketplaceRepo[]): string {
+  const intervals = [...new Set(
+    repos
+      .filter(repo => repo.auto_sync_enabled)
+      .map(repo => repo.sync_interval_hours)
+      .filter(hours => Number.isFinite(hours) && hours > 0),
+  )];
+  if (intervals.length === 0) return 'auto-sync disabled';
+  if (intervals.length > 1) return 'auto-sync by source schedule';
+  const hours = intervals[0];
+  return `auto-sync every ${hours}h`;
+}
+
+interface SourcesMenuProps {
   repos: EnrichmentMarketplaceRepo[];
   syncingId: string | null;
   onSync: (id: string) => void;
 }
 
-function RepoSources({ repos, syncingId, onSync }: RepoSourcesProps) {
+function SourcesMenu({ repos, syncingId, onSync }: SourcesMenuProps) {
+  const [open, setOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(event.target as Node)) setOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [open]);
+
+  const tone = rollupTone(repos, syncingId);
+  const summary = rollupLabel(repos, syncingId);
+
   return (
-    <div className="bg-card border border-border/60 rounded-lg overflow-hidden shadow-none">
-      <div className="px-4 py-2.5 flex items-center gap-2 border-b border-border/60 bg-muted/20">
-        <div className="font-mono text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
-          Repository source
-        </div>
-        <span className="font-mono text-[10px] text-muted-foreground/60">· git-backed enrichment bundle</span>
-      </div>
-      <div className="divide-y divide-border/60">
-        {repos.map(r => {
-          const synced = r.last_sync_status === 'success';
-          const isSyncing = syncingId === r.id || r.last_sync_status === 'syncing' || r.last_sync_status === 'pending';
-          return (
-            <div key={r.id} className="flex items-center gap-3 px-4 py-2.5 hover:bg-muted/20">
-              <GitBranch className="w-[13px] h-[13px] text-muted-foreground shrink-0" />
-              <div className="flex items-center gap-2 min-w-0 shrink-0">
-                <span className="text-[12.5px] text-foreground font-medium">{r.name}</span>
-                <span className="text-[9.5px] font-mono uppercase tracking-[0.1em] px-1.5 py-px rounded border bg-primary/10 border-primary/30 text-primary">
-                  official
-                </span>
-              </div>
-              <span className="font-mono text-[11px] text-muted-foreground truncate min-w-0 flex-1">{r.url}</span>
-              <span className="font-mono text-[10.5px] text-muted-foreground shrink-0">
-                {r.branch}{r.last_sync_commit && (
-                  <> · <span className="text-foreground">{r.last_sync_commit.slice(0, 7)}</span></>
-                )}
-              </span>
-              <span className="font-mono text-[10.5px] text-muted-foreground tabular-nums shrink-0">
-                {r.enrichment_count} integrations
-              </span>
-              {synced && r.last_synced_at && !isSyncing && (
-                <span className="inline-flex items-center gap-1 text-[10.5px] font-mono text-emerald-500 shrink-0">
-                  <CheckCircle className="w-[11px] h-[11px]" />
-                  synced {formatUTCCompact(r.last_synced_at)}
-                </span>
-              )}
-              {isSyncing && (
-                <span className="inline-flex items-center gap-1 text-[10.5px] font-mono text-amber-500 shrink-0">
-                  <Loader2 className="w-[11px] h-[11px] animate-spin" />
-                  syncing
-                </span>
-              )}
-              <button
-                type="button"
-                onClick={() => onSync(r.id)}
-                disabled={isSyncing}
-                className="h-6 px-2 rounded text-[11px] text-muted-foreground hover:text-foreground hover:bg-muted/40 disabled:opacity-50 inline-flex items-center gap-1 font-mono"
-              >
-                <RefreshCw className={cn('w-[10px] h-[10px]', isSyncing && 'animate-spin')} />
-                sync
-              </button>
+    <div className="relative shrink-0" ref={menuRef}>
+      <button
+        type="button"
+        onClick={() => setOpen(value => !value)}
+        aria-expanded={open}
+        aria-controls="marketplace-repository-sources"
+        aria-haspopup="dialog"
+        aria-label={`${summary}. ${open ? 'Hide' : 'Show'} repository sources`}
+        title={summary}
+        className={cn(
+          'h-7 px-2.5 rounded-md border text-[11.5px] font-mono flex items-center gap-2 whitespace-nowrap transition-colors',
+          open
+            ? 'bg-muted/50 border-border text-foreground'
+            : 'bg-muted/20 border-border/60 text-muted-foreground hover:text-foreground hover:bg-muted/40',
+        )}
+      >
+        <span
+          className="w-[5px] h-[5px] rounded-full shrink-0"
+          style={{ background: tone, boxShadow: `0 0 5px ${tone}` }}
+        />
+        <span>sources</span>
+        <span className="text-foreground tabular-nums">{repos.length}</span>
+        <ChevronDown className={cn('w-[11px] h-[11px] transition-transform', open && 'rotate-180')} />
+      </button>
+
+      {open && (
+        <div
+          id="marketplace-repository-sources"
+          role="dialog"
+          aria-label="Repository sources"
+          className="absolute right-0 top-9 z-50 w-[min(520px,calc(100vw-3rem))] rounded-lg border border-border bg-popover p-1.5 text-popover-foreground shadow-[0_18px_40px_-12px_rgba(0,0,0,0.7)]"
+        >
+          <div className="flex items-center justify-between px-2 pt-1.5 pb-2">
+            <div className="font-mono text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+              Repository sources
             </div>
-          );
-        })}
-      </div>
+            <span className="min-w-0 truncate font-mono text-[10px] text-muted-foreground">{summary}</span>
+          </div>
+
+          <TooltipProvider delayDuration={250}>
+            <div className="max-h-[min(420px,70vh)] overflow-y-auto">
+              {repos.length === 0 ? (
+                <div className="px-2 py-5 text-center font-mono text-[10.5px] text-muted-foreground">
+                  No repository sources configured
+                </div>
+              ) : repos.map(repo => {
+                const isSyncing = syncingId === repo.id || repo.last_sync_status === 'syncing' || repo.last_sync_status === 'pending';
+                const statusTone = repoTone(repo, syncingId);
+                const purpose = repoPurpose(repo);
+                return (
+                  <div key={repo.id} className="flex items-center gap-2.5 rounded-md px-2 py-2 hover:bg-muted/30">
+                    <span className="w-[5px] h-[5px] rounded-full shrink-0" style={{ background: statusTone }} />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span className="truncate text-[12px] text-foreground underline decoration-dotted decoration-muted-foreground/60 underline-offset-2 cursor-help" tabIndex={0}>
+                              {repo.name}
+                            </span>
+                          </TooltipTrigger>
+                          <TooltipContent side="top" align="start" sideOffset={7} className="max-w-[320px] px-3 py-2">
+                            <div className="font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-primary">
+                              {purpose.kind}
+                            </div>
+                            <div className="mt-1 text-[11px] leading-relaxed text-popover-foreground">
+                              {purpose.detail}
+                            </div>
+                          </TooltipContent>
+                        </Tooltip>
+                        <span className="shrink-0 rounded border border-primary/30 bg-primary/10 px-1 font-mono text-[9px] uppercase leading-[14px] tracking-[0.1em] text-primary">
+                          official
+                        </span>
+                        <span className="hidden shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground sm:inline">
+                          {repoContentCount(repo)}
+                        </span>
+                      </div>
+                      <div className="mt-0.5 truncate font-mono text-[10.5px] text-muted-foreground">{repo.url}</div>
+                    </div>
+                    <div className="hidden shrink-0 flex-col items-end gap-0.5 sm:flex">
+                      <span className="font-mono text-[10.5px] text-muted-foreground">
+                        {repo.branch}
+                        {repo.last_sync_commit && <> · {repo.last_sync_commit.slice(0, 7)}</>}
+                      </span>
+                      <span className="font-mono text-[10px]" style={{ color: statusTone }}>
+                        {repoStatusLabel(repo, syncingId)}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onSync(repo.id)}
+                      disabled={isSyncing}
+                      aria-label={`Sync ${repo.name}`}
+                      className="inline-flex h-6 shrink-0 items-center gap-1 rounded px-2 font-mono text-[10.5px] text-muted-foreground hover:bg-primary/10 hover:text-primary disabled:opacity-50"
+                    >
+                      <RefreshCw className={cn('w-[10px] h-[10px]', isSyncing && 'animate-spin')} />
+                      sync
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </TooltipProvider>
+
+          <div className="mt-1 flex items-center justify-end border-t border-border/60 px-2 pt-2 pb-1">
+            <span className="font-mono text-[10px] text-muted-foreground/70">{repoCadenceLabel(repos)}</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -736,7 +969,7 @@ function EmptyState() {
       <SearchIcon className="w-6 h-6 text-muted-foreground/60 mx-auto mb-3" />
       <div className="text-[14px] text-foreground">No integrations matched.</div>
       <div className="text-[12px] text-muted-foreground mt-1">
-        Try clearing filters or check the repository sources above.
+        Try clearing filters or check the repository sources in the filter bar.
       </div>
     </div>
   );

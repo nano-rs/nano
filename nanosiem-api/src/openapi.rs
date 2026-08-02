@@ -79,6 +79,7 @@ use crate::handlers;
         (name = "onboarding", description = "Onboarding wizard progress and status"),
         (name = "siem_health", description = "SIEM health check reports and analysis"),
         (name = "system", description = "System overview and metrics"),
+        (name = "system_health", description = "Durable system health lifecycles and external delivery"),
     ),
     components(schemas(ErrorResponse, ErrorDetail))
 )]
@@ -191,6 +192,7 @@ fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         handlers::onboarding::OnboardingApiDoc::openapi(),
         handlers::siem_health::SiemHealthApiDoc::openapi(),
         handlers::siem_health_suppressions::SiemHealthSuppressionsApiDoc::openapi(),
+        handlers::system_health_events::SystemHealthEventsApiDoc::openapi(),
         handlers::observability_slos::ObservabilitySlosApiDoc::openapi(),
         handlers::observability_synthetics::ObservabilitySyntheticsApiDoc::openapi(),
         handlers::observability_metric_monitors::ObservabilityMetricMonitorsApiDoc::openapi(),
@@ -583,10 +585,16 @@ mod tests {
         // waiver: /api/hunts/runners/{id}/agy-waiver (POST grant + DELETE
         // revoke — one template, two operations, so the floor moves by 1).
         // Enterprise floor 550 + 1 = 551; open floor 436 + 1 = 437.
+        // NAN-2282 added 5 shared system-health path templates: events,
+        // summary, acknowledge, resolve, and delivery history.
+        // NAN-2281 then added 4 ENTERPRISE templates for authoring bounded custom
+        // API collectors: /api/integrations/custom/validate,
+        // /api/integrations/custom/preview, /api/integrations/custom, and
+        // /api/integrations/custom/{id}. Open is unchanged.
         #[cfg(feature = "enterprise")]
-        let min_paths = 551;
+        let min_paths = 560;
         #[cfg(not(feature = "enterprise"))]
-        let min_paths = 437;
+        let min_paths = 442;
 
         assert!(
             path_count >= min_paths,

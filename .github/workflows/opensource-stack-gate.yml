@@ -26,7 +26,7 @@ jobs:
   gate:
     # Self-hosted only (repo rule — never ubuntu-latest). Needs docker +
     # docker compose v2 on the runner (same as enrichment-lane-gate).
-    runs-on: [self-hosted, X64]
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 20
     steps:
       - name: Checkout

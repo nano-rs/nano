@@ -119,6 +119,7 @@ const ObservabilityConsole = lazyWithRetryNamed(() => import('@/pages/observabil
 // RulesListPanel, etc. Legacy `/rules/editor-legacy/*` routes are gone.
 const RuleEditorRedesign = lazyWithRetryNamed(() => import('@/pages/RuleEditorRedesign'), 'RuleEditorRedesign');
 const CustomEnrichmentWizard = lazyWithRetryNamed(() => import('@/enterprise/pages/CustomEnrichmentWizard'), 'CustomEnrichmentWizard');
+const CustomIntegrationWizard = lazyWithRetryNamed(() => import('@/enterprise/pages/CustomIntegrationWizard'), 'CustomIntegrationWizard');
 
 // ============================================================================
 // LAZY IMPORTS - Tier 2: Large pages (1000+ lines)
@@ -816,6 +817,22 @@ function ProtectedAppRoutes() {
             <PermissionRoute permission="enrichments:view" element={
               <Suspense fallback={<EditorLoadingFallback />}>
                 <CustomEnrichmentWizard key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* Custom scheduled API integrations */}
+          <Route path="/integrations/custom/new" element={
+            <PermissionRoute permission="log_sources:create" element={
+              <Suspense fallback={<EditorLoadingFallback />}>
+                <CustomIntegrationWizard key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/integrations/custom/:id" element={
+            <PermissionRoute permission="log_sources:view" element={
+              <Suspense fallback={<EditorLoadingFallback />}>
+                <CustomIntegrationWizard key={resetKey} />
               </Suspense>
             } />
           } />

@@ -156,6 +156,8 @@ fn create_req(name: &str, url: String, event_types: Vec<&str>, secret: Option<&s
         channel_type: None,
         channel_config: None,
         rule_filter: None,
+        health_category_filter: None,
+        health_resource_filter: None,
         enabled: Some(true),
     }
 }
@@ -669,6 +671,8 @@ async fn update_without_url_preserves_stored_url() {
             channel_type: Some("slack".into()),
             channel_config: None,
             rule_filter: None,
+            health_category_filter: None,
+            health_resource_filter: None,
             enabled: Some(true),
         })
         .await
@@ -691,6 +695,8 @@ async fn update_without_url_preserves_stored_url() {
         channel_type: None,
         channel_config: None,
         rule_filter: None,
+        health_category_filter: None,
+        health_resource_filter: None,
         enabled: None,
     };
     repo.update(created.id, &update).await.unwrap();

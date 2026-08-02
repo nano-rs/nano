@@ -40,6 +40,8 @@ pub enum NotificationType {
     CaseEscalated,
     /// A scheduled report finished and its artifacts are ready to download.
     ReportReady,
+    /// A cancelled ClickHouse query is still running and holding a CPU core.
+    StuckQueryDetected,
 }
 
 impl std::fmt::Display for NotificationType {
@@ -70,6 +72,7 @@ impl std::fmt::Display for NotificationType {
             NotificationType::ModelDeprecated => write!(f, "model_deprecated"),
             NotificationType::CaseEscalated => write!(f, "case_escalated"),
             NotificationType::ReportReady => write!(f, "report_ready"),
+            NotificationType::StuckQueryDetected => write!(f, "stuck_query_detected"),
         }
     }
 }

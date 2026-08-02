@@ -76,6 +76,19 @@ pub fn wrap_query_for_count(sql: &str) -> String {
     format!("SELECT count(*) AS cnt FROM ({}) AS subquery", sql)
 }
 
+/// NAN-2277: whether raw user SQL carries the scalar-Map pattern that wedges
+/// the CH >=26.4 planner (NAN-2274, upstream ClickHouse#113003): bloom_filter
+/// index analysis over a large scalar-subquery Map has no cancellation point,
+/// so the query becomes an unkillable 100%-CPU thread that only a server
+/// restart clears. Generated pipeline SQL already carries `use_skip_indexes=0`
+/// when it emits the map construct; raw SQL bypasses codegen, so the executor
+/// applies the same guard off this check. Substring match is deliberately
+/// broad: a false positive only costs skip-index pruning on one query (results
+/// are identical), a false negative wedges a core.
+pub(crate) fn raw_sql_needs_skip_index_guard(sql: &str) -> bool {
+    sql.to_ascii_lowercase().contains("mapfromarrays(")
+}
+
 /// Bounded input for the paginated count companion (NAN-1635, finding 2.3).
 ///
 /// The consumer clamps the reported total at `SearchConfig.max_limit`
@@ -170,6 +183,22 @@ pub fn escape_question_marks_in_strings(sql: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NAN-2277: the raw-SQL wedge guard must catch the scalar-Map pattern in
+    /// any casing and leave ordinary hunts untouched.
+    #[test]
+    fn skip_index_guard_matches_scalar_map_pattern_only() {
+        assert!(raw_sql_needs_skip_index_guard(
+            "WITH (SELECT mapFromArrays(groupArray(k), groupArray(v)) FROM t) AS m SELECT 1"
+        ));
+        assert!(raw_sql_needs_skip_index_guard("select MAPFROMARRAYS(a, b)"));
+        assert!(!raw_sql_needs_skip_index_guard(
+            "SELECT count() FROM logs WHERE src_ip = '10.0.0.1'"
+        ));
+        assert!(!raw_sql_needs_skip_index_guard(
+            "SELECT map('a', 1) FROM logs"
+        ));
+    }
 
     /// NAN-1691 (P1-B): enrich-only prevalence decoration (host_count / is_rare /
     /// prevalence_score columns, no real aggregation keyword) must NOT be treated as an

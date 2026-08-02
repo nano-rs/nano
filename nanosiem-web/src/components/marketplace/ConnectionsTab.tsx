@@ -178,11 +178,17 @@ function InstanceDialog({
   const isEdit = Boolean(instance);
 
   const [name, setName] = useState(instance?.name ?? integration.name);
-  const [config, setConfig] = useState<Record<string, string>>(() => {
-    const initial: Record<string, string> = {};
+  const [config, setConfig] = useState<Record<string, unknown>>(() => {
+    const initial: Record<string, unknown> = {};
     for (const field of manifest.configFields) {
       const value = instance?.config?.[field.name];
-      initial[field.name] = typeof value === 'string' ? value : '';
+      if (field.field_type === 'boolean') {
+        initial[field.name] = typeof value === 'boolean' ? value : false;
+      } else if (field.field_type === 'number') {
+        initial[field.name] = typeof value === 'number' ? value : '';
+      } else {
+        initial[field.name] = typeof value === 'string' ? value : '';
+      }
     }
     return initial;
   });
@@ -201,9 +207,12 @@ function InstanceDialog({
       const typedCredentials = Object.fromEntries(
         Object.entries(credentials).filter(([, v]) => v.trim() !== ''),
       );
+      const configuredValues = Object.fromEntries(
+        Object.entries(config).filter(([, value]) => value !== '' && value !== null && value !== undefined),
+      );
       const payload = {
         name,
-        config,
+        config: configuredValues,
         enabled_streams: streams,
         schedule: schedule.trim() === '' ? null : schedule.trim(),
         ...(Object.keys(typedCredentials).length > 0 ? { credentials: typedCredentials } : {}),
@@ -229,9 +238,13 @@ function InstanceDialog({
     },
   });
 
-  const missingRequiredConfig = manifest.configFields.some(
-    (f) => f.required && (config[f.name] ?? '').trim() === '',
-  );
+  const missingRequiredConfig = manifest.configFields.some((field) => {
+    if (!field.required) return false;
+    const value = config[field.name];
+    if (field.field_type === 'boolean') return typeof value !== 'boolean';
+    if (field.field_type === 'number') return typeof value !== 'number' || !Number.isFinite(value);
+    return typeof value !== 'string' || value.trim() === '';
+  });
   // Credentials are required to create, but on edit the stored ones stand.
   const missingCredentials =
     integration.requires_credential === 'required' &&
@@ -267,12 +280,34 @@ function InstanceDialog({
                 {field.label}
                 {field.required && <span className="ml-1 text-red-500">*</span>}
               </Label>
-              <Input
-                value={config[field.name] ?? ''}
-                onChange={(e) => setConfig((c) => ({ ...c, [field.name]: e.target.value }))}
-                placeholder={field.placeholder}
-                className="h-8 font-mono text-[12px]"
-              />
+              {field.field_type === 'boolean' ? (
+                <div className="flex h-8 items-center gap-2">
+                  <Switch
+                    checked={config[field.name] === true}
+                    onCheckedChange={(checked) =>
+                      setConfig((current) => ({ ...current, [field.name]: checked }))
+                    }
+                  />
+                  <span className="text-[11px] text-muted-foreground">
+                    {config[field.name] === true ? 'Enabled' : 'Disabled'}
+                  </span>
+                </div>
+              ) : (
+                <Input
+                  type={field.field_type === 'number' ? 'number' : 'text'}
+                  value={(config[field.name] as string | number | undefined) ?? ''}
+                  onChange={(event) =>
+                    setConfig((current) => ({
+                      ...current,
+                      [field.name]: field.field_type === 'number'
+                        ? (event.target.value === '' ? '' : Number(event.target.value))
+                        : event.target.value,
+                    }))
+                  }
+                  placeholder={field.placeholder}
+                  className="h-8 font-mono text-[12px]"
+                />
+              )}
               {field.help && <p className="text-[11px] text-muted-foreground">{field.help}</p>}
             </div>
           ))}
@@ -464,6 +499,7 @@ export function ConnectionsTab({ entry }: ConnectionsTabProps) {
   const canEdit = hasPermission('log_sources:edit');
   const canDelete = hasPermission('log_sources:delete');
   const canWriteCredentials = hasPermission('credentials:use');
+  const manifest = useMemo(() => collectorManifest(entry.config), [entry.config]);
 
   const [dialogInstance, setDialogInstance] = useState<IntegrationInstance | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -542,6 +578,14 @@ export function ConnectionsTab({ entry }: ConnectionsTabProps) {
           </Button>
         )}
       </div>
+
+      {entry.source_type === 'custom' && (
+        <div className="mx-3 mb-2 rounded border border-primary/20 bg-primary/5 px-3 py-2 text-[11px] text-muted-foreground">
+          Scheduled API lane: up to {(manifest.maxEventsPerRun ?? 25_000).toLocaleString()} events
+          and {Math.round((manifest.maxBytesPerRun ?? 64 * 1024 * 1024) / 1024 / 1024)} MiB per run,
+          with a minimum 15-minute interval. Bulk and firehose data belong on a dedicated ingestion source.
+        </div>
+      )}
 
       <ProvisioningNotice reports={provisioning} />
 

@@ -19,6 +19,8 @@ pub enum HealthIssueType {
     DiskPressure,
     /// Agent is using a deprecated model
     ModelDeprecated,
+    /// A cancelled ClickHouse query is still running (unkillable planner wedge)
+    StuckQuery,
 }
 
 impl std::fmt::Display for HealthIssueType {
@@ -28,6 +30,7 @@ impl std::fmt::Display for HealthIssueType {
             HealthIssueType::DataFeed => write!(f, "data_feed"),
             HealthIssueType::DiskPressure => write!(f, "disk_pressure"),
             HealthIssueType::ModelDeprecated => write!(f, "model_deprecated"),
+            HealthIssueType::StuckQuery => write!(f, "stuck_query"),
         }
     }
 }
@@ -39,6 +42,7 @@ impl HealthIssueType {
             "data_feed" => Some(HealthIssueType::DataFeed),
             "disk_pressure" => Some(HealthIssueType::DiskPressure),
             "model_deprecated" => Some(HealthIssueType::ModelDeprecated),
+            "stuck_query" => Some(HealthIssueType::StuckQuery),
             _ => None,
         }
     }
@@ -90,6 +94,11 @@ pub struct HealthSchedulerConfig {
     pub check_interval_secs: u64,
     /// Default staleness threshold in minutes for feeds without custom config
     pub default_stale_threshold_minutes: i32,
+    /// How long (seconds) a cancelled ClickHouse query may stay alive before it
+    /// is reported as stuck. Cancellation normally completes within seconds;
+    /// the CH >=26.4 planner wedge (NAN-2274, ClickHouse#113003) never
+    /// completes it at all, so anything past this bound is a wedged thread.
+    pub stuck_query_threshold_secs: u64,
 }
 
 impl Default for HealthSchedulerConfig {
@@ -97,6 +106,16 @@ impl Default for HealthSchedulerConfig {
         Self {
             check_interval_secs: 300, // 5 minutes
             default_stale_threshold_minutes: 15,
+            stuck_query_threshold_secs: 600, // 10 minutes past cancellation
         }
     }
+}
+
+/// A cancelled-but-still-running ClickHouse query (NAN-2277)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StuckQueryStatus {
+    pub query_id: String,
+    pub user: String,
+    pub elapsed_secs: f64,
+    pub query_snippet: String,
 }

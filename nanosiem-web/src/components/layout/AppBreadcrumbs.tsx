@@ -100,6 +100,8 @@ const BREADCRUMB_CONFIG: Array<{ path: string; segments: BreadcrumbSegment[]; ca
   { path: '/enrichments/agent/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Marketplace', href: '/marketplace' }, { label: ':dynamic' }], capability: 'agentEnrichment' },
   { path: '/enrichments/custom/new', segments: [{ label: 'Home', href: '/' }, { label: 'Marketplace', href: '/marketplace' }, { label: 'New Enrichment' }], capability: 'customEnrichment' },
   { path: '/enrichments/custom/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Marketplace', href: '/marketplace' }, { label: ':dynamic' }], capability: 'customEnrichment' },
+  { path: '/integrations/custom/new', segments: [{ label: 'Home', href: '/' }, { label: 'Marketplace', href: '/marketplace' }, { label: 'New API Integration' }], capability: 'customEnrichment' },
+  { path: '/integrations/custom/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Marketplace', href: '/marketplace' }, { label: ':dynamic' }], capability: 'customEnrichment' },
   { path: '/settings/storage', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Storage' }] },
   { path: '/settings/ai', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'AI' }], capability: 'melod' },
   { path: '/settings/webhooks', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Webhooks' }] },

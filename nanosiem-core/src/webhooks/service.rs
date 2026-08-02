@@ -352,6 +352,11 @@ impl WebhookService {
             .map(|u| u.to_string())
     }
 
+    /// Public, safe deep-link builder for durable notification producers.
+    pub fn ui_link_public(base: Option<&str>, path: &str) -> Option<String> {
+        Self::ui_link(base, path)
+    }
+
     /// Should this alert's payload be redacted because it derives from a
     /// restricted source (NAN-1800)?
     ///
@@ -509,6 +514,15 @@ impl WebhookService {
                 Some(events_array)
             },
             created_at,
+            health_event_id: None,
+            health_status: None,
+            health_category: None,
+            health_resource_type: None,
+            health_resource_id: None,
+            health_summary: None,
+            health_diagnostic_context: None,
+            health_remediation: None,
+            idempotency_key: None,
         };
 
         let severity_lower = severity.to_lowercase();
@@ -650,6 +664,15 @@ impl WebhookService {
             matched_event_count: None,
             matched_events: None,
             created_at,
+            health_event_id: None,
+            health_status: None,
+            health_category: None,
+            health_resource_type: None,
+            health_resource_id: None,
+            health_summary: None,
+            health_diagnostic_context: None,
+            health_remediation: None,
+            idempotency_key: None,
         };
 
         for webhook in webhooks {
@@ -741,6 +764,15 @@ impl WebhookService {
             matched_event_count: row_count,
             matched_events: None,
             created_at,
+            health_event_id: None,
+            health_status: None,
+            health_category: None,
+            health_resource_type: None,
+            health_resource_id: None,
+            health_summary: None,
+            health_diagnostic_context: None,
+            health_remediation: None,
+            idempotency_key: None,
         };
 
         for webhook in webhooks {
@@ -905,7 +937,7 @@ impl WebhookService {
         payload: &WebhookPayload,
         alert_id: Option<Uuid>,
         event_type: &str,
-    ) {
+    ) -> WebhookTestResult {
         let start = Instant::now();
 
         // Render the provider-specific body once (deterministic across retries).
@@ -921,9 +953,23 @@ impl WebhookService {
                     "Webhook not sent (fail-closed): channel body could not be built"
                 );
                 let duration_ms = start.elapsed().as_millis() as i32;
-                self.record(webhook, alert_id, event_type, None, None, false, Some(&reason), duration_ms)
-                    .await;
-                return;
+                self.record(
+                    webhook,
+                    alert_id,
+                    event_type,
+                    None,
+                    None,
+                    false,
+                    Some(&reason),
+                    duration_ms,
+                )
+                .await;
+                return WebhookTestResult {
+                    success: false,
+                    status_code: None,
+                    error: Some(reason),
+                    duration_ms: duration_ms as u64,
+                };
             }
         };
 
@@ -940,9 +986,23 @@ impl WebhookService {
                     "Webhook delivery blocked by SSRF guard"
                 );
                 let duration_ms = start.elapsed().as_millis() as i32;
-                self.record(webhook, alert_id, event_type, None, None, false, Some(&reason), duration_ms)
-                    .await;
-                return;
+                self.record(
+                    webhook,
+                    alert_id,
+                    event_type,
+                    None,
+                    None,
+                    false,
+                    Some(&reason),
+                    duration_ms,
+                )
+                .await;
+                return WebhookTestResult {
+                    success: false,
+                    status_code: None,
+                    error: Some(reason),
+                    duration_ms: duration_ms as u64,
+                };
             }
         };
 
@@ -958,10 +1018,29 @@ impl WebhookService {
                         "Webhook not sent (fail-closed): request could not be built with configured auth"
                     );
                     let duration_ms = start.elapsed().as_millis() as i32;
-                    self.record(webhook, alert_id, event_type, None, None, false, Some(&reason), duration_ms)
-                        .await;
-                    return;
+                    self.record(
+                        webhook,
+                        alert_id,
+                        event_type,
+                        None,
+                        None,
+                        false,
+                        Some(&reason),
+                        duration_ms,
+                    )
+                    .await;
+                    return WebhookTestResult {
+                        success: false,
+                        status_code: None,
+                        error: Some(reason),
+                        duration_ms: duration_ms as u64,
+                    };
                 }
+            };
+            let request = if let Some(key) = payload.idempotency_key.as_deref() {
+                request.header("X-NanoSIEM-Idempotency-Key", key)
+            } else {
+                request
             };
             match request.body(payload_bytes.clone()).send().await {
                 Ok(response) => {
@@ -979,9 +1058,23 @@ impl WebhookService {
                             "Webhook delivered successfully"
                         );
                         let duration_ms = start.elapsed().as_millis() as i32;
-                        self.record(webhook, alert_id, event_type, Some(status), Some(&body), true, None, duration_ms)
-                            .await;
-                        return;
+                        self.record(
+                            webhook,
+                            alert_id,
+                            event_type,
+                            Some(status),
+                            Some(&body),
+                            true,
+                            None,
+                            duration_ms,
+                        )
+                        .await;
+                        return WebhookTestResult {
+                            success: true,
+                            status_code: Some(status as u16),
+                            error: None,
+                            duration_ms: duration_ms as u64,
+                        };
                     }
 
                     if retryable && attempt < MAX_DELIVERY_ATTEMPTS {
@@ -1007,9 +1100,23 @@ impl WebhookService {
                     );
                     let duration_ms = start.elapsed().as_millis() as i32;
                     let err = format!("HTTP {status} after {attempt} attempt(s)");
-                    self.record(webhook, alert_id, event_type, Some(status), Some(&body), false, Some(&err), duration_ms)
-                        .await;
-                    return;
+                    self.record(
+                        webhook,
+                        alert_id,
+                        event_type,
+                        Some(status),
+                        Some(&body),
+                        false,
+                        Some(&err),
+                        duration_ms,
+                    )
+                    .await;
+                    return WebhookTestResult {
+                        success: false,
+                        status_code: Some(status as u16),
+                        error: Some(err),
+                        duration_ms: duration_ms as u64,
+                    };
                 }
                 Err(e) => {
                     // F-39: strip the URL from the transport error — reqwest
@@ -1041,12 +1148,63 @@ impl WebhookService {
                     );
                     let duration_ms = start.elapsed().as_millis() as i32;
                     let err = format!("{error_msg} after {attempt} attempt(s)");
-                    self.record(webhook, alert_id, event_type, None, None, false, Some(&err), duration_ms)
-                        .await;
-                    return;
+                    self.record(
+                        webhook,
+                        alert_id,
+                        event_type,
+                        None,
+                        None,
+                        false,
+                        Some(&err),
+                        duration_ms,
+                    )
+                    .await;
+                    return WebhookTestResult {
+                        success: false,
+                        status_code: None,
+                        error: Some(err),
+                        duration_ms: duration_ms as u64,
+                    };
                 }
             }
         }
+
+        WebhookTestResult {
+            success: false,
+            status_code: None,
+            error: Some("delivery attempts exhausted".to_string()),
+            duration_ms: start.elapsed().as_millis() as u64,
+        }
+    }
+
+    /// Deliver one durable payload to a pre-selected channel and wait for its
+    /// final result. The caller owns outbox retry state; this method continues
+    /// to provide the existing SSRF pinning, HMAC signing, provider formatting,
+    /// bounded HTTP retries, and ordinary webhook delivery log.
+    pub async fn deliver_persisted(
+        &self,
+        webhook_id: Uuid,
+        payload: &WebhookPayload,
+        subscription_type: &str,
+        delivery_event_type: &str,
+    ) -> Result<WebhookTestResult, String> {
+        let webhook = self
+            .repo
+            .get(webhook_id)
+            .await
+            .map_err(|e| format!("Webhook not found: {e}"))?;
+        if !webhook.enabled {
+            return Err("notification channel is disabled".to_string());
+        }
+        if !webhook.subscribes_to(subscription_type) {
+            return Err(format!(
+                "notification channel is not subscribed to {subscription_type}"
+            ));
+        }
+        let _permit = self.semaphore.acquire().await;
+        Ok(self
+            .deliver(&webhook, payload, None, delivery_event_type)
+            .await)
     }
 
     /// Persist a single delivery-log row, logging (but not propagating) a
@@ -1103,6 +1261,15 @@ impl WebhookService {
             matched_event_count: Some(0),
             matched_events: Some(vec![]),
             created_at: Utc::now(),
+            health_event_id: None,
+            health_status: None,
+            health_category: None,
+            health_resource_type: None,
+            health_resource_id: None,
+            health_summary: None,
+            health_diagnostic_context: None,
+            health_remediation: None,
+            idempotency_key: None,
         };
 
         let start = Instant::now();

@@ -6,7 +6,9 @@
  * A collector-category marketplace entry is the *integration*; an instance is
  * one configured connection to a vendor tenant. The catalog itself is served by
  * the marketplace API — this client only manages instances.
- */
+*/
+
+import type { CredentialFieldDef } from './marketplace';
 
 // =============================================================================
 // Types
@@ -114,8 +116,82 @@ export interface CollectorStreamDef {
   id: string;
   label: string;
   source_type: string;
+  parser?: string;
   default?: boolean;
   description?: string;
+}
+
+export interface CollectorManifestAuth {
+  header_name?: string;
+  credential_field?: string;
+  username_field?: string;
+  password_field?: string;
+  token_url?: string;
+  client_id_field?: string;
+  client_secret_field?: string;
+  scope?: string;
+}
+
+export type CollectorAuthType =
+  | 'none'
+  | 'bearer'
+  | 'api_key_header'
+  | 'basic_auth'
+  | 'oauth2_client_credentials';
+
+export interface CustomCollectorDefinitionRequest {
+  name: string;
+  description?: string;
+  code: string;
+  allowed_domains: string[];
+  allowed_domain_suffixes: string[];
+  credential_fields: CredentialFieldDef[];
+  config_fields: CollectorConfigFieldDef[];
+  auth_type: CollectorAuthType;
+  auth?: CollectorManifestAuth;
+  streams: CollectorStreamDef[];
+  poll_schedule: string;
+}
+
+export interface CustomCollectorDefinition extends CustomCollectorDefinitionRequest {
+  id: string;
+  slug: string;
+  max_run_secs: number;
+  max_events_per_emit: number;
+  max_events_per_run: number;
+  max_bytes_per_run: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CustomCollectorValidationResponse {
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
+}
+
+export interface CustomCollectorPreviewRequest {
+  definition: CustomCollectorDefinitionRequest;
+  config: Record<string, unknown>;
+  credentials: Record<string, string>;
+  enabled_streams: string[];
+}
+
+export interface CustomCollectorPreviewEvent {
+  stream: string;
+  source_type: string;
+  event: unknown;
+}
+
+export interface CustomCollectorPreviewResponse {
+  status: 'success' | 'partial' | 'failed' | 'cancelled';
+  events: CustomCollectorPreviewEvent[];
+  events_emitted: number;
+  bytes_emitted: number;
+  checkpoints: number;
+  duration_ms: number;
+  budget_exhausted: boolean;
+  error?: string;
 }
 
 export interface CollectorConfigFieldDef {
@@ -137,6 +213,9 @@ export function collectorManifest(config: Record<string, unknown> | undefined): 
   streams: CollectorStreamDef[];
   configFields: CollectorConfigFieldDef[];
   pollSchedule?: string;
+  maxRunSecs?: number;
+  maxEventsPerRun?: number;
+  maxBytesPerRun?: number;
 } {
   const cfg = config ?? {};
   return {
@@ -145,6 +224,11 @@ export function collectorManifest(config: Record<string, unknown> | undefined): 
       ? (cfg.config_fields as CollectorConfigFieldDef[])
       : [],
     pollSchedule: typeof cfg.poll_schedule === 'string' ? cfg.poll_schedule : undefined,
+    maxRunSecs: typeof cfg.max_run_secs === 'number' ? cfg.max_run_secs : undefined,
+    maxEventsPerRun:
+      typeof cfg.max_events_per_run === 'number' ? cfg.max_events_per_run : undefined,
+    maxBytesPerRun:
+      typeof cfg.max_bytes_per_run === 'number' ? cfg.max_bytes_per_run : undefined,
   };
 }
 
@@ -160,6 +244,68 @@ export class IntegrationsApi {
   async listInstances(slug?: string): Promise<ListInstancesResponse> {
     const qs = slug ? `?slug=${encodeURIComponent(slug)}` : '';
     return this.request<ListInstancesResponse>(`/api/integrations/instances${qs}`);
+  }
+
+  async validateCustomCollector(
+    request: CustomCollectorDefinitionRequest,
+  ): Promise<CustomCollectorValidationResponse> {
+    return this.request<CustomCollectorValidationResponse>(
+      '/api/integrations/custom/validate',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(request),
+      },
+    );
+  }
+
+  async previewCustomCollector(
+    request: CustomCollectorPreviewRequest,
+  ): Promise<CustomCollectorPreviewResponse> {
+    return this.request<CustomCollectorPreviewResponse>(
+      '/api/integrations/custom/preview',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(request),
+      },
+    );
+  }
+
+  async createCustomCollector(
+    request: CustomCollectorDefinitionRequest,
+  ): Promise<CustomCollectorDefinition> {
+    return this.request<CustomCollectorDefinition>('/api/integrations/custom', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+  }
+
+  async getCustomCollector(id: string): Promise<CustomCollectorDefinition> {
+    return this.request<CustomCollectorDefinition>(
+      `/api/integrations/custom/${encodeURIComponent(id)}`,
+    );
+  }
+
+  async updateCustomCollector(
+    id: string,
+    request: CustomCollectorDefinitionRequest,
+  ): Promise<CustomCollectorDefinition> {
+    return this.request<CustomCollectorDefinition>(
+      `/api/integrations/custom/${encodeURIComponent(id)}`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(request),
+      },
+    );
+  }
+
+  async deleteCustomCollector(id: string): Promise<void> {
+    return this.request<void>(`/api/integrations/custom/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    });
   }
 
   async getInstance(id: string): Promise<IntegrationInstance> {

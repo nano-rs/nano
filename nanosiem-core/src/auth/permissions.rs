@@ -128,6 +128,10 @@ pub const PREVALENCE_EXPORT: &str = "prevalence:export";
 // Notification permissions
 pub const NOTIFICATIONS_VIEW: &str = "notifications:view";
 
+// System health event bus permissions
+pub const SYSTEM_HEALTH_VIEW: &str = "system_health:view";
+pub const SYSTEM_HEALTH_MANAGE: &str = "system_health:manage";
+
 // Settings permissions
 pub const SETTINGS_VIEW: &str = "settings:view";
 pub const SETTINGS_SYSTEM: &str = "settings:system";
@@ -378,6 +382,9 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     PREVALENCE_EXPORT,
     // Notifications
     NOTIFICATIONS_VIEW,
+    // System health
+    SYSTEM_HEALTH_VIEW,
+    SYSTEM_HEALTH_MANAGE,
     // Settings
     SETTINGS_VIEW,
     SETTINGS_SYSTEM,
@@ -555,6 +562,7 @@ pub const CATEGORIES: &[&str] = &[
     "lookup",
     "upload",
     "notifications",
+    "system_health",
     "risk",
     "prevalence",
     "settings",

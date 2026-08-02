@@ -25,6 +25,7 @@ const CATEGORY_LABEL: Record<string, string> = {
   data: 'Data',
   agent: 'Agent',
   identity: 'Identity',
+  collector: 'Collector',
   security: 'Security',
 };
 

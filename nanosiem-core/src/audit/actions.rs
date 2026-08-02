@@ -356,6 +356,14 @@ pub const INTEGRATION_INSTANCE_UPDATED: &str = "integration_instance_updated";
 pub const INTEGRATION_INSTANCE_DELETED: &str = "integration_instance_deleted";
 /// A collector run was triggered by hand rather than by the scheduler
 pub const INTEGRATION_RUN_TRIGGERED: &str = "integration_run_triggered";
+/// A user-authored scheduled API collector definition was published
+pub const CUSTOM_INTEGRATION_CREATED: &str = "custom_integration_created";
+/// A user-authored scheduled API collector definition changed
+pub const CUSTOM_INTEGRATION_UPDATED: &str = "custom_integration_updated";
+/// A user-authored scheduled API collector definition was deleted
+pub const CUSTOM_INTEGRATION_DELETED: &str = "custom_integration_deleted";
+/// User-authored collector code was exercised against transient test values
+pub const CUSTOM_INTEGRATION_PREVIEWED: &str = "custom_integration_previewed";
 
 // =============================================================================
 // Hunt Actions (NAN-2238)
@@ -693,6 +701,11 @@ pub const AVAILABLE_MODEL_DELETED: &str = "available_model_deleted";
 pub const MODEL_CATALOG_SYNCED: &str = "model_catalog_synced";
 /// Webhook was tested
 pub const WEBHOOK_TESTED: &str = "webhook_tested";
+
+/// A system-health lifecycle was acknowledged by an owner.
+pub const SYSTEM_HEALTH_ACKNOWLEDGED: &str = "system_health_acknowledged";
+/// A system-health lifecycle was manually resolved by an owner.
+pub const SYSTEM_HEALTH_RESOLVED: &str = "system_health_resolved";
 /// Organization tier was changed
 pub const TIER_UPDATED: &str = "tier_updated";
 /// Tier limits were customized

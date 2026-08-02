@@ -1494,6 +1494,24 @@ pub fn create_router(state: AppState) -> Router {
     {
         app = app
             .route(
+                "/api/integrations/custom/validate",
+                post(handlers::integrations::validate_custom_collector),
+            )
+            .route(
+                "/api/integrations/custom/preview",
+                post(handlers::integrations::preview_custom_collector),
+            )
+            .route(
+                "/api/integrations/custom",
+                post(handlers::integrations::create_custom_collector),
+            )
+            .route(
+                "/api/integrations/custom/{id}",
+                get(handlers::integrations::get_custom_collector)
+                    .put(handlers::integrations::update_custom_collector)
+                    .delete(handlers::integrations::delete_custom_collector),
+            )
+            .route(
                 "/api/integrations/instances",
                 get(handlers::integrations::list_instances)
                     .post(handlers::integrations::create_instance),
@@ -2711,6 +2729,27 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/siem-health/findings/suppressions/{id}",
             axum::routing::delete(handlers::siem_health_suppressions::deactivate_suppression),
+        )
+        // Normalized, owner-visible system health lifecycles and durable delivery.
+        .route(
+            "/api/system-health/events",
+            get(handlers::system_health_events::list_health_events),
+        )
+        .route(
+            "/api/system-health/summary",
+            get(handlers::system_health_events::get_health_summary),
+        )
+        .route(
+            "/api/system-health/events/{id}/acknowledge",
+            post(handlers::system_health_events::acknowledge_health_event),
+        )
+        .route(
+            "/api/system-health/events/{id}/resolve",
+            post(handlers::system_health_events::resolve_health_event),
+        )
+        .route(
+            "/api/system-health/events/{id}/deliveries",
+            get(handlers::system_health_events::list_health_deliveries),
         )
         // Observability console SLOs (NAN-1536) — PG-backed definitions,
         // attainment computed on read from otel_spans.

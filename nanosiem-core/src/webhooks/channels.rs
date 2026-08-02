@@ -71,7 +71,10 @@ impl ChannelType {
     /// webhook, generic endpoint). PagerDuty's URL is fixed server-side; email
     /// has no URL.
     pub fn user_supplies_url(&self) -> bool {
-        matches!(self, ChannelType::Generic | ChannelType::Slack | ChannelType::Teams)
+        matches!(
+            self,
+            ChannelType::Generic | ChannelType::Slack | ChannelType::Teams
+        )
     }
 
     /// Whether the operator must supply a secret at create time (PagerDuty
@@ -132,9 +135,9 @@ pub fn build_channel_body(
             }
             body(PagerDutyFormatter.format(payload, ctx))
         }
-        ChannelType::Email => Err(
-            "email/SMTP channel delivery is not yet wired (formatter seam only)".to_string(),
-        ),
+        ChannelType::Email => {
+            Err("email/SMTP channel delivery is not yet wired (formatter seam only)".to_string())
+        }
     }
 }
 
@@ -283,11 +286,28 @@ impl ChannelFormatter for SlackFormatter {
                 "text": { "type": "plain_text", "text": truncate(&title, 150), "emoji": true }
             }),
             json!({ "type": "section", "fields": fields }),
-            json!({
-                "type": "context",
-                "elements": [ { "type": "mrkdwn", "text": format!("nano · {}", payload.created_at.to_rfc3339()) } ]
-            }),
         ];
+
+        if let Some(summary) = payload.health_summary.as_deref().filter(|s| !s.is_empty()) {
+            blocks.push(json!({
+                "type": "section",
+                "text": { "type": "mrkdwn", "text": truncate(summary, 2800) }
+            }));
+        }
+        if let Some(remediation) = payload
+            .health_remediation
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            blocks.push(json!({
+                "type": "section",
+                "text": { "type": "mrkdwn", "text": format!("*Suggested action*\n{}", truncate(remediation, 2700)) }
+            }));
+        }
+        blocks.push(json!({
+            "type": "context",
+            "elements": [ { "type": "mrkdwn", "text": format!("nano · {}", payload.created_at.to_rfc3339()) } ]
+        }));
 
         if let Some(link) = payload.link_url.as_deref().filter(|s| !s.is_empty()) {
             blocks.push(json!({
@@ -384,7 +404,7 @@ impl ChannelFormatter for TeamsFormatter {
         }
         facts.push(json!({ "title": "Time", "value": payload.created_at.to_rfc3339() }));
 
-        let body = vec![
+        let mut body = vec![
             json!({
                 "type": "TextBlock",
                 "text": title,
@@ -395,6 +415,23 @@ impl ChannelFormatter for TeamsFormatter {
             }),
             json!({ "type": "FactSet", "facts": facts }),
         ];
+        if let Some(summary) = payload.health_summary.as_deref().filter(|s| !s.is_empty()) {
+            body.push(json!({
+                "type": "TextBlock", "text": truncate(summary, 3000), "wrap": true
+            }));
+        }
+        if let Some(remediation) = payload
+            .health_remediation
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            body.push(json!({
+                "type": "TextBlock",
+                "text": format!("Suggested action: {}", truncate(remediation, 2800)),
+                "wrap": true,
+                "isSubtle": true
+            }));
+        }
 
         let mut actions = Vec::new();
         if let Some(link) = payload.link_url.as_deref().filter(|s| !s.is_empty()) {
@@ -509,10 +546,28 @@ impl ChannelFormatter for PagerDutyFormatter {
         if let Some(link) = &payload.link_url {
             custom.insert("link_url".into(), json!(link));
         }
+        if let Some(category) = &payload.health_category {
+            custom.insert("health_category".into(), json!(category));
+        }
+        if let Some(status) = &payload.health_status {
+            custom.insert("health_status".into(), json!(status));
+        }
+        if let Some(summary) = &payload.health_summary {
+            custom.insert("health_summary".into(), json!(summary));
+        }
+        if let Some(resource_type) = &payload.health_resource_type {
+            custom.insert("health_resource_type".into(), json!(resource_type));
+        }
+        if let Some(resource_id) = &payload.health_resource_id {
+            custom.insert("health_resource_id".into(), json!(resource_id));
+        }
+        if let Some(remediation) = &payload.health_remediation {
+            custom.insert("health_remediation".into(), json!(remediation));
+        }
 
         let mut event = json!({
             "routing_key": ctx.routing_key.unwrap_or_default(),
-            "event_action": "trigger",
+            "event_action": if payload.health_status.as_deref() == Some("resolved") { "resolve" } else { "trigger" },
             "payload": {
                 "summary": summary,
                 "severity": pagerduty_severity(severity),
@@ -532,7 +587,9 @@ impl ChannelFormatter for PagerDutyFormatter {
         //   - none for rule-less non-test events (e.g. case events): PagerDuty
         //     auto-generates a unique key so each is its own incident, rather
         //     than every case event collapsing into one.
-        let dedup_key = if let Some(alert_id) = payload.alert_id {
+        let dedup_key = if let Some(health_event_id) = payload.health_event_id {
+            Some(format!("nano-health-{health_event_id}"))
+        } else if let Some(alert_id) = payload.alert_id {
             Some(typeid::encode(typeid::alert::PREFIX, &alert_id))
         } else if payload.event_type == "webhook.test" {
             Some("nano-test".to_string())

@@ -64,6 +64,218 @@ pub(crate) fn resolve_subsearch_limit(maxout: Option<usize>) -> usize {
         .min(SUBSEARCH_RESULT_LIMIT_MAX)
 }
 
+/// What the generator knows about the CTE feeding a command stage.
+///
+/// Generator CTEs are ordinary (non-materialized) CTEs: ClickHouse re-executes
+/// every reference independently. So any rewrite that references its source
+/// MORE THAN ONCE is only sound when re-executing that source yields the same
+/// rows — otherwise the two references silently see different data.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SourceStability {
+    /// `source` is the deterministic base scan: `stage_0`, no requery command
+    /// injected an `ORDER BY … LIMIT` into it. The dedup survivor-id rewrite
+    /// needs this stronger property — it scans the source twice AND assumes a
+    /// plain base projection (NAN-1636).
+    pub deterministic_base: bool,
+    /// Re-executing `source` yields the same ROW SET. False once any upstream
+    /// stage picks an arbitrary bounded subset (`head`, `tail`, `sort N`,
+    /// `sample`, `top`/`rare`, a LIMITed subsearch, a requery-limited base) —
+    /// see [`command_preserves_row_stability`] (NAN-2265).
+    pub rows_stable: bool,
+    /// Escape hatch for an UNSTABLE source: `Some` when the instability is
+    /// only a trailing run of pure row-subset selectors (`head` / `tail` /
+    /// `sort N` / `sample`) over identity-carrying rows — see
+    /// [`ClickHouseSqlGenerator::snapshot_refetch_plan`]. The eventstats /
+    /// anomaly attach then replaces the unstable source with its
+    /// deterministic id-closure (`FROM <ancestor> WHERE <sid> IN <ids pinned
+    /// once via the scalar cache>` — `snapshot_closure_source_sql`), which
+    /// the bounded NAN-1642 map/scalar attach applies to verbatim, instead of
+    /// falling back to the whole-partition window that re-buffers every wide
+    /// row. Measured on Saturn (24h / 21.9M rows, wide `SELECT *` terminal,
+    /// 3 GiB/query cap, max_threads=4, real generated SQL both sides), peak
+    /// memory for `head N | eventstats avg(bytes_out) by dest_ip`, closure vs
+    /// window: 20k → 131 MiB vs 491 MiB; 200k → 0.92–1.01 GiB vs 1.74–1.78
+    /// GiB; 500k → 2.03–2.29 GiB vs **Code 241 (both runs)**; 1M → 2.58 GiB
+    /// — at the plain-`head` pipeline floor (~2.5 GiB), where the window is
+    /// long dead (NAN-2265).
+    pub snapshot_refetch: Option<SnapshotRefetch>,
+}
+
+/// The two ingredients of the snapshot id-closure shape (NAN-2265): the last
+/// row-stable CTE to re-read, and the row-identity column whose pinned values
+/// select the closure. `sid` is a CONTENT hash on the ingest path (NAN-2264),
+/// so the closure may contain content-twin copies beyond the selector's bound
+/// — the emitted rows and the attached aggregates always come from the same
+/// deterministic set either way.
+#[derive(Clone, Debug)]
+pub(crate) struct SnapshotRefetch {
+    /// Name of the last row-stable CTE (`stage_<j>`). Re-executing it yields
+    /// the same row set, so `FROM <ancestor> WHERE <sid> IN <pinned ids>` is
+    /// a deterministic stand-in for the selector chain's sample.
+    pub ancestor: String,
+    /// The row-identity column (`id` for logs, `span_id` for spans).
+    pub sid: &'static str,
+}
+
+/// Whether `cmd` hands its downstream stages the same ROW SET on every
+/// re-execution, given a stable input (NAN-2265).
+///
+/// `false` for the commands that select an arbitrary bounded subset: their
+/// `LIMIT` has no total order to break ties, so two executions of the same CTE
+/// can emit different rows. Exhaustive on purpose — a new command must make
+/// this call explicitly rather than inherit "stable" from a `_` arm.
+fn command_preserves_row_stability(cmd: &Command) -> bool {
+    match cmd {
+        // Arbitrary bounded subsets: an unordered `LIMIT` (head), a partially
+        // ordered one (tail / sort N / top / rare — ties at the cut are broken
+        // by whichever thread got there first), or an explicitly random one
+        // (sample). `head` is the analyst-facing case from NAN-2265.
+        Command::Head { .. }
+        | Command::Tail { .. }
+        | Command::Sample { .. }
+        | Command::Top { .. }
+        | Command::Rare { .. } => false,
+        Command::Sort { limit, .. } => limit.is_none(),
+        // `timechart … limit=N` keeps the top N split-by SERIES by total, so
+        // series tied on the cut are picked arbitrarily. Unlimited timechart is
+        // a plain GROUP BY over a stable input.
+        Command::Timechart { limit, .. } => limit.is_none(),
+        // Subsearch arms carry their own unordered `LIMIT maxout`, so which
+        // rows they contribute (and, for join, which main-side rows survive)
+        // can differ per execution. Note these are the one unstable case whose
+        // ROW COUNT is not itself bounded — the main arm is whatever the
+        // pipeline produced — so the eventstats/anomaly window fallback can
+        // buffer a large partition here. Correctness wins: a Code 241 is loud,
+        // a mis-attached aggregate is silent.
+        Command::Join { .. } | Command::Append { .. } => false,
+        // Re-query commands: the base CTE gets an injected `ORDER BY … LIMIT`
+        // (see `has_requery_command`), and their own output is assembled in
+        // Rust post-processing.
+        Command::Asset { .. }
+        | Command::Tree { .. }
+        | Command::Cloud { .. }
+        | Command::Baseline { .. }
+        | Command::Lateral { .. }
+        // Rows come from an external service capped at max_rows.
+        | Command::InputLookup { .. }
+        | Command::Ai { .. } => false,
+        // Row-set preserving (projections, filters, per-row enrichment) or
+        // group-determined (GROUP BY over a stable input yields the same
+        // groups). `dedup` keeps one row per key group: the row COUNT is
+        // stable and only a timestamp TIE can swap which member survives —
+        // already arbitrary in both dedup shapes — so it is not treated as a
+        // subset selector here. Gating on it would send the common
+        // `dedup | eventstats` pipeline back to the whole-partition window
+        // over an unbounded row set, i.e. the OOM class NAN-1642 removed.
+        Command::Stats { .. }
+        | Command::Chart { .. }
+        | Command::StreamStats { .. }
+        | Command::Where { .. }
+        | Command::Table { .. }
+        | Command::Rename { .. }
+        | Command::Lookup { .. }
+        | Command::Eval { .. }
+        | Command::Dedup { .. }
+        | Command::Bin { .. }
+        | Command::Rex { .. }
+        | Command::Fields { .. }
+        | Command::Transaction { .. }
+        | Command::Fillnull { .. }
+        | Command::Mvexpand { .. }
+        | Command::Spath { .. }
+        | Command::Format { .. }
+        | Command::Return { .. }
+        | Command::Risk { .. }
+        | Command::Prevalence { .. }
+        | Command::Reverse
+        | Command::EventStats { .. }
+        | Command::Sequence { .. }
+        | Command::Funnel { .. }
+        | Command::Anomaly { .. }
+        | Command::ResolveIdentity { .. }
+        // Markers that short-circuit to a curated surface or are pure
+        // pass-throughs in SQL generation.
+        | Command::Output { .. }
+        | Command::Services
+        | Command::Service { .. }
+        | Command::Trace { .. }
+        | Command::Metric { .. }
+        | Command::Retro { .. } => true,
+    }
+}
+
+/// Whether `cmd` merely SELECTS A SUBSET of its input rows, passing every
+/// selected row through byte-identical — `SELECT * FROM src [ORDER BY …]
+/// LIMIT n` shapes with no aggregation, projection, or row synthesis
+/// (NAN-2265).
+///
+/// These are the stages the eventstats / anomaly snapshot-refetch can rewind
+/// through: because each selected row IS a row of the stable ancestor,
+/// re-reading the ancestor filtered to the snapshotted row ids reproduces
+/// exactly the rows the selector chain emitted. `top` / `rare` /
+/// `timechart limit=N` are unstable but NOT selectors — they emit aggregated
+/// rows, so their fallback window buffers narrow aggregates, not the raw-row
+/// OOM class this shape exists to avoid.
+fn command_is_row_subset_selector(cmd: &Command) -> bool {
+    match cmd {
+        Command::Head { .. } | Command::Tail { .. } | Command::Sample { .. } => true,
+        Command::Sort { limit, .. } => limit.is_some(),
+        _ => false,
+    }
+}
+
+/// Whether `cmd` preserves the ROW IDENTITY of its input: every output row is
+/// exactly one input row (no aggregation, no row synthesis or duplication)
+/// still carrying the untouched `sid` column (NAN-2265).
+///
+/// Row-stability is NOT enough for the snapshot id-closure ancestor: `stats`
+/// is row-stable but its output rows have no `id` at all (UNKNOWN_IDENTIFIER
+/// in the closure), and `mvexpand` multiplies rows per id. Conservative
+/// allowlist: a command not listed keeps the window fallback (correct, just
+/// heavier); add it here once its identity behavior is reasoned through.
+fn command_preserves_row_identity(cmd: &Command, sid: &str) -> bool {
+    match cmd {
+        // Per-row filters/enrichers/annotators: one output row per input row
+        // (or a subset), `SELECT *`-style so the id column passes through.
+        Command::Where { .. }
+        | Command::Lookup { .. }
+        | Command::Rex { .. }
+        | Command::Bin { .. }
+        | Command::Fillnull { .. }
+        | Command::Spath { .. }
+        | Command::Risk { .. }
+        | Command::Prevalence { .. }
+        | Command::Reverse
+        | Command::Dedup { .. }
+        | Command::EventStats { .. }
+        | Command::StreamStats { .. }
+        | Command::ResolveIdentity { .. }
+        | Command::Anomaly { .. } => true,
+        // Full sort (no limit) reorders only; a LIMITed sort is a selector,
+        // handled by `command_is_row_subset_selector`.
+        Command::Sort { limit, .. } => limit.is_none(),
+        // Eval keeps every row; an `eval id=…` reassignment is caught by the
+        // caller's `is_upstream_computed_field(sid)` guard.
+        Command::Eval { .. } => true,
+        // Keep-mode projections update `available_columns`, which the caller
+        // checks for `sid` — the projection itself is one-row-per-row.
+        Command::Table { .. } | Command::Fields { keep: true, .. } => true,
+        // Exclude-mode can drop the id column (`fields - id`); renames can
+        // alias it away. Allowed only when they provably don't touch it.
+        Command::Fields {
+            keep: false,
+            fields,
+        } => !fields.iter().any(|f| f.eq_ignore_ascii_case(sid)),
+        Command::Rename { mappings } => !mappings
+            .iter()
+            .any(|m| m.from.eq_ignore_ascii_case(sid) || m.to.eq_ignore_ascii_case(sid)),
+        // Everything else aggregates, duplicates, or synthesizes rows
+        // (stats/chart/timechart/top/rare/transaction/sequence/funnel/
+        // mvexpand/format/return/…): no physical row identity survives.
+        _ => false,
+    }
+}
+
 /// Explicit columns in the hybrid schema (stored as direct columns with bloom filters)
 /// All other UDM fields are stored in the `ext` JSON column (extended fields)
 ///
@@ -1428,11 +1640,15 @@ impl ClickHouseSqlGenerator {
     }
 
     /// The physical per-row identity column for the active dataset (NAN-1721 /
-    /// O27) — the deterministic tie-break in window `ORDER BY` clauses and the
-    /// `dedup` survivor key. `id` on logs (UDM/OCSF), `span_id` on spans; `None`
-    /// for a profile with no unique per-row id (metrics), where callers drop the
-    /// tie-break / fall back to the sort-based shape. Keyed off `core_fields` so
-    /// it stays in lock-step with the profile's own identity contract.
+    /// O27) — the deterministic tie-break in window `ORDER BY` clauses. `id` on
+    /// logs (UDM/OCSF), `span_id` on spans; `None` for a profile with no unique
+    /// per-row id (metrics), where callers drop the tie-break / fall back to the
+    /// sort-based shape. Keyed off `core_fields` so it stays in lock-step with
+    /// the profile's own identity contract.
+    ///
+    /// NOT a de-duplication key: on logs `id` is a CONTENT hash, so
+    /// content-identical rows share one (NAN-2264). `dedup` consults this only
+    /// to recognise a physical row scan, never to elect a survivor.
     pub(crate) fn row_identity_column(&self) -> Option<&'static str> {
         if self.profile.core_fields().contains(&"id") {
             Some("id")
@@ -1441,6 +1657,77 @@ impl ClickHouseSqlGenerator {
         } else {
             None
         }
+    }
+
+    /// NAN-2265: plan the snapshot id-closure rewrite for an UNSTABLE command
+    /// stage source, or `None` when the guards fail (callers then fall back to
+    /// the single-scan window shape).
+    ///
+    /// Applicable when the prefix decomposes into `stage_0 … stage_j` all
+    /// row-stable AND row-identity-preserving, followed by a non-empty run of
+    /// pure row-subset selectors (`head` / `tail` / `sort N` / `sample`) —
+    /// and the row-identity column still exists at the source. The attach
+    /// then pins the selector output's ids ONCE (scalar-subquery cache: one
+    /// evaluation per query, `ScalarSubqueriesCacheMiss = 1`) and swaps the
+    /// unstable source for `stage_j WHERE id IN <pinned ids>` — a
+    /// deterministic set every reference reads identically, so the bounded
+    /// map/scalar attach applies to it unchanged.
+    fn snapshot_refetch_plan(
+        &self,
+        prior_stages: &[QueryStage],
+        base_is_deterministic: bool,
+        available_columns: &Option<HashSet<String>>,
+    ) -> Option<SnapshotRefetch> {
+        if !base_is_deterministic || !matches!(prior_stages.first(), Some(QueryStage::Search(_))) {
+            return None;
+        }
+        let sid = self.row_identity_column()?;
+        // The id must still exist at the source (an include-mode `fields` /
+        // `table` prunes it) and must be the physical row identity, not an
+        // upstream `eval id=…` reassignment. Selectors neither prune nor
+        // compute columns, so a check at the source covers the ancestor too.
+        if self.is_upstream_computed_field(sid) {
+            return None;
+        }
+        if let Some(cols) = available_columns {
+            if !cols.contains(sid) {
+                return None;
+            }
+        }
+        // `stage_1..=stage_j` is the maximal contiguous prefix that is BOTH
+        // row-stable (re-reading it yields the same rows) and row-identity
+        // preserving (its rows still ARE base rows, one per id) — `stats` is
+        // stable but emits id-less aggregate rows, `mvexpand` duplicates ids;
+        // an id-filtered re-read of either cannot reproduce a sample.
+        let mut j = 0usize;
+        for (idx, stage) in prior_stages.iter().enumerate().skip(1) {
+            match stage {
+                QueryStage::Command(c)
+                    if command_preserves_row_stability(c)
+                        && command_preserves_row_identity(c, sid) =>
+                {
+                    j = idx
+                }
+                _ => break,
+            }
+        }
+        // The remainder must be a non-empty run of pure row-subset selectors:
+        // anything else (top/rare/timechart-limit output, join/append, a stage
+        // sandwiched behind a selector) cannot be reproduced by an id-filtered
+        // re-read of the ancestor.
+        if j + 1 >= prior_stages.len() {
+            return None;
+        }
+        for stage in &prior_stages[j + 1..] {
+            match stage {
+                QueryStage::Command(c) if command_is_row_subset_selector(c) => {}
+                _ => return None,
+            }
+        }
+        Some(SnapshotRefetch {
+            ancestor: format!("stage_{}", j),
+            sid,
+        })
     }
 
     // Phase 2b: route the storage binding (table name / timestamp expression)
@@ -2377,21 +2664,48 @@ impl ClickHouseSqlGenerator {
                         }
                         _ => {}
                     }
-                    // The dedup survivor-id rewrite (commands.rs) scans its source
+                    // The sort-free dedup rewrite (commands.rs) scans its source
                     // CTE twice — only sound when that source is the deterministic
                     // base scan: stage_0, and no requery command (asset/tree/cloud)
                     // injected `ORDER BY … LIMIT` into it (a bounded top-N samples
                     // tie rows nondeterministically per scan).
-                    let source_is_deterministic_base = i == 1
-                        && !has_requery_command
-                        && matches!(stages[0], QueryStage::Search(_));
+                    let base_is_deterministic =
+                        !has_requery_command && matches!(stages[0], QueryStage::Search(_));
+                    // NAN-2265: the eventstats / anomaly map-scalar attach also
+                    // references its source twice (once to build the constants,
+                    // once to emit the rows they are attached to). It needs the
+                    // weaker property — same row set per execution — which the
+                    // whole prefix must satisfy, not just stage_0.
+                    let rows_stable = base_is_deterministic
+                        && stages[1..i].iter().all(|s| match s {
+                            QueryStage::Search(_) => false,
+                            QueryStage::Command(c) => command_preserves_row_stability(c),
+                        });
+                    // Unstable source: offer the snapshot-refetch escape hatch
+                    // when the instability is only a trailing selector run —
+                    // eventstats / numeric-anomaly then pin the subset once
+                    // instead of re-buffering wide rows in a window.
+                    let snapshot_refetch = if rows_stable {
+                        None
+                    } else {
+                        self.snapshot_refetch_plan(
+                            &stages[..i],
+                            base_is_deterministic,
+                            &ctx.available_columns,
+                        )
+                    };
+                    let stability = SourceStability {
+                        deterministic_base: i == 1 && base_is_deterministic,
+                        rows_stable,
+                        snapshot_refetch,
+                    };
                     let cte = self.generate_command_cte(
                         &cte_name,
                         &prev_cte,
                         cmd,
                         ctx,
                         &stages[..i],
-                        source_is_deterministic_base,
+                        stability,
                     )?;
                     // This stage's value-computed outputs (rex captures, eval
                     // assignments, …) shadow schema fields / UDM aliases for
@@ -2435,6 +2749,22 @@ impl ClickHouseSqlGenerator {
             settings.push_str(
                 ", allow_suspicious_types_in_order_by=1, allow_suspicious_types_in_group_by=1",
             );
+        }
+        // NAN-2274: the analyzer evaluates the NAN-1642 group-agg map scalars
+        // during analysis and folds the result into the plan as a literal map —
+        // one entry per group key (230k on the incident query). On CH ≥26.4,
+        // skip-index condition building (MergeTreeIndexConditionBloomFilter →
+        // tryMatchJSONSubcolumnToIndex) effectively never terminates traversing
+        // a condition tree carrying such a map, and planning never checks the
+        // cancel flag — max_execution_time fires but is ignored, KILL QUERY is
+        // ignored, and an HTTPHandler thread burns a full core until the server
+        // is restarted (reproduced on 26.4.3 and 26.7.1). Skip indexes are pure
+        // granule pruning — disabling them cannot change results — and these
+        // pipelines filter on the (source_type, timestamp) primary key, which
+        // this setting does not touch: the incident query went from
+        // wedged-forever to 16s with identical output.
+        if commands_advanced::emits_group_agg_map(&sql) {
+            settings.push_str(", use_skip_indexes=0");
         }
 
         // NAN-876: stage_0 preserves the physical `action` column for
@@ -2501,9 +2831,10 @@ impl ClickHouseSqlGenerator {
         cmd: &Command,
         ctx: &mut GeneratorContext,
         prior_stages: &[QueryStage],
-        // Whether `source_cte` is the deterministic base scan — see the dedup
-        // survivor-id rewrite guards (NAN-1636).
-        source_is_deterministic_base: bool,
+        // What re-executing `source_cte` is guaranteed to yield — see the dedup
+        // survivor-id rewrite guards (NAN-1636) and the eventstats / anomaly
+        // attach guard (NAN-2265).
+        stability: SourceStability,
     ) -> Result<String, SqlGenError> {
         // Handle join specially since it needs to generate subsearch SQL
         if let Command::Join {
@@ -2539,8 +2870,7 @@ impl ClickHouseSqlGenerator {
             return Ok(format!("{} AS (\n{}\n)", cte_name, inner_sql));
         }
 
-        let inner_sql =
-            self.generate_command_sql_with_ctx(source_cte, cmd, ctx, source_is_deterministic_base)?;
+        let inner_sql = self.generate_command_sql_with_ctx(source_cte, cmd, ctx, stability)?;
         Ok(format!("{} AS (\n{}\n)", cte_name, inner_sql))
     }
 
@@ -3272,7 +3602,27 @@ impl ClickHouseSqlGenerator {
                     }
                     // Use previous result as source, wrapped in parentheses with alias
                     let source = format!("({}) AS stage_{}", current_sql, i - 1);
-                    let cmd_sql = self.generate_command_sql(&source, cmd)?;
+                    // A subsearch stage source is an inline subquery, textually
+                    // duplicated by any twice-scanning rewrite — so the same
+                    // row-stability rule applies as for CTE stages (NAN-2265).
+                    // The multi-stage subsearch base carries no LIMIT (the
+                    // subsearch bound is applied to the finished body), so the
+                    // prefix decides. `deterministic_base` stays false: this is
+                    // never the base CTE scan the dedup rewrite requires.
+                    let stability = SourceStability {
+                        deterministic_base: false,
+                        rows_stable: matches!(stages[0], QueryStage::Search(_))
+                            && stages[1..i].iter().all(|s| match s {
+                                QueryStage::Search(_) => false,
+                                QueryStage::Command(c) => command_preserves_row_stability(c),
+                            }),
+                        // Subsearch stages are nested inline subqueries, not
+                        // named CTEs — there is no ancestor CTE name for the
+                        // snapshot-refetch to re-read, so an unstable subsearch
+                        // prefix keeps the single-scan window fallback.
+                        snapshot_refetch: None,
+                    };
+                    let cmd_sql = self.generate_command_sql_with_stability(&source, cmd, stability)?;
                     // Track this subsearch stage's value-computed outputs for
                     // the subsearch stages after it (NAN-1341).
                     self.note_upstream_computed(cmd);
@@ -3607,12 +3957,28 @@ impl ClickHouseSqlGenerator {
     }
 
     /// Generate SQL for a command (public API without context tracking).
-    /// Callers here (subsearch nesting, prevalence re-embedding) never hand the
-    /// deterministic base scan as `source`, so the dedup survivor-id rewrite
-    /// stays off — they keep the legacy `LIMIT 1 BY` shape (NAN-1636).
+    /// Callers here (subsearch nesting, prevalence re-embedding) hand an
+    /// arbitrary — often `LIMIT`-bounded — subquery as `source` and cannot
+    /// vouch for what re-executing it yields, so every source-scanned-twice
+    /// rewrite stays off: dedup keeps the legacy single-scan `ORDER BY <keys>,
+    /// <time> LIMIT 1 BY <keys>` shape (NAN-1636, corrected by NAN-2264) and
+    /// eventstats / anomaly keep the single-scan window shape (NAN-2265).
     pub fn generate_command_sql(&self, source: &str, cmd: &Command) -> Result<String, SqlGenError> {
+        self.generate_command_sql_with_stability(source, cmd, SourceStability::default())
+    }
+
+    /// [`Self::generate_command_sql`] for callers that CAN vouch for what
+    /// re-executing `source` yields (the subsearch stage chain, NAN-2265).
+    fn generate_command_sql_with_stability(
+        &self,
+        source: &str,
+        cmd: &Command,
+        stability: SourceStability,
+    ) -> Result<String, SqlGenError> {
         let mut no_ctx: Option<HashSet<String>> = None;
-        self.generate_command_sql_inner(source, cmd, &mut no_ctx, None, false, false, false, false)
+        self.generate_command_sql_inner(
+            source, cmd, &mut no_ctx, None, false, false, false, stability,
+        )
     }
 
     fn generate_command_sql_with_ctx(
@@ -3620,7 +3986,7 @@ impl ClickHouseSqlGenerator {
         source: &str,
         cmd: &Command,
         ctx: &mut GeneratorContext,
-        source_is_deterministic_base: bool,
+        stability: SourceStability,
     ) -> Result<String, SqlGenError> {
         let sparkline_span = Self::compute_sparkline_span_secs(ctx.time_range);
         let has_prior_risk = ctx.has_prior_risk;
@@ -3632,7 +3998,7 @@ impl ClickHouseSqlGenerator {
             has_prior_risk,
             ctx.aggregated,
             ctx.single_resolve_identity,
-            source_is_deterministic_base,
+            stability,
         );
         if matches!(cmd, Command::Risk { .. }) {
             ctx.has_prior_risk = true;

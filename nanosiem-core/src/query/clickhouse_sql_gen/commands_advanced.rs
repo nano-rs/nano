@@ -6,7 +6,7 @@
 //! Sequence, Funnel, Anomaly, Tree, Asset, Cloud.
 
 use super::helpers::*;
-use super::{extract_fields_from_search_expr, ClickHouseSqlGenerator};
+use super::{extract_fields_from_search_expr, ClickHouseSqlGenerator, SourceStability};
 use crate::query::ast::*;
 use crate::query::sql_gen::SqlGenError;
 
@@ -51,7 +51,14 @@ fn null_canonical_key_sql(key_exprs: &[String]) -> String {
 /// (NAN-1642: 24h/21.4M rows in 1.9s/155MiB where both the window and a LEFT
 /// JOIN join-back OOM — the JOIN defeats ClickHouse lazy materialization).
 /// The scalar is evaluated once per query (ClickHouse scalar-subquery cache).
-fn group_agg_map_sql(build_key_sql: &str, value_sql: &str, stats_source: &str) -> String {
+///
+/// It is also a SECOND reference to `stats_source`, so callers must only use it
+/// when re-executing that source yields the same rows (NAN-2265).
+pub(super) fn group_agg_map_sql(
+    build_key_sql: &str,
+    value_sql: &str,
+    stats_source: &str,
+) -> String {
     format!(
         "(SELECT mapFromArrays(groupArray(__nano_k), groupArray(__nano_v)) FROM \
          (SELECT {} AS __nano_k, {} AS __nano_v FROM {} GROUP BY __nano_k))",
@@ -59,18 +66,114 @@ fn group_agg_map_sql(build_key_sql: &str, value_sql: &str, stats_source: &str) -
     )
 }
 
+/// True when `sql` contains a [`group_agg_map_sql`] emission. The settings
+/// emitter keys the NAN-2274 `use_skip_indexes=0` guard off the emitted
+/// construct rather than a command allow-list, so any future map-emitting
+/// stage inherits the guard automatically. `__nano_` is codegen-private
+/// vocabulary, so the substring can only come from this generator (a user
+/// literal containing it would over-match, which is harmless). Must stay in
+/// sync with the format string above — guarded by
+/// `group_agg_map_marker_stays_in_sync`.
+pub(super) fn emits_group_agg_map(sql: &str) -> bool {
+    sql.contains("mapFromArrays(groupArray(__nano_k)")
+}
+
+/// The snapshot id-closure source (NAN-2265): a deterministic stand-in for an
+/// UNSTABLE selector-run source.
+///
+/// The inner scalar `(SELECT groupArray(<sid>) FROM <source>)` references the
+/// unstable stage EXACTLY ONCE — the scalar-subquery cache evaluates it once
+/// per query however many times the identical text recurs (measured:
+/// `ScalarSubqueriesCacheMiss` = 1 for it, cache hits for every re-use). The
+/// wrapper then re-reads the last row-STABLE CTE filtered to those pinned ids,
+/// which yields the SAME row set on every reference — so the attach layers can
+/// treat this subquery as a stable source and keep their NAN-1642 map/scalar
+/// shapes verbatim.
+///
+/// Why a closure and not an exact row replay: `id` is a CONTENT hash
+/// (SHA256(source_type + timestamp_micros + message), NAN-2264), so
+/// content-identical rows can share an id. When a sampled id has content
+/// twins, the closure contains every copy — the emitted rows and the
+/// aggregates stay mutually consistent by construction (both sides read this
+/// one deterministic set), at the cost of possibly emitting a few more rows
+/// than the selector's bound. An id-exact replay is impossible without a
+/// unique per-row identity, and silently attaching constants from a different
+/// sample (the bug this exists to fix) is strictly worse.
+///
+/// Memory: the wide columns are read only for granules containing pinned ids
+/// — no whole-partition buffering. On Saturn (24h/21.9M rows, 3 GiB cap,
+/// max_threads=4), `head 500k | eventstats … by dest_ip` completes at
+/// 2.03–2.29 GiB where the window fallback is Code 241 in both runs, and
+/// `head 1M` completes at the plain-`head` pipeline floor (~2.5 GiB).
+fn snapshot_closure_source_sql(ancestor: &str, sid: &str, source: &str) -> String {
+    format!(
+        "(SELECT * FROM {anc} WHERE {sid} IN (SELECT arrayJoin((SELECT groupArray({sid}) FROM {src}))))",
+        anc = ancestor,
+        sid = sid,
+        src = source
+    )
+}
+
+/// Inputs for an anomaly constants-attach layer.
+///
+/// Two shapes come out of it, chosen by `rows_stable`: the bounded map/scalar
+/// attach (NAN-1642), which aggregates `stats_source` — a SECOND reference to
+/// the stage source — and the single-scan window form (NAN-2265), which
+/// aggregates the very rows it annotates and so cannot disagree with them.
+/// (The numeric raw-row paths route an unstable SELECTOR-run source through
+/// [`snapshot_closure_source_sql`] BEFORE building the plan, arriving here
+/// with `rows_stable: true` and the closure as both sources.)
+struct AttachPlan<'a> {
+    /// Rows to annotate.
+    attach_source: &'a str,
+    /// Value expression evaluated on the ATTACH rows (window form).
+    attach_value: &'a str,
+    /// Rows to aggregate for the constants (map / scalar form).
+    stats_source: &'a str,
+    /// Value expression evaluated on the STATS rows (map / scalar form).
+    stats_value: &'a str,
+    /// `(build_key, lookup_key)` — the map-build side groups `stats_source` by
+    /// `build_key`, each row of `attach_source` looks its group up via
+    /// `lookup_key` (also the window's PARTITION BY, since it is evaluated on
+    /// the attach rows). `None` means a single global group.
+    keys: Option<(&'a str, &'a str)>,
+    /// Whether re-executing the stage source yields the same rows — see
+    /// [`crate::query::clickhouse_sql_gen::SourceStability`].
+    rows_stable: bool,
+}
+
+impl AttachPlan<'_> {
+    /// Window clause for the single-scan form: the lookup key is already an
+    /// expression over the attach rows, so it partitions them directly and
+    /// groups NULL keys exactly like the map's canonicalized key does.
+    fn over_clause(&self) -> String {
+        match self.keys {
+            Some((_, lookup_key)) => format!("OVER (PARTITION BY {})", lookup_key),
+            None => "OVER ()".to_string(),
+        }
+    }
+}
+
 /// Per-group (or global) z-score constants attach layer: annotates every row
-/// of `attach_source` with `avg_val` / `stddev_val` computed over
-/// `stats_source`. `keys` is `(build_key, lookup_key)` — the map-build side
-/// groups `stats_source` by `build_key`, each row of `attach_source` looks its
-/// group up via `lookup_key`; `None` means a single global group (plain scalar
-/// tuple, no map needed).
-fn zscore_attach_sql(
-    attach_source: &str,
-    stats_source: &str,
-    value_expr: &str,
-    keys: Option<(&str, &str)>,
-) -> String {
+/// of the attach source with `avg_val` / `stddev_val`.
+fn zscore_attach_sql(plan: &AttachPlan) -> String {
+    if !plan.rows_stable {
+        let over = plan.over_clause();
+        return format!(
+            "SELECT *, avg({v}) {o} as avg_val,\n      \
+             stddevPop({v}) {o} as stddev_val\n    \
+             FROM {atk}",
+            v = plan.attach_value,
+            o = over,
+            atk = plan.attach_source
+        );
+    }
+    let (attach_source, stats_source, value_expr, keys) = (
+        plan.attach_source,
+        plan.stats_source,
+        plan.stats_value,
+        plan.keys,
+    );
     match keys {
         None => format!(
             "WITH (SELECT tuple(toFloat64(avg({v})), toFloat64(stddevPop({v}))) FROM {ss}) AS __nano_stats\n    \
@@ -102,17 +205,33 @@ fn zscore_attach_sql(
 }
 
 /// Per-group (or global) MAD constants attach layer: annotates every row of
-/// `attach_source` with `median_val` / `mad_val` computed over `stats_source`.
-/// Two bounded GROUP BY passes replace the two stacked whole-partition
-/// quantile windows: the second map's build references the first
-/// (`__nano_med[__nano_k]`) to compute the median absolute deviation — the
-/// identical scalar text is computed once (scalar-subquery cache).
-fn mad_attach_sql(
-    attach_source: &str,
-    stats_source: &str,
-    value_expr: &str,
-    keys: Option<(&str, &str)>,
-) -> String {
+/// the attach source with `median_val` / `mad_val`.
+///
+/// Stable source: two bounded GROUP BY passes replace the two stacked
+/// whole-partition quantile windows — the second map's build references the
+/// first (`__nano_med[__nano_k]`) to compute the median absolute deviation,
+/// and the identical scalar text is computed once (scalar-subquery cache).
+/// Unstable source (NAN-2265): the stacked quantile windows, which read the
+/// rows they annotate.
+fn mad_attach_sql(plan: &AttachPlan) -> String {
+    if !plan.rows_stable {
+        let over = plan.over_clause();
+        return format!(
+            "SELECT *, quantile(0.5)(abs({v} - median_val)) {o} as mad_val\n    \
+             FROM (\n      \
+             SELECT *, quantile(0.5)({v}) {o} as median_val\n      \
+             FROM {atk}\n    )",
+            v = plan.attach_value,
+            o = over,
+            atk = plan.attach_source
+        );
+    }
+    let (attach_source, stats_source, value_expr, keys) = (
+        plan.attach_source,
+        plan.stats_source,
+        plan.stats_value,
+        plan.keys,
+    );
     match keys {
         None => format!(
             "WITH (SELECT toFloat64(quantile(0.5)({v})) FROM {ss}) AS __nano_med,\n      \
@@ -345,20 +464,46 @@ impl ClickHouseSqlGenerator {
         ))
     }
 
-    /// Generate SQL for eventstats command using the map-scalar attach shape.
+    /// Generate SQL for eventstats command.
     ///
-    /// NAN-1642: the previous whole-partition window emission
-    /// (`agg(x) OVER (PARTITION BY k)` / `OVER ()`) buffered the entire
-    /// partition in memory and OOM'd (Code 241) at ≥15min windows at
-    /// production scale. Per-group aggregates are now computed once into a
-    /// scalar Map (bounded GROUP BY memory) and attached per row via a map
-    /// lookup on the null-canonicalized key; with no `by` clause the whole
-    /// set is a single global group and a plain scalar subquery suffices.
+    /// Two shapes, chosen by `source_rows_are_stable`:
+    ///
+    /// * **map-scalar attach** (stable source, the common case) — NAN-1642: the
+    ///   previous whole-partition window emission (`agg(x) OVER (PARTITION BY
+    ///   k)` / `OVER ()`) buffered the entire partition in memory and OOM'd
+    ///   (Code 241) at ≥15min windows at production scale. Per-group aggregates
+    ///   are computed once into a scalar Map (bounded GROUP BY memory) and
+    ///   attached per row via a map lookup on the null-canonicalized key; with
+    ///   no `by` clause the whole set is a single global group and a plain
+    ///   scalar subquery suffices.
+    /// * **whole-partition window** (unstable source) — NAN-2265: the attach
+    ///   shape references `source` TWICE (build the constants, then emit the
+    ///   rows), and ordinary CTEs are re-executed per reference. Downstream of
+    ///   an arbitrary bounded subset (`head N`, `sort N`, `sample`, …) the two
+    ///   references see DIFFERENT rows, so the aggregate is attached to rows it
+    ///   was not computed from — measured on 18.3M local rows: `head 20000 |
+    ///   eventstats avg(bytes_out) by dest_ip` mis-attached ~13k of ~15.5k
+    ///   groups on every run. The window references `source` once, so it cannot
+    ///   diverge.
+    ///
+    /// The window is only reachable behind a stage that bounded the rows (the
+    /// one exception is a LIMITed subsearch — see
+    /// `command_preserves_row_stability`), so it never buffers the unbounded
+    /// partition NAN-1642 removed for any other pipeline. It is not
+    /// free at production row widths, though: measured on Saturn (24h, 21.6M
+    /// rows, wide `SELECT *` terminal, 3 GiB/query cap) peak memory for
+    /// `head N | eventstats avg(bytes_out) by dest_ip`, window vs map attach —
+    /// N=1k 1.75 vs 1.76 GiB, N=20k 2.02 vs 1.77, N=100k 2.80 vs 2.22, N=200k
+    /// OOM (Code 241) vs 2.81. Both shapes are dominated by the base wide scan
+    /// until ~50k rows; past that the window costs ~25% more, and a very large
+    /// `head` can tip a query that used to complete (with the wrong numbers)
+    /// into a loud Code 241.
     pub(super) fn generate_eventstats_sql(
         &self,
         source: &str,
         aggregations: &[Aggregation],
         group_by: &Option<Vec<String>>,
+        stability: &SourceStability,
     ) -> Result<String, SqlGenError> {
         let key_exprs: Vec<String> = group_by
             .as_ref()
@@ -370,6 +515,34 @@ impl ClickHouseSqlGenerator {
         // time column (`start_time` for spans), not the logs-only `timestamp`.
         // Logs keep `timestamp` byte-identical.
         let tc = self.time_column();
+
+        // Snapshot id-closure (NAN-2265): an unstable source behind a pure
+        // selector run is replaced by its deterministic id-closure — the
+        // selector's ids pinned once (scalar cache), the rows re-read from the
+        // stable ancestor. The closure is a STABLE source, so the bounded
+        // map/scalar attach below applies to it verbatim; the whole-partition
+        // window is only left for sources with no such closure.
+        let closure_source: Option<String> = (!stability.rows_stable)
+            .then(|| stability.snapshot_refetch.as_ref())
+            .flatten()
+            .map(|snap| snapshot_closure_source_sql(&snap.ancestor, snap.sid, source));
+        let source: &str = closure_source.as_deref().unwrap_or(source);
+        let rows_stable = stability.rows_stable || closure_source.is_some();
+
+        // `None` = plain aggregate feeding the map/scalar attach; `Some(clause)`
+        // = the single-scan window form. One emission table serves both so the
+        // two shapes can never drift on which aggregate a function maps to.
+        let over: Option<String> = (!rows_stable).then(|| {
+            if grouped {
+                format!("OVER (PARTITION BY {})", key_exprs.join(", "))
+            } else {
+                "OVER ()".to_string()
+            }
+        });
+        let windowed = |call: String| match &over {
+            Some(clause) => format!("{} {}", call, clause),
+            None => call,
+        };
 
         let mut value_exprs: Vec<String> = Vec::with_capacity(aggregations.len());
         let mut aliases: Vec<String> = Vec::with_capacity(aggregations.len());
@@ -392,12 +565,14 @@ impl ClickHouseSqlGenerator {
             // field's own type, and values()/list() stay String — matching
             // the window emission's output types.
             let value_expr = match agg.func {
-                AggFunc::Count => "toFloat64(count())".to_string(),
+                AggFunc::Count => format!("toFloat64({})", windowed("count()".to_string())),
                 AggFunc::Dc => {
                     // Same aggregates the window emission used: exact
                     // count(DISTINCT) over the whole set, uniqExact per group.
-                    if grouped {
-                        format!("toFloat64(uniqExact({}))", field_expr)
+                    // ClickHouse has no DISTINCT window function, so the
+                    // single-scan whole-set form uses uniqExact — also exact.
+                    if grouped || over.is_some() {
+                        format!("toFloat64({})", windowed(format!("uniqExact({})", field_expr)))
                     } else {
                         format!("toFloat64(count(DISTINCT {}))", field_expr)
                     }
@@ -405,39 +580,58 @@ impl ClickHouseSqlGenerator {
                 AggFunc::EstDc => {
                     // Approximate distinct count: bounded memory via
                     // uniqCombined64 (~0.9% measured error).
-                    format!("toFloat64(uniqCombined64({}))", field_expr)
+                    format!(
+                        "toFloat64({})",
+                        windowed(format!("uniqCombined64({})", field_expr))
+                    )
                 }
-                AggFunc::Sum => format!("toFloat64(sum({}))", field_expr),
-                AggFunc::Avg => format!("toFloat64(avg({}))", field_expr),
-                AggFunc::Min => format!("min({})", field_expr),
-                AggFunc::Max => format!("max({})", field_expr),
-                AggFunc::Stdev => format!("toFloat64(stddevPop({}))", field_expr),
-                AggFunc::Var => format!("toFloat64(varPop({}))", field_expr),
-                AggFunc::Range => format!("toFloat64(max({0}) - min({0}))", field_expr),
-                AggFunc::Median => format!("toFloat64(median({}))", field_expr),
-                AggFunc::Perc95 => format!("toFloat64(quantile(0.95)({}))", field_expr),
+                AggFunc::Sum => format!("toFloat64({})", windowed(format!("sum({})", field_expr))),
+                AggFunc::Avg => format!("toFloat64({})", windowed(format!("avg({})", field_expr))),
+                AggFunc::Min => windowed(format!("min({})", field_expr)),
+                AggFunc::Max => windowed(format!("max({})", field_expr)),
+                AggFunc::Stdev => {
+                    format!("toFloat64({})", windowed(format!("stddevPop({})", field_expr)))
+                }
+                AggFunc::Var => format!("toFloat64({})", windowed(format!("varPop({})", field_expr))),
+                AggFunc::Range => format!(
+                    "toFloat64({} - {})",
+                    windowed(format!("max({})", field_expr)),
+                    windowed(format!("min({})", field_expr))
+                ),
+                AggFunc::Median => format!("toFloat64({})", windowed(format!("median({})", field_expr))),
+                AggFunc::Perc95 => format!(
+                    "toFloat64({})",
+                    windowed(format!("quantile(0.95)({})", field_expr))
+                ),
                 AggFunc::Percentile(p) => {
                     format!(
-                        "toFloat64(quantile({})({}))",
-                        f64::from(p) / 100.0,
-                        field_expr
+                        "toFloat64({})",
+                        windowed(format!(
+                            "quantile({})({})",
+                            f64::from(p) / 100.0,
+                            field_expr
+                        ))
                     )
                 }
                 AggFunc::Values => format!(
-                    "arrayStringConcat(arrayFilter(x -> x != '', \
-                     groupUniqArray({})(toString({}))), ', ')",
-                    self.max_group_array_size, field_expr
+                    "arrayStringConcat(arrayFilter(x -> x != '', {}), ', ')",
+                    windowed(format!(
+                        "groupUniqArray({})(toString({}))",
+                        self.max_group_array_size, field_expr
+                    ))
                 ),
                 AggFunc::List => format!(
-                    "arrayStringConcat(arrayFilter(x -> x != '', \
-                     groupArray({})(toString({}))), ', ')",
-                    self.max_group_array_size, field_expr
+                    "arrayStringConcat(arrayFilter(x -> x != '', {}), ', ')",
+                    windowed(format!(
+                        "groupArray({})(toString({}))",
+                        self.max_group_array_size, field_expr
+                    ))
                 ),
-                AggFunc::First => format!("any({})", field_expr),
-                AggFunc::Last => format!("anyLast({})", field_expr),
-                AggFunc::Earliest => format!("argMin({}, {tc})", field_expr),
-                AggFunc::Latest => format!("argMax({}, {tc})", field_expr),
-                AggFunc::Mode => format!("(topK(1)({}))[1]", field_expr),
+                AggFunc::First => windowed(format!("any({})", field_expr)),
+                AggFunc::Last => windowed(format!("anyLast({})", field_expr)),
+                AggFunc::Earliest => windowed(format!("argMin({}, {tc})", field_expr)),
+                AggFunc::Latest => windowed(format!("argMax({}, {tc})", field_expr)),
+                AggFunc::Mode => format!("({})[1]", windowed(format!("topK(1)({})", field_expr))),
                 AggFunc::Sparkline => {
                     return Err(SqlGenError::InvalidQuery(
                         "eventstats does not support sparkline() — there is no whole-partition \
@@ -492,6 +686,22 @@ impl ClickHouseSqlGenerator {
 
             value_exprs.push(value_expr);
             aliases.push(alias);
+        }
+
+        // Unstable source (NAN-2265): the window carries its own per-row
+        // aggregate, so there is no separate constants pass to reference the
+        // source a second time.
+        if over.is_some() {
+            let projections: Vec<String> = value_exprs
+                .iter()
+                .zip(aliases.iter())
+                .map(|(expr, alias)| format!("{} AS {}", expr, escape_identifier(alias)))
+                .collect();
+            return Ok(format!(
+                "  SELECT *, {} FROM {}",
+                projections.join(", "),
+                source
+            ));
         }
 
         // One scalar per eventstats stage: multiple aggregations share a
@@ -957,7 +1167,9 @@ impl ClickHouseSqlGenerator {
         by_fields: &[String],
         threshold: f64,
         method: &AnomalyMethod,
+        stability: &SourceStability,
     ) -> Result<String, SqlGenError> {
+        let source_rows_are_stable = stability.rows_stable;
         let by_exprs: Vec<String> = by_fields
             .iter()
             .map(|b| by_field_sql(b, self))
@@ -967,8 +1179,14 @@ impl ClickHouseSqlGenerator {
         // → compute the aggregation per by_fields group, then detect anomalies on the result
         let is_aggregation = field.contains('(');
         if is_aggregation {
-            return self
-                .generate_anomaly_aggregation_sql(source, field, &by_exprs, threshold, method);
+            return self.generate_anomaly_aggregation_sql(
+                source,
+                field,
+                &by_exprs,
+                threshold,
+                method,
+                source_rows_are_stable,
+            );
         }
 
         let field_expr = by_field_sql(field, self);
@@ -1020,13 +1238,32 @@ impl ClickHouseSqlGenerator {
 
         if is_numeric {
             // Direct anomaly on numeric values
+            // Snapshot id-closure (NAN-2265): the numeric path annotates RAW
+            // rows, so an unstable selector-run source is replaced by its
+            // deterministic id-closure — the bounded map/scalar attach then
+            // applies to it verbatim instead of a whole-partition window over
+            // wide rows.
+            let closure_source: Option<String> = (!source_rows_are_stable)
+                .then(|| stability.snapshot_refetch.as_ref())
+                .flatten()
+                .map(|snap| snapshot_closure_source_sql(&snap.ancestor, snap.sid, source));
+            let source: &str = closure_source.as_deref().unwrap_or(source);
+            let rows_stable = source_rows_are_stable || closure_source.is_some();
+            let plan = AttachPlan {
+                attach_source: source,
+                attach_value: &field_expr,
+                stats_source: source,
+                stats_value: &field_expr,
+                keys,
+                rows_stable,
+            };
             match method {
                 AnomalyMethod::ZScore => {
-                    let attach = zscore_attach_sql(source, source, &field_expr, keys);
+                    let attach = zscore_attach_sql(&plan);
                     Ok(Self::zscore_outer_sql(&field_expr, threshold, &attach, true))
                 }
                 AnomalyMethod::Mad => {
-                    let attach = mad_attach_sql(source, source, &field_expr, keys);
+                    let attach = mad_attach_sql(&plan);
                     Ok(Self::mad_outer_sql(&field_expr, threshold, &attach, true))
                 }
             }
@@ -1084,15 +1321,29 @@ impl ClickHouseSqlGenerator {
                 ),
             };
 
+            // The pair-count GROUP BY and the windowed pair dedup are two
+            // references to `source`; the window form aggregates `count_source`
+            // itself — one row per (by, field) pair carrying the same count, so
+            // the same distribution — and references `source` once (NAN-2265).
+            let plan = AttachPlan {
+                attach_source: &count_source,
+                attach_value: count_field,
+                stats_source: &pair_source,
+                stats_value: "__nano_cnt",
+                keys: pair_keys,
+                // No id-closure rewrite here: the attach operates on aggregated
+                // (by, field) pair rows — its window fallback buffers narrow
+                // aggregates, not the raw-row OOM class, and pair rows carry
+                // no row id to close over (NAN-2265).
+                rows_stable: source_rows_are_stable,
+            };
             match method {
                 AnomalyMethod::ZScore => {
-                    let attach =
-                        zscore_attach_sql(&count_source, &pair_source, "__nano_cnt", pair_keys);
+                    let attach = zscore_attach_sql(&plan);
                     Ok(Self::zscore_outer_sql(count_field, threshold, &attach, true))
                 }
                 AnomalyMethod::Mad => {
-                    let attach =
-                        mad_attach_sql(&count_source, &pair_source, "__nano_cnt", pair_keys);
+                    let attach = mad_attach_sql(&plan);
                     Ok(Self::mad_outer_sql(count_field, threshold, &attach, true))
                 }
             }
@@ -1108,6 +1359,7 @@ impl ClickHouseSqlGenerator {
         by_exprs: &[String],
         threshold: f64,
         method: &AnomalyMethod,
+        source_rows_are_stable: bool,
     ) -> Result<String, SqlGenError> {
         // Build the GROUP BY and aggregation source
         // e.g., SELECT user, url_domain, count() as _agg_value FROM source GROUP BY user, url_domain
@@ -1159,13 +1411,25 @@ impl ClickHouseSqlGenerator {
         // distribution, unchanged). No is_anomaly filter on this path: all
         // groups are returned, scored.
         let val = "_agg_value";
+        let plan = AttachPlan {
+            attach_source: &agg_source,
+            attach_value: val,
+            stats_source: &agg_source,
+            stats_value: val,
+            keys: None,
+            // No id-closure rewrite here: aggregation-first anomaly attaches
+            // over the per-group aggregate rows — bounded by group cardinality,
+            // not the raw-row OOM class, and aggregate rows carry no row id
+            // (NAN-2265).
+            rows_stable: source_rows_are_stable,
+        };
         match method {
             AnomalyMethod::ZScore => {
-                let attach = zscore_attach_sql(&agg_source, &agg_source, val, None);
+                let attach = zscore_attach_sql(&plan);
                 Ok(Self::zscore_outer_sql(val, threshold, &attach, false))
             }
             AnomalyMethod::Mad => {
-                let attach = mad_attach_sql(&agg_source, &agg_source, val, None);
+                let attach = mad_attach_sql(&plan);
                 Ok(Self::mad_outer_sql(val, threshold, &attach, false))
             }
         }

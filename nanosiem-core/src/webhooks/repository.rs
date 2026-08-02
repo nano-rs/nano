@@ -62,7 +62,8 @@ impl WebhookRepository {
             r#"
             SELECT id, name, url, url_encrypted, url_host, headers_encrypted, secret_encrypted,
                    severity_filter, event_types, channel_type, channel_config,
-                   rule_filter, enabled, created_at, updated_at
+                   rule_filter, health_category_filter, health_resource_filter,
+                   enabled, created_at, updated_at
             FROM webhooks
             ORDER BY name
             "#,
@@ -79,7 +80,8 @@ impl WebhookRepository {
             r#"
             SELECT id, name, url, url_encrypted, url_host, headers_encrypted, secret_encrypted,
                    severity_filter, event_types, channel_type, channel_config,
-                   rule_filter, enabled, created_at, updated_at
+                   rule_filter, health_category_filter, health_resource_filter,
+                   enabled, created_at, updated_at
             FROM webhooks
             WHERE enabled = true
             ORDER BY name
@@ -104,7 +106,8 @@ impl WebhookRepository {
             r#"
             SELECT id, name, url, url_encrypted, url_host, headers_encrypted, secret_encrypted,
                    severity_filter, event_types, channel_type, channel_config,
-                   rule_filter, enabled, created_at, updated_at
+                   rule_filter, health_category_filter, health_resource_filter,
+                   enabled, created_at, updated_at
             FROM webhooks
             WHERE id = $1
             "#,
@@ -176,11 +179,12 @@ impl WebhookRepository {
 
         let webhook = sqlx::query_as::<_, Webhook>(
             r#"
-            INSERT INTO webhooks (name, url, url_encrypted, url_host, headers_encrypted, secret_encrypted, severity_filter, event_types, channel_type, channel_config, rule_filter, enabled)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            INSERT INTO webhooks (name, url, url_encrypted, url_host, headers_encrypted, secret_encrypted, severity_filter, event_types, channel_type, channel_config, rule_filter, health_category_filter, health_resource_filter, enabled)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             RETURNING id, name, url, url_encrypted, url_host, headers_encrypted, secret_encrypted,
                       severity_filter, event_types, channel_type, channel_config,
-                      rule_filter, enabled, created_at, updated_at
+                      rule_filter, health_category_filter, health_resource_filter,
+                      enabled, created_at, updated_at
             "#
         )
         .bind(&request.name)
@@ -194,6 +198,8 @@ impl WebhookRepository {
         .bind(&channel_type)
         .bind(&channel_config)
         .bind(rule_filter.as_deref())
+        .bind(&request.health_category_filter)
+        .bind(&request.health_resource_filter)
         .bind(enabled)
         .fetch_one(&self.pool)
         .await?;
@@ -274,11 +280,14 @@ impl WebhookRepository {
                 -- F-39: encrypted URL + display host move together with the URL.
                 url_encrypted = CASE WHEN $15 THEN $16::bytea ELSE url_encrypted END,
                 url_host = CASE WHEN $15 THEN $17::text ELSE url_host END,
+                health_category_filter = COALESCE($18::text[], health_category_filter),
+                health_resource_filter = COALESCE($19::text[], health_resource_filter),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING id, name, url, url_encrypted, url_host, headers_encrypted, secret_encrypted,
                       severity_filter, event_types, channel_type, channel_config,
-                      rule_filter, enabled, created_at, updated_at
+                      rule_filter, health_category_filter, health_resource_filter,
+                      enabled, created_at, updated_at
             "#,
         )
         .bind(id)
@@ -298,6 +307,8 @@ impl WebhookRepository {
         .bind(url_should_update) // $15: should update the URL columns?
         .bind(url_encrypted_value.as_deref()) // $16: new encrypted URL
         .bind(url_host_value) // $17: new display host
+        .bind(&request.health_category_filter) // $18: health category routing
+        .bind(&request.health_resource_filter) // $19: health resource routing
         .fetch_optional(&self.pool)
         .await?
         .ok_or(WebhookRepositoryError::NotFound(id))?;

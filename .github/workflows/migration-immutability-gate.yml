@@ -40,7 +40,7 @@ concurrency:
 
 jobs:
   gate:
-    runs-on: [self-hosted, X64]
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     steps:
       - name: Checkout

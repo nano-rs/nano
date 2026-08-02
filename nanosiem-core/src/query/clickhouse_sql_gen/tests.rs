@@ -3030,37 +3030,54 @@
     }
 
 
-    // ── dedup survivor-id rewrite (NAN-1636, finding 2.7) ──────────────────
+    // ── sort-free dedup (NAN-1636 finding 2.7, corrected by NAN-2264) ──────
     //
     // The legacy `ORDER BY <keys>, timestamp LIMIT 1 BY <keys>` full-sorts
     // every wide row — Code 241 OOM at ≥~15min windows under the production
     // 3GiB/query profile. Over the deterministic base scan the stage instead
-    // filters to per-key argMin(id, timestamp) survivors. Every guard trips
-    // back to the legacy shape.
+    // restricts each group to its oldest timestamp (an aggregate, not a sort)
+    // and collapses the ties with `LIMIT 1 BY <keys>`. Every guard trips back
+    // to the legacy shape.
+    //
+    // NAN-2264: the rewrite originally elected survivors with `WHERE id IN
+    // (SELECT argMin(id, <time>) …)`, which is one-row-per-key only if `id` is
+    // unique per PHYSICAL row. It is a CONTENT hash, deliberately shared by
+    // content-identical rows, so every row carrying the elected id passed and
+    // dedup emitted duplicates. Hence the fall-back assertions below key on the
+    // legacy `ORDER BY <keys>, <time>` — `LIMIT 1 BY` alone no longer
+    // distinguishes the shapes, since both now carry it.
 
-    /// `dedup` directly over the base scan (stage_0) must emit the survivor-id
-    /// shape: no sort, keep-oldest via argMin(id, timestamp).
+    /// `dedup` directly over the base scan (stage_0): keep-oldest via a
+    /// per-key `min(timestamp)`, one row per key via `LIMIT 1 BY`, no sort.
     #[test]
-    fn dedup_on_base_scan_emits_survivor_id_in() {
+    fn dedup_on_base_scan_is_sort_free_and_one_row_per_key() {
         let query = parse_query("* | dedup src_ip").unwrap();
         let sql = ClickHouseSqlGenerator::new()
             .generate(&query, &time_range())
             .unwrap();
         assert!(
-            sql.contains("WHERE id IN (") && sql.contains("argMin(id, timestamp) FROM stage_0"),
-            "dedup over the base scan must select survivors via argMin(id, timestamp), got:\n{sql}"
+            sql.contains("min(timestamp) FROM stage_0") && sql.contains("GROUP BY src_ip"),
+            "dedup over the base scan must restrict candidates to each key's oldest \
+             row, got:\n{sql}"
         );
         assert!(
-            sql.contains("GROUP BY src_ip"),
-            "survivor subquery must group by the dedup keys, got:\n{sql}"
+            sql.contains("LIMIT 1 BY src_ip"),
+            "dedup must collapse each key with LIMIT 1 BY — the one-row-per-key \
+             guarantee (NAN-2264), got:\n{sql}"
         );
         assert!(
-            !sql.contains("LIMIT 1 BY"),
-            "rewritten dedup must not carry the OOM-class full-row sort + LIMIT 1 BY, got:\n{sql}"
+            !sql.contains("ORDER BY src_ip, timestamp"),
+            "rewritten dedup must not carry the OOM-class full-row sort, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("argMin(id"),
+            "dedup must not elect survivors by content-hash id (NAN-2264), got:\n{sql}"
         );
     }
 
-    /// Multi-key dedup groups the survivor subquery by every key.
+    /// Multi-key dedup threads every key through the candidate match, the
+    /// grouping AND the LIMIT BY — a key missing from any one of them silently
+    /// changes the output grain.
     #[test]
     fn dedup_multi_key_groups_by_all_keys() {
         let query = parse_query("error | dedup src_ip, user").unwrap();
@@ -3068,15 +3085,39 @@
             .generate(&query, &time_range())
             .unwrap();
         assert!(
-            sql.contains("GROUP BY src_ip, \"user\"") && sql.contains("argMin(id, timestamp)"),
-            "multi-key dedup must group survivors by all keys, got:\n{sql}"
+            sql.contains("GROUP BY src_ip, \"user\"") && sql.contains("min(timestamp)"),
+            "multi-key dedup must group candidates by all keys, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("LIMIT 1 BY src_ip, \"user\""),
+            "every dedup key must reach the LIMIT BY, got:\n{sql}"
         );
     }
 
-    /// Guard 1: an upstream include-mode projection that pruned `id` would make
-    /// the IN-subquery UNKNOWN_IDENTIFIER — keep the legacy shape.
+    /// ClickHouse's `IN` keeps SQL NULL semantics (`transform_null_in = 0`), so
+    /// a tuple carrying NULL matches nothing. A bare `(<keys>, <time>) IN (…)`
+    /// would silently DROP every row whose dedup key is NULL — reachable today
+    /// (`enrich_time` is Nullable, as is any eval-computed key) — where the
+    /// legacy shape kept one row for the NULL group. Verified against a live
+    /// ClickHouse in `tests/dedup_row_identity_tests.rs`.
     #[test]
-    fn dedup_after_id_pruning_projection_falls_back() {
+    fn dedup_candidate_match_is_null_safe() {
+        let query = parse_query("* | dedup enrich_time").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("isNull(enrich_time), assumeNotNull(enrich_time)"),
+            "a Nullable dedup key must be matched NULL-totally, or its whole group \
+             is dropped instead of collapsing to one row, got:\n{sql}"
+        );
+    }
+
+    /// Guard 1: an upstream projection puts a stage between dedup and the base
+    /// scan, so the double-scan rewrite must not fire. (Belt and braces: such a
+    /// projection can also prune the time column the candidate subquery needs.)
+    #[test]
+    fn dedup_after_projection_falls_back() {
         for q in [
             "* | fields src_ip, user | dedup src_ip",
             "* | table src_ip, user | dedup src_ip",
@@ -3086,24 +3127,31 @@
                 .generate(&query, &time_range())
                 .unwrap();
             assert!(
-                sql.contains("LIMIT 1 BY src_ip") && !sql.contains("argMin("),
-                "dedup after id-pruning projection must keep the legacy shape for {q}, got:\n{sql}"
+                sql.contains("ORDER BY src_ip, timestamp") && sql.contains("LIMIT 1 BY src_ip"),
+                "dedup after a projection must keep the legacy shape for {q}, got:\n{sql}"
+            );
+            assert!(
+                !sql.contains("min(timestamp) FROM"),
+                "the double-scan rewrite must not fire for {q}, got:\n{sql}"
             );
         }
     }
 
-    /// Guard 2: an upstream `eval id=…` shadows the physical row id — survivor
-    /// selection on the reassigned value would keep the wrong rows.
+    /// Guard 2: an upstream `eval` is itself a stage, so dedup's source is no
+    /// longer the base scan. `eval timestamp=…` additionally reassigns the very
+    /// column the candidate subquery aggregates.
     #[test]
-    fn dedup_after_eval_id_shadowing_falls_back() {
-        let query = parse_query("* | eval id=user | dedup src_ip").unwrap();
-        let sql = ClickHouseSqlGenerator::new()
-            .generate(&query, &time_range())
-            .unwrap();
-        assert!(
-            sql.contains("LIMIT 1 BY src_ip") && !sql.contains("argMin("),
-            "dedup after `eval id=…` must keep the legacy shape, got:\n{sql}"
-        );
+    fn dedup_after_eval_falls_back() {
+        for q in ["* | eval id=user | dedup src_ip", "* | eval timestamp=now() | dedup src_ip"] {
+            let query = parse_query(q).unwrap();
+            let sql = ClickHouseSqlGenerator::new()
+                .generate(&query, &time_range())
+                .unwrap();
+            assert!(
+                sql.contains("LIMIT 1 BY src_ip") && !sql.contains("min(timestamp) FROM"),
+                "dedup after `eval` must keep the legacy shape for {q}, got:\n{sql}"
+            );
+        }
     }
 
     /// Guard 3: the rewrite scans its source CTE twice, so any non-base source
@@ -3121,8 +3169,12 @@
                 .generate(&query, &time_range())
                 .unwrap();
             assert!(
-                sql.contains("LIMIT 1 BY src_ip") && !sql.contains("argMin("),
+                sql.contains("ORDER BY src_ip, timestamp") && sql.contains("LIMIT 1 BY src_ip"),
                 "dedup with a non-base source must keep the legacy shape for {q}, got:\n{sql}"
+            );
+            assert!(
+                !sql.contains("min(timestamp) FROM"),
+                "the double-scan rewrite must not fire for {q}, got:\n{sql}"
             );
         }
     }
@@ -3138,7 +3190,9 @@
             .generate(&query, &time_range())
             .unwrap();
         assert!(
-            sql.contains("LIMIT 1 BY src_host") && !sql.contains("argMin("),
+            sql.contains("ORDER BY src_host, timestamp")
+                && sql.contains("LIMIT 1 BY src_host")
+                && !sql.contains("min(timestamp) FROM"),
             "dedup over a LIMITed requery base scan must keep the legacy shape, got:\n{sql}"
         );
     }
@@ -3153,33 +3207,35 @@
             .generate(&query, &time_range())
             .unwrap();
         assert!(
-            sql.contains("LIMIT 1 BY src_ip") && !sql.contains("argMin("),
+            sql.contains("ORDER BY src_ip, timestamp")
+                && sql.contains("LIMIT 1 BY src_ip")
+                && !sql.contains("min(timestamp) FROM"),
             "subsearch dedup must keep the legacy shape, got:\n{sql}"
         );
     }
 
-    /// Spans have no logs `id`/`timestamp` columns, but they DO have
-    /// `span_id`/`start_time` — so dedup (O27) uses the spans-safe deterministic
-    /// survivor key `argMin(span_id, start_time)` rather than erroring on the
-    /// logs `id`/`timestamp` identity. (Before O27 this hard-errored on spans.)
+    /// Spans have no logs `timestamp` column — the candidate aggregate is over
+    /// the dataset time column `start_time` (O27). Before O27 this hard-errored
+    /// on spans.
     #[test]
-    fn dedup_on_spans_dataset_uses_span_id_survivor() {
+    fn dedup_on_spans_dataset_uses_the_spans_time_column() {
         let query = parse_query("* | dedup service_name").unwrap();
         let sql = ClickHouseSqlGenerator::new()
             .with_dataset(otel::Dataset::Spans)
             .generate(&query, &time_range())
             .unwrap();
         assert!(
-            sql.contains("argMin(span_id, start_time)") && sql.contains("GROUP BY service_name"),
-            "spans dedup must use the span_id/start_time survivor key, got:\n{sql}"
+            sql.contains("min(start_time) FROM stage_0")
+                && sql.contains("GROUP BY service_name")
+                && sql.contains("LIMIT 1 BY service_name"),
+            "spans dedup must aggregate the spans time column, got:\n{sql}"
         );
-        // Never the logs-only id/timestamp identity on spans.
-        assert!(!sql.contains("argMin(id"), "{sql}");
+        // Never the logs-only `timestamp` column on spans (Code 47).
+        assert!(!sql.contains("min(timestamp)"), "{sql}");
     }
 
     /// OCSF: dedup keys resolve through the active profile (src_ip → the
-    /// promoted endpoint column); `id` is a physical ocsf_logs column, so the
-    /// survivor-id rewrite still fires.
+    /// promoted endpoint column), and the base scan still rewrites.
     #[test]
     fn dedup_ocsf_resolves_keys_and_rewrites() {
         use crate::schema::OcsfProfile;
@@ -3189,12 +3245,16 @@
             .generate(&query, &time_range())
             .unwrap();
         assert!(
-            sql.contains("argMin(id, timestamp)") && sql.contains("WHERE id IN ("),
+            sql.contains("min(timestamp) FROM stage_0") && sql.contains("LIMIT 1 BY "),
             "OCSF dedup over the base scan must rewrite, got:\n{sql}"
         );
         assert!(
             !sql.contains("GROUP BY src_ip"),
             "OCSF dedup key must resolve through the profile, not stay a raw UDM name, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("LIMIT 1 BY src_ip"),
+            "the OCSF LIMIT BY must bind the resolved column, not the raw UDM name, got:\n{sql}"
         );
     }
 
@@ -3211,7 +3271,7 @@
             .generate(&query, &time_range())
             .unwrap();
         assert!(
-            sql.contains("argMin(id, timestamp)"),
+            sql.contains("min(timestamp) FROM stage_0"),
             "downstream head must not disable the rewrite (guards are about the SOURCE), got:\n{sql}"
         );
         // The dedup stage itself is sort-free — reintroducing the legacy
@@ -3697,6 +3757,63 @@
         assert!(
             !sql.contains("mapFromArrays") && !sql.contains("OVER ("),
             "no map and no window for the global group, got:\n{sql}"
+        );
+    }
+
+    /// NAN-2274: keyed anomaly/eventstats fold a per-group literal map into
+    /// the plan (one entry per group key); on CH ≥26.4 skip-index condition
+    /// building can spin forever on such a tree, unkillably — planning never
+    /// checks the cancel flag. Every map-emitting pipeline must carry
+    /// `use_skip_indexes=0`.
+    #[test]
+    fn map_emitting_pipelines_disable_skip_indexes() {
+        for q in [
+            "error | anomaly bytes_out by user",
+            "error | anomaly bytes_out by user method=mad",
+            "error | eventstats avg(bytes_out) as ab by user",
+        ] {
+            let query = parse_query(q).unwrap();
+            let sql = ClickHouseSqlGenerator::new()
+                .generate(&query, &time_range())
+                .unwrap();
+            assert!(
+                sql.contains("use_skip_indexes=0"),
+                "map-emitting `{q}` must disable skip indexes (NAN-2274), got:\n{sql}"
+            );
+        }
+    }
+
+    /// Counterpart to the NAN-2274 guard: map-free queries must NOT lose skip
+    /// indexes — interactive hunts depend on the bloom/text indexes for
+    /// granule pruning.
+    #[test]
+    fn map_free_queries_keep_skip_indexes() {
+        for q in [
+            "error",
+            "error | anomaly bytes_out",
+            "error | stats count by user",
+        ] {
+            let query = parse_query(q).unwrap();
+            let sql = ClickHouseSqlGenerator::new()
+                .generate(&query, &time_range())
+                .unwrap();
+            assert!(
+                !sql.contains("use_skip_indexes"),
+                "map-free `{q}` must keep skip indexes active, got:\n{sql}"
+            );
+        }
+    }
+
+    /// Drift guard: the NAN-2274 settings gate detects map emissions by
+    /// substring; if `group_agg_map_sql`'s shape changes, this must fail
+    /// before the gate silently stops firing.
+    #[test]
+    fn group_agg_map_marker_stays_in_sync() {
+        assert!(
+            commands_advanced::emits_group_agg_map(&commands_advanced::group_agg_map_sql(
+                "k", "v", "t"
+            )),
+            "emits_group_agg_map no longer recognizes group_agg_map_sql output"
         );
     }
 

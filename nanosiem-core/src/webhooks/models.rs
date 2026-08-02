@@ -20,13 +20,16 @@ pub const EVENT_TYPE_CASE: &str = "case";
 /// Opt-in (not in [`default_event_types`]) so existing webhooks are unaffected;
 /// a future notification-channels layer can route this stream (NAN-1793).
 pub const EVENT_TYPE_REPORT: &str = "report";
+/// Webhook subscribes to normalized system-health lifecycle events.
+pub const EVENT_TYPE_SYSTEM_HEALTH: &str = "system_health";
 
 /// Every valid `event_types` value. Used to validate create/update requests.
-pub const VALID_EVENT_TYPES: [&str; 4] = [
+pub const VALID_EVENT_TYPES: [&str; 5] = [
     EVENT_TYPE_SIEM_ALERT,
     EVENT_TYPE_OBS_ALERT,
     EVENT_TYPE_CASE,
     EVENT_TYPE_REPORT,
+    EVENT_TYPE_SYSTEM_HEALTH,
 ];
 
 /// The default subscription for a new (or pre-column) webhook: both alert
@@ -91,6 +94,12 @@ pub struct Webhook {
     /// `None`/empty = all rules.
     #[sqlx(default)]
     pub rule_filter: Option<Vec<Uuid>>,
+    /// Optional system-health category routing filter. None/empty = all.
+    #[sqlx(default)]
+    pub health_category_filter: Option<Vec<String>>,
+    /// Optional system-health resource-type routing filter. None/empty = all.
+    #[sqlx(default)]
+    pub health_resource_filter: Option<Vec<String>>,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -164,6 +173,8 @@ pub struct WebhookResponse {
     pub channel_config: serde_json::Value,
     /// Optional detection-rule routing filter as `rule_…` typeids (null = all).
     pub rule_filter: Option<Vec<String>>,
+    pub health_category_filter: Option<Vec<String>>,
+    pub health_resource_filter: Option<Vec<String>>,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -183,8 +194,7 @@ impl From<&Webhook> for WebhookResponse {
             // Fall back to parsing the internal `url` for legacy rows whose
             // `url_host` column hasn't been populated by a delivery-path hydrate.
             url_host: w.url_host.clone().or_else(|| url_host(&w.url)),
-            has_url: w.url_encrypted.as_ref().map_or(false, |u| !u.is_empty())
-                || !w.url.is_empty(),
+            has_url: w.url_encrypted.as_ref().map_or(false, |u| !u.is_empty()) || !w.url.is_empty(),
             has_headers: w
                 .headers_encrypted
                 .as_ref()
@@ -198,6 +208,8 @@ impl From<&Webhook> for WebhookResponse {
                 .rule_filter
                 .as_ref()
                 .map(|ids| ids.iter().map(encode_rule_id).collect()),
+            health_category_filter: w.health_category_filter.clone(),
+            health_resource_filter: w.health_resource_filter.clone(),
             enabled: w.enabled,
             created_at: w.created_at,
             updated_at: w.updated_at,
@@ -226,6 +238,10 @@ pub struct CreateWebhookRequest {
     /// Optional detection-rule routing filter (`rule_…` typeids or bare UUIDs).
     /// Omit/empty = all rules.
     pub rule_filter: Option<Vec<String>>,
+    /// Route system-health events only for these categories. Empty/all omitted.
+    pub health_category_filter: Option<Vec<String>>,
+    /// Route system-health events only for these resource types. Empty/all omitted.
+    pub health_resource_filter: Option<Vec<String>>,
     pub enabled: Option<bool>,
 }
 
@@ -249,13 +265,21 @@ pub struct UpdateWebhookRequest {
     /// Replace the detection-rule routing filter (omit = no change; pass `[]` to
     /// clear). `rule_…` typeids or bare UUIDs.
     pub rule_filter: Option<Vec<String>>,
+    /// Replace the system-health category filter (empty clears it).
+    pub health_category_filter: Option<Vec<String>>,
+    /// Replace the system-health resource-type filter (empty clears it).
+    pub health_resource_filter: Option<Vec<String>>,
     pub enabled: Option<bool>,
 }
 
 impl CreateWebhookRequest {
     /// Validate `event_types`: see [`validate_event_types`].
     pub fn validate_event_types(&self) -> Result<(), String> {
-        validate_event_types(self.event_types.as_deref())
+        validate_event_types(self.event_types.as_deref())?;
+        validate_health_filters(
+            self.health_category_filter.as_deref(),
+            self.health_resource_filter.as_deref(),
+        )
     }
 
     /// Validate the channel type + its required fields for a create.
@@ -272,7 +296,11 @@ impl CreateWebhookRequest {
 impl UpdateWebhookRequest {
     /// Validate `event_types`: see [`validate_event_types`].
     pub fn validate_event_types(&self) -> Result<(), String> {
-        validate_event_types(self.event_types.as_deref())
+        validate_event_types(self.event_types.as_deref())?;
+        validate_health_filters(
+            self.health_category_filter.as_deref(),
+            self.health_resource_filter.as_deref(),
+        )
     }
 
     /// Validate the channel type on update. `url` is only required at create
@@ -385,6 +413,49 @@ fn validate_event_types(event_types: Option<&[String]>) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_health_filters(
+    categories: Option<&[String]>,
+    resources: Option<&[String]>,
+) -> Result<(), String> {
+    const CATEGORIES: &[&str] = &[
+        "integration",
+        "enrichment",
+        "log_source",
+        "ingestion",
+        "parser",
+        "storage",
+        "query",
+        "credential",
+        "service",
+    ];
+    if let Some(values) = categories {
+        if values.len() > CATEGORIES.len() {
+            return Err("too many health_category_filter values".to_string());
+        }
+        for value in values {
+            if !CATEGORIES.contains(&value.as_str()) {
+                return Err(format!("invalid system health category '{value}'"));
+            }
+        }
+    }
+    if let Some(values) = resources {
+        if values.len() > 50 {
+            return Err("too many health_resource_filter values".to_string());
+        }
+        for value in values {
+            let valid = !value.is_empty()
+                && value.len() <= 64
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+            if !valid {
+                return Err(format!("invalid system health resource type '{value}'"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A delivery log entry
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, utoipa::ToSchema)]
 pub struct WebhookDeliveryLog {
@@ -439,6 +510,26 @@ pub struct WebhookPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_events: Option<Vec<serde_json::Value>>,
     pub created_at: DateTime<Utc>,
+    /// Normalized system-health fields. Absent for alerts/cases/reports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_event_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_resource_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_resource_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_diagnostic_context: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_remediation: Option<String>,
+    /// Stable logical-delivery key for downstream idempotency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 /// Result of a test delivery

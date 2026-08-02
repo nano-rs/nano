@@ -835,3 +835,253 @@ enabled = true
             "expected unsafe-enrich_source rejection, got {err2:?}"
         );
     }
+
+    /// NAN-2275: the normalize stage accepted RFC 3339 only, while parsers
+    /// overwhelmingly emit `YYYY-MM-DD HH:MM:SS[.fff]`. Every one of those
+    /// failed the parse, failed `is_timestamp`, and fell through to `now()` —
+    /// so the LOG time was replaced by INGEST time, silently. 0 of 2817 Google
+    /// Workspace rows carried their real time, and one instant rendered as five
+    /// days of activity. It also made the `dedupe` transform inert, since its
+    /// key includes `timestamp` and `now()` never repeats.
+    ///
+    /// This EXECUTES the generated block rather than pattern-matching the text:
+    /// the bug was a runtime parse failure that a string assertion would have
+    /// sailed straight past.
+    ///
+    /// Runs under a deliberately NON-UTC timezone. A bare `parse_timestamp` of a
+    /// zone-less string reads it in the host's zone — measured 4h off on UTC-4.
+    /// The container happens to run UTC, so a UTC-only test would pass while
+    /// still shipping a host-dependent skew.
+    #[test]
+    fn normalize_keeps_log_time_in_every_shape_a_parser_emits() {
+        use vrl::compiler::runtime::Runtime;
+        use vrl::compiler::state::RuntimeState;
+        use vrl::compiler::{compile, TargetValue, TimeZone};
+        use vrl::value::{ObjectMap, Secrets, Value};
+
+        let content = VectorConfigManager::pipeline_config_content();
+        let block = extract_vrl_blocks(content)
+            .into_iter()
+            .find(|b| b.contains(".udm.timestamp = format_timestamp!"))
+            .expect("normalize block that sets .udm.timestamp");
+
+        let fns = vrl::stdlib::all();
+        let program = compile(block, &fns)
+            .expect("normalize block compiles")
+            .program;
+
+        // Not UTC on purpose — see the doc comment.
+        let tz = TimeZone::parse("America/New_York").expect("tz");
+
+        // (input on `.timestamp`, expected `.udm.timestamp`)
+        // Rendered `+00:00` rather than `Z` — same instant, this is how the VRL
+        // crate formats `%+`. What matters is the OFFSET is zero despite the
+        // non-UTC runtime timezone above.
+        let cases = [
+            // The shape most parsers emit. Must be read as UTC, not local.
+            ("2026-07-29 13:36:59", "2026-07-29T13:36:59+00:00"),
+            ("2026-07-29 13:36:59.002", "2026-07-29T13:36:59.002+00:00"),
+            ("2026-07-29 13:36:59.002456", "2026-07-29T13:36:59.002456+00:00"),
+            // Already RFC 3339 — the only shape that used to work.
+            ("2026-07-29T13:36:59.002Z", "2026-07-29T13:36:59.002+00:00"),
+            // An explicit offset must still be honoured, not overridden.
+            ("2026-07-29T13:36:59-04:00", "2026-07-29T17:36:59+00:00"),
+            ("2026-07-29 13:36:59+00:00", "2026-07-29T13:36:59+00:00"),
+        ];
+
+        for (input, expected) in cases {
+            let mut obj = ObjectMap::new();
+            obj.insert("timestamp".into(), Value::from(input));
+            obj.insert("message".into(), Value::from("x"));
+            let mut target = TargetValue {
+                value: Value::Object(obj),
+                metadata: Value::Object(ObjectMap::new()),
+                secrets: Secrets::new(),
+            };
+
+            let mut runtime = Runtime::new(RuntimeState::default());
+            runtime
+                .resolve(&mut target, &program, &tz)
+                .unwrap_or_else(|e| panic!("{input}: normalize failed: {e}"));
+
+            let got = target
+                .value
+                .get(vrl::path!("udm", "timestamp"))
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| panic!("{input}: no .udm.timestamp"));
+
+            assert_eq!(got, expected, "{input} must keep the LOG time");
+
+            let fell_back = target
+                .value
+                .get(vrl::path!("metadata", "timestamp_fallback"))
+                .is_some();
+            assert!(!fell_back, "{input} must not fall back to now()");
+        }
+    }
+
+    /// The fallback still exists for genuinely unparseable input — but it now
+    /// leaves a mark. The previous version fell back with no error, no metric
+    /// and no field, which is why a whole source read as "live" for five days.
+    #[test]
+    fn an_unparseable_timestamp_falls_back_but_says_so() {
+        use vrl::compiler::runtime::Runtime;
+        use vrl::compiler::state::RuntimeState;
+        use vrl::compiler::{compile, TargetValue, TimeZone};
+        use vrl::value::{ObjectMap, Secrets, Value};
+
+        let content = VectorConfigManager::pipeline_config_content();
+        let block = extract_vrl_blocks(content)
+            .into_iter()
+            .find(|b| b.contains(".udm.timestamp = format_timestamp!"))
+            .expect("normalize block");
+        let program = compile(block, &vrl::stdlib::all())
+            .expect("compiles")
+            .program;
+
+        let mut obj = ObjectMap::new();
+        obj.insert("timestamp".into(), Value::from("not a timestamp"));
+        let mut target = TargetValue {
+            value: Value::Object(obj),
+            metadata: Value::Object(ObjectMap::new()),
+            secrets: Secrets::new(),
+        };
+
+        let mut runtime = Runtime::new(RuntimeState::default());
+        runtime
+            .resolve(&mut target, &program, &TimeZone::Local)
+            .expect("normalize must not error on junk");
+
+        assert!(
+            target
+                .value
+                .get(vrl::path!("udm", "timestamp"))
+                .is_some(),
+            "still stamped, so the event is not dropped"
+        );
+        assert_eq!(
+            target
+                .value
+                .get(vrl::path!("metadata", "timestamp_fallback"))
+                .and_then(|v| v.as_boolean()),
+            Some(true),
+            "the fallback must be visible, not silent"
+        );
+    }
+
+    /// NAN-2276: the SAME RFC-3339-only parse exists twice, and the copy fixed
+    /// in NAN-2275 was the one real parsers never reach.
+    ///
+    /// `normalize` takes only `["placeholder_combiner", "generic_parser"]`.
+    /// DB-backed parsers arrive via `db_parsers_combined` and go straight into
+    /// `clickhouse_mapping` — so fixing normalize alone left every deployed
+    /// parser still stamped with ingest time, which is exactly what the live
+    /// Google Workspace rows showed after that deploy.
+    ///
+    /// Pins the mapping stage against the same shapes, under a non-UTC zone.
+    #[test]
+    fn clickhouse_mapping_keeps_log_time_for_db_backed_parsers() {
+        use vrl::compiler::runtime::Runtime;
+        use vrl::compiler::state::RuntimeState;
+        use vrl::compiler::{compile, TargetValue, TimeZone};
+        use vrl::value::{ObjectMap, Secrets, Value};
+
+        let content = VectorConfigManager::pipeline_config_content();
+        let block = extract_vrl_blocks(content)
+            .into_iter()
+            .find(|b| b.contains(".id = uuid_v7()"))
+            .expect("clickhouse_mapping block");
+
+        let program = compile(block, &vrl::stdlib::all())
+            .expect("clickhouse_mapping compiles")
+            .program;
+        let tz = TimeZone::parse("America/New_York").expect("tz");
+
+        // The mapping stage renders "%Y-%m-%d %H:%M:%S" (ClickHouse DateTime).
+        let cases = [
+            ("2026-07-29 13:36:59", "2026-07-29 13:36:59"),
+            ("2026-07-29 13:36:59.002", "2026-07-29 13:36:59"),
+            ("2026-07-29T13:36:59.002Z", "2026-07-29 13:36:59"),
+            // An explicit offset is converted, not ignored.
+            ("2026-07-29T13:36:59-04:00", "2026-07-29 17:36:59"),
+        ];
+
+        for (input, expected) in cases {
+            let mut obj = ObjectMap::new();
+            obj.insert("timestamp".into(), Value::from(input));
+            obj.insert("message".into(), Value::from("x"));
+            obj.insert("metadata".into(), Value::Object(ObjectMap::new()));
+            let mut target = TargetValue {
+                value: Value::Object(obj),
+                metadata: Value::Object(ObjectMap::new()),
+                secrets: Secrets::new(),
+            };
+
+            let mut runtime = Runtime::new(RuntimeState::default());
+            runtime
+                .resolve(&mut target, &program, &tz)
+                .unwrap_or_else(|e| panic!("{input}: mapping failed: {e}"));
+
+            let got = target
+                .value
+                .get(vrl::path!("timestamp"))
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| panic!("{input}: no .timestamp"));
+            assert_eq!(got, expected, "{input} must keep the LOG time");
+
+            // metadata is JSON-encoded by this stage; the marker must be absent.
+            let meta = target
+                .value
+                .get(vrl::path!("metadata"))
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_default();
+            assert!(
+                !meta.contains("timestamp_fallback"),
+                "{input} must not fall back, got metadata {meta}"
+            );
+        }
+    }
+
+    /// Junk still falls back here too — but says so, in the JSON-encoded
+    /// metadata this stage produces.
+    #[test]
+    fn clickhouse_mapping_marks_its_timestamp_fallback() {
+        use vrl::compiler::runtime::Runtime;
+        use vrl::compiler::state::RuntimeState;
+        use vrl::compiler::{compile, TargetValue, TimeZone};
+        use vrl::value::{ObjectMap, Secrets, Value};
+
+        let content = VectorConfigManager::pipeline_config_content();
+        let block = extract_vrl_blocks(content)
+            .into_iter()
+            .find(|b| b.contains(".id = uuid_v7()"))
+            .expect("clickhouse_mapping block");
+        let program = compile(block, &vrl::stdlib::all())
+            .expect("compiles")
+            .program;
+
+        let mut obj = ObjectMap::new();
+        obj.insert("timestamp".into(), Value::from("not a timestamp"));
+        obj.insert("message".into(), Value::from("x"));
+        obj.insert("metadata".into(), Value::Object(ObjectMap::new()));
+        let mut target = TargetValue {
+            value: Value::Object(obj),
+            metadata: Value::Object(ObjectMap::new()),
+            secrets: Secrets::new(),
+        };
+
+        let mut runtime = Runtime::new(RuntimeState::default());
+        runtime
+            .resolve(&mut target, &program, &TimeZone::Local)
+            .expect("must not error on junk");
+
+        let meta = target
+            .value
+            .get(vrl::path!("metadata"))
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            meta.contains("timestamp_fallback"),
+            "the fallback must be visible, got {meta}"
+        );
+    }

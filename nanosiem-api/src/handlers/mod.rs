@@ -130,6 +130,7 @@ pub mod settings;
 pub mod setup;
 pub mod siem_health;
 pub mod siem_health_suppressions;
+pub mod system_health_events;
 pub mod source_configs;
 pub mod source_scopes;
 pub mod system;

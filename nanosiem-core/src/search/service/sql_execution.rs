@@ -3,7 +3,8 @@
 use super::*;
 use crate::auth::ScopeSet;
 use crate::search::execution::clickhouse_executor::{
-    wrap_query_for_count, wrap_query_with_pagination, BoundedCountInput, ClickHouseExecutor,
+    raw_sql_needs_skip_index_guard, wrap_query_for_count, wrap_query_with_pagination,
+    BoundedCountInput, ClickHouseExecutor,
 };
 use crate::search::query_processing::enforce_source_scope;
 
@@ -438,8 +439,17 @@ impl SearchService {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
-        let paginated_sql = wrap_query_with_pagination(sql, limit, offset);
-        let count_sql = wrap_query_for_count(sql);
+        let mut paginated_sql = wrap_query_with_pagination(sql, limit, offset);
+        let mut count_sql = wrap_query_for_count(sql);
+        // NAN-2277: raw SQL bypasses the codegen-side `use_skip_indexes=0`
+        // guard (NAN-2274), so a scalar-Map query submitted here can still hit
+        // the CH >=26.4 unkillable planner wedge (ClickHouse#113003). Apply the
+        // same guard when the text carries the map pattern; top-level SETTINGS
+        // on the wrap applies to the whole query including the subquery.
+        if raw_sql_needs_skip_index_guard(sql) {
+            paginated_sql.push_str(" SETTINGS use_skip_indexes = 0");
+            count_sql.push_str(" SETTINGS use_skip_indexes = 0");
+        }
 
         // NAN-2001: main query + count companion both run on the selected
         // raw-SQL identity so neither the rows nor the total leak audit data.

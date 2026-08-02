@@ -113,6 +113,7 @@ export interface CatalogStats {
   data_count: number;
   agent_count: number;
   identity_count: number;
+  collector_count: number;
 }
 
 export interface CatalogListResponse {

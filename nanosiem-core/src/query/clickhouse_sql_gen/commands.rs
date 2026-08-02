@@ -7,7 +7,7 @@
 
 use super::eval_functions::eval_expression_to_sql;
 use super::helpers::*;
-use super::ClickHouseSqlGenerator;
+use super::{ClickHouseSqlGenerator, SourceStability};
 use crate::query::ast::*;
 use crate::query::sql_gen::SqlGenError;
 use std::collections::HashSet;
@@ -26,10 +26,11 @@ impl ClickHouseSqlGenerator {
         // True when the pipeline has exactly one resolve_identity — the stage
         // then also emits bare `identity_*` aliases (NAN-1346 #5).
         single_resolve_identity: bool,
-        // True when `source` is the deterministic base scan (stage_0 with no
-        // injected ORDER BY/LIMIT) — the only source the dedup survivor-id
-        // rewrite may scan twice (NAN-1636).
-        source_is_deterministic_base: bool,
+        // What re-executing `source` is guaranteed to yield — gates every
+        // rewrite that references the source CTE more than once: the sort-free
+        // dedup rewrite (NAN-1636, corrected by NAN-2264) and the eventstats /
+        // anomaly map-scalar attach (NAN-2265).
+        stability: SourceStability,
     ) -> Result<String, SqlGenError> {
         // Whether the raw time column still exists at this pipeline stage:
         // false after an aggregating command (stats/timechart/top/...) or after a
@@ -286,54 +287,88 @@ impl ClickHouseSqlGenerator {
                     .collect();
                 let partition_by = partition_fields.join(", ");
 
-                // Survivor-id rewrite (NAN-1636). The legacy `ORDER BY <keys>,
-                // timestamp LIMIT 1 BY <keys>` full-sorts every wide (~200-column)
-                // row before the LIMIT BY — Code 241 (MergeSortingTransform OOM) at
-                // ≥~15min windows under the production 3GiB/query profile. Selecting
-                // survivor ids with argMin(id, timestamp) sorts nothing and keeps
-                // the same keep-oldest semantics (`keep_first` is ignored in both
-                // shapes; timestamp ties are nondeterministic in both; `id` is the
-                // unique per-row UUIDv7). Guards — ALL must hold, else keep the
-                // legacy shape:
+                // Sort-free dedup (NAN-1636, corrected by NAN-2264). The legacy
+                // `ORDER BY <keys>, timestamp LIMIT 1 BY <keys>` full-sorts every
+                // wide (~200-column) row before the LIMIT BY — Code 241
+                // (MergeSortingTransform OOM) at ≥~15min windows under the
+                // production 3GiB/query profile.
+                //
+                // NAN-1636 replaced it with `WHERE id IN (SELECT argMin(id,
+                // <time>) …)`, which is one-row-per-key ONLY if `id` is unique per
+                // PHYSICAL row. It is not: `ClickHouseLogRow` derives `id` as a
+                // CONTENT hash — SHA256(source_type + timestamp_micros + message)
+                // — deliberately, so retried batches insert idempotently
+                // (`ingestion/row.rs`). MergeTree does not enforce uniqueness, so
+                // content-identical rows coexist sharing an id, and picking one as
+                // survivor passed EVERY row carrying that id. A repeated
+                // explicitly-supplied OCSF id had the same effect. `dedup` emitted
+                // duplicates — the one thing it exists to prevent (NAN-2264).
+                //
+                // The correct sort-free shape restricts each group to its OLDEST
+                // timestamp (an aggregate, not a sort — same keep-oldest semantics
+                // as the legacy form) and then lets `LIMIT 1 BY <keys>` collapse
+                // the ties. `LIMIT 1 BY` guarantees exactly one row per key by
+                // construction, independent of any id, and lowers to a
+                // LimitByTransform over a key-only hash map — no
+                // MergeSortingTransform, so the NAN-1636 memory win is preserved.
+                // `keep_first` is ignored in both shapes and timestamp ties stay
+                // nondeterministic in both, as before.
+                //
+                // Guards — ALL must hold, else keep the legacy shape:
                 //  - `source` must be the deterministic base scan: the rewrite
                 //    scans the source CTE twice (outer + IN-subquery), so a
                 //    nondeterministic upstream stage (`head` with no ORDER BY, a
                 //    LIMITed requery base) could sample different rows per scan;
-                //  - `id` must still exist at this stage — an upstream
-                //    include-mode `fields`/`table` that pruned it would make the
-                //    IN-subquery UNKNOWN_IDENTIFIER;
-                //  - the survivor id / time column must be the physical row
-                //    identity — not an upstream `eval id=…`/`eval timestamp=…`
-                //    reassignment.
-                // O27 (NAN-1721): the survivor id and time columns are
-                // profile-relative. Logs carry `(id, timestamp)` — byte-identical
-                // to the legacy shape; spans carry `(span_id, start_time)` (the
-                // spans-safe survivor key). Profiles with no per-row id column
-                // (metrics) fall to the LIMIT-BY shape below, whose ORDER BY now
-                // uses the dataset time column instead of a hardcoded `timestamp`
-                // that does not exist on `otel_spans`.
+                //  - the dataset time column must still exist at this stage — an
+                //    upstream include-mode `fields`/`table` that pruned it would
+                //    make the IN-subquery UNKNOWN_IDENTIFIER — and must be the
+                //    physical row time, not an upstream `eval timestamp=…`;
+                //  - the dataset must be a physical row scan, i.e. one whose
+                //    profile has a per-row identity column (`id` on logs,
+                //    `span_id` on spans). The emitted SQL no longer references
+                //    that column — this deliberately pins the rewrite to exactly
+                //    the datasets NAN-1636 measured. `metrics` / the derived
+                //    `risk` grain keep the legacy shape: relaxing the gate for
+                //    them is a separate question, because double-scanning a
+                //    derived aggregate base is its own performance trade.
+                // O27 (NAN-1721): the time column is profile-relative — `timestamp`
+                // on logs, `start_time` on spans (a literal `timestamp` does not
+                // exist on `otel_spans`); the legacy ORDER BY below uses it too.
                 let time_col = self.time_column();
-                let survivor_id = self.row_identity_column();
-                let survivor_available = match survivor_id {
-                    None => false,
-                    Some(sid) => match available_columns {
-                        None => true,
-                        Some(cols) => cols.contains(sid),
-                    },
+                let base_is_physical_row_scan = self.row_identity_column().is_some();
+                let time_col_available = match available_columns {
+                    None => true,
+                    Some(cols) => cols.contains(time_col),
                 };
-                let survivor_is_row_identity = match survivor_id {
-                    None => false,
-                    Some(sid) => {
-                        self.profile.core_fields().contains(&time_col)
-                            && !self.is_upstream_computed_field(sid)
-                            && !self.is_upstream_computed_field(time_col)
-                    }
-                };
-                if source_is_deterministic_base && survivor_available && survivor_is_row_identity {
-                    let sid = survivor_id
-                        .expect("survivor_id is Some under the row-identity guard");
+                let time_col_is_row_time = self.profile.core_fields().contains(&time_col)
+                    && !self.is_upstream_computed_field(time_col);
+                if stability.deterministic_base
+                    && base_is_physical_row_scan
+                    && time_col_available
+                    && time_col_is_row_time
+                {
+                    // Null-safe candidate matching. ClickHouse's IN keeps SQL NULL
+                    // semantics by default (`transform_null_in = 0`), so a tuple
+                    // carrying NULL matches nothing: a bare `(<keys>, <time>) IN
+                    // (…)` would DROP every row whose dedup key is NULL, where the
+                    // legacy shape keeps one (GROUP BY and LIMIT BY both treat
+                    // NULL as an ordinary group value). Reachable today —
+                    // `enrich_time` is Nullable, as is any eval-computed key.
+                    // Matching on `(isNull(k), assumeNotNull(k))` is total: NULL
+                    // maps to `(1, <default>)`, a real value to `(0, <value>)`, so
+                    // the two can never collide. Constant-folded away for the
+                    // non-Nullable columns that carry most dedup keys. The time
+                    // element needs no such wrapper: it is the dataset's primary
+                    // time column, non-Nullable on every dataset table (it is the
+                    // partition/ORDER BY key), and the guard above rejects an
+                    // upstream reassignment of it.
+                    let match_keys = partition_fields
+                        .iter()
+                        .map(|f| format!("isNull({f}), assumeNotNull({f})"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     Ok(format!(
-                        "  SELECT * FROM {src}\n  WHERE {sid} IN (\n    SELECT argMin({sid}, {time_col}) FROM {src}\n    GROUP BY {partition_by}\n  )",
+                        "  SELECT * FROM {src}\n  WHERE ({match_keys}, {time_col}) IN (\n    SELECT {match_keys}, min({time_col}) FROM {src}\n    GROUP BY {partition_by}\n  )\n  LIMIT 1 BY {partition_by}",
                         src = source
                     ))
                 } else {
@@ -1128,7 +1163,7 @@ impl ClickHouseSqlGenerator {
             Command::EventStats {
                 aggregations,
                 group_by,
-            } => self.generate_eventstats_sql(source, aggregations, group_by),
+            } => self.generate_eventstats_sql(source, aggregations, group_by, &stability),
             Command::Sequence {
                 group_by,
                 maxspan,
@@ -1145,7 +1180,14 @@ impl ClickHouseSqlGenerator {
                 by_fields,
                 threshold,
                 method,
-            } => self.generate_anomaly_sql(source, field, by_fields, *threshold, method),
+            } => self.generate_anomaly_sql(
+                source,
+                field,
+                by_fields,
+                *threshold,
+                method,
+                &stability,
+            ),
             // InputLookup is handled in post-processing (Rust code), not SQL
             Command::InputLookup { .. } => Ok(format!("SELECT * FROM {}", source)),
             Command::Tree {

@@ -763,10 +763,35 @@ ts = .metadata.timestamp
 if ts == null { ts = .timestamp }
 if ts == null { ts = now() }
 if is_string(ts) {
-    parsed_ts, err = parse_timestamp(ts, "%+")
-    if err == null { ts = parsed_ts }
+    raw_ts = to_string(ts) ?? ""
+    parsed_ts, ts_err = parse_timestamp(raw_ts, "%+")
+    if ts_err != null {
+        # Parsers overwhelmingly emit "YYYY-MM-DD HH:MM:SS[.fff]" — a space,
+        # no zone. `%+` needs the T AND an offset, so every one of those failed,
+        # fell through to now(), and shipped INGEST time as the log time
+        # (NAN-2275). It also made the dedupe transform below inert, since its
+        # key includes timestamp and now() never repeats.
+        #
+        # Parsed as UTC explicitly rather than by re-formatting: a bare
+        # parse_timestamp reads a zone-less string in the HOST timezone, which
+        # measured 4h off on a UTC-4 machine. The container runs UTC today, but
+        # Vector defaults to local and nothing pins it.
+        candidate_ts = replace(raw_ts, " ", "T")
+        if !match(candidate_ts, r'(Z|[+-]\d{2}:?\d{2})$') {
+            candidate_ts = candidate_ts + "Z"
+        }
+        parsed_ts, ts_err = parse_timestamp(candidate_ts, "%+")
+    }
+    if ts_err == null { ts = parsed_ts }
 }
-if !is_timestamp(ts) { ts = now() }
+if !is_timestamp(ts) {
+    # Marked, not silent. The previous version fell back with no error, no
+    # metric and no field, so a whole source read as "live" for five days
+    # before anyone noticed the timestamps were ingest time.
+    if !is_object(.metadata) { .metadata = {} }
+    .metadata.timestamp_fallback = true
+    ts = now()
+}
 .udm.timestamp = format_timestamp!(ts, "%+")
 '''
 
@@ -871,19 +896,46 @@ source = '''
 # Internal marker exists only long enough for the per-parser sample transform
 # to retain failures. The durable diagnostic lives in metadata.parse_error.
 del(._nano_parser_failure)
+ts_fell_back = false
 if !exists(.timestamp) {
+    ts_fell_back = true
     .timestamp = format_timestamp!(now(), format: "%Y-%m-%d %H:%M:%S")
 } else if is_string(.timestamp) {
-    ts, err = parse_timestamp(.timestamp, "%+")
+    raw_ts = to_string(.timestamp) ?? ""
+    ts, err = parse_timestamp(raw_ts, "%+")
+    if err != null {
+        # The SECOND copy of this parse (NAN-2276). `normalize` has the same
+        # logic, but only `placeholder_combiner` and `generic_parser` feed it —
+        # DB-backed parsers arrive via `db_parsers_combined` and land HERE, so
+        # fixing normalize alone left every real parser still mis-stamped.
+        #
+        # Parsers emit "YYYY-MM-DD HH:MM:SS[.fff]"; `%+` needs the T and an
+        # offset, so every one of them fell through to now() and shipped INGEST
+        # time as the log time. Parsed as UTC explicitly rather than bare: a
+        # zone-less parse reads in the HOST timezone (4h off on UTC-4).
+        candidate_ts = replace(raw_ts, " ", "T")
+        if !match(candidate_ts, r'(Z|[+-]\d{2}:?\d{2})$') {
+            candidate_ts = candidate_ts + "Z"
+        }
+        ts, err = parse_timestamp(candidate_ts, "%+")
+    }
     if err == null {
         .timestamp = format_timestamp!(ts, format: "%Y-%m-%d %H:%M:%S")
     } else {
+        ts_fell_back = true
         .timestamp = format_timestamp!(now(), format: "%Y-%m-%d %H:%M:%S")
     }
 } else if is_timestamp(.timestamp) {
     .timestamp = format_timestamp!(.timestamp, format: "%Y-%m-%d %H:%M:%S")
 } else {
+    ts_fell_back = true
     .timestamp = format_timestamp!(now(), format: "%Y-%m-%d %H:%M:%S")
+}
+# Marked, not silent. Written before `.metadata` is JSON-encoded below, and
+# guarded because a parser can leave `.metadata` as a non-object.
+if ts_fell_back {
+    if !is_object(.metadata) { .metadata = {} }
+    .metadata.timestamp_fallback = true
 }
 .message = to_string(.message) ?? ""
 if is_object(.metadata) {

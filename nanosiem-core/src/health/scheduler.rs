@@ -13,10 +13,14 @@ use tracing::{debug, error, info, warn};
 use crate::audit::{AuditEmitter, AuditEvent, AuditSource};
 use crate::db::DualPool;
 use crate::models::notification::NotificationType;
+use crate::system_health::{
+    HealthCategory, HealthSeverity, PublishHealthEvent, SystemHealthRepository,
+};
 
 use super::ai_monitor::{AiMonitor, AiProviderConnectivityChecker};
 use super::feed_monitor::FeedMonitor;
 use super::repository::{HealthNotification, HealthRepository};
+use super::stuck_query_monitor::StuckQueryMonitor;
 use super::types::{HealthIssueType, HealthSchedulerConfig};
 
 /// Health monitoring scheduler
@@ -25,7 +29,9 @@ pub struct HealthScheduler {
     health_repo: HealthRepository,
     ai_monitor: AiMonitor,
     feed_monitor: FeedMonitor,
+    stuck_query_monitor: StuckQueryMonitor,
     audit_emitter: AuditEmitter,
+    system_health_repo: SystemHealthRepository,
 }
 
 impl HealthScheduler {
@@ -42,11 +48,17 @@ impl HealthScheduler {
         ai_checker: Option<Arc<dyn AiProviderConnectivityChecker>>,
         airgap: bool,
     ) -> Self {
+        let stuck_query_monitor = StuckQueryMonitor::new(
+            dual_pool.clickhouse().clone(),
+            config.stuck_query_threshold_secs,
+        );
         Self {
             config,
             health_repo: HealthRepository::new(pool.clone()),
+            system_health_repo: SystemHealthRepository::new(pool.clone()),
             ai_monitor: AiMonitor::new(pool.clone(), ai_checker, airgap),
             feed_monitor: FeedMonitor::with_clickhouse(pool, dual_pool.clickhouse().clone()),
+            stuck_query_monitor,
             audit_emitter: AuditEmitter::new(dual_pool),
         }
     }
@@ -90,6 +102,14 @@ impl HealthScheduler {
             }
         } else {
             debug!("Feed monitoring disabled, skipping staleness checks");
+        }
+
+        // Stuck-query check has no settings gate: it is one lightweight
+        // system-table probe per cycle, and the failure mode it detects (a
+        // permanently wedged 100%-CPU ClickHouse thread, NAN-2274 /
+        // ClickHouse#113003) has no other signal anywhere in the product.
+        if let Err(e) = self.check_stuck_queries().await {
+            error!(error = %e, "Failed to check for stuck ClickHouse queries");
         }
     }
 
@@ -137,11 +157,30 @@ impl HealthScheduler {
                         );
                     }
                 }
+                let event = Self::ai_provider_health_event(&status);
+                if let Err(error) = self.system_health_repo.publish(&event).await {
+                    warn!(
+                        provider = %status.provider_type,
+                        %error,
+                        "Failed to publish AI-provider system health event"
+                    );
+                }
             } else {
                 // Provider is healthy - resolve any existing issue
                 self.health_repo
                     .resolve_issue(&HealthIssueType::AiProvider.to_string(), &issue_key)
                     .await?;
+                if let Err(error) = self
+                    .system_health_repo
+                    .resolve_by_dedup_key(&Self::ai_provider_dedup_key(&status.provider_type))
+                    .await
+                {
+                    warn!(
+                        provider = %status.provider_type,
+                        %error,
+                        "Failed to resolve AI-provider system health event"
+                    );
+                }
             }
         }
 
@@ -177,11 +216,108 @@ impl HealthScheduler {
                     }
                     self.emit_feed_stale_audit(&status).await;
                 }
+
+                // NAN-2282: adapt the EXISTING staleness detector into the
+                // normalized bus. This deliberately does not add another
+                // ClickHouse probe or replace the current in-app notification.
+                let event = Self::feed_stale_health_event(&status);
+                if let Err(error) = self.system_health_repo.publish(&event).await {
+                    warn!(
+                        feed_id = %status.feed_id,
+                        %error,
+                        "Failed to publish stale-feed system health event"
+                    );
+                }
             } else {
                 // Feed is healthy - resolve any existing issue
                 self.health_repo
                     .resolve_issue(&HealthIssueType::DataFeed.to_string(), &issue_key)
                     .await?;
+                if let Err(error) = self
+                    .system_health_repo
+                    .resolve_by_dedup_key(&Self::feed_stale_dedup_key(status.feed_id))
+                    .await
+                {
+                    warn!(
+                        feed_id = %status.feed_id,
+                        %error,
+                        "Failed to resolve stale-feed system health event"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Report cancelled-but-still-running ClickHouse queries and resolve the
+    /// ones that have disappeared (thread cleared by a server restart).
+    async fn check_stuck_queries(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let probe = self.stuck_query_monitor.check_stuck_queries().await;
+
+        let current: std::collections::HashSet<&str> =
+            probe.statuses.iter().map(|s| s.query_id.as_str()).collect();
+
+        for status in &probe.statuses {
+            let notification = Self::stuck_query_notification(status);
+            if let Some(recipients) = self
+                .health_repo
+                .notify_issue_once(
+                    &HealthIssueType::StuckQuery.to_string(),
+                    &status.query_id,
+                    &notification,
+                )
+                .await?
+            {
+                if recipients == 0 {
+                    warn!("No admin users found to notify about stuck ClickHouse query");
+                } else {
+                    info!(
+                        query_id = %status.query_id,
+                        elapsed_secs = status.elapsed_secs,
+                        recipients,
+                        "Sent stuck ClickHouse query notifications to admin users"
+                    );
+                }
+            }
+
+            let event = Self::stuck_query_health_event(status);
+            if let Err(error) = self.system_health_repo.publish(&event).await {
+                warn!(
+                    query_id = %status.query_id,
+                    %error,
+                    "Failed to publish stuck-query system health event"
+                );
+            }
+        }
+
+        // A tracked stuck query that is no longer in system.processes means the
+        // server was restarted (the only way the thread clears) — resolve it.
+        // Only an authoritative probe may resolve: an errored or
+        // degraded-to-local view returning nothing would otherwise resolve
+        // every tracked issue, re-arm notify_issue_once, and re-notify the
+        // same wedge on every probe flap.
+        if !probe.authoritative {
+            return Ok(());
+        }
+        for issue in self.health_repo.list_active_issues().await? {
+            if issue.issue_type == HealthIssueType::StuckQuery.to_string()
+                && !current.contains(issue.issue_key.as_str())
+            {
+                self.health_repo
+                    .resolve_issue(&issue.issue_type, &issue.issue_key)
+                    .await?;
+                if let Err(error) = self
+                    .system_health_repo
+                    .resolve_by_dedup_key(&Self::stuck_query_dedup_key(&issue.issue_key))
+                    .await
+                {
+                    warn!(
+                        query_id = %issue.issue_key,
+                        %error,
+                        "Failed to resolve stuck-query system health event"
+                    );
+                }
             }
         }
 
@@ -209,6 +345,96 @@ impl HealthScheduler {
                 "error_message": status.error_message,
             }),
         }
+    }
+
+    fn ai_provider_health_event(status: &super::types::AiProviderStatus) -> PublishHealthEvent {
+        let mut event = PublishHealthEvent::new(
+            Self::ai_provider_dedup_key(&status.provider_type),
+            HealthCategory::Service,
+            HealthSeverity::High,
+            format!("AI provider unavailable: {}", status.provider_name),
+            status
+                .error_message
+                .clone()
+                .unwrap_or_else(|| "The provider connectivity check failed.".to_string()),
+            "ai_provider",
+            "health_scheduler.ai_monitor",
+        );
+        event.resource_id = Some(status.provider_type.clone());
+        event.resource_name = Some(status.provider_name.clone());
+        event.diagnostic_context = serde_json::json!({
+            "provider_type": status.provider_type,
+            "checked_at": status.checked_at,
+            "error_message": status.error_message,
+        });
+        event.remediation = Some(
+            "Verify the provider credential, API endpoint, account quota, network egress, and provider status."
+                .to_string(),
+        );
+        event
+    }
+
+    fn ai_provider_dedup_key(provider_type: &str) -> String {
+        format!("service:ai_provider:{provider_type}:unavailable")
+    }
+
+    fn stuck_query_notification(status: &super::types::StuckQueryStatus) -> HealthNotification {
+        let elapsed = if status.elapsed_secs >= 3600.0 {
+            format!("{:.1} hours", status.elapsed_secs / 3600.0)
+        } else {
+            format!("{:.0} minutes", status.elapsed_secs / 60.0)
+        };
+
+        HealthNotification {
+            notification_type: NotificationType::StuckQueryDetected,
+            title: "Unkillable ClickHouse query detected".to_string(),
+            message: Some(format!(
+                "Query {} (user: {}) was cancelled but has been running for {}. \
+                 It is stuck in query planning, is holding a CPU core at 100%, and \
+                 will not stop on its own — restarting the ClickHouse server is the \
+                 only way to clear it.",
+                status.query_id, status.user, elapsed
+            )),
+            link: None,
+            metadata: serde_json::json!({
+                "query_id": status.query_id,
+                "user": status.user,
+                "elapsed_secs": status.elapsed_secs,
+                "query_snippet": status.query_snippet,
+            }),
+        }
+    }
+
+    fn stuck_query_health_event(status: &super::types::StuckQueryStatus) -> PublishHealthEvent {
+        let mut event = PublishHealthEvent::new(
+            Self::stuck_query_dedup_key(&status.query_id),
+            HealthCategory::Query,
+            HealthSeverity::High,
+            "Unkillable ClickHouse query detected",
+            format!(
+                "Query {} has remained active for {:.0} seconds after cancellation and is holding a CPU core.",
+                status.query_id, status.elapsed_secs
+            ),
+            "clickhouse_query",
+            "health_scheduler.stuck_query_monitor",
+        );
+        event.resource_id = Some(status.query_id.clone());
+        event.resource_name = Some(status.user.clone());
+        event.diagnostic_context = serde_json::json!({
+            "query_id": status.query_id,
+            "user": status.user,
+            "elapsed_secs": status.elapsed_secs,
+            "query_snippet": status.query_snippet,
+        });
+        event.remediation = Some(
+            "Restart the affected ClickHouse server to clear the wedged query-planning thread."
+                .to_string(),
+        );
+        event
+    }
+
+    fn stuck_query_dedup_key(query_id: &str) -> String {
+        format!("query:{query_id}:stuck")
     }
 
     fn feed_stale_notification(status: &super::types::FeedStalenessStatus) -> HealthNotification {
@@ -245,6 +471,42 @@ impl HealthScheduler {
                 "minutes_since_last_event": status.minutes_since_last_event,
             }),
         }
+    }
+
+    fn feed_stale_health_event(status: &super::types::FeedStalenessStatus) -> PublishHealthEvent {
+        let staleness_detail = status
+            .minutes_since_last_event
+            .map(|minutes| format!("No data received for {minutes} minutes"))
+            .unwrap_or_else(|| "No data has ever been received".to_string());
+        let mut event = PublishHealthEvent::new(
+            Self::feed_stale_dedup_key(status.feed_id),
+            HealthCategory::LogSource,
+            HealthSeverity::High,
+            format!("Log source stopped sending: {}", status.feed_name),
+            format!(
+                "{staleness_detail}; configured stale threshold is {} minutes.",
+                status.stale_threshold_minutes
+            ),
+            "log_source",
+            "health_scheduler.feed_monitor",
+        );
+        event.resource_id = Some(status.feed_id.to_string());
+        event.resource_name = Some(status.feed_name.clone());
+        event.diagnostic_context = serde_json::json!({
+            "last_event_at": status.last_event_at,
+            "minutes_since_last_event": status.minutes_since_last_event,
+            "stale_threshold_minutes": status.stale_threshold_minutes,
+        });
+        event.remediation = Some(
+            "Check the upstream sender, credentials, network path, parser routing, and recent source configuration changes."
+                .to_string(),
+        );
+        event
+    }
+
+    /// Stable identity shared by the stale producer and healthy recovery path.
+    fn feed_stale_dedup_key(feed_id: uuid::Uuid) -> String {
+        format!("log_source:{feed_id}:stale")
     }
 
     /// Emit an audit event when a feed goes stale

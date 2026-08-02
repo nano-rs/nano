@@ -47,6 +47,7 @@ import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
 import { useToast } from '@/hooks/use-toast';
 import { Markdown } from '@/components/ui/markdown';
+import { SystemHealthEventsPanel } from '@/components/system-health/SystemHealthEventsPanel';
 import {
   Popover,
   PopoverContent,
@@ -1724,6 +1725,7 @@ export function SiemHealth() {
         <div className="mt-8 flex items-center justify-center py-16">
           <RefreshCw className="h-5 w-5 animate-spin text-muted-foreground" />
         </div>
+        <SystemHealthEventsPanel />
       </div>
     );
   }
@@ -1744,6 +1746,7 @@ export function SiemHealth() {
             </p>
           </div>
         </div>
+        <SystemHealthEventsPanel />
         <div className="mt-8 rounded-xl border border-border bg-card px-6 py-12 text-center">
           <HeartPulse className="mx-auto mb-3 h-8 w-8 text-muted-foreground/40" />
           <p className="text-[13px] text-foreground">
@@ -1849,6 +1852,8 @@ export function SiemHealth() {
           </div>
         )}
       </div>
+
+      <SystemHealthEventsPanel />
 
       {/* Pipeline spine */}
       <div className="mt-4">

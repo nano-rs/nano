@@ -32,9 +32,57 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # NAN-2283: per-job path gating. The workflow-level `paths:` filter above is
+  # the union of both packages, so before this job existed a `nanosiem-web`-only
+  # PR still started every job below — including `desktop`, which runs Rust
+  # tests that a TypeScript change cannot possibly affect. Same `dorny` idiom as
+  # build-and-push.yml's `changes` job.
+  #
+  # `workflow_dispatch` has no base ref to diff against, so the filter outputs
+  # are empty there; every `if:` below carries an explicit dispatch escape so a
+  # manual run still executes everything.
+  #
+  # Every gate below FAILS OPEN (`needs.changes.result != 'success'`). If this
+  # job breaks, the dependents run instead of silently skipping — a broken gate
+  # that quietly reports "skipped" on a green PR is exactly the NAN-2198 failure
+  # this workflow exists to end. Wasting a run costs minutes; not running the
+  # tests costs a shipped bug.
+  changes:
+    runs-on: [self-hosted, Linux, X64]
+    permissions:
+      contents: read
+      # Required, and NOT optional the way it is in build-and-push.yml's copy of
+      # this job. That one runs on `push`, where paths-filter diffs locally with
+      # git. On `pull_request` it calls the GitHub API to list changed files, and
+      # a `permissions:` block replaces the defaults rather than adding to them —
+      # so without this the action dies on "Resource not accessible by
+      # integration" and every dependent job skips.
+      pull-requests: read
+    outputs:
+      desktop: ${{ steps.filter.outputs.desktop }}
+      web: ${{ steps.filter.outputs.web }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            desktop:
+              - 'nano-desktop/**'
+              - '.github/workflows/desktop-web-tests.yml'
+            web:
+              - 'nanosiem-web/**'
+              - '.github/workflows/desktop-web-tests.yml'
+
   web:
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.changes.result != 'success' || needs.changes.outputs.web == 'true') }}
     # Self-hosted only (repo rule — never ubuntu-latest).
-    runs-on: [self-hosted, X64]
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -97,7 +145,13 @@ jobs:
     #
     # Linux + Node only: no Tauri, no webview, so this does not need the macOS
     # runner the `desktop` job below requires.
-    runs-on: [self-hosted, X64]
+    needs: [changes]
+    # Gated on BOTH packages, deliberately. `nano-desktop` reuses source from
+    # `nanosiem-web/src` (vite aliases at runtime, direct resolution during
+    # `tsc`), so a web-only change can break this typecheck. Cheap to run — it
+    # is on the self-hosted X64 box — so err toward running it.
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.changes.result != 'success' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.web == 'true') }}
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -107,6 +161,13 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "22"
+
+      # Desktop imports shared TypeScript directly from nanosiem-web. Bare
+      # imports inside those files resolve from nanosiem-web/node_modules, so a
+      # desktop-only install leaves React, Radix, and CodeMirror unresolved.
+      - name: Install shared web deps
+        working-directory: nanosiem-web
+        run: npm ci
 
       - name: Install deps
         working-directory: nano-desktop
@@ -125,9 +186,9 @@ jobs:
     # `nano-desktop/src-tauri` is its own cargo workspace, excluded from the
     # root one, so the main `test` job never saw it.
     #
-    # GitHub-hosted macOS rather than the self-hosted Linux runners, for the
-    # same reason `desktop-release.yml` uses it: Tauri needs a system webview,
-    # and macOS already has one. On Linux this job would need
+    # macOS rather than the self-hosted Linux runners, for the same reason
+    # `desktop-release.yml` uses it: Tauri needs a system webview, and macOS
+    # already has one. On Linux this job would need
     # libwebkit2gtk/libsoup/libjavascriptcoregtk installed — and the repo has
     # exactly one precedent for `apt-get` (sync-mirror), which does it inside
     # `container: rust:1-bookworm`, not on the bare runner. Installing on the
@@ -136,9 +197,17 @@ jobs:
     # workspace files `build-and-push` deliberately avoids. macOS sidesteps
     # both — verified: the 111 tests run there with zero extra packages.
     #
-    # Path-filtered to nano-desktop, so the pricier runner is only used when
-    # that package actually changes.
-    runs-on: macos-latest
+    # NAN-2283: self-hosted macOS (`mac-studio`, M1 Max) instead of
+    # `macos-latest`. GitHub-hosted macOS bills at 10x on private repos, and
+    # this job plus desktop-release.yml consumed ~1,230 of the 2,000-minute
+    # monthly allowance in July on its own. The Studio is Apple Silicon like
+    # the hosted runner it replaces, so nothing about the build changes.
+    #
+    # The `changes` gate above is what the old comment here claimed but did not
+    # do: `nanosiem-web`-only PRs no longer start this job at all.
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.changes.result != 'success' || needs.changes.outputs.desktop == 'true') }}
+    runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 30
     steps:
       - name: Checkout

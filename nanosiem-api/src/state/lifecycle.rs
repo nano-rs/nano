@@ -134,6 +134,22 @@ impl AppState {
         scheduler.start()
     }
 
+    /// Drain the durable system-health outbox through the existing notification
+    /// channel delivery spine. Leader-only invocation prevents duplicate work;
+    /// row claims remain fenced with `FOR UPDATE SKIP LOCKED` for safe handover.
+    pub fn start_system_health_dispatcher(&self) -> tokio::task::JoinHandle<()> {
+        let repository = nanosiem_core::system_health::SystemHealthRepository::new(
+            self.pool.clone(),
+        );
+        let dispatcher = std::sync::Arc::new(
+            nanosiem_core::system_health::SystemHealthDispatcher::new(
+                repository,
+                self.node_id.clone(),
+            ),
+        );
+        dispatcher.start(std::time::Duration::from_secs(2))
+    }
+
     /// Start the case change listener for real-time SSE notifications.
     ///
     /// Listens on the PostgreSQL `case_changes` channel. When a case is created
@@ -252,6 +268,8 @@ impl AppState {
         // connectivity checks. Keep the entire check + transactional notify
         // path under leadership so replicas do not duplicate external work.
         handles.push(self.start_health_scheduler());
+        handles.push(self.start_system_health_dispatcher());
+        tracing::info!("System health outbox dispatcher started (leader-only)");
         tracing::info!("Health monitoring scheduler started (leader-only)");
 
         // === Egress schedulers — skipped in air-gap mode ===

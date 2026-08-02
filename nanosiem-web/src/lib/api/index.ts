@@ -53,6 +53,7 @@ import { IpAllowlistApi } from './ip-allowlist';
 import { OnboardingApi } from './onboarding';
 import { DemoApi } from './demo';
 import { SiemHealthApi } from './siem-health';
+import { SystemHealthApi } from './system-health';
 import { PlaybooksApi } from '@/enterprise/api/playbooks';
 import { ReportsApi } from './reports';
 
@@ -84,6 +85,9 @@ export type {
   IntegrationInstance, StreamStatus, CreateInstanceRequest as CreateIntegrationInstanceRequest,
   UpdateInstanceRequest as UpdateIntegrationInstanceRequest, ListInstancesResponse,
   TriggerRunResponse, CollectorStreamDef, CollectorConfigFieldDef, StreamProvisionReport,
+  CollectorManifestAuth, CollectorAuthType, CustomCollectorDefinitionRequest,
+  CustomCollectorDefinition, CustomCollectorValidationResponse,
+  CustomCollectorPreviewRequest, CustomCollectorPreviewEvent, CustomCollectorPreviewResponse,
 } from './integrations';
 export { collectorManifest } from './integrations';
 
@@ -180,6 +184,7 @@ class ApiClient {
   private _onboarding: OnboardingApi;
   private _demo: DemoApi;
   private _siemHealth: SiemHealthApi;
+  private _systemHealth: SystemHealthApi;
   private _playbooks: PlaybooksApi;
   private _reports: ReportsApi;
 
@@ -250,6 +255,7 @@ class ApiClient {
     this._onboarding = new OnboardingApi(this.request.bind(this));
     this._demo = new DemoApi(this.request.bind(this));
     this._siemHealth = new SiemHealthApi(this.request.bind(this));
+    this._systemHealth = new SystemHealthApi(this.request.bind(this));
     this._playbooks = new PlaybooksApi(this.request.bind(this));
     this._reports = new ReportsApi(this.request.bind(this), this.getAccessToken.bind(this));
   }
@@ -319,6 +325,10 @@ class ApiClient {
 
   get siemHealth(): SiemHealthApi {
     return this._siemHealth;
+  }
+
+  get systemHealth(): SystemHealthApi {
+    return this._systemHealth;
   }
 
   get playbooks(): PlaybooksApi {

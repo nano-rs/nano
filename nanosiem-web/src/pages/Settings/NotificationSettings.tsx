@@ -60,11 +60,16 @@ const EVENT_TYPE_OPTIONS: { value: string; label: string }[] = [
   { value: 'obs_alert', label: 'Observability alerts' },
   { value: 'case', label: 'Cases' },
   { value: 'report', label: 'Scheduled reports' },
+  { value: 'system_health', label: 'System health' },
 ];
 const EVENT_TYPE_LABEL: Record<string, string> = Object.fromEntries(
   EVENT_TYPE_OPTIONS.map(o => [o.value, o.label]),
 );
 const DEFAULT_EVENT_TYPES = ['siem_alert', 'obs_alert'];
+const HEALTH_CATEGORY_OPTIONS = [
+  'integration', 'enrichment', 'log_source', 'ingestion', 'parser',
+  'storage', 'query', 'credential', 'service',
+];
 
 interface ChannelTypeMeta {
   value: ChannelType;
@@ -177,6 +182,8 @@ function NotificationSettings() {
   const [formSeverityFilter, setFormSeverityFilter] = useState<string[]>([]);
   const [formEventTypes, setFormEventTypes] = useState<string[]>(DEFAULT_EVENT_TYPES);
   const [formRuleFilter, setFormRuleFilter] = useState('');
+  const [formHealthCategories, setFormHealthCategories] = useState<string[]>([]);
+  const [formHealthResources, setFormHealthResources] = useState('');
   const [formEnabled, setFormEnabled] = useState(true);
 
   const load = useCallback(async () => {
@@ -207,6 +214,8 @@ function NotificationSettings() {
     setFormSeverityFilter([]);
     setFormEventTypes(DEFAULT_EVENT_TYPES);
     setFormRuleFilter('');
+    setFormHealthCategories([]);
+    setFormHealthResources('');
     setFormEnabled(true);
     setDialogOpen(true);
   };
@@ -223,6 +232,8 @@ function NotificationSettings() {
     setFormSeverityFilter(c.severity_filter || []);
     setFormEventTypes(c.event_types && c.event_types.length > 0 ? c.event_types : DEFAULT_EVENT_TYPES);
     setFormRuleFilter((c.rule_filter || []).join(', '));
+    setFormHealthCategories(c.health_category_filter || []);
+    setFormHealthResources((c.health_resource_filter || []).join(', '));
     setFormEnabled(c.enabled);
     setDialogOpen(true);
   };
@@ -267,6 +278,10 @@ function NotificationSettings() {
       .split(',')
       .map(s => s.trim())
       .filter(Boolean);
+    const healthResources = formHealthResources
+      .split(',')
+      .map(s => s.trim().toLowerCase())
+      .filter(Boolean);
 
     setSaving(true);
     try {
@@ -282,6 +297,8 @@ function NotificationSettings() {
           severity_filter: formSeverityFilter.length > 0 ? formSeverityFilter : undefined,
           event_types: formEventTypes,
           rule_filter: ruleFilter,
+          health_category_filter: formHealthCategories,
+          health_resource_filter: healthResources,
           enabled: formEnabled,
         };
         // F-39: only send the URL when the user typed a new one; blank keeps the
@@ -299,6 +316,8 @@ function NotificationSettings() {
           severity_filter: formSeverityFilter.length > 0 ? formSeverityFilter : undefined,
           event_types: formEventTypes,
           rule_filter: ruleFilter.length > 0 ? ruleFilter : undefined,
+          health_category_filter: formHealthCategories.length > 0 ? formHealthCategories : undefined,
+          health_resource_filter: healthResources.length > 0 ? healthResources : undefined,
           enabled: formEnabled,
         };
         if (formType === 'generic' && Object.keys(headersMap).length > 0) request.headers = headersMap;
@@ -410,6 +429,11 @@ function NotificationSettings() {
       }
       return [...prev, eventType];
     });
+  };
+  const toggleHealthCategory = (category: string) => {
+    setFormHealthCategories(prev => prev.includes(category)
+      ? prev.filter(value => value !== category)
+      : [...prev, category]);
   };
 
   if (loading) {
@@ -776,6 +800,47 @@ function NotificationSettings() {
                 ))}
               </div>
             </div>
+
+            {formEventTypes.includes('system_health') && (
+              <div className="space-y-3 rounded-md border border-border bg-card/40 p-3">
+                <div>
+                  <label className="block text-[11px] font-medium text-foreground/80 mb-1.5">
+                    Health categories <span className="text-muted-foreground/70 font-normal ml-1">(empty = all)</span>
+                  </label>
+                  <div className="flex flex-wrap gap-1.5">
+                    {HEALTH_CATEGORY_OPTIONS.map(category => (
+                      <button
+                        key={category}
+                        type="button"
+                        onClick={() => toggleHealthCategory(category)}
+                        className={cn(
+                          'h-6 rounded-sm border px-2 font-mono text-[10px] transition-colors',
+                          formHealthCategories.includes(category)
+                            ? 'border-primary bg-primary/15 text-primary'
+                            : 'border-border bg-card text-muted-foreground hover:bg-foreground/5 hover:text-foreground',
+                        )}
+                      >
+                        {category}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-foreground/80 mb-1.5">
+                    Health resource types <span className="text-muted-foreground/70 font-normal ml-1">(optional)</span>
+                  </label>
+                  <Input
+                    value={formHealthResources}
+                    onChange={e => setFormHealthResources(e.target.value)}
+                    placeholder="integration, enrichment, log_source"
+                    className="h-8 text-[11.5px] font-mono"
+                  />
+                  <p className="text-[10.5px] text-muted-foreground mt-1">
+                    Route only matching resource types. Leave empty to receive every selected health category.
+                  </p>
+                </div>
+              </div>
+            )}
 
             <div>
               <label className="block text-[11px] font-medium text-foreground/80 mb-1.5">

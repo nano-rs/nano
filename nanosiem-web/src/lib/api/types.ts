@@ -6132,6 +6132,8 @@ export interface WebhookConfig {
   channel_config: Record<string, unknown>;
   /** Optional detection-rule routing filter as rule_… typeids (null = all). */
   rule_filter: string[] | null;
+  health_category_filter: string[] | null;
+  health_resource_filter: string[] | null;
   enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -6147,6 +6149,8 @@ export interface CreateWebhookRequest {
   channel_type?: ChannelType;
   channel_config?: Record<string, unknown>;
   rule_filter?: string[];
+  health_category_filter?: string[];
+  health_resource_filter?: string[];
   enabled?: boolean;
 }
 
@@ -6160,6 +6164,8 @@ export interface UpdateWebhookRequest {
   channel_type?: ChannelType;
   channel_config?: Record<string, unknown>;
   rule_filter?: string[];
+  health_category_filter?: string[];
+  health_resource_filter?: string[];
   enabled?: boolean;
 }
 

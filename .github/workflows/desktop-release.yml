@@ -11,8 +11,9 @@ name: nano Desktop release
 # one-time OS warning (macOS: right-click > Open; Windows SmartScreen: More info >
 # Run anyway). Add code-signing secrets later to drop the warning.
 #
-# GitHub-hosted runners (macos-latest / windows-latest) are used on purpose: the
-# repo's self-hosted runners are Linux and can't produce mac/windows bundles.
+# Runner choice: a mac/windows bundle can't be produced on the repo's Linux
+# runners. macOS now builds on the self-hosted `mac-studio` (NAN-2283); Windows
+# is still GitHub-hosted until a self-hosted Windows runner exists.
 
 on:
   workflow_dispatch:
@@ -30,11 +31,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest # Apple Silicon runner -> arm64 .dmg/.app
+          # NAN-2283: self-hosted Apple Silicon (`mac-studio`, M1 Max) instead
+          # of `macos-latest`. Same arm64 .dmg/.app, without the 10x billing
+          # multiplier GitHub-hosted macOS carries on private repos.
+          - platform: '["self-hosted", "macOS", "ARM64"]'
             rust_target: aarch64-apple-darwin
-          - platform: windows-latest # -> .msi + .nsis (.exe)
+          # Still GitHub-hosted (2x) — no self-hosted Windows runner exists yet.
+          - platform: '["windows-latest"]'
             rust_target: x86_64-pc-windows-msvc
-    runs-on: ${{ matrix.platform }}
+    # JSON-encoded so a multi-label self-hosted target survives the matrix;
+    # `runs-on` takes the decoded array.
+    runs-on: ${{ fromJSON(matrix.platform) }}
     timeout-minutes: 45
     steps:
       - name: Checkout

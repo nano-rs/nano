@@ -50,6 +50,8 @@ async fn loopback_target_blocked_without_opt_in() {
             channel_type: None,
             channel_config: None,
             rule_filter: None,
+            health_category_filter: None,
+            health_resource_filter: None,
             enabled: Some(true),
         })
         .await

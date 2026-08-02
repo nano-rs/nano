@@ -6,6 +6,7 @@ const CATEGORY_TONE: Record<string, string> = {
   data: 'oklch(72% 0.18 28)',
   agent: 'oklch(80% 0.13 78)',
   identity: 'oklch(70% 0.16 160)',
+  collector: 'oklch(72% 0.14 230)',
   security: 'oklch(74% 0.16 290)',
 };
 

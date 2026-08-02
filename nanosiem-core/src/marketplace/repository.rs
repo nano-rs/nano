@@ -240,14 +240,15 @@ impl MarketplaceRepository {
     /// Get catalog stats
     #[instrument(skip(self))]
     pub async fn get_catalog_stats(&self) -> Result<CatalogStats, MarketplaceError> {
-        let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+        let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64)>(
             r#"
             SELECT
                 COUNT(*) as total_entries,
                 COUNT(*) FILTER (WHERE installed = true) as installed_count,
                 COUNT(*) FILTER (WHERE category = 'data') as data_count,
                 COUNT(*) FILTER (WHERE category = 'agent') as agent_count,
-                COUNT(*) FILTER (WHERE category = 'identity') as identity_count
+                COUNT(*) FILTER (WHERE category = 'identity') as identity_count,
+                COUNT(*) FILTER (WHERE category = 'collector') as collector_count
             FROM marketplace_catalog
             "#,
         )
@@ -260,6 +261,7 @@ impl MarketplaceRepository {
             data_count: row.2,
             agent_count: row.3,
             identity_count: row.4,
+            collector_count: row.5,
         })
     }
 
@@ -446,6 +448,146 @@ impl MarketplaceRepository {
         .map_err(MarketplaceError::Database)?;
 
         self.hydrate_with_run_state(Self::hydrate(result)).await
+    }
+
+    /// Publish a user-authored scheduled API collector directly into the
+    /// marketplace. The catalog row is the definition; credentials remain on
+    /// each `integration_instances` connection and never enter this method.
+    #[instrument(skip(self, code, credential_fields, config))]
+    pub async fn create_catalog_for_custom_collector(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        code: &str,
+        allowed_domains: &[String],
+        credential_fields: &serde_json::Value,
+        config: &serde_json::Value,
+    ) -> Result<MarketplaceCatalogEntry, MarketplaceError> {
+        let slug = custom_slug(name);
+        let requires_credential = if credential_fields
+            .as_array()
+            .map(|fields| fields.is_empty())
+            .unwrap_or(true)
+        {
+            "none"
+        } else {
+            "required"
+        };
+
+        let result = sqlx::query_as::<_, MarketplaceCatalogEntry>(
+            r#"
+            INSERT INTO marketplace_catalog (
+                slug, name, description, category, tags, icon, author,
+                source_type, manifest_version, execution_backend,
+                requires_credential, credential_fields, code, allowed_domains, config,
+                installed, installed_at, installed_version, enabled
+            ) VALUES (
+                $1, $2, $3, 'collector', ARRAY['api', 'custom'], 'code', 'Custom',
+                'custom', 1, 'collector',
+                $4, $5, $6, $7, $8,
+                true, NOW(), 1, true
+            )
+            RETURNING *
+            "#,
+        )
+        .bind(&slug)
+        .bind(name)
+        .bind(description)
+        .bind(requires_credential)
+        .bind(credential_fields)
+        .bind(code)
+        .bind(allowed_domains)
+        .bind(config)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| map_custom_collector_write_error(e, &slug))?;
+
+        self.hydrate_with_run_state(Self::hydrate(result)).await
+    }
+
+    /// Update a custom collector definition without touching any connection's
+    /// encrypted credentials, cursors, schedule, or enabled-stream selection.
+    #[instrument(skip(self, code, credential_fields, config))]
+    pub async fn update_catalog_for_custom_collector(
+        &self,
+        id: Uuid,
+        name: &str,
+        description: Option<&str>,
+        code: &str,
+        allowed_domains: &[String],
+        credential_fields: &serde_json::Value,
+        config: &serde_json::Value,
+    ) -> Result<MarketplaceCatalogEntry, MarketplaceError> {
+        let slug = custom_slug(name);
+        let requires_credential = if credential_fields
+            .as_array()
+            .map(|fields| fields.is_empty())
+            .unwrap_or(true)
+        {
+            "none"
+        } else {
+            "required"
+        };
+
+        let result = sqlx::query_as::<_, MarketplaceCatalogEntry>(
+            r#"
+            UPDATE marketplace_catalog SET
+                slug = $2,
+                name = $3,
+                description = $4,
+                requires_credential = $5,
+                credential_fields = $6,
+                code = $7,
+                allowed_domains = $8,
+                config = $9,
+                manifest_version = manifest_version + 1,
+                installed_version = manifest_version + 1,
+                updated_at = NOW()
+            WHERE id = $1
+              AND source_type = 'custom'
+              AND category = 'collector'
+              AND execution_backend = 'collector'
+            RETURNING *
+            "#,
+        )
+        .bind(id)
+        .bind(&slug)
+        .bind(name)
+        .bind(description)
+        .bind(requires_credential)
+        .bind(credential_fields)
+        .bind(code)
+        .bind(allowed_domains)
+        .bind(config)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| map_custom_collector_write_error(e, &slug))?
+        .ok_or_else(|| MarketplaceError::CatalogEntryNotFound(id.to_string()))?;
+
+        self.hydrate_with_run_state(Self::hydrate(result)).await
+    }
+
+    /// Delete only a user-authored collector. Callers must first ensure there
+    /// are no configured instances; the FK cascades by design, so keeping that
+    /// policy at the handler boundary prevents accidental credential/cursor
+    /// loss while retaining database referential integrity.
+    #[instrument(skip(self))]
+    pub async fn delete_catalog_for_custom_collector(
+        &self,
+        id: Uuid,
+    ) -> Result<(), MarketplaceError> {
+        let result = sqlx::query(
+            "DELETE FROM marketplace_catalog \
+             WHERE id = $1 AND source_type = 'custom' \
+             AND category = 'collector' AND execution_backend = 'collector'",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(MarketplaceError::CatalogEntryNotFound(id.to_string()));
+        }
+        Ok(())
     }
 
     /// Delete a marketplace catalog entry by custom_enrichment_id
@@ -915,4 +1057,19 @@ impl MarketplaceRepository {
 
         Ok(())
     }
+}
+
+fn custom_slug(name: &str) -> String {
+    name.to_lowercase()
+        .replace(' ', "-")
+        .replace(|c: char| !c.is_alphanumeric() && c != '-', "")
+}
+
+fn map_custom_collector_write_error(error: sqlx::Error, slug: &str) -> MarketplaceError {
+    if let sqlx::Error::Database(ref db_err) = error {
+        if db_err.constraint() == Some("marketplace_catalog_slug_key") {
+            return MarketplaceError::SlugAlreadyExists(slug.to_string());
+        }
+    }
+    MarketplaceError::Database(error)
 }
