@@ -364,6 +364,8 @@ pub const CUSTOM_INTEGRATION_UPDATED: &str = "custom_integration_updated";
 pub const CUSTOM_INTEGRATION_DELETED: &str = "custom_integration_deleted";
 /// User-authored collector code was exercised against transient test values
 pub const CUSTOM_INTEGRATION_PREVIEWED: &str = "custom_integration_previewed";
+/// PIVT generated a collector code candidate from a user-authored definition
+pub const CUSTOM_INTEGRATION_CODE_GENERATED: &str = "custom_integration_code_generated";
 
 // =============================================================================
 // Hunt Actions (NAN-2238)

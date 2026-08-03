@@ -1494,6 +1494,10 @@ pub fn create_router(state: AppState) -> Router {
     {
         app = app
             .route(
+                "/api/integrations/custom/generate-code",
+                post(handlers::integration_generation::generate_collector_code::<AppState>),
+            )
+            .route(
                 "/api/integrations/custom/validate",
                 post(handlers::integrations::validate_custom_collector),
             )

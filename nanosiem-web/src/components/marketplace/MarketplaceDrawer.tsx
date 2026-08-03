@@ -13,6 +13,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
 import { Sheet, SheetContent } from '@/components/ui/sheet';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { PreviewModal } from './PreviewModal';
 import { useAuth } from '@/contexts/AuthContext';
 import { api } from '@/lib/api';
@@ -35,21 +36,31 @@ const TABS = [
   { id: 'code',   label: 'Code',        icon: CodeIcon },
   { id: 'perms',  label: 'Permissions', icon: Lock },
 ] as const;
-type TabId = typeof TABS[number]['id'];
+export type MarketplaceDrawerTab = typeof TABS[number]['id'];
+type TabId = MarketplaceDrawerTab;
 
 interface MarketplaceDrawerProps {
   slug: string | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onUpdated: () => void;
+  initialTab?: MarketplaceDrawerTab;
 }
 
-export function MarketplaceDrawer({ slug, open, onOpenChange, onUpdated }: MarketplaceDrawerProps) {
+export function MarketplaceDrawer({
+  slug,
+  open,
+  onOpenChange,
+  onUpdated,
+  initialTab = 'config',
+}: MarketplaceDrawerProps) {
   const { toast } = useToast();
   const { hasPermission } = useAuth();
   const canPreview = hasPermission('enrichments:configure');
   const canViewCode =
     hasPermission('enrichments:view') && hasPermission('enrichments:code');
+  const canDeleteCustomCollector =
+    hasPermission('log_sources:delete') && hasPermission('enrichments:code');
   // Air-gap mode — shared cache with the catalog page's query key. When the
   // entry needs network, the egress "Sync now" action is replaced by an
   // import-from-file route so the drawer stays honest offline (NAN-1212).
@@ -73,6 +84,9 @@ export function MarketplaceDrawer({ slug, open, onOpenChange, onUpdated }: Marke
   const [updating, setUpdating] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [previewOpen, setPreviewOpen] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [checkingDelete, setCheckingDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
     if (!slug || !open) return;
@@ -80,12 +94,13 @@ export function MarketplaceDrawer({ slug, open, onOpenChange, onUpdated }: Marke
     setCredentials({});
     setShowSecrets({});
     setCredsDirty(false);
-    setTab('config');
+    setDeleteOpen(false);
+    setTab(initialTab);
     api.marketplace.getCatalogEntry(slug)
       .then(setEntry)
       .catch(() => toast({ title: 'Error', description: 'Failed to load details', variant: 'destructive' }))
       .finally(() => setLoading(false));
-  }, [slug, open, toast]);
+  }, [slug, open, toast, initialTab]);
 
   // ⌘↵ to apply (Esc handled by Sheet itself)
   useEffect(() => {
@@ -150,6 +165,55 @@ export function MarketplaceDrawer({ slug, open, onOpenChange, onUpdated }: Marke
       onOpenChange(false);
     } catch {
       toast({ title: 'Error', description: 'Failed to uninstall', variant: 'destructive' });
+    }
+  };
+
+  const prepareCustomCollectorDelete = async () => {
+    if (!entry) return;
+    setCheckingDelete(true);
+    try {
+      const { instances } = await api.integrations.listInstances(entry.slug);
+      if (instances.length > 0) {
+        setTab('connections');
+        toast({
+          title: 'Delete connections first',
+          description: `${instances.length} connection${instances.length === 1 ? '' : 's'} still belong to this integration. Remove them from Connections, then delete the integration.`,
+          variant: 'destructive',
+        });
+        return;
+      }
+      setDeleteOpen(true);
+    } catch (error) {
+      toast({
+        title: 'Could not check connections',
+        description: error instanceof Error ? error.message : 'Unknown error',
+        variant: 'destructive',
+      });
+    } finally {
+      setCheckingDelete(false);
+    }
+  };
+
+  const handleDeleteCustomCollector = async () => {
+    if (!entry) return;
+    setDeleting(true);
+    try {
+      await api.integrations.deleteCustomCollector(entry.id);
+      setDeleteOpen(false);
+      toast({
+        title: 'Integration deleted',
+        description: `${entry.name} was permanently removed. Its Log Sources were kept.`,
+      });
+      onUpdated();
+      onOpenChange(false);
+    } catch (error) {
+      toast({
+        title: 'Could not delete integration',
+        description: error instanceof Error ? error.message : 'Unknown error',
+        variant: 'destructive',
+      });
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -239,6 +303,9 @@ export function MarketplaceDrawer({ slug, open, onOpenChange, onUpdated }: Marke
               handleToggleEnabled={handleToggleEnabled}
               handleSync={handleSync}
               handleUninstall={handleUninstall}
+              prepareCustomCollectorDelete={prepareCustomCollectorDelete}
+              canDeleteCustomCollector={canDeleteCustomCollector}
+              checkingDelete={checkingDelete}
               handleUpdate={handleUpdate}
               handleExport={handleExport}
               handleSaveCredentials={handleSaveCredentials}
@@ -252,6 +319,24 @@ export function MarketplaceDrawer({ slug, open, onOpenChange, onUpdated }: Marke
           )}
         </SheetContent>
       </Sheet>
+      <ConfirmDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        title="Permanently delete this integration?"
+        description={
+          <>
+            <span className="font-medium text-foreground">{entry?.name}</span> and its authored
+            collector code will be removed from Marketplace. Previously-created Log Sources are
+            retained so their parser configuration and history are not destroyed.
+          </>
+        }
+        confirmLabel="Delete integration"
+        loadingLabel="Deleting…"
+        variant="danger"
+        loading={deleting}
+        confirmIcon={<Trash2 className="h-3 w-3" />}
+        onConfirm={() => void handleDeleteCustomCollector()}
+      />
       <PreviewModal
         slug={previewOpen ? entry?.slug ?? null : null}
         name={entry?.name ?? null}
@@ -278,6 +363,9 @@ interface DrawerInnerProps {
   handleToggleEnabled: (enabled: boolean) => Promise<void>;
   handleSync: () => Promise<void>;
   handleUninstall: () => Promise<void>;
+  prepareCustomCollectorDelete: () => Promise<void>;
+  canDeleteCustomCollector: boolean;
+  checkingDelete: boolean;
   handleUpdate: () => Promise<void>;
   handleExport: () => Promise<void>;
   handleSaveCredentials: () => Promise<void>;
@@ -294,9 +382,10 @@ function DrawerInner(props: DrawerInnerProps) {
     entry, canViewCode, airGap, tab, setTab,
     credentials, setCredentials, credsDirty, markCredsDirty,
     showSecrets, setShowSecrets, generateToken,
-    handleToggleEnabled, handleSync, handleUninstall, handleUpdate, handleExport, handleSaveCredentials,
+    handleToggleEnabled, handleSync, handleUninstall, prepareCustomCollectorDelete,
+    handleUpdate, handleExport, handleSaveCredentials,
     syncing, updating, exporting, savingCreds,
-    canPreview,
+    canPreview, canDeleteCustomCollector, checkingDelete,
     onOpenPreview,
   } = props;
 
@@ -384,6 +473,9 @@ function DrawerInner(props: DrawerInnerProps) {
             handleToggleEnabled={handleToggleEnabled}
             handleSync={handleSync}
             handleUninstall={handleUninstall}
+            prepareCustomCollectorDelete={prepareCustomCollectorDelete}
+            canDeleteCustomCollector={canDeleteCustomCollector}
+            checkingDelete={checkingDelete}
             handleSaveCredentials={handleSaveCredentials}
             syncing={syncing}
             savingCreds={savingCreds}
@@ -477,6 +569,9 @@ interface ConfigTabProps {
   handleToggleEnabled: (enabled: boolean) => Promise<void>;
   handleSync: () => Promise<void>;
   handleUninstall: () => Promise<void>;
+  prepareCustomCollectorDelete: () => Promise<void>;
+  canDeleteCustomCollector: boolean;
+  checkingDelete: boolean;
   handleSaveCredentials: () => Promise<void>;
   syncing: boolean;
   savingCreds: boolean;
@@ -489,13 +584,16 @@ function ConfigTab(props: ConfigTabProps) {
   const {
     entry, airGap, credentials, setCredentials, credsDirty, markCredsDirty,
     showSecrets, setShowSecrets, generateToken,
-    handleToggleEnabled, handleSync, handleUninstall, handleSaveCredentials,
+    handleToggleEnabled, handleSync, handleUninstall, prepareCustomCollectorDelete,
+    handleSaveCredentials, canDeleteCustomCollector, checkingDelete,
     syncing, savingCreds, hasUpdate, handleUpdate, updating,
   } = props;
 
   const credentialFields: CredentialFieldDef[] = entry.credential_fields ?? [];
   const needsCreds = entry.requires_credential !== 'none' && credentialFields.length > 0;
   const isSystem = entry.source_type === 'system';
+  const isCustomCollector = entry.source_type === 'custom'
+    && entry.execution_backend === 'collector';
   // Air-gap + connectivity-required: the live "Sync now" egress can't run.
   // Swap it for an import-from-file route so the action stays honest.
   const egressBlocked = airGap && (entry.requires_network ?? false);
@@ -678,7 +776,11 @@ function ConfigTab(props: ConfigTabProps) {
       {/* Action footer */}
       <div className="pt-2 border-t border-border/60 flex items-center gap-2">
         {!entry.installed ? (
-          <p className="text-[12px] text-muted-foreground">Install this enrichment to start using it.</p>
+          <p className="text-[12px] text-muted-foreground">
+            {isCustomCollector
+              ? 'This integration is uninstalled. Its retained connections can still be deleted.'
+              : 'Install this enrichment to start using it.'}
+          </p>
         ) : (
           <>
             <Button
@@ -709,19 +811,37 @@ function ConfigTab(props: ConfigTabProps) {
                 </Button>
               )
             )}
-            <div className="flex-1" />
-            {!isSystem && (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-8 rounded-md text-muted-foreground hover:text-red-500"
-                onClick={handleUninstall}
-              >
-                <Trash2 className="w-3.5 h-3.5 mr-1" /> Uninstall
-              </Button>
-            )}
           </>
         )}
+        <div className="flex-1" />
+        {isCustomCollector ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 rounded-md text-muted-foreground hover:text-red-500"
+            onClick={() => void prepareCustomCollectorDelete()}
+            disabled={!canDeleteCustomCollector || checkingDelete}
+            title={
+              canDeleteCustomCollector
+                ? 'Permanently delete this custom integration'
+                : 'Requires permissions to delete Log Sources and view integration code'
+            }
+          >
+            {checkingDelete
+              ? <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" />
+              : <Trash2 className="w-3.5 h-3.5 mr-1" />}
+            Delete integration
+          </Button>
+        ) : entry.installed && !isSystem ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 rounded-md text-muted-foreground hover:text-red-500"
+            onClick={handleUninstall}
+          >
+            <Trash2 className="w-3.5 h-3.5 mr-1" /> Uninstall
+          </Button>
+        ) : null}
       </div>
     </div>
   );

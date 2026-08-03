@@ -38,7 +38,10 @@ import { useToast } from '@/hooks/use-toast';
 import { formatUTCCompact } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
 import { IntegrationCard } from '@/components/marketplace/IntegrationCard';
-import { MarketplaceDrawer } from '@/components/marketplace/MarketplaceDrawer';
+import {
+  MarketplaceDrawer,
+  type MarketplaceDrawerTab,
+} from '@/components/marketplace/MarketplaceDrawer';
 import { InstallDialog } from '@/components/marketplace/InstallDialog';
 import { CoverageHero } from '@/components/marketplace/CoverageHero';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
@@ -133,6 +136,7 @@ export function Marketplace() {
   const [searchQuery, setSearchQuery] = useState('');
   const [installEntry, setInstallEntry] = useState<MarketplaceCatalogEntry | null>(null);
   const [detailSlug, setDetailSlug] = useState<string | null>(null);
+  const [detailTab, setDetailTab] = useState<MarketplaceDrawerTab>('config');
   const [syncingRepo, setSyncingRepo] = useState<string | null>(null);
 
   const categoryFilter = (searchParams.get('category') as CategoryFilter | null) || 'all';
@@ -145,9 +149,12 @@ export function Marketplace() {
   useEffect(() => {
     const slug = searchParams.get('slug');
     if (!slug) return;
+    const requestedTab = searchParams.get('tab');
+    setDetailTab(requestedTab === 'connections' ? 'connections' : 'config');
     setDetailSlug(slug);
     const next = new URLSearchParams(searchParams);
     next.delete('slug');
+    next.delete('tab');
     setSearchParams(next, { replace: true });
   }, [searchParams, setSearchParams]);
 
@@ -290,7 +297,10 @@ export function Marketplace() {
     setSearchParams(params);
   };
 
-  const handleCardOpen = (slug: string) => setDetailSlug(slug);
+  const handleCardOpen = (slug: string) => {
+    setDetailTab('config');
+    setDetailSlug(slug);
+  };
   const handleInstallClick = (slug: string) => {
     const entry = entries.find(e => e.slug === slug);
     if (!entry) return;
@@ -640,8 +650,14 @@ export function Marketplace() {
       <MarketplaceDrawer
         slug={detailSlug}
         open={!!detailSlug}
-        onOpenChange={(open) => !open && setDetailSlug(null)}
+        onOpenChange={(open) => {
+          if (!open) {
+            setDetailSlug(null);
+            setDetailTab('config');
+          }
+        }}
         onUpdated={loadAll}
+        initialTab={detailTab}
       />
     </div>
   );

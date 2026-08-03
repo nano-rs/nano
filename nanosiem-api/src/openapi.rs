@@ -217,6 +217,7 @@ fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         sub_docs.push(handlers::entity_context::EntityContextApiDoc::openapi());
         sub_docs.push(handlers::agent_enrichment::AgentEnrichmentApiDoc::openapi());
         sub_docs.push(handlers::custom_enrichment::CustomEnrichmentApiDoc::openapi());
+        sub_docs.push(handlers::integration_generation::IntegrationGenerationApiDoc::openapi());
         // /api/enrichment/agent/lookup lives inside handlers::enrichment but
         // its handler + supporting types are cfg-gated for enterprise (Phase
         // 3.3); keep the doc alongside the handler.

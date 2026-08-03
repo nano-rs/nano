@@ -73,6 +73,8 @@ pub use nanosiem_enterprise::handlers::incidents;
 // runtime they drive.
 #[cfg(feature = "enterprise")]
 pub mod integrations;
+#[cfg(feature = "enterprise")]
+pub use nanosiem_enterprise::handlers::integration_generation;
 pub mod ip_allowlist;
 #[cfg(feature = "enterprise")]
 pub mod license;

@@ -94,7 +94,10 @@ async fn linking_a_second_stream_widens_the_shared_log_source() {
         .await
         .expect("widen");
 
-    assert!(added, "a source_type the log source did not claim is a write");
+    assert!(
+        added,
+        "a source_type the log source did not claim is a write"
+    );
 
     let after = repo.find_by_id(created.id).await.expect("refetch");
     let values = after.match_values.expect("match_values");
@@ -126,7 +129,10 @@ async fn widening_is_idempotent() {
     let service = ParserRepositoryService::new(pool.clone());
 
     let created = repo
-        .create(&log_source_named(&unique("netskope"), vec!["netskope_alert".into()]))
+        .create(&log_source_named(
+            &unique("netskope"),
+            vec!["netskope_alert".into()],
+        ))
         .await
         .expect("create log source");
 
@@ -165,16 +171,15 @@ async fn no_grant_required_when_already_covered() {
     let service = ParserRepositoryService::new(pool.clone());
 
     let created = repo
-        .create(&log_source_named(&unique("slack"), vec!["slack_access_log".into()]))
+        .create(&log_source_named(
+            &unique("slack"),
+            vec!["slack_access_log".into()],
+        ))
         .await
         .expect("create log source");
 
     let added = service
-        .ensure_log_source_claims_source_type(
-            created.id,
-            "slack_access_log",
-            &TargetGrants::none(),
-        )
+        .ensure_log_source_claims_source_type(created.id, "slack_access_log", &TargetGrants::none())
         .await
         .expect("a no-op must not require a grant");
 
@@ -194,7 +199,10 @@ async fn widening_requires_log_source_edit() {
     let service = ParserRepositoryService::new(pool.clone());
 
     let created = repo
-        .create(&log_source_named(&unique("gws-denied"), vec!["gws_login".into()]))
+        .create(&log_source_named(
+            &unique("gws-denied"),
+            vec!["gws_login".into()],
+        ))
         .await
         .expect("create log source");
 
@@ -218,6 +226,86 @@ async fn widening_requires_log_source_edit() {
     cleanup(&pool, created.id).await;
 }
 
+// =============================================================================
+// NAN-2290: parserless collector streams still materialize a Log Source
+// =============================================================================
+
+#[tokio::test]
+#[ignore]
+async fn parserless_collector_gets_a_raw_pass_through_log_source() {
+    let pool = common::migrated_pool().await;
+    let repo = LogSourceRepository::new(pool.clone());
+    let service = ParserRepositoryService::new(pool.clone());
+    let source_type = unique("custom-api-events");
+
+    let (id, created) = service
+        .ensure_raw_collector_log_source(&source_type, None, &TargetGrants::system())
+        .await
+        .expect("create raw collector source");
+
+    assert!(created);
+    let source = repo
+        .find_by_id(id)
+        .await
+        .expect("created source is visible");
+    assert_eq!(source.source_type, "routed");
+    assert_eq!(source.parser_vrl.trim(), ". = .");
+    assert!(source.validated, "the built-in identity VRL is valid");
+    assert_eq!(source.lifecycle_status, "active");
+    assert_eq!(source.match_field.as_deref(), Some("source_type"));
+    assert_eq!(source.match_values, Some(vec![source_type]));
+
+    cleanup(&pool, id).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn existing_raw_collector_source_is_reused_without_create_permission() {
+    let pool = common::migrated_pool().await;
+    let service = ParserRepositoryService::new(pool.clone());
+    let source_type = unique("custom-api-reuse");
+
+    let (id, created) = service
+        .ensure_raw_collector_log_source(&source_type, None, &TargetGrants::system())
+        .await
+        .expect("create raw collector source");
+    assert!(created);
+
+    let (same_id, created_again) = service
+        .ensure_raw_collector_log_source(&source_type, None, &TargetGrants::none())
+        .await
+        .expect("reuse must be a no-op with no grant");
+    assert_eq!(same_id, id);
+    assert!(!created_again);
+
+    cleanup(&pool, id).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn creating_raw_collector_source_requires_log_source_create() {
+    let pool = common::migrated_pool().await;
+    let service = ParserRepositoryService::new(pool.clone());
+    let source_type = unique("custom-api-denied");
+
+    let err = service
+        .ensure_raw_collector_log_source(&source_type, None, &TargetGrants::none())
+        .await
+        .expect_err("creation without log_sources:create must be refused");
+    assert!(
+        matches!(err, ParserRepositoryError::Forbidden(ref p) if p == TargetEffect::LogSourceCreate.permission()),
+        "expected Forbidden(log_sources:create), got {err:?}"
+    );
+    assert!(
+        service
+            .find_log_source_claiming_source_type(&source_type)
+            .await
+            .expect("lookup")
+            .is_none(),
+        "a refused create must write nothing"
+    );
+}
+
 /// The reason this is one SQL statement rather than a read-modify-write.
 ///
 /// Two callers provisioning different streams onto the same shared log source
@@ -236,7 +324,10 @@ async fn concurrent_widens_do_not_lose_values() {
     let repo = LogSourceRepository::new(pool.clone());
 
     let created = repo
-        .create(&log_source_named(&unique("concurrent"), vec!["primary".into()]))
+        .create(&log_source_named(
+            &unique("concurrent"),
+            vec!["primary".into()],
+        ))
         .await
         .expect("create log source");
 
@@ -298,7 +389,10 @@ async fn union_and_append_cannot_lose_each_other() {
     let repo = LogSourceRepository::new(pool.clone());
 
     let created = repo
-        .create(&log_source_named(&unique("union-race"), vec!["primary".into()]))
+        .create(&log_source_named(
+            &unique("union-race"),
+            vec!["primary".into()],
+        ))
         .await
         .expect("create log source");
 
@@ -413,7 +507,11 @@ async fn an_upstream_update_cannot_drop_an_alias_a_sender_still_uses() {
     let created = repo
         .create(&log_source_named(
             &unique("no-narrow"),
-            vec!["apache".into(), "apache_access".into(), "apache_error".into()],
+            vec![
+                "apache".into(),
+                "apache_access".into(),
+                "apache_error".into(),
+            ],
         ))
         .await
         .expect("create log source");
@@ -437,7 +535,11 @@ async fn an_upstream_update_cannot_drop_an_alias_a_sender_still_uses() {
             "{kept} was dropped by an upstream update (NAN-2249): {values:?}"
         );
     }
-    assert_eq!(values.len(), 3, "nothing added, nothing removed: {values:?}");
+    assert_eq!(
+        values.len(),
+        3,
+        "nothing added, nothing removed: {values:?}"
+    );
 
     cleanup(&pool, created.id).await;
 }

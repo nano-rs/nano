@@ -691,6 +691,21 @@ impl nanosiem_enterprise::handlers::custom_enrichment::CustomEnrichmentAppState 
 }
 
 #[cfg(feature = "enterprise")]
+impl nanosiem_enterprise::handlers::integration_generation::IntegrationGenerationAppState
+    for AppState
+{
+    fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+    fn agent_config_registry(&self) -> &Arc<RwLock<Option<Arc<AgentConfigRegistry>>>> {
+        &self.agent_config_registry
+    }
+    fn melod_service(&self) -> &Arc<RwLock<Option<Arc<MelodService>>>> {
+        &self.melod_service
+    }
+}
+
+#[cfg(feature = "enterprise")]
 #[async_trait::async_trait]
 impl nanosiem_enterprise::handlers::melod::MelodAppState for AppState {
     fn pool(&self) -> &PgPool {

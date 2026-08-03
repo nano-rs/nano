@@ -88,6 +88,7 @@ export type {
   CollectorManifestAuth, CollectorAuthType, CustomCollectorDefinitionRequest,
   CustomCollectorDefinition, CustomCollectorValidationResponse,
   CustomCollectorPreviewRequest, CustomCollectorPreviewEvent, CustomCollectorPreviewResponse,
+  GenerateCustomCollectorCodeRequest, GenerateCustomCollectorCodeResponse,
 } from './integrations';
 export { collectorManifest } from './integrations';
 

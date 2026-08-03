@@ -169,6 +169,176 @@ impl ParserRepositoryService {
         )
     }
 
+    /// Find a live log-source definition that already claims `source_type`.
+    ///
+    /// Collector manifests without an explicit `parser:` may be paired with a
+    /// parser an operator created directly in Log Sources rather than imported
+    /// from a repository. Repository catalog resolution cannot see those rows;
+    /// consulting them before creating a raw placeholder prevents two sources
+    /// from claiming the same collector route.
+    pub async fn find_log_source_claiming_source_type(
+        &self,
+        source_type: &str,
+    ) -> Result<Option<Uuid>, ParserRepositoryError> {
+        if !is_safe_source_type(source_type) {
+            return Err(ParserRepositoryError::InvalidRequest(format!(
+                "invalid collector source_type {source_type:?}"
+            )));
+        }
+
+        sqlx::query_scalar(
+            r#"
+            SELECT id
+              FROM log_sources
+             WHERE kind = 'log'
+               AND $1 = ANY(match_values)
+             ORDER BY created_at ASC
+             LIMIT 1
+            "#,
+        )
+        .bind(source_type)
+        .fetch_optional(&self.pg_pool)
+        .await
+        .map_err(ParserRepositoryError::Database)
+    }
+
+    /// Ensure a parserless collector stream still has an operator-visible Log
+    /// Source. The placeholder is an intentional identity transform: raw events
+    /// keep flowing unchanged, while the source becomes a first-class place to
+    /// inspect health and add parser VRL later.
+    ///
+    /// Creation consumes the same `log_sources:create` capability as the
+    /// canonical endpoint. A transaction-scoped advisory lock serializes the
+    /// check/create pair for one source type, preventing concurrent connections
+    /// from materializing duplicate placeholders.
+    pub async fn ensure_raw_collector_log_source(
+        &self,
+        source_type: &str,
+        declared_parser: Option<&str>,
+        grants: &TargetGrants,
+    ) -> Result<(Uuid, bool), ParserRepositoryError> {
+        if !is_safe_source_type(source_type) {
+            return Err(ParserRepositoryError::InvalidRequest(format!(
+                "invalid collector source_type {source_type:?}"
+            )));
+        }
+
+        let mut tx = self
+            .pg_pool
+            .begin()
+            .await
+            .map_err(ParserRepositoryError::Database)?;
+
+        // Stable namespace value chosen only to separate this lock family from
+        // any future advisory locks that also hash source-type strings.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 2290))")
+            .bind(source_type)
+            .execute(&mut *tx)
+            .await
+            .map_err(ParserRepositoryError::Database)?;
+
+        // Reuse any source that appeared while this request waited for the
+        // lock. For a declared-but-missing parser, only our own raw placeholder
+        // is acceptable; silently substituting an unrelated parser would break
+        // the explicit-parser guarantee.
+        let existing: Option<(Uuid, String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT id, parser_vrl, description
+              FROM log_sources
+             WHERE kind = 'log'
+               AND $1 = ANY(match_values)
+             ORDER BY created_at ASC
+             LIMIT 1
+            "#,
+        )
+        .bind(source_type)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ParserRepositoryError::Database)?;
+
+        if let Some((id, parser_vrl, description)) = existing {
+            let is_raw_placeholder = parser_vrl.trim() == ". = ."
+                && description.as_deref().is_some_and(|value| {
+                    value.starts_with("Raw pass-through source for collector events")
+                });
+            if declared_parser.is_none() || is_raw_placeholder {
+                tx.commit().await.map_err(ParserRepositoryError::Database)?;
+                return Ok((id, false));
+            }
+            return Err(ParserRepositoryError::InvalidRequest(format!(
+                "source_type {source_type:?} is already claimed by log source {id}, but the declared parser {:?} is unavailable",
+                declared_parser.unwrap_or_default()
+            )));
+        }
+
+        // Reusing a source is a read-only no-op and consumes no create
+        // capability. Check the grant only after the locked re-read proves a
+        // row will actually be inserted.
+        grants
+            .ensure(TargetEffect::LogSourceCreate)
+            .map_err(|effect| ParserRepositoryError::Forbidden(effect.permission().to_string()))?;
+
+        let id = Uuid::new_v4();
+        let base_name = format!(
+            "{} (raw collector)",
+            source_type.chars().take(220).collect::<String>()
+        );
+        let name_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM log_sources WHERE name = $1)")
+                .bind(&base_name)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(ParserRepositoryError::Database)?;
+        let name = if name_exists {
+            let short_id = id.simple().to_string();
+            format!(
+                "{} (raw collector {})",
+                source_type.chars().take(205).collect::<String>(),
+                &short_id[..8]
+            )
+        } else {
+            base_name
+        };
+        let description = match declared_parser {
+            Some(parser) => format!(
+                "Raw pass-through source for collector events with source_type '{source_type}'. The declared parser '{parser}' was not available; add parser VRL here or sync its repository."
+            ),
+            None => format!(
+                "Raw pass-through source for collector events with source_type '{source_type}'. Add parser VRL here when these events should be normalized."
+            ),
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO log_sources (
+                id, name, description, namespace, timezone, source_type,
+                parser_vrl, output_fields, category, match_field, match_values,
+                validated, validation_error, lifecycle_status
+            )
+            VALUES (
+                $1, $2, $3, 'default', 'UTC', 'routed',
+                '. = .', NULL, 'application', 'source_type', ARRAY[$4]::text[],
+                true, NULL, 'active'
+            )
+            "#,
+        )
+        .bind(id)
+        .bind(&name)
+        .bind(&description)
+        .bind(source_type)
+        .execute(&mut *tx)
+        .await
+        .map_err(ParserRepositoryError::Database)?;
+
+        tx.commit().await.map_err(ParserRepositoryError::Database)?;
+        info!(
+            log_source_id = %id,
+            source_type = %source_type,
+            "Created raw pass-through log source for parserless collector stream"
+        );
+        Ok((id, true))
+    }
+
     // =========================================================================
     // Repository CRUD
     // =========================================================================
@@ -2222,5 +2392,4 @@ mod tests {
             "expected target_table rejection, got {err:?}"
         );
     }
-
 }

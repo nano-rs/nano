@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { ReactNode, useEffect, useMemo, useState } from 'react';
+import { ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import {
@@ -93,6 +93,12 @@ import {
   logSourceTransportLabel,
 } from '@/lib/log-source-transports';
 import { cn } from '@/lib/utils';
+import { nplFieldEquals } from '@/lib/npl-quote';
+import {
+  buildLogSourceParserPrompt,
+  extractRecentParserSamples,
+  isRawPassThroughVrl,
+} from '@/lib/log-source-pivt-context';
 import { useQuery } from '@tanstack/react-query';
 
 const CONFIG_TYPE_TO_SOURCE_TYPE: Record<string, string> = {
@@ -1979,6 +1985,8 @@ function VrlEditorTab({
             <div className={cn('h-full', sidePanelTab === 'ai' ? 'block' : 'hidden')}>
               <LogSourceAiPanel
                 parserId={source.id}
+                sourceName={source.name}
+                sourceType={effectiveSourceType(source)}
                 currentVrl={currentVrl}
                 onVrlUpdate={onAiVrlUpdate}
                 onUndo={onUndo}
@@ -2565,6 +2573,8 @@ const AI_QUICK_ACTIONS = [
 // scale called for in design-ref/shadcn/log-source-vrl.jsx (AIAssistPanel, lines 294+).
 function LogSourceAiPanel({
   parserId,
+  sourceName,
+  sourceType,
   currentVrl,
   onVrlUpdate,
   onUndo,
@@ -2573,6 +2583,8 @@ function LogSourceAiPanel({
   baseParserVrl,
 }: {
   parserId: string;
+  sourceName: string;
+  sourceType: string;
   currentVrl: string;
   onVrlUpdate: (info: VrlUpdateInfo) => void;
   onUndo?: () => void;
@@ -2589,6 +2601,7 @@ function LogSourceAiPanel({
   const { data: melodStatus, loading: melodStatusLoading } = useMelodStatus();
   const editParserJob = useMelodJob<MelodEditParserResponse>();
   const loading = editParserJob.loading;
+  const rawPassThrough = mode === 'parser' && isRawPassThroughVrl(currentVrl);
 
   const [messages, setMessages] = useState<AiChatMessage[]>([]);
   const [input, setInput] = useState('');
@@ -2598,12 +2611,18 @@ function LogSourceAiPanel({
   // proposed VRL against them.
   const [sampleLogs, setSampleLogs] = useState('');
   const [showSampleInput, setShowSampleInput] = useState(false);
+  const [fetchingSamples, setFetchingSamples] = useState(false);
+  const [autoSampleCount, setAutoSampleCount] = useState(0);
+  const autoSamplesRef = useRef<{ parserId: string; sourceType: string; samples: string[] } | null>(null);
   const storageKey = `melod-session-${mode}-${parserId}`;
   const [sessionId, setSessionId] = useState<string | undefined>(
     () => localStorage.getItem(storageKey) ?? undefined,
   );
   const scrollRef = useState<HTMLDivElement | null>(null);
   const [scrollEl, setScrollEl] = scrollRef;
+  const busy = loading || fetchingSamples;
+  const hasAutoSampleContext = autoSamplesRef.current?.parserId === parserId
+    && autoSamplesRef.current.sourceType === sourceType;
 
   // Auto-scroll to bottom when messages change.
   useEffect(() => {
@@ -2612,21 +2631,61 @@ function LogSourceAiPanel({
 
   const send = async (text: string) => {
     const userMessage = text.trim();
-    if (!userMessage || loading) return;
+    if (!userMessage || busy) return;
     const vrlBefore = currentVrl;
-    setInput('');
-    setMessages((prev) => [...prev, { role: 'user', content: userMessage }]);
+    let messageAdded = false;
+    let sampleFetchAttempted = false;
 
     try {
-      const sampleLogsArray = sampleLogs
+      let sampleLogsArray = sampleLogs
         .split('\n')
         .map((l) => l.trim())
         .filter((l) => l.length > 0);
+      const shouldAutoFetch = mode === 'parser'
+        && sampleLogsArray.length === 0
+        && (rawPassThrough || hasAutoSampleContext);
+
+      if (shouldAutoFetch) {
+        const cached = autoSamplesRef.current;
+        if (cached?.parserId === parserId && cached.sourceType === sourceType) {
+          sampleLogsArray = cached.samples;
+        } else {
+          sampleFetchAttempted = true;
+          setFetchingSamples(true);
+          const now = new Date();
+          const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+          const response = await api.search({
+            query: nplFieldEquals('source_type', sourceType),
+            time_range: { start: yesterday.toISOString(), end: now.toISOString() },
+            limit: 5,
+            skip_field_stats: true,
+          });
+          sampleLogsArray = extractRecentParserSamples(response.results ?? []);
+          if (sampleLogsArray.length === 0) {
+            throw new Error(`No recent events found for source_type="${sourceType}". Wait for the collector to run or paste a sample with the play button.`);
+          }
+          autoSamplesRef.current = { parserId, sourceType, samples: sampleLogsArray };
+          setAutoSampleCount(sampleLogsArray.length);
+        }
+      }
+
+      const modelMessage = mode === 'parser' && (rawPassThrough || hasAutoSampleContext || shouldAutoFetch)
+        ? buildLogSourceParserPrompt({
+            userMessage,
+            sourceName,
+            sourceType,
+            isRawPassThrough: rawPassThrough,
+          })
+        : userMessage;
+
+      setInput('');
+      setMessages((prev) => [...prev, { role: 'user', content: userMessage }]);
+      messageAdded = true;
       const response = await editParserJob.start(() =>
         api.melodEditParser({
           parser_id: parserId,
           current_vrl: currentVrl,
-          message: userMessage,
+          message: modelMessage,
           session_id: sessionId,
           ...(sampleLogsArray.length > 0
             ? { sample_logs: sampleLogsArray }
@@ -2660,11 +2719,13 @@ function LogSourceAiPanel({
       ]);
     } catch (err) {
       toast({
-        title: 'Error',
+        title: sampleFetchAttempted ? 'Could not load recent samples' : 'Error',
         description: err instanceof Error ? err.message : 'Failed to process request',
         variant: 'destructive',
       });
-      setMessages((prev) => prev.slice(0, -1));
+      if (messageAdded) setMessages((prev) => prev.slice(0, -1));
+    } finally {
+      setFetchingSamples(false);
     }
   };
 
@@ -2688,6 +2749,14 @@ function LogSourceAiPanel({
   }
 
   const lineCount = currentVrl.split('\n').length;
+  const quickActions = rawPassThrough
+    ? [
+        'Build a complete parser from recent events',
+        'Explain the raw event shape',
+        'Map the most useful security fields',
+        'Generate parser test cases',
+      ]
+    : AI_QUICK_ACTIONS;
 
   return (
     <div className="flex flex-col h-full min-h-0 overflow-hidden">
@@ -2701,6 +2770,12 @@ function LogSourceAiPanel({
                 <span className="font-medium text-foreground">pivt is editing your extension overlay</span> —{' '}
                 <span className="font-mono text-[10.5px]">{lineCount}</span> lines. The OOTB parser is in pivt's
                 context as read-only reference; edits here only touch the extension.
+              </>
+            ) : rawPassThrough ? (
+              <>
+                <span className="font-medium text-foreground">pivt recognizes this raw pass-through</span> —{' '}
+                <span className="font-mono text-[10.5px]">source_type={sourceType}</span>. Recent events are fetched
+                automatically when you ask it to build the parser.
               </>
             ) : (
               <>
@@ -2722,17 +2797,23 @@ function LogSourceAiPanel({
             <span>pivt is thinking…</span>
           </div>
         )}
+        {fetchingSamples && (
+          <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+            <Loader2 className="w-3.5 h-3.5 animate-spin text-primary" />
+            <span>Fetching recent events for <span className="font-mono">{sourceType}</span>…</span>
+          </div>
+        )}
       </div>
 
       {/* Quick actions + input */}
       <div className="shrink-0 px-3 py-2 border-t border-border">
         <div className="flex items-center gap-1.5 flex-wrap mb-2">
-          {AI_QUICK_ACTIONS.map((a) => (
+          {quickActions.map((a) => (
             <button
               key={a}
               type="button"
               onClick={() => send(a)}
-              disabled={loading}
+              disabled={busy}
               className="h-6 px-2 rounded-full border border-border bg-card text-[10.5px] text-foreground/80 hover:text-foreground hover:border-primary/40 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {a}
@@ -2751,6 +2832,11 @@ function LogSourceAiPanel({
               rows={3}
               className="resize-none min-h-[64px] max-h-[160px] px-2.5 py-1.5 rounded-md border border-border bg-card font-mono text-[11px] focus:border-primary focus:outline-none focus-visible:ring-0"
             />
+          </div>
+        )}
+        {autoSampleCount > 0 && !showSampleInput && (
+          <div className="mb-2 font-mono text-[10px] text-muted-foreground">
+            {autoSampleCount} recent event{autoSampleCount === 1 ? '' : 's'} loaded automatically · source_type={sourceType}
           </div>
         )}
         <div className="flex items-end gap-2">
@@ -2773,7 +2859,7 @@ function LogSourceAiPanel({
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
-                send(input);
+                void send(input);
               }
             }}
             rows={2}
@@ -2783,10 +2869,10 @@ function LogSourceAiPanel({
           <Button
             size="sm"
             className="h-[34px] gap-1.5 shrink-0"
-            onClick={() => send(input)}
-            disabled={!input.trim() || loading}
+            onClick={() => void send(input)}
+            disabled={!input.trim() || busy}
           >
-            {loading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+            {busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
           </Button>
         </div>
         {canUndo && onUndo && (
@@ -3086,6 +3172,8 @@ function ExtensionTab({
                 <div className={cn('h-full', sidePanelTab === 'ai' ? 'block' : 'hidden')}>
                   <LogSourceAiPanel
                     parserId={source.id}
+                    sourceName={source.name}
+                    sourceType={effectiveSourceType(source)}
                     currentVrl={editedExt}
                     mode="extension"
                     baseParserVrl={source.parser_vrl}

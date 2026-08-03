@@ -21,7 +21,7 @@
  */
 
 import { useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle, CheckCircle2, Clock, Loader2, Play, Plus,
@@ -472,7 +472,13 @@ function ProvisioningNotice({ reports }: { reports: StreamProvisionReport[] }) {
               </>
             )}
             {p.status === 'not_permitted' && (
-              <> — {p.missing}. Ask an administrator to import the parser.</>
+              <>
+                {' — '}
+                {p.missing.startsWith('Missing permission')
+                  ? p.missing
+                  : `Missing permission: ${p.missing}`}
+                . Ask an administrator to provision this stream’s Log Source.
+              </>
             )}
             {p.status === 'failed' && <> — {p.error}</>}
           </li>
@@ -492,6 +498,7 @@ interface ConnectionsTabProps {
 }
 
 export function ConnectionsTab({ entry }: ConnectionsTabProps) {
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const { hasPermission } = useAuth();
@@ -589,17 +596,22 @@ export function ConnectionsTab({ entry }: ConnectionsTabProps) {
 
       <ProvisioningNotice reports={provisioning} />
 
-      {!entry.installed ? (
-        <p className="px-3 py-4 text-[12px] text-muted-foreground">
-          Install this integration before connecting a tenant.
-        </p>
-      ) : instancesQuery.isLoading ? (
+      {!entry.installed && instances.length > 0 && (
+        <div className="mx-3 mb-2 rounded border border-amber-500/25 bg-amber-500/5 px-3 py-2 text-[11px] text-muted-foreground">
+          This integration is uninstalled. Its connections are retained but disabled; delete them
+          here before permanently deleting the integration.
+        </div>
+      )}
+
+      {instancesQuery.isLoading ? (
         <div className="flex items-center gap-2 px-3 py-4 text-[12px] text-muted-foreground">
           <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…
         </div>
       ) : instances.length === 0 ? (
         <p className="px-3 py-4 text-[12px] text-muted-foreground">
-          Not connected to a tenant yet.
+          {entry.installed
+            ? 'Not connected to a tenant yet.'
+            : 'This integration is uninstalled and has no retained connections.'}
         </p>
       ) : (
         <div className="border-t border-border">
@@ -629,13 +641,13 @@ export function ConnectionsTab({ entry }: ConnectionsTabProps) {
                 <div className="flex shrink-0 items-center gap-1.5">
                   <Switch
                     checked={instance.enabled}
-                    disabled={!canEdit || toggleEnabled.isPending}
+                    disabled={!entry.installed || !canEdit || toggleEnabled.isPending}
                     onCheckedChange={(enabled) => toggleEnabled.mutate({ id: instance.id, enabled })}
                   />
                   <Button
                     size="sm"
                     variant="ghost"
-                    disabled={!canEdit || !instance.enabled || instance.running}
+                    disabled={!entry.installed || !canEdit || !instance.enabled || instance.running}
                     title={
                       instance.running
                         ? 'A run is already in flight'
@@ -648,7 +660,7 @@ export function ConnectionsTab({ entry }: ConnectionsTabProps) {
                   <Button
                     size="sm"
                     variant="ghost"
-                    disabled={!canEdit}
+                    disabled={!entry.installed || !canEdit}
                     onClick={() => {
                       setDialogInstance(instance);
                       setDialogOpen(true);
@@ -691,7 +703,35 @@ export function ConnectionsTab({ entry }: ConnectionsTabProps) {
           integration={entry}
           instance={dialogInstance ?? undefined}
           canWriteCredentials={canWriteCredentials}
-          onSaved={(saved) => setProvisioning(saved.provisioning ?? [])}
+          onSaved={(saved) => {
+            const reports = saved.provisioning ?? [];
+            setProvisioning(reports);
+            // Updating an existing tenant should keep the operator in context.
+            // A newly-created tenant, however, should hand off to the resource
+            // it just materialized so collection can be inspected immediately.
+            if (dialogInstance) return;
+            if (saved.enabled_streams.length > 0 && reports.length === 0) {
+              toast({
+                title: 'Connection created; source provisioning needs attention',
+                description: 'No Log Source result was returned. Review this connection before relying on collection.',
+                variant: 'destructive',
+              });
+              return;
+            }
+            const problems = reports.filter((report) => report.status !== 'linked');
+            const logSourceIds = [
+              ...new Set(
+                reports
+                  .filter((report) => report.status === 'linked')
+                  .map((report) => report.log_source_id),
+              ),
+            ];
+            if (problems.length === 0 && logSourceIds.length === 1) {
+              navigate(`/ingestion/log-sources/${logSourceIds[0]}`);
+            } else if (problems.length === 0 && logSourceIds.length > 1) {
+              navigate('/ingestion/log-sources');
+            }
+          }}
         />
       )}
 

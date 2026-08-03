@@ -21,6 +21,7 @@ export interface CodeInputProps {
   language?: 'json' | 'shell' | 'plain';
   placeholder?: string;
   maxLength?: number;
+  height?: string;
   minHeight?: string;
   className?: string;
 }
@@ -31,6 +32,7 @@ export function CodeInput({
   language = 'plain',
   placeholder,
   maxLength,
+  height,
   minHeight = '80px',
   className = '',
 }: CodeInputProps) {
@@ -123,7 +125,7 @@ export function CodeInput({
     <div
       ref={containerRef}
       className={`cm-editor-container w-full overflow-hidden rounded-lg border border-border bg-background ${className}`}
-      style={{ minHeight }}
+      style={{ height, minHeight: height ?? minHeight }}
     />
   );
 }

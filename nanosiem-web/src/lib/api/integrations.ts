@@ -194,6 +194,30 @@ export interface CustomCollectorPreviewResponse {
   error?: string;
 }
 
+export interface GenerateCustomCollectorCodeRequest {
+  definition_name: string;
+  /** Natural-language instructions for the code builder, not the catalog description. */
+  description: string;
+  curl_example?: string;
+  api_docs?: string;
+  sample_response?: string;
+  allowed_domains: string[];
+  allowed_domain_suffixes: string[];
+  credential_fields: CredentialFieldDef[];
+  config_fields: CollectorConfigFieldDef[];
+  auth_type: CollectorAuthType;
+  auth?: CollectorManifestAuth;
+  streams: CollectorStreamDef[];
+  poll_schedule: string;
+}
+
+export interface GenerateCustomCollectorCodeResponse {
+  /** Candidate code; the wizard does not apply it until the operator confirms. */
+  code: string;
+  explanation: string;
+  warnings: string[];
+}
+
 export interface CollectorConfigFieldDef {
   name: string;
   label: string;
@@ -251,6 +275,19 @@ export class IntegrationsApi {
   ): Promise<CustomCollectorValidationResponse> {
     return this.request<CustomCollectorValidationResponse>(
       '/api/integrations/custom/validate',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(request),
+      },
+    );
+  }
+
+  async generateCustomCollectorCode(
+    request: GenerateCustomCollectorCodeRequest,
+  ): Promise<GenerateCustomCollectorCodeResponse> {
+    return this.request<GenerateCustomCollectorCodeResponse>(
+      '/api/integrations/custom/generate-code',
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

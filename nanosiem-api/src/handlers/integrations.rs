@@ -22,6 +22,7 @@ use nanosiem_core::audit::{
     AuditEvent, AuditSource, ClientContext, CUSTOM_INTEGRATION_CREATED, CUSTOM_INTEGRATION_DELETED,
     CUSTOM_INTEGRATION_PREVIEWED, CUSTOM_INTEGRATION_UPDATED, INTEGRATION_INSTANCE_CREATED,
     INTEGRATION_INSTANCE_DELETED, INTEGRATION_INSTANCE_UPDATED, INTEGRATION_RUN_TRIGGERED,
+    LOG_SOURCE_CREATED,
 };
 use nanosiem_core::auth::permissions;
 use nanosiem_core::crypto::EncryptionService;
@@ -45,8 +46,8 @@ use nanosiem_enterprise::integrations::{
         CUSTOM_COLLECTOR_MIN_POLL_INTERVAL_SECS, CUSTOM_COLLECTOR_PREVIEW_MAX_BYTES,
         CUSTOM_COLLECTOR_PREVIEW_MAX_EVENTS, CUSTOM_COLLECTOR_PREVIEW_MAX_RUN_SECS,
     },
-    CollectorRun, CollectorRuntime, IntegrationRepository, StreamProvisionReport,
-    StreamProvisioner,
+    CollectorRun, CollectorRuntime, IntegrationRepository, StreamProvisionOutcome,
+    StreamProvisionReport, StreamProvisioner,
 };
 
 use crate::handlers::repository_target_authz::held_target_grants;
@@ -516,14 +517,20 @@ fn validate_definition_shape(request: &CustomCollectorDefinitionRequest) -> Vec<
 
     names.clear();
     for stream in &request.streams {
-        if !identifier_is_safe(&stream.id) {
-            errors.push(format!("stream {:?} has an invalid id", stream.id));
+        if !identifier_is_safe(&stream.id) || stream.id.len() > 100 {
+            errors.push(format!(
+                "stream {:?} has an invalid id (maximum 100 characters)",
+                stream.id
+            ));
         }
         if !names.insert(stream.id.as_str()) {
             errors.push(format!("stream {:?} is duplicated", stream.id));
         }
-        if !identifier_is_safe(&stream.source_type) {
-            errors.push(format!("stream {:?} has an invalid source_type", stream.id));
+        if !identifier_is_safe(&stream.source_type) || stream.source_type.len() > 200 {
+            errors.push(format!(
+                "stream {:?} has an invalid source_type (maximum 200 characters)",
+                stream.id
+            ));
         }
         if stream.label.trim().is_empty() {
             errors.push(format!("stream {:?} needs a label", stream.id));
@@ -787,6 +794,46 @@ async fn build_response(
         streams,
         provisioning,
     })
+}
+
+/// Audit each first-class Log Source actually created as a side effect of
+/// collector provisioning. The integration-instance event cannot substitute
+/// for the target resource's own audit trail.
+fn audit_created_log_sources(
+    state: &AppState,
+    auth: &AuthContext,
+    client: &ClientContext,
+    instance_id: Uuid,
+    reports: &[StreamProvisionReport],
+) {
+    for report in reports {
+        let StreamProvisionOutcome::Linked {
+            log_source_id,
+            created: true,
+        } = &report.outcome
+        else {
+            continue;
+        };
+
+        state.emit_audit(
+            AuditEvent::builder(AuditSource::LogSource, LOG_SOURCE_CREATED)
+                .actor(Some(auth.user_id()), None)
+                .api_key(auth.api_key_id, auth.api_key_name.clone())
+                .resource(
+                    "log_source",
+                    Some(*log_source_id),
+                    Some(report.source_type.clone()),
+                )
+                .client_context(client)
+                .details(serde_json::json!({
+                    "source": "collector_stream_provisioning",
+                    "integration_instance_id": instance_id.to_string(),
+                    "stream_id": report.stream_id.clone(),
+                    "source_type": report.source_type.clone(),
+                }))
+                .build(),
+        );
+    }
 }
 
 /// Reject stream ids the manifest does not declare.
@@ -1408,6 +1455,8 @@ pub async fn create_instance(
             Vec::new()
         });
 
+    audit_created_log_sources(&state, &auth, &client, instance.id, &provisioning);
+
     state.emit_audit(
         AuditEvent::builder(AuditSource::LogSource, INTEGRATION_INSTANCE_CREATED)
             .actor(Some(auth.user_id()), None)
@@ -1531,6 +1580,8 @@ pub async fn update_instance(
             tracing::warn!(instance_id = %instance.id, error = %e, "Stream provisioning failed");
             Vec::new()
         });
+
+    audit_created_log_sources(&state, &auth, &client, instance.id, &provisioning);
 
     state.emit_audit(
         AuditEvent::builder(AuditSource::LogSource, INTEGRATION_INSTANCE_UPDATED)
@@ -1733,6 +1784,17 @@ mod tests {
             .iter()
             .any(|error| error.contains("letter or number")));
         assert!(errors.iter().any(|error| error.contains("cannot exceed")));
+    }
+
+    #[test]
+    fn definition_rejects_stream_keys_that_exceed_persistence_limits() {
+        let mut request = valid_definition();
+        request.streams[0].id = "a".repeat(101);
+        request.streams[0].source_type = "b".repeat(201);
+
+        let errors = validate_definition_shape(&request);
+        assert!(errors.iter().any(|error| error.contains("maximum 100")));
+        assert!(errors.iter().any(|error| error.contains("maximum 200")));
     }
 
     #[test]
