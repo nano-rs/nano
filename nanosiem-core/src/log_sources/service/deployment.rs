@@ -5,17 +5,26 @@
 use sqlx;
 use uuid::Uuid;
 
-use super::helpers::log_source_to_parser;
 use super::LogSourceService;
 use super::LogSourceServiceError;
 use crate::log_sources::types::{
     DeploymentAction, DeploymentResult, DeploymentStatus, LogSourceDeployment, VrlValidationResult,
 };
-use crate::parsers::Parser;
 
 impl LogSourceService {
     /// Deploy a log source to Vector
     pub async fn deploy(&self, id: Uuid) -> Result<DeploymentResult, LogSourceServiceError> {
+        // NAN-2297: stage → validate → backup → promote → reload is ONE critical
+        // section against a single on-disk staging directory. Held for the whole
+        // sequence, not per-step, so a concurrent deploy cannot clean this one's
+        // staging mid-validate, promote a half-built tree, or (since NAN-2296)
+        // prune files this deploy just promoted. Shared with ParserService and
+        // SourceConfigService via the manager handed in at construction.
+        //
+        // Everything below must stay on lock-free helpers or `*_locked`
+        // variants — the mutex is not reentrant.
+        let _deploy_guard = self.vector_config.lock_deploys().await;
+
         let log_source = self.repository().find_by_id(id).await?;
 
         tracing::info!(
@@ -92,17 +101,10 @@ impl LogSourceService {
         // Enable this log source for deployment
         self.repository().enable(id).await?;
 
-        let all_log_sources = self.list_enabled_for_deploy().await?;
-
-        // Convert LogSource to Parser for VectorConfigManager compatibility
-        let mut parsers: Vec<Parser> = all_log_sources
-            .into_iter()
-            .map(log_source_to_parser)
-            .collect();
-        // NAN-928: resolve dispatch source-config route names so the
-        // generator wires fetch-source parsers to the user's source-config
-        // route instead of creating a parser-owned Vector source.
-        self.resolve_dispatch_route_names(&mut parsers).await?;
+        // NAN-928: the helper also resolves dispatch source-config route names
+        // so the generator wires fetch-source parsers to the user's
+        // source-config route instead of creating a parser-owned Vector source.
+        let parsers = self.effective_deployed_parsers().await?;
 
         // Stage and validate
         if let Err(e) = self.vector_config.stage_parsers(&parsers).await {
@@ -213,12 +215,52 @@ impl LogSourceService {
             log_source.name
         );
 
-        // Step 3: Backup, promote, and reload
-        let _ = self.vector_config.backup_current().await;
+        // Step 3: Backup, promote, and reload.
+        //
+        // NAN-2301: the failure is non-fatal (an incoherent tree is healed by
+        // the very promotion below, so refusing to run it would be a trap) but
+        // no longer silent, and no longer falls back to an older snapshot. A
+        // leftover backup describes a different starting state; restoring it is
+        // an unrelated overwrite, and when the leftover is the empty
+        // first-install backup it deletes a live config outright.
+        let backup = match self.vector_config.backup_current().await {
+            Ok(generation) => Some(generation),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to back up current config before promoting — this deploy will not be \
+                     able to roll back: {}",
+                    e
+                );
+                None
+            }
+        };
 
         if let Err(e) = self.vector_config.promote_staged().await {
             let error_msg = format!("Failed to promote staged config: {}", e);
             tracing::error!("{}", error_msg);
+
+            // NAN-2305: restore the snapshot taken directly above — and only
+            // that one. A promotion that failed partway leaves the ACTIVE tree
+            // mixed: some files replaced, some not, and (since NAN-2296) some
+            // pruned. This path used to return straight from here, so the
+            // deploy was reported failed while a half-published config stayed
+            // live and every later reload rejected it. The parser path has
+            // restored since NAN-2300; this is the same sequence.
+            match backup.as_ref() {
+                Some(generation) => {
+                    if let Err(restore_err) = self.vector_config.restore_backup(generation).await {
+                        tracing::error!(
+                            "Restore after failed promotion also failed: {}. Active config may be \
+                             inconsistent — manual intervention required.",
+                            restore_err
+                        );
+                    }
+                }
+                None => tracing::error!(
+                    "Promotion failed with no snapshot from this attempt to restore. The active \
+                     config may be partially replaced — manual intervention required."
+                ),
+            }
 
             let _ = self
                 .repository()
@@ -241,17 +283,33 @@ impl LogSourceService {
             });
         }
 
-        // Reload Vector
-        if let Err(e) = self.vector_config.reload_vector().await {
-            tracing::error!("Vector reload failed, attempting rollback: {}", e);
+        // Reload Vector, confirm it accepted the config, and roll back if not.
+        //
+        // NAN-2305: this was a bare `reload_vector` plus a hand-rolled rollback
+        // that skipped the post-reload health poll the parser path has. Both
+        // halves now go through the shared helper, so the two entrypoints agree
+        // on what a verified deploy is — and on what gets RECORDED, since the
+        // helper is the only thing that knows whether the restore actually ran.
+        //
+        // `_locked`: this method already holds the deploy guard (NAN-2297).
+        if let Err(failure) = self
+            .vector_config
+            .reload_and_verify_locked(backup.as_ref())
+            .await
+        {
+            let error_msg = format!("{}", failure);
+            tracing::error!(
+                "Deploy failed for log source '{}': {}",
+                log_source.name,
+                error_msg
+            );
 
-            if let Err(rollback_err) = self.vector_config.restore_backup().await {
-                let error_msg = format!(
-                    "Reload failed and rollback also failed: {} / {}",
-                    e, rollback_err
-                );
-                tracing::error!("{}", error_msg);
-
+            // A backup existed but nothing was rolled back ⇒ the restore itself
+            // failed, which is the one outcome that needs a human. Preserved as
+            // a hard error (it was `RollbackFailed` before) rather than folded
+            // into the generic failure result.
+            if !failure.rolled_back && backup.is_some() {
+                let error_msg = format!("Reload failed and rollback also failed: {}", error_msg);
                 let _ = self
                     .repository()
                     .record_deployment(
@@ -262,28 +320,36 @@ impl LogSourceService {
                         None,
                     )
                     .await;
-
                 return Err(LogSourceServiceError::RollbackFailed(error_msg));
             }
 
-            let _ = self.vector_config.reload_vector().await;
-
+            let (action, status) = if failure.rolled_back {
+                (DeploymentAction::Rollback, DeploymentStatus::RolledBack)
+            } else {
+                (DeploymentAction::Deploy, DeploymentStatus::Failed)
+            };
             let _ = self
                 .repository()
                 .record_deployment(
                     id,
-                    DeploymentAction::Rollback.as_str(),
-                    DeploymentStatus::RolledBack.as_str(),
-                    Some(&format!("Rolled back due to reload failure: {}", e)),
+                    action.as_str(),
+                    status.as_str(),
+                    Some(&error_msg),
                     None,
                 )
                 .await;
+
+            let message = if failure.rolled_back {
+                format!("Reload failed, rolled back: {}", error_msg)
+            } else {
+                format!("Reload failed and was NOT rolled back: {}", error_msg)
+            };
 
             return Ok(DeploymentResult {
                 success: false,
                 log_source_id: id,
                 action: DeploymentAction::Deploy.as_str().to_string(),
-                message: format!("Reload failed, rolled back: {}", e),
+                message,
                 validation_result: None,
                 deployment_id: None,
             });
@@ -346,9 +412,7 @@ impl LogSourceService {
         self.repository().mark_undeployed(id).await?;
 
         // Redeploy all remaining enabled log sources (using active versions)
-        let enabled = self.list_enabled_for_deploy().await?;
-        let mut parsers: Vec<Parser> = enabled.into_iter().map(log_source_to_parser).collect();
-        self.resolve_dispatch_route_names(&mut parsers).await?;
+        let parsers = self.effective_deployed_parsers().await?;
 
         if let Err(e) = self.vector_config.deploy_and_reload(&parsers).await {
             let error_msg = format!("Failed to redeploy after undeploy: {}", e);
@@ -429,9 +493,7 @@ impl LogSourceService {
 
     /// Deploy all enabled log sources (using active version VRL)
     pub async fn deploy_all(&self) -> Result<(), LogSourceServiceError> {
-        let enabled = self.list_enabled_for_deploy().await?;
-        let mut parsers: Vec<Parser> = enabled.into_iter().map(log_source_to_parser).collect();
-        self.resolve_dispatch_route_names(&mut parsers).await?;
+        let parsers = self.effective_deployed_parsers().await?;
 
         self.vector_config.deploy_and_reload(&parsers).await?;
 

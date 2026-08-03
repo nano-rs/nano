@@ -592,10 +592,13 @@ mod tests {
         // API collectors: /api/integrations/custom/validate,
         // /api/integrations/custom/preview, /api/integrations/custom, and
         // /api/integrations/custom/{id}. Open is unchanged.
+        // NAN-2306 added 2 shared hunt-report audit receipt templates:
+        // /api/hunts/report-branding-events and /api/hunts/{id}/report-exports.
+        // PDF bytes and branding remain device-local; both paths count in both editions.
         #[cfg(feature = "enterprise")]
-        let min_paths = 560;
+        let min_paths = 562;
         #[cfg(not(feature = "enterprise"))]
-        let min_paths = 442;
+        let min_paths = 444;
 
         assert!(
             path_count >= min_paths,

@@ -381,6 +381,13 @@ impl From<nanosiem_core::ParserServiceError> for ApiError {
                 nanosiem_core::parsers::ParserRepositoryError::DuplicateName(name) => {
                     ApiError::ValidationError(format!("Parser name already exists: {}", name))
                 }
+                // NAN-2305: migration 283's unique index fired past the
+                // service-level check (concurrent write, or the ASCII/Unicode
+                // normalization gap). Same class as DuplicateName — the name
+                // is unusable, pick another — so the same 400.
+                nanosiem_core::parsers::ParserRepositoryError::GeneratedNameConflict(msg) => {
+                    ApiError::ValidationError(msg.clone())
+                }
                 nanosiem_core::parsers::ParserRepositoryError::DatabaseError(e) => {
                     tracing::error!(error = %e, "Parser repository database error");
                     ApiError::DatabaseError("A database error occurred".to_string())
@@ -391,6 +398,13 @@ impl From<nanosiem_core::ParserServiceError> for ApiError {
             }
             nanosiem_core::ParserServiceError::InvalidSourceType(t) => {
                 ApiError::ValidationError(format!("Invalid source type: {}", t))
+            }
+            // NAN-2305: same class as `DuplicateName` above (the requested name
+            // is unusable, pick another) so it gets the same 400 rather than
+            // introducing a second status code for "rename and retry". The
+            // message is already self-describing — no prefix.
+            nanosiem_core::ParserServiceError::NameCollision(msg) => {
+                ApiError::ValidationError(msg.clone())
             }
             nanosiem_core::ParserServiceError::NotValidated => {
                 ApiError::ValidationError("Parser must be validated before enabling".to_string())
@@ -456,6 +470,12 @@ impl From<nanosiem_core::LogSourceServiceError> for ApiError {
             // NAN-2158: a rejected `match_field` is an injection payload, not a
             // server fault — 400 with the offending value named, so an operator
             // fixing a legacy row can see what to change.
+            // NAN-2311: same class as the parser-side NameCollision — the
+            // requested name is unusable, pick another. 400, not the 500 the
+            // bare unique-violation used to produce.
+            nanosiem_core::LogSourceServiceError::NameCollision(msg) => {
+                ApiError::ValidationError(msg.clone())
+            }
             nanosiem_core::LogSourceServiceError::InvalidMatchField(msg) => {
                 ApiError::ValidationError(format!("Invalid match_field: {}", msg))
             }

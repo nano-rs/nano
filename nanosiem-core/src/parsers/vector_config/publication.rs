@@ -186,6 +186,8 @@ struct PublicationEnvelope {
 
 struct RendererRuntime {
     epoch: i64,
+    /// NAN-2304: see [`renderer_fingerprint`].
+    fingerprint: String,
     signing_key: Option<SigningKey>,
 }
 
@@ -204,7 +206,48 @@ struct PublicationState {
     current_content_hash: Option<String>,
     current_renderer_epoch: i64,
     current_renderer_version: String,
+    /// NAN-2304: the fingerprint recorded on the committed generation's
+    /// snapshot row, or `""` for a generation published before the column
+    /// existed (and when nothing is committed yet).
+    current_renderer_fingerprint: String,
 }
+
+/// Tuple shape returned by [`PUBLICATION_STATE_SELECT`].
+type CommittedStateRow = (i64, i64, Option<i64>, Option<String>, i64, String, String);
+
+/// The singleton publication pointer, plus the renderer fingerprint of the
+/// generation it points at.
+///
+/// NAN-2304: the fingerprint lives on the immutable snapshot row rather than on
+/// the pointer, so migration 229's pointer-shape CHECK and composite FK stay
+/// exactly as they were. `LEFT JOIN` because the pointer is NULL until the
+/// first publication; `COALESCE` maps both "nothing committed yet" and a
+/// generation published before the column existed to the empty fingerprint,
+/// which never equals a real (hex-digest) one.
+const PUBLICATION_STATE_SELECT: &str = "\
+    SELECT state.source_revision, state.published_source_revision, \
+           state.current_generation, state.current_content_hash, \
+           state.current_renderer_epoch, state.current_renderer_version, \
+           COALESCE(snapshots.renderer_fingerprint, '') \
+      FROM vector_config_publication_state state \
+      LEFT JOIN vector_config_snapshots snapshots \
+             ON snapshots.generation = state.current_generation \
+     WHERE state.singleton = TRUE";
+
+/// [`PUBLICATION_STATE_SELECT`] taking the singleton row lock that serializes
+/// the current-pointer CAS. `FOR UPDATE OF state` rather than a bare
+/// `FOR UPDATE`: PostgreSQL refuses to lock the nullable side of an outer join,
+/// and the snapshot row needs no lock — migration 229 makes it immutable.
+const PUBLICATION_STATE_SELECT_FOR_UPDATE: &str = "\
+    SELECT state.source_revision, state.published_source_revision, \
+           state.current_generation, state.current_content_hash, \
+           state.current_renderer_epoch, state.current_renderer_version, \
+           COALESCE(snapshots.renderer_fingerprint, '') \
+      FROM vector_config_publication_state state \
+      LEFT JOIN vector_config_snapshots snapshots \
+             ON snapshots.generation = state.current_generation \
+     WHERE state.singleton = TRUE \
+     FOR UPDATE OF state";
 
 #[derive(Debug, PartialEq, Eq)]
 enum PublicationDecision {
@@ -247,14 +290,10 @@ impl VectorConfigPublisher {
         &self,
     ) -> Result<Option<PublicationOutcome>, VectorConfigPublicationError> {
         let runtime = renderer_runtime()?;
-        let state = sqlx::query_as::<_, (i64, i64, Option<i64>, Option<String>, i64, String)>(
-            "SELECT source_revision, published_source_revision, current_generation, current_content_hash, \
-                    current_renderer_epoch, current_renderer_version \
-             FROM vector_config_publication_state WHERE singleton = TRUE",
-        )
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(VectorConfigPublicationError::MissingState)?;
+        let state = sqlx::query_as::<_, CommittedStateRow>(PUBLICATION_STATE_SELECT)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(VectorConfigPublicationError::MissingState)?;
 
         match compare_renderer_precedence(runtime.epoch, RENDERER_VERSION, state.4, &state.5)? {
             Ordering::Less => {
@@ -269,6 +308,13 @@ impl VectorConfigPublisher {
             }
             Ordering::Greater => return Ok(None),
             Ordering::Equal => {}
+        }
+        // NAN-2304: an env-only render change (schema profile, router presence
+        // flags) leaves `source_revision` untouched, so without this the pod
+        // would report the committed generation as current forever and never
+        // re-render. Fall through to a full render + publish instead.
+        if state.6 != runtime.fingerprint {
+            return Ok(None);
         }
         if state.0 != state.1 {
             return Ok(None);
@@ -337,6 +383,10 @@ impl VectorConfigPublisher {
     /// same renderer identity must produce the same hash. A higher explicit
     /// epoch wins first (including an intentional semantic-version rollback);
     /// semantic versions order renderers only within the same epoch.
+    ///
+    /// NAN-2304: renderer identity is `(epoch, version, fingerprint)` — the
+    /// fingerprint covering render-affecting environment inputs that no
+    /// database revision can see. See [`renderer_fingerprint_inputs`].
     pub async fn publish(
         &self,
         expected_revision: i64,
@@ -344,14 +394,10 @@ impl VectorConfigPublisher {
     ) -> Result<PublicationOutcome, VectorConfigPublicationError> {
         let runtime = renderer_runtime()?;
         let mut tx = self.pool.begin().await?;
-        let state = sqlx::query_as::<_, (i64, i64, Option<i64>, Option<String>, i64, String)>(
-            "SELECT source_revision, published_source_revision, current_generation, current_content_hash, \
-                    current_renderer_epoch, current_renderer_version \
-             FROM vector_config_publication_state WHERE singleton = TRUE FOR UPDATE",
-        )
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(VectorConfigPublicationError::MissingState)?;
+        let state = sqlx::query_as::<_, CommittedStateRow>(PUBLICATION_STATE_SELECT_FOR_UPDATE)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(VectorConfigPublicationError::MissingState)?;
 
         let state = PublicationState {
             source_revision: state.0,
@@ -360,6 +406,7 @@ impl VectorConfigPublisher {
             current_content_hash: state.3,
             current_renderer_epoch: state.4,
             current_renderer_version: state.5,
+            current_renderer_fingerprint: state.6,
         };
         match decide_publication(
             &state,
@@ -367,6 +414,7 @@ impl VectorConfigPublisher {
             &snapshot.content_hash,
             runtime.epoch,
             RENDERER_VERSION,
+            &runtime.fingerprint,
         )? {
             PublicationDecision::Stale { actual_revision } => {
                 tx.rollback().await?;
@@ -406,38 +454,105 @@ impl VectorConfigPublisher {
             PublicationDecision::PublishNew => {}
         }
 
-        let generation: i64 =
-            sqlx::query_scalar("SELECT nextval('vector_config_generation_seq')::BIGINT")
-                .fetch_one(&mut *tx)
-                .await?;
-        let stored_manifest = serde_json::to_value(StoredManifest {
-            version: MANIFEST_VERSION,
-            renderer_epoch: runtime.epoch,
-            renderer_version: RENDERER_VERSION,
-            files: snapshot
-                .manifest
-                .iter()
-                .map(|entry| StoredManifestEntry {
-                    path: &entry.path,
-                    size: entry.size,
-                })
-                .collect(),
-        })?;
+        // NAN-2304: a fingerprint change at the same renderer epoch/version is
+        // an env-only render change. Legitimate and self-healing after a
+        // deployment-wide flip has finished rolling — but if replicas disagree
+        // permanently (one pod's `NANO_SCHEMA_PROFILE` edited by hand), each
+        // reconcile tick allocates a generation, so make the cause visible.
+        if !state.current_renderer_fingerprint.is_empty()
+            && state.current_renderer_fingerprint != runtime.fingerprint
+        {
+            tracing::warn!(
+                committed_fingerprint = %state.current_renderer_fingerprint,
+                running_fingerprint = %runtime.fingerprint,
+                renderer_epoch = runtime.epoch,
+                renderer_version = RENDERER_VERSION,
+                "Vector configuration render inputs changed outside the database \
+                 (schema profile / router presence flags / source-config paths); \
+                 committing this renderer's generation. Sustained churn here \
+                 means API replicas disagree on those environment values"
+            );
+        }
 
-        sqlx::query(
-            "INSERT INTO vector_config_snapshots \
-             (generation, source_revision, renderer_epoch, renderer_version, content_hash, manifest, created_by) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        // NAN-2304: this renderer identity may ALREADY own a generation at this
+        // revision. Before the fingerprint, renderer identities were totally
+        // ordered, so a superseded renderer never reached this point and the
+        // uniqueness key was never contended. Fingerprints are deliberately
+        // unordered (see `decide_publication`), so two renderers can now
+        // leapfrog the pointer — A publishes, B publishes, A renders again —
+        // and A's second attempt collided with its own first generation on
+        // `vector_config_snapshots_source_renderer_key`. That surfaced as a
+        // raw unique violation every reconcile tick, which for a deployment
+        // stuck mid-flip meant NEITHER renderer could publish again.
+        //
+        // The existing generation IS this renderer's output for this revision,
+        // so adopt it. Snapshots are immutable, so it needs no rewrite — only
+        // the pointer moves.
+        let existing: Option<(i64, String)> = sqlx::query_as(
+            "SELECT generation, content_hash FROM vector_config_snapshots \
+             WHERE source_revision = $1 AND renderer_epoch = $2 \
+               AND renderer_version = $3 AND renderer_fingerprint = $4",
         )
-        .bind(generation)
         .bind(expected_revision)
         .bind(runtime.epoch)
         .bind(RENDERER_VERSION)
-        .bind(&snapshot.content_hash)
-        .bind(stored_manifest)
-        .bind(&self.node_id)
-        .execute(&mut *tx)
+        .bind(&runtime.fingerprint)
+        .fetch_optional(&mut *tx)
         .await?;
+
+        let generation = match existing {
+            Some((generation, committed_hash)) => {
+                // Same identity, same revision, different bytes — the invariant
+                // `decide_publication` enforces against the CURRENT pointer,
+                // enforced here against the identity's own prior generation.
+                if committed_hash != snapshot.content_hash {
+                    tx.rollback().await?;
+                    return Err(VectorConfigPublicationError::DivergentRender {
+                        source_revision: expected_revision,
+                        committed_hash,
+                        rendered_hash: snapshot.content_hash.clone(),
+                    });
+                }
+                generation
+            }
+            None => {
+                let generation: i64 =
+                    sqlx::query_scalar("SELECT nextval('vector_config_generation_seq')::BIGINT")
+                        .fetch_one(&mut *tx)
+                        .await?;
+                let stored_manifest = serde_json::to_value(StoredManifest {
+                    version: MANIFEST_VERSION,
+                    renderer_epoch: runtime.epoch,
+                    renderer_version: RENDERER_VERSION,
+                    files: snapshot
+                        .manifest
+                        .iter()
+                        .map(|entry| StoredManifestEntry {
+                            path: &entry.path,
+                            size: entry.size,
+                        })
+                        .collect(),
+                })?;
+
+                sqlx::query(
+                    "INSERT INTO vector_config_snapshots \
+                     (generation, source_revision, renderer_epoch, renderer_version, \
+                      renderer_fingerprint, content_hash, manifest, created_by) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                )
+                .bind(generation)
+                .bind(expected_revision)
+                .bind(runtime.epoch)
+                .bind(RENDERER_VERSION)
+                .bind(&runtime.fingerprint)
+                .bind(&snapshot.content_hash)
+                .bind(stored_manifest)
+                .bind(&self.node_id)
+                .execute(&mut *tx)
+                .await?;
+                generation
+            }
+        };
 
         let advanced = sqlx::query(
             "UPDATE vector_config_publication_state \
@@ -858,6 +973,7 @@ fn decide_publication(
     rendered_hash: &str,
     renderer_epoch: i64,
     renderer_version: &str,
+    renderer_fingerprint: &str,
 ) -> Result<PublicationDecision, VectorConfigPublicationError> {
     if state.source_revision != expected_revision
         || state.published_source_revision > expected_revision
@@ -881,6 +997,24 @@ fn decide_publication(
         }
         Ordering::Greater => return Ok(PublicationDecision::PublishNew),
         Ordering::Equal => {}
+    }
+
+    // NAN-2304: epoch and semantic version do not identify a renderer on their
+    // own — `renderer_fingerprint_inputs` (schema profile, router presence
+    // flags, source-config paths) change the bytes at one binary version. A
+    // different fingerprint is a DIFFERENT renderer, so it publishes rather
+    // than reusing the committed generation or being rejected as a divergent
+    // render of the same one.
+    //
+    // Deliberately not part of `compare_renderer_precedence`: a fingerprint is
+    // an opaque digest with no meaningful order, and ordering it would freeze
+    // whichever direction sorted lower — e.g. an intended udm→ocsf rollout
+    // would complete with every pod permanently superseded. The running
+    // renderer always wins, so the deployment converges on the profile the
+    // pods actually have. A partially-applied env change therefore churns
+    // generations while it lasts, which the WARN in `publish` surfaces.
+    if state.current_renderer_fingerprint != renderer_fingerprint {
+        return Ok(PublicationDecision::PublishNew);
     }
 
     if state.published_source_revision == expected_revision {
@@ -920,8 +1054,88 @@ fn compare_renderer_precedence(
 fn renderer_runtime() -> Result<RendererRuntime, VectorConfigPublicationError> {
     Ok(RendererRuntime {
         epoch: renderer_epoch_from_env()?,
+        fingerprint: renderer_fingerprint(),
         signing_key: signing_key_from_env()?,
     })
+}
+
+/// Environment inputs that change the rendered Vector configuration but live
+/// outside the database, and therefore outside `source_revision`. NAN-2304.
+///
+/// Renderer identity was `(epoch, semantic version)` alone, so a deployment-wide
+/// env flip at one binary version was invisible to the publication protocol:
+///
+///   * `NANO_SCHEMA_PROFILE=udm` → `ocsf` (or back) does not touch the
+///     database, so `source_revision` never moves. `local_current_outcome`
+///     kept reporting `Reused` against the already-materialized UDM generation
+///     — indefinitely. The OCSF lane would never have shipped.
+///   * During the rolling restart that applies such a flip, replicas at ONE
+///     binary version render different bytes. Whichever pod committed first
+///     owned the revision, and every pod on the other profile got
+///     `DivergentRender` — permanently, once the rollout completed, because
+///     the committed hash for that revision can never match again.
+///
+/// Folding these into the renderer identity makes an env-only change a
+/// different renderer, so it publishes a new generation instead of reusing or
+/// rejecting one. Values are hashed, never stored in the clear.
+fn renderer_fingerprint_inputs() -> Vec<(&'static str, String)> {
+    // Mirrors `VectorConfigManager::ocsf_mode`, INCLUDING its fallback: a
+    // malformed profile value renders as UDM, so it must fingerprint as UDM.
+    // `log_telemetry_profile_for` is the canonical stable discriminator
+    // ("udm" | "ocsf"); the per-query dataset ids it also folds into "udm" are
+    // not reachable from `NANO_SCHEMA_PROFILE`.
+    let schema_profile = crate::schema::active_profile_from_env()
+        .map(|profile| crate::schema::log_telemetry_profile_for(profile.id()))
+        .unwrap_or("udm");
+
+    vec![
+        ("schema_profile", schema_profile.to_string()),
+        // Both decide how `_router.toml` wires the base Vector config's
+        // sources — see `router::otlp_source_present` / `hec_normalize_present`.
+        (
+            "otlp_source_present",
+            super::router::otlp_source_present().to_string(),
+        ),
+        (
+            "hec_normalize_present",
+            super::router::hec_normalize_present().to_string(),
+        ),
+        // Owned by SourceConfigService, whose rendered tree is published in the
+        // same snapshot: both values are embedded in the generated source TOML.
+        (
+            "sources_runtime_path",
+            crate::source_configs::SourceConfigService::resolve_runtime_path(),
+        ),
+        (
+            "creds_backend",
+            crate::source_configs::creds_backend::creds_backend_override_label().to_string(),
+        ),
+    ]
+}
+
+/// Hash of [`renderer_fingerprint_inputs`] — the env half of renderer identity.
+fn renderer_fingerprint() -> String {
+    fingerprint_from_inputs(&renderer_fingerprint_inputs())
+}
+
+/// Pure encoder for [`renderer_fingerprint`], split out so the fingerprint
+/// contract is testable without mutating process-global environment.
+///
+/// Sorted by key and length-prefixed so no combination of values can be
+/// re-partitioned into a different input set with the same digest.
+fn fingerprint_from_inputs(inputs: &[(&str, String)]) -> String {
+    let mut sorted: Vec<&(&str, String)> = inputs.iter().collect();
+    sorted.sort_by(|left, right| left.0.cmp(right.0));
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"nano.vector-config.renderer-inputs.v1");
+    for (key, value) in sorted {
+        hasher.update((key.len() as u64).to_be_bytes());
+        hasher.update(key.as_bytes());
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hex::encode(hasher.finalize())
 }
 
 fn renderer_epoch_from_env() -> Result<i64, VectorConfigPublicationError> {
@@ -1399,12 +1613,35 @@ mod tests {
         ));
     }
 
+    /// Stand-in for the running renderer's environment digest. Opaque by
+    /// design — `decide_publication` only ever compares fingerprints for
+    /// equality, never orders them.
+    const TEST_FINGERPRINT: &str = "fingerprint-a";
+
     fn committed_state(
         source_revision: i64,
         published_source_revision: i64,
         content_hash: &str,
         renderer_epoch: i64,
         renderer_version: &str,
+    ) -> PublicationState {
+        committed_state_with_fingerprint(
+            source_revision,
+            published_source_revision,
+            content_hash,
+            renderer_epoch,
+            renderer_version,
+            TEST_FINGERPRINT,
+        )
+    }
+
+    fn committed_state_with_fingerprint(
+        source_revision: i64,
+        published_source_revision: i64,
+        content_hash: &str,
+        renderer_epoch: i64,
+        renderer_version: &str,
+        renderer_fingerprint: &str,
     ) -> PublicationState {
         PublicationState {
             source_revision,
@@ -1413,6 +1650,7 @@ mod tests {
             current_content_hash: Some(content_hash.to_string()),
             current_renderer_epoch: renderer_epoch,
             current_renderer_version: renderer_version.to_string(),
+            current_renderer_fingerprint: renderer_fingerprint.to_string(),
         }
     }
 
@@ -1420,7 +1658,7 @@ mod tests {
     fn delayed_node_cannot_regress_committed_revision() {
         let committed = committed_state(12, 12, "new", 0, RENDERER_VERSION);
         assert_eq!(
-            decide_publication(&committed, 11, "old", 0, RENDERER_VERSION).unwrap(),
+            decide_publication(&committed, 11, "old", 0, RENDERER_VERSION, TEST_FINGERPRINT).unwrap(),
             PublicationDecision::Stale {
                 actual_revision: 12
             }
@@ -1431,7 +1669,7 @@ mod tests {
     fn restarted_node_reuses_identical_committed_generation() {
         let committed = committed_state(12, 12, "same", 0, RENDERER_VERSION);
         assert_eq!(
-            decide_publication(&committed, 12, "same", 0, RENDERER_VERSION).unwrap(),
+            decide_publication(&committed, 12, "same", 0, RENDERER_VERSION, TEST_FINGERPRINT).unwrap(),
             PublicationDecision::Reuse { generation: 7 }
         );
     }
@@ -1440,7 +1678,7 @@ mod tests {
     fn same_revision_with_different_render_is_rejected() {
         let committed = committed_state(12, 12, "node-a", 0, RENDERER_VERSION);
         assert!(matches!(
-            decide_publication(&committed, 12, "node-b", 0, RENDERER_VERSION),
+            decide_publication(&committed, 12, "node-b", 0, RENDERER_VERSION, TEST_FINGERPRINT),
             Err(VectorConfigPublicationError::DivergentRender { .. })
         ));
     }
@@ -1449,7 +1687,7 @@ mod tests {
     fn newer_renderer_may_advance_same_database_revision() {
         let committed = committed_state(12, 12, "old-render", 3, "1.2.3");
         assert_eq!(
-            decide_publication(&committed, 12, "new-render", 3, "1.2.4").unwrap(),
+            decide_publication(&committed, 12, "new-render", 3, "1.2.4", TEST_FINGERPRINT).unwrap(),
             PublicationDecision::PublishNew
         );
     }
@@ -1462,7 +1700,7 @@ mod tests {
     fn parser_health_renderer_supersedes_pre_health_release() {
         let committed = committed_state(12, 12, "pre-health", 0, "0.1.682");
         assert_eq!(
-            decide_publication(&committed, 12, "with-health", 0, RENDERER_VERSION).unwrap(),
+            decide_publication(&committed, 12, "with-health", 0, RENDERER_VERSION, TEST_FINGERPRINT).unwrap(),
             PublicationDecision::PublishNew
         );
     }
@@ -1471,7 +1709,7 @@ mod tests {
     fn higher_epoch_allows_intentional_semver_rollback() {
         let committed = committed_state(12, 12, "old-render", 3, "2.0.0");
         assert_eq!(
-            decide_publication(&committed, 12, "rollback-render", 4, "1.5.0").unwrap(),
+            decide_publication(&committed, 12, "rollback-render", 4, "1.5.0", TEST_FINGERPRINT).unwrap(),
             PublicationDecision::PublishNew
         );
     }
@@ -1480,11 +1718,180 @@ mod tests {
     fn lower_epoch_cannot_advance_even_with_newer_semver() {
         let committed = committed_state(12, 12, "new-epoch", 4, "1.0.0");
         assert_eq!(
-            decide_publication(&committed, 12, "old-epoch", 3, "9.0.0").unwrap(),
+            decide_publication(&committed, 12, "old-epoch", 3, "9.0.0", TEST_FINGERPRINT).unwrap(),
             PublicationDecision::SupersededRenderer {
                 committed_epoch: 4,
                 committed_version: "1.0.0".to_string(),
             }
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // NAN-2304 (Finding B): the renderer fingerprint. `NANO_SCHEMA_PROFILE` and
+    // the router presence flags change the rendered bytes without touching any
+    // database row, so before this they were invisible to a protocol keyed on
+    // (source_revision, epoch, semantic version) alone.
+    // -----------------------------------------------------------------------
+
+    /// The mixed-profile rollout. Both replicas run one binary at one epoch,
+    /// so epoch/version comparison is Equal — but they render different bytes.
+    /// Without the fingerprint in the identity this is a `DivergentRender`
+    /// error, and it stays one forever: once the rollout completes, EVERY pod
+    /// is on the losing profile and can never match the committed hash for
+    /// that revision, so the new profile's config never ships.
+    #[test]
+    fn schema_profile_flip_publishes_instead_of_rejecting_a_divergent_render() {
+        let committed =
+            committed_state_with_fingerprint(12, 12, "udm-render", 0, RENDERER_VERSION, "udm-fp");
+        assert_eq!(
+            decide_publication(
+                &committed,
+                12,
+                "ocsf-render",
+                0,
+                RENDERER_VERSION,
+                "ocsf-fp",
+            )
+            .unwrap(),
+            PublicationDecision::PublishNew,
+        );
+    }
+
+    /// The same flip when the two profiles happen to render identical bytes
+    /// (e.g. no parsers deployed yet, so no OCSF lane is emitted). Content
+    /// hashes match, so the hash check cannot tell the renderers apart; only
+    /// the fingerprint can. Reusing here would pin the deployment to a
+    /// generation produced by a renderer that no longer exists.
+    #[test]
+    fn schema_profile_flip_is_not_reusable_even_when_content_matches() {
+        let committed =
+            committed_state_with_fingerprint(12, 12, "same", 0, RENDERER_VERSION, "udm-fp");
+        assert_eq!(
+            decide_publication(&committed, 12, "same", 0, RENDERER_VERSION, "ocsf-fp").unwrap(),
+            PublicationDecision::PublishNew,
+        );
+    }
+
+    /// A generation committed before the fingerprint column existed reads back
+    /// as `""`. The first reconcile after upgrade must republish once rather
+    /// than trusting an identity it cannot verify.
+    #[test]
+    fn pre_fingerprint_generation_is_republished_once() {
+        let committed = committed_state_with_fingerprint(12, 12, "same", 0, RENDERER_VERSION, "");
+        assert_eq!(
+            decide_publication(&committed, 12, "same", 0, RENDERER_VERSION, "udm-fp").unwrap(),
+            PublicationDecision::PublishNew,
+        );
+    }
+
+    /// The fingerprint must not disturb the steady state: an unchanged
+    /// environment still reuses the committed generation, and a genuine
+    /// same-identity divergence is still an error rather than a fresh
+    /// generation.
+    #[test]
+    fn matching_fingerprint_preserves_reuse_and_divergence_detection() {
+        let committed = committed_state(12, 12, "same", 0, RENDERER_VERSION);
+        assert_eq!(
+            decide_publication(&committed, 12, "same", 0, RENDERER_VERSION, TEST_FINGERPRINT)
+                .unwrap(),
+            PublicationDecision::Reuse { generation: 7 },
+        );
+        assert!(matches!(
+            decide_publication(
+                &committed,
+                12,
+                "other",
+                0,
+                RENDERER_VERSION,
+                TEST_FINGERPRINT
+            ),
+            Err(VectorConfigPublicationError::DivergentRender { .. })
+        ));
+    }
+
+    /// The fingerprint is a tiebreak WITHIN one epoch/version, never a way
+    /// around the monotonic renderer fence — otherwise a rolled-back API image
+    /// with a different environment could overwrite a newer generation.
+    #[test]
+    fn fingerprint_change_cannot_defeat_the_renderer_epoch_fence() {
+        let committed =
+            committed_state_with_fingerprint(12, 12, "new-epoch", 4, "1.0.0", "udm-fp");
+        assert_eq!(
+            decide_publication(&committed, 12, "old-epoch", 3, "9.0.0", "ocsf-fp").unwrap(),
+            PublicationDecision::SupersededRenderer {
+                committed_epoch: 4,
+                committed_version: "1.0.0".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_every_render_affecting_input() {
+        let baseline = vec![
+            ("schema_profile", "udm".to_string()),
+            ("otlp_source_present", "true".to_string()),
+            ("hec_normalize_present", "true".to_string()),
+            ("sources_runtime_path", "/etc/vector/sources".to_string()),
+            ("creds_backend", "auto".to_string()),
+        ];
+        let reference = fingerprint_from_inputs(&baseline);
+        assert_eq!(reference.len(), 64, "must satisfy the migration's CHECK");
+
+        for index in 0..baseline.len() {
+            let mut changed = baseline.clone();
+            changed[index].1.push_str("-changed");
+            assert_ne!(
+                fingerprint_from_inputs(&changed),
+                reference,
+                "changing {} must produce a new renderer identity",
+                baseline[index].0,
+            );
+        }
+    }
+
+    /// Order-independent (the inputs are a set, not a sequence) and immune to
+    /// re-partitioning: `a=bc` must not collide with `ab=c`.
+    #[test]
+    fn fingerprint_is_order_independent_and_unambiguous() {
+        let forward = vec![
+            ("schema_profile", "ocsf".to_string()),
+            ("creds_backend", "disk".to_string()),
+        ];
+        let reversed = vec![
+            ("creds_backend", "disk".to_string()),
+            ("schema_profile", "ocsf".to_string()),
+        ];
+        assert_eq!(
+            fingerprint_from_inputs(&forward),
+            fingerprint_from_inputs(&reversed)
+        );
+
+        assert_ne!(
+            fingerprint_from_inputs(&[("ab", "c".to_string())]),
+            fingerprint_from_inputs(&[("a", "bc".to_string())]),
+        );
+    }
+
+    /// The live inputs must actually reach the digest — a guard against the
+    /// helper being wired to a constant. Serialized against nothing else
+    /// because it mutates process-global environment; kept to one test.
+    #[test]
+    fn live_renderer_fingerprint_tracks_the_schema_profile_env() {
+        let previous = std::env::var(crate::schema::SCHEMA_PROFILE_ENV).ok();
+
+        std::env::set_var(crate::schema::SCHEMA_PROFILE_ENV, "udm");
+        let udm = renderer_fingerprint();
+        std::env::set_var(crate::schema::SCHEMA_PROFILE_ENV, "ocsf");
+        let ocsf = renderer_fingerprint();
+
+        match previous {
+            Some(value) => std::env::set_var(crate::schema::SCHEMA_PROFILE_ENV, value),
+            None => std::env::remove_var(crate::schema::SCHEMA_PROFILE_ENV),
+        }
+
+        assert_ne!(
+            udm, ocsf,
+            "an OCSF deployment must not be able to reuse a UDM generation",
         );
     }
 
@@ -1500,7 +1907,7 @@ mod tests {
     fn newer_source_revision_gets_its_own_generation_even_if_content_matches() {
         let committed = committed_state(13, 12, "same", 0, RENDERER_VERSION);
         assert_eq!(
-            decide_publication(&committed, 13, "same", 0, RENDERER_VERSION).unwrap(),
+            decide_publication(&committed, 13, "same", 0, RENDERER_VERSION, TEST_FINGERPRINT).unwrap(),
             PublicationDecision::PublishNew
         );
     }
@@ -1509,7 +1916,7 @@ mod tests {
     fn older_renderer_cannot_regress_newer_generation() {
         let committed = committed_state(12, 12, "new-render", 3, "1.2.4");
         assert_eq!(
-            decide_publication(&committed, 12, "old-render", 3, "1.2.3").unwrap(),
+            decide_publication(&committed, 12, "old-render", 3, "1.2.3", TEST_FINGERPRINT).unwrap(),
             PublicationDecision::SupersededRenderer {
                 committed_epoch: 3,
                 committed_version: "1.2.4".to_string(),

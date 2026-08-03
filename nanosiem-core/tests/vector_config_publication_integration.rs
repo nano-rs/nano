@@ -14,6 +14,14 @@ CREATE TABLE log_sources (
     dispatch_source_config_id UUID, kind TEXT, enrich_kind TEXT,
     enrich_source TEXT, target_table TEXT, normalize_vrl TEXT
 );
+-- NAN-2304 fences active-version changes into source_revision, so migration
+-- 283 attaches triggers here.
+CREATE TABLE log_source_versions (
+    id SERIAL PRIMARY KEY,
+    log_source_id UUID, version_number INTEGER, parser_vrl TEXT,
+    output_fields JSONB, is_active BOOLEAN, extension_vrl TEXT,
+    extension_enabled BOOLEAN
+);
 CREATE TABLE source_configurations (
     id UUID PRIMARY KEY,
     name TEXT, config_type TEXT, connection_config JSONB, credential_id UUID,
@@ -66,6 +74,13 @@ async fn isolated_pool() -> (PgPool, PgPool, String) {
     .execute(&pool)
     .await
     .expect("apply Vector publication migration");
+    // NAN-2304: adds `renderer_fingerprint`, which `publish` now writes.
+    sqlx::raw_sql(include_str!(
+        "../../migrations/postgres/284_vector_config_publication_fidelity.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("apply publication fidelity migration");
     (admin, pool, schema)
 }
 

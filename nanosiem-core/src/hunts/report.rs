@@ -10,9 +10,10 @@
 //! review because the call site looks correct.
 //!
 //! So the wire type has no field for any of them. There is nothing to ignore
-//! and nothing to validate away: the report carries evidence identifiers, a
-//! narrative, and the trail it took. Everything load-bearing is derived
-//! server-side in one transaction from facts already in the database.
+//! and nothing to validate away: the report carries evidence identifiers,
+//! narratives, durable fact claims, and the trail it took. Everything
+//! load-bearing — including provenance for both leads and facts — is derived
+//! server-side in one transaction.
 //!
 //! ```text
 //!   agent  ──► SweepReport ──► [ server: resolve evidence, derive provenance,
@@ -41,6 +42,11 @@ pub struct SweepReport {
     /// successful sweep and its `no_leads` outcome is useful signal.
     #[serde(default)]
     pub candidates: Vec<LeadCandidate>,
+    /// Durable environment facts established by this sweep. They are resolved
+    /// and committed with the report under the same lease/fence transaction;
+    /// they never feed scoring or suppression.
+    #[serde(default)]
+    pub knowledge: Vec<super::knowledge::KnowledgeCandidate>,
     /// The ordered queries and pivots the sweep actually made.
     ///
     /// Recorded because the path distinguishes a hunt that is wandering
@@ -210,6 +216,31 @@ mod tests {
         assert!(round_tripped.get("score").is_none());
         assert!(round_tripped.get("fingerprint").is_none());
         assert!(round_tripped.get("source_types").is_none());
+    }
+
+    #[test]
+    fn knowledge_is_optional_for_existing_report_callers() {
+        let report: SweepReport = serde_json::from_str(r#"{"candidates":[]}"#).expect("parses");
+        assert!(report.knowledge.is_empty());
+    }
+
+    #[test]
+    fn knowledge_has_no_runner_control_fields() {
+        let report: SweepReport = serde_json::from_str(
+            r#"{
+                "knowledge": [{
+                    "category": "account",
+                    "subject": "svc_backup",
+                    "fact": "runs nightly",
+                    "sweep_id": "hsweep_attacker_chosen",
+                    "source_types": ["forged"]
+                }]
+            }"#,
+        )
+        .expect("parses");
+        let serialized = serde_json::to_value(&report.knowledge[0]).expect("serializes");
+        assert!(serialized.get("sweep_id").is_none());
+        assert!(serialized.get("source_types").is_none());
     }
 
     #[test]

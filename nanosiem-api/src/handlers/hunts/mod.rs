@@ -33,6 +33,7 @@ mod ideas;
 mod knowledge;
 mod leads;
 mod recon;
+mod reports;
 mod runners;
 mod specs;
 mod sweeps;
@@ -42,6 +43,7 @@ pub use ideas::*;
 pub use knowledge::*;
 pub use leads::*;
 pub use recon::*;
+pub use reports::*;
 pub use runners::*;
 pub use specs::*;
 pub use sweeps::*;
@@ -125,6 +127,9 @@ pub(crate) fn artifact_scope(auth: &AuthContext) -> ArtifactScope {
         list_rule_ideas,
         send_rule_idea,
         reject_rule_idea,
+        // Local report audit receipts (NAN-2306)
+        record_hunt_report_export,
+        record_hunt_report_branding,
     ),
     components(schemas(
         ListHuntsResponse,
@@ -166,6 +171,7 @@ pub(crate) fn artifact_scope(auth: &AuthContext) -> ArtifactScope {
         nanosiem_core::hunts::HuntSuppression,
         leads::RecordSuppressionRequest,
         nanosiem_core::hunts::HuntKnowledge,
+        nanosiem_core::hunts::KnowledgeCandidate,
         nanosiem_core::hunts::KnowledgeCategoryCount,
         nanosiem_core::hunts::RecordKnowledgeRequest,
         nanosiem_core::hunts::RecordKnowledgeResponse,
@@ -216,6 +222,9 @@ pub(crate) fn artifact_scope(auth: &AuthContext) -> ArtifactScope {
         nanosiem_core::hunts::SendRuleIdeaRequest,
         nanosiem_core::hunts::RejectRuleIdeaRequest,
         nanosiem_core::hunts::RuleIdeaDecision,
+        reports::HuntReportExportRequest,
+        reports::HuntReportBrandingRequest,
+        reports::HuntReportAuditResponse,
     ))
 )]
 pub struct HuntsApiDoc;
@@ -259,12 +268,15 @@ mod tests {
         ("GET", "/api/hunts/rule-ideas"),
         ("POST", "/api/hunts/rule-ideas/{id}/send"),
         ("POST", "/api/hunts/rule-ideas/{id}/reject"),
+        ("POST", "/api/hunts/report-branding-events"),
         ("GET", "/api/hunts/{id}"),
         ("PATCH", "/api/hunts/{id}"),
         ("DELETE", "/api/hunts/{id}"),
         ("GET", "/api/hunts/{id}/sweeps"),
         ("POST", "/api/hunts/{id}/sweeps"),
         ("POST", "/api/hunts/{id}/toggle"),
+        ("POST", "/api/hunts/{id}/schedule"),
+        ("POST", "/api/hunts/{id}/report-exports"),
     ];
 
     /// The static collections (`runners`, `sweeps`, `leads`, `profile`,
@@ -305,7 +317,7 @@ mod tests {
         templates.dedup();
         assert_eq!(
             templates.len(),
-            27,
+            30,
             "the hunts route set changed; update min_paths in openapi.rs to match"
         );
     }

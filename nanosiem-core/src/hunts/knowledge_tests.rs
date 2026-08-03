@@ -83,8 +83,10 @@ fn code_lines(source: &str) -> impl Iterator<Item = (usize, &str)> {
 ///
 /// Both directions are checked:
 ///
-/// * this module must not reach the suppression / dismissal vocabulary; and
-/// * the suppression, scoring and service files must not reach knowledge.
+/// * this module must not reach the suppression / dismissal vocabulary;
+/// * scoring must not consult knowledge; and
+/// * the report path may WRITE prepared knowledge atomically, but it must never
+///   READ knowledge back into lead scoring or suppression.
 ///
 /// The second is the one that matters more. The coupling is far more likely to
 /// be added over THERE — "while I'm in the dismissal path, let me check what we
@@ -108,22 +110,40 @@ fn knowledge_never_reaches_the_suppression_or_dismissal_path() {
         }
     }
 
-    // The other direction. `knowledge` on its own rather than the table name,
-    // because the coupling would most likely arrive as a Rust call
-    // (`KnowledgeRepository`, `knowledge::recall`) long before it arrived as
-    // SQL — and a repository method is exactly as effective as a JOIN.
-    for (label, source) in [
-        ("repository.rs", REPOSITORY_SOURCE),
-        ("scoring.rs", SCORING_SOURCE),
-        ("service.rs", SERVICE_SOURCE),
-    ] {
-        for (line_no, line) in code_lines(source) {
-            if line.to_lowercase().contains("knowledge") {
-                violations.push(format!(
-                    "{label}:{line_no} reaches hunt knowledge: {}",
-                    line.trim()
-                ));
-            }
+    for (line_no, line) in code_lines(SCORING_SOURCE) {
+        if line.to_lowercase().contains("knowledge") {
+            violations.push(format!(
+                "scoring.rs:{line_no} reaches hunt knowledge: {}",
+                line.trim()
+            ));
+        }
+    }
+
+    // NAN-2309 deliberately lets the report transaction WRITE facts after lead
+    // scoring. Reading them here would be the dangerous coupling: a poisoned
+    // memory could then change whether or how a lead reaches the analyst.
+    for forbidden_read in ["FROM hunt_knowledge", "JOIN hunt_knowledge"] {
+        if REPOSITORY_SOURCE.contains(forbidden_read) {
+            violations.push(format!(
+                "repository.rs reads hunt knowledge through `{forbidden_read}`"
+            ));
+        }
+    }
+
+    for forbidden_read in ["KnowledgeRepository", "list_knowledge", "HuntKnowledge"] {
+        if SERVICE_SOURCE.contains(forbidden_read) {
+            violations.push(format!(
+                "service.rs reads stored knowledge through `{forbidden_read}`"
+            ));
+        }
+    }
+
+    let prepare = function_body(SERVICE_SOURCE, "async fn prepare_knowledge(");
+    for forbidden in ["suppress", "dismiss", "score(", "ScoreInputs"] {
+        if prepare.to_lowercase().contains(&forbidden.to_lowercase()) {
+            violations.push(format!(
+                "service.rs prepare_knowledge reaches `{forbidden}`"
+            ));
         }
     }
 
@@ -131,10 +151,8 @@ fn knowledge_never_reaches_the_suppression_or_dismissal_path() {
         violations.is_empty(),
         "hunt knowledge has been wired to the suppression / lead-dismissal path (NAN-2239). \
          Knowledge INFORMS a sweep and must never suppress: a poisoned memory must cost the \
-         agent one misleading, not cost the analyst a finding they never saw. Suppression stays \
-         analyst-authored. If a sweep needs to consult knowledge, it does so through \
-         `GET /api/hunts/knowledge` before it starts looking — not from inside the commit or \
-         triage path:\n{}",
+         agent one misleading, not cost the analyst a finding they never saw. The report \
+         transaction may persist prepared facts, but scoring and triage must never read them:\n{}",
         violations.join("\n")
     );
 
@@ -150,6 +168,28 @@ fn knowledge_never_reaches_the_suppression_or_dismissal_path() {
         "knowledge.rs no longer contains the recording insert — this guard is scanning the \
          wrong file"
     );
+}
+
+/// Extract one function body by brace matching for the structural guards.
+fn function_body(source: &str, signature: &str) -> String {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("function `{signature}` not found"));
+    let open = source[start..].find('{').expect("function has a body") + start;
+    let mut depth = 0usize;
+    for (offset, ch) in source[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return source[open..=open + offset].to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced braces in `{signature}`");
 }
 
 /// The suppression path is a WRITE authority; knowledge is not.

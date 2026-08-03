@@ -15,9 +15,15 @@ impl ParserService {
     /// Render the canonical parser configuration without reloading Vector.
     /// Publication callers construct this service against an isolated render
     /// root, so no pod-local live tree is treated as shared state.
+    ///
+    /// NAN-2304: renders the EFFECTIVE deployed set (active versions), not the
+    /// parser editor's working copies. This used to call `list()`, which reads
+    /// `log_sources.parser_vrl` directly — so saving a draft bumped
+    /// `source_revision` and the 5s reconciler published an unvalidated parser
+    /// nobody had chosen to deploy, and the extension/sampling transforms that
+    /// `list()` does not select vanished from the published config.
     pub async fn render_to_vector_config(&self) -> Result<(), ParserServiceError> {
-        let parsers = self.list().await?;
-        let mut parsers = parsers;
+        let mut parsers = self.repository().list_effective_deployed().await?;
         crate::parsers::resolve_parser_dispatch_routes(&self.pool, &mut parsers)
             .await
             .map_err(|e| ParserServiceError::DeploymentFailed(e.to_string()))?;
@@ -26,9 +32,12 @@ impl ParserService {
     }
 
     /// Deploy all enabled parsers to Vector
+    ///
+    /// NAN-2304: same effective-deployed set as `render_to_vector_config` and
+    /// as `LogSourceService`, so boot, enable/disable, and publication all
+    /// generate identical config from identical inputs.
     pub async fn deploy_to_vector(&self) -> Result<(), ParserServiceError> {
-        let parsers = self.list().await?;
-        let mut parsers = parsers;
+        let mut parsers = self.repository().list_effective_deployed().await?;
         // NAN-2126: resolve every fetch parser to its source-configuration.
         // Missing/orphaned bindings fail closed before config generation.
         crate::parsers::resolve_parser_dispatch_routes(&self.pool, &mut parsers)
@@ -51,6 +60,13 @@ impl ParserService {
         &self,
         parser_id: Uuid,
     ) -> Result<DeploymentResult, ParserServiceError> {
+        // NAN-2297: one critical section for the whole stage → validate →
+        // promote → deploy_and_verify sequence. Previously the lock was only
+        // taken inside `deploy_and_verify`, i.e. AFTER this method had already
+        // staged and promoted unserialized. `deploy_and_verify_locked` below is
+        // the non-locking variant — the public wrapper would deadlock here.
+        let _deploy_guard = self.vector_config.lock_deploys().await;
+
         let parser = self.repository().find_by_id(parser_id).await?;
         // Redact secrets at the source — `config_snapshot` is persisted to
         // `log_source_deployments` and returned by GET /api/log-sources/{id}/deployments
@@ -119,10 +135,16 @@ impl ParserService {
         tracing::info!("VRL validation passed for parser '{}'", parser.name);
 
         // Step 2: Stage config and run vector validate
-        // First, get all parsers and create a list with this parser enabled
-        let mut all_parsers = self.list().await?;
+        //
+        // NAN-2304: every OTHER parser is staged from its effective deployed
+        // definition (active version), never from a working draft it happens to
+        // have open in the editor. This parser is the one being deployed, so it
+        // is substituted with the working copy validated in step 1 — otherwise
+        // this method would validate one VRL and stage a different one.
+        let mut all_parsers = self.repository().list_effective_deployed().await?;
         for p in &mut all_parsers {
             if p.id == parser_id {
+                *p = parser.clone();
                 p.enabled = true;
             }
         }
@@ -245,10 +267,56 @@ impl ParserService {
 
         tracing::info!("Vector validation passed for parser '{}'", parser.name);
 
-        // Step 3: Promote staged config to active
+        // Step 3: Back up the CURRENT config, then promote the staged tree.
+        //
+        // NAN-2300: the backup must be taken before promotion. It used to happen
+        // inside the verify helper, i.e. after promote — so it captured the
+        // config that had just been published, and a failed health check
+        // "rolled back" to the deployment that was failing. Matches what
+        // LogSourceService::deploy has always done.
+        let backup = match self.vector_config.backup_current().await {
+            Ok(generation) => Some(generation),
+            Err(e) => {
+            // Not fatal, and must not be. Two reasons it fails: a first deploy
+            // with nothing to back up, and (NAN-2301) an active tree that is
+            // already incoherent, which the backup gate refuses to record as a
+            // rollback target. Aborting on the second would be a trap — that
+            // deploy is what prunes the stale file and heals the tree, so
+            // refusing to run it would leave the pipeline broken permanently.
+                // Loud, because it means this deploy has NO rollback target —
+                // and deliberately no fallback to whatever older snapshot is
+                // lying around, which would restore an unrelated starting state.
+                tracing::warn!(
+                    "Failed to back up current config before promoting (may be the first deploy) — \
+                     this deploy will not be able to roll back: {}",
+                    e
+                );
+                None
+            }
+        };
+
         if let Err(e) = self.vector_config.promote_staged().await {
             let error_msg = format!("Failed to promote staged config: {}", e);
             tracing::error!("{}", error_msg);
+
+            // A promotion that failed partway leaves the active tree mixed:
+            // some files replaced, some not, and possibly some pruned. Restore
+            // the snapshot taken above — and only that one.
+            match backup.as_ref() {
+                Some(generation) => {
+                    if let Err(restore_err) = self.vector_config.restore_backup(generation).await {
+                        tracing::error!(
+                            "Restore after failed promotion also failed: {}. Active config may be \
+                             inconsistent — manual intervention required.",
+                            restore_err
+                        );
+                    }
+                }
+                None => tracing::error!(
+                    "Promotion failed with no snapshot from this attempt to restore. The active \
+                     config may be partially replaced — manual intervention required."
+                ),
+            }
 
             let _ = self
                 .repository()
@@ -271,20 +339,39 @@ impl ParserService {
             });
         }
 
-        // Step 4: Deploy with health verification and auto-rollback
-        // This: backs up config, writes all files atomically, reloads Vector,
-        // polls health for 10s, and auto-rolls back if Vector becomes unhealthy.
-        if let Err(e) = self.vector_config.deploy_and_verify(&all_parsers).await {
-            let error_msg = format!("{}", e);
+        // Step 4: Reload and verify. Rolls back to the pre-promotion backup
+        // taken in step 3 if Vector does not come up healthy.
+        //
+        // NAN-2300: this no longer re-writes the config tree. The old helper
+        // called `deploy_parsers` again here, rebuilding the active tree from
+        // `all_parsers` on top of what promotion had just published from the
+        // VALIDATED staging snapshot — a second, unvalidated render of the same
+        // thing. Promotion is the publish step; this only signals and verifies.
+        //
+        // `_locked`: this method already holds the deploy guard (NAN-2297).
+        if let Err(failure) = self
+            .vector_config
+            .reload_and_verify_locked(backup.as_ref())
+            .await
+        {
+            let error_msg = format!("{}", failure);
             tracing::error!("Deploy failed for parser '{}': {}", parser.name, error_msg);
 
-            // Record rollback if it happened
+            // Record a rollback only when one actually happened. This used to
+            // record `rolled_back` for every error out of this path — including
+            // a restore that failed and a first deploy with no backup to
+            // restore — so the history claimed a recovery that never ran.
+            let (action, status) = if failure.rolled_back {
+                (DeploymentAction::Rollback, DeploymentStatus::RolledBack)
+            } else {
+                (DeploymentAction::Deploy, DeploymentStatus::Failed)
+            };
             let _ = self
                 .repository()
                 .record_deployment(
                     parser_id,
-                    DeploymentAction::Rollback.as_str(),
-                    DeploymentStatus::RolledBack.as_str(),
+                    action.as_str(),
+                    status.as_str(),
                     Some(&error_msg),
                     Some(&config_snapshot),
                 )

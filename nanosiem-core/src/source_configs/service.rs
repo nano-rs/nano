@@ -11,7 +11,9 @@ use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 use super::creds_backend::{CredsBackend, CredsBackendError};
-use super::repository::{RouteClaim, SourceConfigRepository, SourceConfigRepositoryError};
+use super::repository::{
+    RouteClaim, SourceConfigIdentity, SourceConfigRepository, SourceConfigRepositoryError,
+};
 use super::types::{
     DeploymentResult, ListParams, NewRoutingRule, NewSourceConfiguration, RoutingRule,
     SourceConfigDeployment, SourceConfigType, SourceConfiguration, SourceConfigurationWithRules,
@@ -211,7 +213,11 @@ impl SourceConfigService {
     /// Resolve the runtime path where Vector reads dynamic source configs.
     /// In Docker: /etc/vector/sources (shared volume mount)
     /// In K8s / multi-Vector: /etc/vector/runtime/current (atomic generation pointer)
-    fn resolve_runtime_path() -> String {
+    ///
+    /// `pub(crate)` because the value is embedded IN the generated TOML, which
+    /// makes it a render-affecting input the publication renderer fingerprint
+    /// has to cover (NAN-2304).
+    pub(crate) fn resolve_runtime_path() -> String {
         std::env::var("VECTOR_SOURCES_RUNTIME_PATH")
             .unwrap_or_else(|_| "/etc/vector/sources".to_string())
     }
@@ -332,6 +338,19 @@ impl SourceConfigService {
             }
         }
 
+        // NAN-2305: UNIQUE(name) lets `prod kafka` in alongside `Prod-Kafka`;
+        // both generate `sources/configs/prod_kafka.toml` and the deploy of
+        // the second overwrites the first. Same list-then-insert race as the
+        // check above, backstopped by migration 283's unique index.
+        if let Some(err) = Self::identity_conflict(
+            &request.config_type,
+            &request.name,
+            &self.repository.list_identities().await?,
+            None,
+        ) {
+            return Err(err);
+        }
+
         // Validate credential exists if specified
         if let Some(cred_id) = request.credential_id {
             self.credential_repo
@@ -351,6 +370,49 @@ impl SourceConfigService {
     /// two would emit colliding `otlp_route` transforms over `otlp_logs_prep`).
     fn is_single_instance_driver(config_type: &str) -> bool {
         matches!(config_type, "splunk_hec" | "otlp")
+    }
+
+    /// NAN-2305: decide whether `name` would take a generated on-disk stem
+    /// that another source configuration already holds.
+    ///
+    /// `source_configurations.name` is UNIQUE, but only as a raw string. The
+    /// generated artifacts key off `config_safe_stem`, which lowercases the
+    /// name and collapses every non-alphanumeric to `_`, so `Prod-Kafka` and
+    /// `prod kafka` both resolve to `prod_kafka` — one
+    /// `sources/configs/prod_kafka.toml`, one `[sources.prod_kafka_source]`
+    /// block, one `prod_kafka_route` transform. Deploying the second
+    /// overwrites the first's file, and every fetch parser bound to the first
+    /// via `dispatch_route_name` silently starts reading the second's stream.
+    ///
+    /// Compares stems, not `safe_name(name)`, so the pinned singleton stem is
+    /// respected in both directions: a `kafka` config named `Splunk HEC` is
+    /// rejected against the OOTB `splunk_hec` row it would collide with on
+    /// disk, which a name-only comparison would miss.
+    ///
+    /// Pure so the decision is testable without a database; the caller loads
+    /// the rows and excludes the row being renamed.
+    fn identity_conflict(
+        config_type: &str,
+        name: &str,
+        existing: &[SourceConfigIdentity],
+        exclude: Option<Uuid>,
+    ) -> Option<SourceConfigServiceError> {
+        let generated = Self::config_safe_stem(config_type, name);
+        let holder = crate::vector_naming::find_identity_holder(
+            &generated,
+            existing
+                .iter()
+                .filter(|c| Some(c.id) != exclude)
+                .map(|c| (Self::config_safe_stem(&c.config_type, &c.name), c.name.clone())),
+        )?;
+        Some(SourceConfigServiceError::InvalidConfig(
+            crate::vector_naming::describe_identity_conflict(
+                "source configuration",
+                name,
+                &generated,
+                &holder,
+            ),
+        ))
     }
 
     /// Pure decision helper for the single-instance check. Returns
@@ -438,6 +500,26 @@ impl SourceConfigService {
         // NAN-1919: a patched default_source_type is interpolated into the
         // generated routing VRL — validate it before persistence.
         Self::validate_default_source_type(request.default_source_type.as_deref())?;
+
+        // NAN-2305: a rename (or a driver change, which can move the stem on
+        // or off the pinned singleton value) must not land on a stem another
+        // config already owns — the rename cleanup below would then delete the
+        // OTHER config's file as a stale orphan. Only queried when the stem
+        // can actually move; `id` is excluded so a rename that keeps the same
+        // stem still succeeds.
+        if request.name.is_some() || request.config_type.is_some() {
+            let effective_type = request
+                .config_type
+                .as_deref()
+                .unwrap_or(&existing.config_type);
+            let effective_name = request.name.as_deref().unwrap_or(&existing.name);
+            let all = self.repository.list_identities().await?;
+            if let Some(err) =
+                Self::identity_conflict(effective_type, effective_name, &all, Some(id))
+            {
+                return Err(err);
+            }
+        }
 
         // Validate credential exists if specified
         if let Some(cred_id) = request.credential_id {

@@ -53,7 +53,8 @@ pub async fn get_sweep(
 /// it actually read, derives the provenance manifest from what resolved,
 /// measures prevalence and prior history itself, and only then — inside one
 /// transaction that reasserts the runner's fence under lock — derives the
-/// fingerprint and computes the score.
+/// fingerprint, computes the score, and persists any prepared knowledge before
+/// the sweep is marked finished. A rejected fence commits neither half.
 ///
 /// A `409` means the lease is gone: the sweep was reassigned, expired, or has
 /// already finished. The runner must STOP rather than retry, because the

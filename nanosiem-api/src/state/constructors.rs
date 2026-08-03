@@ -342,6 +342,9 @@ impl AppState {
             &vector_config_dir,
         )
         .with_deploy_lock(parser_service.deploy_lock());
+
+        // NAN-2297: taken before the struct literal below moves `parser_service`.
+        let shared_vector_config = parser_service.vector_config();
         let vector_config_publisher = Arc::new(nanosiem_core::VectorConfigPublisher::new(
             pg_pool.clone(),
             &vector_config_dir,
@@ -371,9 +374,14 @@ impl AppState {
             node_id,
             enrichment: Arc::new(RwLock::new(enrichment_service)),
             parser_service,
-            log_source_service: LogSourceService::with_dual_pool_and_config_dir(
+            // NAN-2297: share ParserService's config manager, so all three
+            // writers to the Vector config tree (parsers, log sources, source
+            // configs) serialize on ONE deploy mutex. Building a second manager
+            // here gave log-source publishes a private lock while they staged
+            // into the same directory.
+            log_source_service: LogSourceService::with_dual_pool_and_vector_config(
                 &dual_pool,
-                &vector_config_dir,
+                shared_vector_config,
             ),
             // ClickHouse-backed rollup of per-source_type events/bytes/last_event_at.
             // Reads through `table_names.read("logs_per_source_5m")` so it picks

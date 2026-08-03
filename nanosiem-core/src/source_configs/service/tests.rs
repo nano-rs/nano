@@ -2485,6 +2485,113 @@
         ));
     }
 
+    // ------------------------------------------------------------------
+    // NAN-2305: generated-stem uniqueness on create / rename
+    // ------------------------------------------------------------------
+
+    /// One row as `SourceConfigRepository::list_identities` returns it.
+    fn config_row(id: u128, config_type: &str, name: &str) -> SourceConfigIdentity {
+        SourceConfigIdentity {
+            id: Uuid::from_u128(id),
+            name: name.to_string(),
+            config_type: config_type.to_string(),
+        }
+    }
+
+    /// The defect the test above only half-covered: `rename_changes_on_disk_stem`
+    /// correctly reports that `Prod-Kafka` and `prod kafka` share a stem, but
+    /// nothing stopped both from existing. UNIQUE(name) accepts them, and then
+    /// deploying the second overwrites `sources/configs/prod_kafka.toml` — and
+    /// every fetch parser bound to the first via `dispatch_route_name` starts
+    /// reading the second's stream.
+    #[test]
+    fn create_is_rejected_when_the_generated_stem_is_taken() {
+        let existing = [config_row(1, "kafka", "Prod-Kafka")];
+
+        let err = SourceConfigService::identity_conflict("kafka", "prod kafka", &existing, None)
+            .expect("a name generating a taken stem must be rejected");
+
+        let msg = err.to_string();
+        assert!(msg.contains("prod_kafka"), "{msg}");
+        assert!(msg.contains("Prod-Kafka"), "{msg}");
+    }
+
+    /// The check compares STEMS, not `safe_name(name)`, so the pinned singleton
+    /// stem is honoured in both directions. A `kafka` config named `Splunk HEC`
+    /// would generate `splunk_hec.toml` — the exact file the OOTB Splunk HEC
+    /// row owns — even though the two rows' names differ and their config types
+    /// differ, so neither existing uniqueness rule sees it.
+    #[test]
+    fn a_non_hec_config_cannot_take_the_pinned_singleton_stem() {
+        let existing = [config_row(1, "splunk_hec", "Splunk HEC")];
+
+        assert!(
+            SourceConfigService::identity_conflict("kafka", "splunk hec", &existing, None)
+                .is_some(),
+            "a kafka config generating splunk_hec.toml must be rejected"
+        );
+    }
+
+    /// A false positive blocks a legitimate config, so distinct stems pass —
+    /// including the OOTB seed set, which must remain creatable side by side.
+    #[test]
+    fn distinct_stems_are_accepted() {
+        let existing = [
+            config_row(1, "splunk_hec", "Splunk HEC"),
+            config_row(2, "kafka", "Kafka"),
+            config_row(3, "aws_s3", "AWS S3"),
+            config_row(4, "gcp_pubsub", "GCP Pub/Sub"),
+            config_row(5, "otlp", "OpenTelemetry (OTLP)"),
+        ];
+
+        for (config_type, name) in [
+            ("kafka", "Prod Kafka"),
+            ("aws_s3", "AWS S3 Archive"),
+            ("http", "HTTP Ingestion"),
+        ] {
+            assert!(
+                SourceConfigService::identity_conflict(config_type, name, &existing, None)
+                    .is_none(),
+                "expected '{name}' ({config_type}) to be accepted"
+            );
+        }
+    }
+
+    /// A rename that keeps the same stem must still be allowed — the row under
+    /// edit is excluded, or no source configuration could ever be renamed.
+    #[test]
+    fn rename_that_keeps_the_same_stem_is_allowed() {
+        let existing = [config_row(1, "kafka", "Prod-Kafka")];
+        let self_id = Uuid::from_u128(1);
+
+        assert!(
+            SourceConfigService::identity_conflict("kafka", "prod kafka", &existing, Some(self_id))
+                .is_none()
+        );
+    }
+
+    /// ...while a rename onto ANOTHER config's stem is rejected. This case is
+    /// worse than a create: the NAN-947 rename cleanup deletes the pre-rename
+    /// file, so landing on an occupied stem would delete the other config's
+    /// TOML as a stale orphan.
+    #[test]
+    fn rename_onto_another_configs_stem_is_rejected() {
+        let existing = [
+            config_row(1, "kafka", "Prod-Kafka"),
+            config_row(2, "kafka", "Audit Kafka"),
+        ];
+        let renaming = Uuid::from_u128(2);
+
+        let err = SourceConfigService::identity_conflict(
+            "kafka",
+            "prod kafka",
+            &existing,
+            Some(renaming),
+        )
+        .expect("rename onto another config's stem must be rejected");
+        assert!(err.to_string().contains("Prod-Kafka"), "{err}");
+    }
+
     #[test]
     fn validate_safe_strings_still_rejects_control_chars_inside_nested() {
         // Depth check must not short-circuit before the control-char check

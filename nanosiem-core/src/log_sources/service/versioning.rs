@@ -11,29 +11,6 @@ use crate::log_sources::types::{
 };
 
 impl LogSourceService {
-    /// Get enabled log sources with active version VRL for deployment.
-    /// Uses active version parser_vrl instead of working copy.
-    /// Falls back to working copy for log sources with no versions (backwards compat).
-    pub(super) async fn list_enabled_for_deploy(
-        &self,
-    ) -> Result<Vec<LogSource>, LogSourceServiceError> {
-        let all = self.repository().list_enabled().await?;
-        let mut result = Vec::with_capacity(all.len());
-        for mut ls in all {
-            if let Ok(Some(active)) = self.version_repository().get_active_version(ls.id).await {
-                ls.parser_vrl = active.parser_vrl;
-                if let Some(fields) = active.output_fields {
-                    ls.output_fields = Some(fields);
-                }
-                // Pull active extension snapshot — extension is part of the published version.
-                ls.extension_vrl = active.extension_vrl;
-                ls.extension_enabled = active.extension_enabled;
-            }
-            result.push(ls);
-        }
-        Ok(result)
-    }
-
     /// Publish the current working copy as a new active version, then deploy.
     pub async fn publish(
         &self,
@@ -100,7 +77,8 @@ impl LogSourceService {
 
         tracing::info!("Published log source '{}' ({}) as new version", ls.name, id);
 
-        // Deploy (now uses active version via list_enabled_for_deploy)
+        // Deploy — renders the active version just created, via the canonical
+        // effective-deployed query shared with publication (NAN-2304).
         self.deploy(id).await
     }
 

@@ -37,6 +37,10 @@ use crate::auth::{ArtifactScope, ScopeSet};
 use crate::hunts::error::HuntError;
 use crate::hunts::evidence::{EvidenceResolver, ResolvedEvidence};
 use crate::hunts::fingerprint::{CanonicalEntity, ValidatedSignal};
+use crate::hunts::knowledge::{
+    clamp_ttl_days, normalize_category, normalize_evidence_refs, normalize_fact,
+    normalize_subject, sanitize_confidence, KnowledgeCandidate, PreparedKnowledge,
+};
 use crate::hunts::models::*;
 use crate::hunts::report::{BudgetUsage, LeadCandidate, SweepReport};
 use crate::hunts::repository::{
@@ -56,6 +60,11 @@ const ALLOWED_ENTITY_TYPES: &[&str] = &[
 /// through the model's context; without this, one sweep could enqueue an
 /// unbounded number of ClickHouse round trips.
 pub const MAX_CANDIDATES_PER_REPORT: usize = 50;
+
+/// Hard ceiling on durable facts accepted from one sweep. Each fact may require
+/// a ClickHouse evidence lookup, so this is both a storage and cross-database
+/// work bound on attacker-influenceable model output.
+pub const MAX_KNOWLEDGE_PER_REPORT: usize = 50;
 
 #[derive(Clone)]
 pub struct HuntService {
@@ -232,6 +241,19 @@ impl HuntService {
         // counted so a sweep spraying candidates is visible.
         rejected += report.candidates.len().saturating_sub(MAX_CANDIDATES_PER_REPORT);
 
+        let mut knowledge = Vec::new();
+        let mut knowledge_rejected = 0usize;
+        for candidate in report.knowledge.iter().take(MAX_KNOWLEDGE_PER_REPORT) {
+            match self.prepare_knowledge(candidate, scope).await? {
+                Some(fact) => knowledge.push(fact),
+                None => knowledge_rejected += 1,
+            }
+        }
+        knowledge_rejected += report
+            .knowledge
+            .len()
+            .saturating_sub(MAX_KNOWLEDGE_PER_REPORT);
+
         self.repo
             .commit_sweep_report(CommitInputs {
                 sweep_id,
@@ -243,8 +265,54 @@ impl HuntService {
                 note: report.note,
                 leads: prepared,
                 rejected,
+                knowledge,
+                knowledge_rejected,
             })
             .await
+    }
+
+    /// Normalize one durable fact and derive its evidence/provenance.
+    ///
+    /// Invalid agent claims reject only that fact, just as an uncorroborated
+    /// entity rejects only one lead. Resolver failures still fail the report:
+    /// persisting a fact with invented provenance would be worse than retrying
+    /// the sweep commit.
+    async fn prepare_knowledge(
+        &self,
+        candidate: &KnowledgeCandidate,
+        scope: &ScopeSet,
+    ) -> Result<Option<PreparedKnowledge>, HuntError> {
+        let Ok(category) = normalize_category(&candidate.category) else {
+            return Ok(None);
+        };
+        let Ok(subject) = normalize_subject(&candidate.subject) else {
+            return Ok(None);
+        };
+        let Ok(fact) = normalize_fact(&candidate.fact) else {
+            return Ok(None);
+        };
+        let Ok(confidence) = sanitize_confidence(candidate.confidence) else {
+            return Ok(None);
+        };
+        let evidence_event_ids = normalize_evidence_refs(&candidate.evidence_event_ids);
+        let ttl_days = clamp_ttl_days(candidate.ttl_days);
+        let resolved = self.resolver.resolve(&evidence_event_ids, scope).await?;
+        let provenance = resolved.provenance();
+        let stored_refs = resolved
+            .events
+            .iter()
+            .map(|event| event.canonical_event_id.clone())
+            .collect();
+
+        Ok(Some(PreparedKnowledge {
+            category,
+            subject,
+            fact,
+            confidence,
+            evidence_event_ids: stored_refs,
+            ttl_days,
+            provenance,
+        }))
     }
 
     /// Resolve one candidate into something the repository can persist, or

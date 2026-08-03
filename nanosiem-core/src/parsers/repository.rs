@@ -20,6 +20,107 @@ pub enum ParserRepositoryError {
     NotFound(Uuid),
     #[error("Parser with name '{0}' already exists")]
     DuplicateName(String),
+    /// NAN-2305: the name is unique as a string but its generated Vector
+    /// identifier is taken (migration 283's unique index).
+    #[error("{0}")]
+    GeneratedNameConflict(String),
+}
+
+/// NAN-2305: translate the generated-identity unique violation into an error
+/// the operator can act on.
+///
+/// Reachable two ways past `ParserService::ensure_generated_identity_free`: a
+/// write racing another write, and a name whose ASCII-normalized form collides
+/// while the Unicode-aware Rust check saw none (`Café` vs `Cafe` — see
+/// migration 283). Without this the caller gets an opaque 500 for something a
+/// rename fixes.
+fn map_name_unique_violation(err: sqlx::Error, name: &str) -> ParserRepositoryError {
+    if let sqlx::Error::Database(db_err) = &err {
+        // PG SQLSTATE 23505 = unique_violation.
+        if db_err.code().as_deref() == Some("23505")
+            && db_err.constraint() == Some("log_sources_generated_vector_identity")
+        {
+            return ParserRepositoryError::GeneratedNameConflict(format!(
+                "the name '{name}' generates a Vector config filename and router route that \
+                 another log source already uses. Generated identifiers lowercase the name and \
+                 replace every non-alphanumeric character with '_'. Choose a name that differs \
+                 by more than case, spacing or punctuation."
+            ));
+        }
+    }
+    ParserRepositoryError::from(err)
+}
+
+/// The ONE canonical projection of "what is actually deployed" for every log
+/// source. Shared by the direct-deploy path (`LogSourceService`) and by the
+/// publication renderer (`ParserService::render_to_vector_config`), so the two
+/// can no longer disagree about what a parser IS. NAN-2304.
+///
+/// Two properties this query owes its callers:
+///
+/// 1. **The active version, never the editor's working draft.**
+///    `log_sources.parser_vrl` / `extension_*` are the working copy the parser
+///    editor writes on every save. Publication used to read them directly, so
+///    an unvalidated draft nobody chose to deploy shipped straight to Vector:
+///    those columns are `source_revision` trigger inputs (migration 229) and
+///    the publication reconciler runs every 5s. The active
+///    `log_source_versions` row is the published artefact; the working copy is
+///    only the fallback for sources that have never been published.
+/// 2. **Every deployment-affecting column.** `ParserRepository::list` omitted
+///    `sampling_*` and `extension_*`, and `row_to_parser` defaults absent
+///    columns OFF — so publishing silently deleted a sampling or extension
+///    transform that a direct deploy had emitted.
+///
+/// `LEFT JOIN LATERAL … LIMIT 1` rather than a plain join on `is_active`: the
+/// partial index on `log_source_versions` is not unique, so a plain join would
+/// multiply one log source into duplicate parsers — which the NAN-2247
+/// source_type collision guard would then refuse to deploy — if two rows were
+/// ever active at once. The lateral yields at most one row by construction.
+///
+/// Disabled sources are included deliberately: `deploy_parsers` needs them in
+/// the slice to prune their generated files and legacy credential files, and
+/// every downstream consumer filters on `enabled` itself.
+const EFFECTIVE_DEPLOYED_PARSERS_SQL: &str = r#"
+SELECT
+    ls.id, ls.name, ls.description, ls.source_type,
+    CASE WHEN active.present THEN active.parser_vrl ELSE ls.parser_vrl END
+        AS parser_vrl,
+    COALESCE(active.output_fields, ls.output_fields) AS output_fields,
+    CASE WHEN active.present THEN active.extension_vrl ELSE ls.extension_vrl END
+        AS extension_vrl,
+    CASE WHEN active.present THEN active.extension_enabled ELSE ls.extension_enabled END
+        AS extension_enabled,
+    ls.dispatch_source_config_id, ls.enabled, ls.validated, ls.validation_error,
+    ls.namespace, ls.timezone, ls.match_values, ls.category, ls.vendor, ls.product,
+    ls.kind, ls.enrich_kind, ls.enrich_source, ls.target_table, ls.normalize_vrl,
+    ls.sampling_ratio, ls.sampling_exclude_condition,
+    ls.created_at, ls.updated_at
+FROM log_sources ls
+LEFT JOIN LATERAL (
+    SELECT
+        TRUE AS present,
+        lsv.parser_vrl,
+        lsv.output_fields,
+        lsv.extension_vrl,
+        lsv.extension_enabled
+    FROM log_source_versions lsv
+    WHERE lsv.log_source_id = ls.id AND lsv.is_active = TRUE
+    ORDER BY lsv.version_number DESC, lsv.id DESC
+    LIMIT 1
+) active ON TRUE
+ORDER BY ls.name
+"#;
+
+/// Load the effective deployed parser set — see [`EFFECTIVE_DEPLOYED_PARSERS_SQL`].
+///
+/// Free function (not a method) for the same reason as
+/// [`resolve_parser_dispatch_routes`]: `LogSourceService` and `ParserService`
+/// both need it and neither owns the other's repository. NAN-2304.
+pub async fn list_effective_deployed_parsers(pool: &PgPool) -> Result<Vec<Parser>, sqlx::Error> {
+    let rows = sqlx::query(EFFECTIVE_DEPLOYED_PARSERS_SQL)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.iter().map(row_to_parser).collect())
 }
 
 pub struct ParserRepository {
@@ -31,6 +132,11 @@ impl ParserRepository {
         Self { pool }
     }
 
+    /// See [`list_effective_deployed_parsers`]. NAN-2304.
+    pub async fn list_effective_deployed(&self) -> Result<Vec<Parser>, ParserRepositoryError> {
+        Ok(list_effective_deployed_parsers(&self.pool).await?)
+    }
+
     pub async fn list(&self) -> Result<Vec<Parser>, ParserRepositoryError> {
         let rows = sqlx::query(
             r#"
@@ -40,6 +146,11 @@ impl ParserRepository {
                 dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 kind, enrich_kind, enrich_source, target_table, normalize_vrl,
+                -- NAN-2304: these are deployment-affecting. Omitting them made
+                -- `row_to_parser` silently default sampling OFF and the
+                -- extension overlay absent for every consumer of this row.
+                sampling_ratio, sampling_exclude_condition,
+                extension_vrl, extension_enabled,
                 created_at, updated_at
             FROM log_sources
             ORDER BY name
@@ -60,6 +171,11 @@ impl ParserRepository {
                 dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 kind, enrich_kind, enrich_source, target_table, normalize_vrl,
+                -- NAN-2304: these are deployment-affecting. Omitting them made
+                -- `row_to_parser` silently default sampling OFF and the
+                -- extension overlay absent for every consumer of this row.
+                sampling_ratio, sampling_exclude_condition,
+                extension_vrl, extension_enabled,
                 created_at, updated_at
             FROM log_sources
             WHERE enabled = true
@@ -81,6 +197,11 @@ impl ParserRepository {
                 dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 kind, enrich_kind, enrich_source, target_table, normalize_vrl,
+                -- NAN-2304: these are deployment-affecting. Omitting them made
+                -- `row_to_parser` silently default sampling OFF and the
+                -- extension overlay absent for every consumer of this row.
+                sampling_ratio, sampling_exclude_condition,
+                extension_vrl, extension_enabled,
                 created_at, updated_at
             FROM log_sources
             WHERE id = $1
@@ -94,6 +215,20 @@ impl ParserRepository {
         Ok(row_to_parser(&row))
     }
 
+    /// NAN-2305: `(id, name)` for every log source, and nothing else.
+    ///
+    /// The generated-identity guard runs on every create and rename and only
+    /// needs names. `list` selects `parser_vrl` and `normalize_vrl` for every
+    /// row, so reusing it would drag megabytes of VRL through a name
+    /// comparison on each save.
+    pub async fn list_identities(&self) -> Result<Vec<(Uuid, String)>, ParserRepositoryError> {
+        Ok(
+            sqlx::query_as::<_, (Uuid, String)>("SELECT id, name FROM log_sources ORDER BY name")
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
     pub async fn find_by_name(&self, name: &str) -> Result<Parser, ParserRepositoryError> {
         let row = sqlx::query(
             r#"
@@ -103,6 +238,11 @@ impl ParserRepository {
                 dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 kind, enrich_kind, enrich_source, target_table, normalize_vrl,
+                -- NAN-2304: these are deployment-affecting. Omitting them made
+                -- `row_to_parser` silently default sampling OFF and the
+                -- extension overlay absent for every consumer of this row.
+                sampling_ratio, sampling_exclude_condition,
+                extension_vrl, extension_enabled,
                 created_at, updated_at
             FROM log_sources
             WHERE name = $1
@@ -150,7 +290,8 @@ impl ParserRepository {
         .bind(&parser.output_fields)
         .bind(parser.dispatch_source_config_id)
         .fetch_one(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| map_name_unique_violation(e, &parser.name))?;
 
         Ok(row_to_parser(&row))
     }
@@ -208,7 +349,14 @@ impl ParserRepository {
         .bind(update.dispatch_source_config_id)
         .bind(update.enabled)
         .fetch_one(&self.pool)
-        .await?;
+        .await
+        // Only a rename can trip the generated-identity index, so an update
+        // that leaves `name` alone maps straight through — quoting an empty
+        // name back at the caller would be worse than the raw error.
+        .map_err(|e| match update.name.as_deref() {
+            Some(name) => map_name_unique_violation(e, name),
+            None => ParserRepositoryError::from(e),
+        })?;
 
         Ok(row_to_parser(&row))
     }

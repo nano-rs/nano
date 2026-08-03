@@ -11,7 +11,8 @@ mod vector_config;
 
 pub use credential_repository::{CredentialRepository, CredentialRepositoryError};
 pub use repository::{
-    resolve_parser_dispatch_routes, ParserRepository, ParserRepositoryError,
+    list_effective_deployed_parsers, resolve_parser_dispatch_routes, ParserRepository,
+    ParserRepositoryError,
 };
 pub use service::{ParserService, ParserServiceError};
 pub use types::*;

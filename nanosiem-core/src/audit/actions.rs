@@ -438,6 +438,12 @@ pub const HUNT_RUNNER_AGY_WAIVER_GRANTED: &str = "hunt_runner_agy_waiver_granted
 /// because "when did this stop being true" is half of the question above, and a
 /// grant with no matching revocation is what makes a stale waiver visible.
 pub const HUNT_RUNNER_AGY_WAIVER_REVOKED: &str = "hunt_runner_agy_waiver_revoked";
+/// A source-scoped hunt report was rendered and saved locally by an analyst.
+/// The audit detail stores content hashes and presentation metadata, never PDF bytes.
+pub const HUNT_REPORT_EXPORTED: &str = "hunt_report_exported";
+/// Device-local report branding changed. Only the sanitized logo hash and
+/// dimensions are recorded; the image itself never leaves the workstation.
+pub const HUNT_REPORT_BRANDING_UPDATED: &str = "hunt_report_branding_updated";
 
 // =============================================================================
 // Source Config Actions

@@ -26,6 +26,31 @@ fn reserved_route_claim(name: &str) -> Option<String> {
         .then_some(claim)
 }
 
+/// NAN-2305: decide whether `name` would take a generated Vector identifier
+/// that another log source already holds.
+///
+/// `log_sources.name` is UNIQUE, but that uniqueness is on the raw string,
+/// and nothing the deploy writes uses the raw string. `<safe_name>.toml`,
+/// `[transforms.<safe_name>_parse]` and the `source_router.<safe_name>` route
+/// key all key off the lossy form, so `My Source` and `my-source` are two
+/// accepted rows fighting over one filename and one route key. The deploy
+/// loop writes both to `my_source.toml` (last wins) and its disabled branch
+/// deletes that same path, so a disabled namesake can remove an enabled
+/// source's config outright. Either way one log source silently stops being
+/// ingested.
+///
+/// Pure so the decision is testable without a database; the caller supplies
+/// the existing `(id, name)` rows and excludes the row being renamed.
+fn identity_conflict(
+    name: &str,
+    existing: &[(Uuid, String)],
+    exclude: Option<Uuid>,
+) -> Option<String> {
+    // NAN-2311: delegates to the shared rule so the parser and log-source
+    // paths cannot drift apart — they guard the same generated namespace.
+    crate::vector_naming::generated_identity_conflict("log source", name, existing, exclude)
+}
+
 impl ParserService {
     /// List all parsers
     pub async fn list(&self) -> Result<Vec<Parser>, ParserServiceError> {
@@ -47,6 +72,25 @@ impl ParserService {
         Ok(self.repository().find_by_name(name).await?)
     }
 
+    /// NAN-2305: reject a name whose generated Vector identifier is taken.
+    ///
+    /// Racy on its own (list-then-write), exactly like the NAN-883
+    /// single-instance check: migration 283's unique index on the normalized
+    /// name is the backstop that closes the window between two concurrent
+    /// creates. This runs first so the ordinary case gets an error naming the
+    /// conflicting source instead of a bare unique-violation.
+    async fn ensure_generated_identity_free(
+        &self,
+        name: &str,
+        exclude: Option<Uuid>,
+    ) -> Result<(), ParserServiceError> {
+        let existing = self.repository().list_identities().await?;
+        match identity_conflict(name, &existing, exclude) {
+            Some(detail) => Err(ParserServiceError::NameCollision(detail)),
+            None => Ok(()),
+        }
+    }
+
     /// Create a new parser
     pub async fn create(&self, new_parser: NewParser) -> Result<Parser, ParserServiceError> {
         // Validate source type
@@ -63,6 +107,11 @@ impl ParserService {
                 "parser name maps to the reserved source_type '{claim}': the 'nano_' prefix is reserved for nano-internal enrichment routing (NAN-1124). Rename the parser."
             )));
         }
+
+        // NAN-2305: the DB's UNIQUE(name) accepts `my-source` next to
+        // `My Source`; the generated namespace does not.
+        self.ensure_generated_identity_free(&new_parser.name, None)
+            .await?;
 
         if matches!(
             new_parser.source_type.as_str(),
@@ -121,6 +170,13 @@ impl ParserService {
                     "parser name maps to the reserved source_type '{claim}': the 'nano_' prefix is reserved for nano-internal enrichment routing (NAN-1124). Rename the parser."
                 )));
             }
+
+            // NAN-2305: a rename into another source's generated identifier is
+            // the same collision as a create, and the rename path is the more
+            // likely one — the operator is editing an existing source and has
+            // no reason to suspect the new name overlaps. `id` is excluded so
+            // a rename that keeps the same stem still succeeds.
+            self.ensure_generated_identity_free(name, Some(id)).await?;
         }
 
         // Validate source type if provided
@@ -239,39 +295,4 @@ impl ParserService {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::reserved_route_claim;
-
-    /// NAN-1124: names whose `safe_name` lands in the reserved `nano_` namespace
-    /// are rejected; everything else is allowed. `safe_name` lowercases and maps
-    /// non-alphanumerics to `_`, so spaces/dashes/case all normalize.
-    #[test]
-    fn reserves_nano_prefixed_route_claims() {
-        for name in [
-            "nano_enrich",
-            "Nano Enrich",
-            "nano enrich",
-            "nano-enrich",
-            "NANO_IDENTITY",
-        ] {
-            assert!(
-                reserved_route_claim(name).is_some(),
-                "expected '{name}' to be reserved (safe_name starts with nano_)"
-            );
-        }
-        // Not reserved: no `nano_` prefix on the normalized route value.
-        for name in [
-            "Apache HTTP Server",
-            "windows_event",
-            "nanoenrich",
-            "nano",
-            "okta",
-            "nginx",
-        ] {
-            assert!(
-                reserved_route_claim(name).is_none(),
-                "expected '{name}' to be allowed (safe_name does not start nano_)"
-            );
-        }
-    }
-}
+mod tests;

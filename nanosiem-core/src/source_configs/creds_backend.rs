@@ -47,6 +47,23 @@ pub enum CredsBackend {
     },
 }
 
+/// The `VECTOR_CREDS_BACKEND` override, normalized to the three values
+/// [`CredsBackend::detect`] actually distinguishes.
+///
+/// The chosen backend decides which credential path is embedded in the
+/// generated source TOML, so it is a render-affecting input the publication
+/// renderer fingerprint has to cover (NAN-2304). Only the ENV override is
+/// visible here — with no override the backend is auto-detected from the
+/// in-pod ServiceAccount token file, which is a property of the pod rather
+/// than of its configuration, and identical across replicas of one deployment.
+pub(crate) fn creds_backend_override_label() -> &'static str {
+    match std::env::var(ENV_OVERRIDE).ok().as_deref() {
+        Some("k8s_secret") => "k8s_secret",
+        Some("disk") => "disk",
+        _ => "auto",
+    }
+}
+
 impl CredsBackend {
     /// Pick a backend based on env override + SA-token-file presence. Disk-
     /// mode arguments are passed in unconditionally so that an explicit

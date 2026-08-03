@@ -385,6 +385,71 @@
         }
     }
 
+    // ------------------------------------------------------------------
+    // NAN-2305: two log sources, one generated filename
+    // ------------------------------------------------------------------
+
+    /// The gap NAN-2247 leaves open.
+    ///
+    /// That check guards the source_type CLAIM, and only catches a name
+    /// collision when neither parser carries `match_values` (the claim then
+    /// falls back to `safe_name`). Give them distinct `match_values` — the
+    /// normal case for any real parser — and the claims differ, the check
+    /// passes, and both parsers still resolve to `my_source.toml`. Before the
+    /// guard this returned `Ok(())` with one file on disk: whichever parser
+    /// the loop wrote last. The other log source was simply not ingested.
+    #[tokio::test]
+    async fn deploy_refuses_two_parsers_that_generate_one_filename() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let manager = VectorConfigManager::new(tmp.path());
+
+        let a = Parser {
+            match_values: Some(vec!["sysmon_json".to_string()]),
+            ..log_test_parser("My Source", true)
+        };
+        let b = Parser {
+            match_values: Some(vec!["sysmon_xml".to_string()]),
+            ..log_test_parser("my-source", true)
+        };
+
+        let err = manager
+            .deploy_parsers(&[a, b])
+            .await
+            .expect_err("two parsers generating one filename must fail the deploy");
+
+        let msg = err.to_string();
+        assert!(msg.contains("my_source"), "must name the identifier: {msg}");
+        assert!(msg.contains("My Source"), "must name both claimants: {msg}");
+        assert!(msg.contains("my-source"), "must name both claimants: {msg}");
+        assert!(
+            !manager.parsers_dir.join("my_source.toml").exists(),
+            "a refused deploy must leave the active tree untouched"
+        );
+    }
+
+    /// The nastier half, and one NAN-2247 cannot see at all because it only
+    /// considers ENABLED parsers.
+    ///
+    /// The per-parser loop's disabled branch REMOVES `<safe_name>.toml`. So an
+    /// enabled source and a disabled namesake in one deploy meant the enabled
+    /// source's config was deleted — or never survived — purely on iteration
+    /// order, with the deploy reporting success either way.
+    #[tokio::test]
+    async fn deploy_refuses_an_enabled_parser_and_a_disabled_namesake() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let manager = VectorConfigManager::new(tmp.path());
+
+        let err = manager
+            .deploy_parsers(&[
+                log_test_parser("My Source", true),
+                log_test_parser("my-source", false),
+            ])
+            .await
+            .expect_err("a disabled namesake deletes the enabled source's config");
+
+        assert!(err.to_string().contains("my_source"), "{err}");
+    }
+
     /// NAN-1584: the OCSF sink must fork every ENABLED, non-enrichment parser's
     /// `_ocsf_prepare` output (plus the always-on generic Base Event lane). This
     /// shared computation backs both the active `write_ocsf_sink_config` and the

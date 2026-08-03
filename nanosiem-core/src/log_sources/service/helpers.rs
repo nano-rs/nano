@@ -4,7 +4,6 @@
 
 use super::LogSourceService;
 use super::LogSourceServiceError;
-use crate::log_sources::types::LogSource;
 use crate::parsers::Parser;
 
 impl LogSourceService {
@@ -23,6 +22,24 @@ impl LogSourceService {
             .await
             .map_err(|e| LogSourceServiceError::DeploymentFailed(e.to_string()))
     }
+
+    /// The effective deployed parser set, with dispatch routes stamped —
+    /// exactly what `ParserService` renders for publication. NAN-2304.
+    ///
+    /// Replaces `list_enabled_for_deploy()` + `log_source_to_parser`, a second
+    /// hand-written LogSource→Parser mapping that could (and did) drift from
+    /// the one publication uses. Disabled sources are now included: the
+    /// generator needs them to prune their generated files, and it filters on
+    /// `enabled` everywhere else.
+    pub(super) async fn effective_deployed_parsers(
+        &self,
+    ) -> Result<Vec<Parser>, LogSourceServiceError> {
+        let mut parsers = crate::parsers::list_effective_deployed_parsers(&self.pool)
+            .await
+            .map_err(|e| LogSourceServiceError::DeploymentFailed(e.to_string()))?;
+        self.resolve_dispatch_route_names(&mut parsers).await?;
+        Ok(parsers)
+    }
 }
 
 // ============================================================================
@@ -37,48 +54,3 @@ pub(super) fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Convert LogSource to Parser for VectorConfigManager compatibility
-pub(super) fn log_source_to_parser(ls: LogSource) -> Parser {
-    Parser {
-        id: ls.id,
-        name: ls.name,
-        description: ls.description,
-        source_type: ls.source_type,
-        parser_vrl: ls.parser_vrl,
-        output_fields: ls.output_fields,
-        feed_id: None, // No longer used
-        // NAN-928: carry the dispatch source-config binding through to the
-        // generator so kafka/aws_s3/gcp_pubsub branches can emit a filter on
-        // the source-config's `*_route` instead of a parser-owned source.
-        dispatch_source_config_id: ls.dispatch_source_config_id,
-        // Resolved at deploy time by `resolve_dispatch_route_names` — leave
-        // None here; only the deploy entry-points have the pool needed to
-        // look up the source-config's safe_name.
-        dispatch_route_name: None,
-        namespace: ls.namespace,
-        enabled: ls.enabled,
-        validated: ls.validated,
-        validation_error: ls.validation_error,
-        timezone: ls.timezone,
-        match_values: ls.match_values,
-        sampling_ratio: ls.sampling_ratio,
-        sampling_exclude_condition: ls.sampling_exclude_condition,
-        category: ls.category,
-        vendor: ls.vendor,
-        product: ls.product,
-        // NAN-1149: carry the enrichment-parser flavor through so an
-        // enrichment source published via LogSourceService::deploy stages into
-        // the push enrichment lane (write_enrichment_config) instead of being
-        // misrouted as a log parser. For ordinary log sources these are the
-        // schema defaults (kind="log", rest None) — behaviour-preserving.
-        kind: ls.kind,
-        enrich_kind: ls.enrich_kind,
-        enrich_source: ls.enrich_source,
-        target_table: ls.target_table,
-        normalize_vrl: ls.normalize_vrl,
-        extension_vrl: ls.extension_vrl,
-        extension_enabled: ls.extension_enabled,
-        created_at: ls.created_at,
-        updated_at: ls.updated_at,
-    }
-}

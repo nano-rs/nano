@@ -9,6 +9,18 @@ use super::helpers::row_to_log_source;
 use super::{LogSourceRepository, LogSourceRepositoryError};
 
 impl LogSourceRepository {
+    /// `(id, name)` for every log source, for the NAN-2311 generated-identity
+    /// check. Deliberately unpaginated and identity-only: a capped `list` would
+    /// silently stop enforcing past the page boundary, and dragging VRL blobs
+    /// through a name comparison on every save is wasteful.
+    pub async fn list_identities(&self) -> Result<Vec<(Uuid, String)>, LogSourceRepositoryError> {
+        Ok(
+            sqlx::query_as::<_, (Uuid, String)>("SELECT id, name FROM log_sources ORDER BY name")
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
     /// List all log sources with optional filtering
     pub async fn list(
         &self,

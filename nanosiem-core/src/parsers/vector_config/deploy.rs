@@ -26,6 +26,396 @@ use crate::parsers::types::Parser;
 /// test (passing the committed `enrichment_lane_content()`) and the deploy-time
 /// guard in `write_enrichment_config` (passing the freshly-generated lane), so
 /// the same invariant gates both `cargo test` and every live reload.
+/// Why a reload-and-verify failed, and whether the previous config was actually
+/// put back.
+///
+/// NAN-2300 follow-up: the caller used to record `rolled_back` for EVERY error
+/// out of this path — including a reload that failed before any restore was
+/// attempted, a restore that itself failed, and a first deploy with no backup to
+/// restore. The deployment history then claimed a recovery that never happened,
+/// which is the same misleading-success shape that made NAN-2296 take hours to
+/// find. The caller cannot infer this from an error string, so it is returned.
+#[derive(Debug)]
+pub struct VerifyFailure {
+    pub error: VectorConfigError,
+    /// True only when the previous config was successfully restored on disk.
+    /// Says nothing about whether Vector is healthy on it — that is logged.
+    pub rolled_back: bool,
+}
+
+impl std::fmt::Display for VerifyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
+/// Default endpoint for Vector's internal-metrics Prometheus exporter.
+///
+/// `vector` is the compose SERVICE name in every shipped topology
+/// (docker-compose.yml, docker-compose.opensource.yml,
+/// docker-compose.siem-only.yml) — the api container already addresses Vector by
+/// that name for ingest (`VECTOR_INGEST_URL: http://vector:8080/`). The exporter
+/// itself is `[sinks.prometheus_metrics]` in config/vector/92-metrics.toml.
+const DEFAULT_VECTOR_METRICS_URL: &str = "http://vector:9598/metrics";
+
+/// Seconds to wait for Vector to acknowledge a reload before calling it dead.
+///
+/// Matches the `VECTOR_RELOAD_ACK_TIMEOUT_SECS` default used by
+/// `deploy/scripts/s3-config-sync.sh` and the k8s config-sync sidecar, so the
+/// two implementations of this protocol cannot drift.
+///
+/// It must stay comfortably above `scrape_interval_secs` on
+/// `[sources.internal_metrics]` (10s in 92-metrics.toml): the counters below are
+/// only *exported* when that source next scrapes, so a timeout near the scrape
+/// interval reports "Vector never acknowledged" for reloads that in fact
+/// succeeded — and the caller reacts to that by rolling back a good config.
+const DEFAULT_RELOAD_ACK_TIMEOUT_SECS: u64 = 45;
+
+/// Vector's own answer to "did you accept the config I just published?".
+///
+/// NAN-2305: nothing on the Rust deploy path used to ask. `reload_vector`
+/// returned `Ok(())` whether or not it had managed to signal Vector at all, and
+/// the post-deploy probe accepted "a process named vector exists" as proof. A
+/// Vector that REJECTS a new graph keeps serving the previous one and stays
+/// alive, so it passed both checks: the deployment was recorded successful, the
+/// rollback branch was unreachable, and the newly added source received zero
+/// events. That is the NAN-2296 shape — seven hours of a frozen pipeline behind
+/// a green deploy.
+///
+/// The one signal that separates the two cases is Vector's own internal
+/// counters, which `deploy/scripts/s3-config-sync.sh` has compared across a
+/// reload since the S3 generation sync shipped. This is the same protocol, with
+/// the same metric names and the same env knob, so the shell and Rust halves
+/// cannot come to disagree about what "accepted" means.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct ReloadCounters {
+    /// `*reloaded_total` — one increment per topology Vector successfully
+    /// applied, including a reload that resolves to an unchanged topology.
+    pub reloads: f64,
+    /// `*component_errors_total{error_type="configuration_failed"}` — Vector
+    /// refused a config. It goes on running the PREVIOUS topology, which is
+    /// precisely why every liveness probe stays green through this.
+    pub config_failures: f64,
+}
+
+/// Sum the two reload counters out of a Prometheus text-format exposition.
+///
+/// Mirrors the awk in `deploy/scripts/s3-config-sync.sh:read_reload_metrics`.
+/// The metric name is matched on its SUFFIX because the exporter prefixes the
+/// `internal_metrics` namespace (`nanosiem_vector_` in 92-metrics.toml, plain
+/// `vector_` on a stock config). Pinning the full name would stop matching the
+/// moment a deployment renames the namespace — and a counter that never matches
+/// is indistinguishable from a Vector that never acknowledged, i.e. it would
+/// turn every deploy into a rollback.
+pub(super) fn parse_reload_counters(body: &str) -> ReloadCounters {
+    let mut counters = ReloadCounters {
+        reloads: 0.0,
+        config_failures: 0.0,
+    };
+
+    for line in body.lines() {
+        let line = line.trim();
+        // `# HELP` / `# TYPE` metadata.
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let Some(series) = fields.next() else {
+            continue;
+        };
+        // Field 3, when present, is a Prometheus timestamp — ignored.
+        let Some(value) = fields.next().and_then(|v| v.parse::<f64>().ok()) else {
+            continue;
+        };
+        let name = series.split('{').next().unwrap_or(series);
+
+        if name.ends_with("reloaded_total") {
+            counters.reloads += value;
+        } else if name.ends_with("component_errors_total")
+            && series.contains(r#"error_type="configuration_failed""#)
+        {
+            counters.config_failures += value;
+        }
+    }
+
+    counters
+}
+
+/// Did `now` see a reload that `before` had not?
+///
+/// Not simply `now > before`. Vector's metrics registry drops series that stop
+/// being updated, and both of these are one-shot counters — they tick once per
+/// reload and are then untouched, so they age out and REAPPEAR FROM 1 rather
+/// than resuming their old total. Measured against a live collector: a Vector
+/// up six days, having reloaded at least five times, exported no
+/// `reloaded_total` at all; one SIGHUP later it exported
+/// `nanosiem_vector_reloaded_total{host="…"} 1`.
+///
+/// So a counter that came back LOWER than the snapshot is not a counter going
+/// backwards — it is a new series, and any positive value on it was necessarily
+/// counted after the snapshot was taken, which is to say after our reload. Plain
+/// `>` reads that as "no acknowledgement" and rolls back a config Vector
+/// accepted. The window is narrow (the snapshot has to land just before the
+/// series ages out) but it is on the deploy path for every tenant, and its
+/// failure mode is the expensive direction. `deploy/scripts/s3-config-sync.sh`
+/// compares with a plain `>` and has the same latent gap.
+fn counter_advanced(before: f64, now: f64) -> bool {
+    now > before || (now > 0.0 && now < before)
+}
+
+/// What Vector said about the reload we just triggered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReloadAck {
+    /// The success counter moved: Vector built and swapped in a new topology.
+    Accepted,
+    /// The failure counter moved and no success followed: Vector refused the
+    /// config and is still running the previous topology.
+    Rejected,
+    /// The counters were readable and neither moved before the deadline. Vector
+    /// never even attempted the reload (no signal reached it, or its config
+    /// watcher is not watching what we wrote).
+    NotAcknowledged,
+    /// The metrics endpoint could not be read, so there is no evidence either
+    /// way. Never treated as success on its own.
+    Unverifiable,
+    /// Acceptance checking was switched off for this deployment
+    /// (`VECTOR_RELOAD_ACK_TIMEOUT_SECS=0`).
+    VerificationDisabled,
+}
+
+/// One shared client for every metrics scrape.
+///
+/// `from_env` is called per deploy AND per health-poll iteration (20 of those
+/// in a 10s window), and building a `reqwest::Client` sets up a fresh
+/// connection pool and TLS root store each time. Cloning is an `Arc` bump.
+///
+/// The per-request timeout is deliberately short: every one of these runs while
+/// the shared deploy mutex is held, so a hung scrape must not eat the
+/// acknowledgement window it is supposed to be measuring.
+fn metrics_client() -> Option<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .map_err(|e| tracing::error!("Could not build the Vector metrics client: {e}"))
+                .ok()
+        })
+        .as_ref()
+}
+
+/// Reads Vector's reload counters over HTTP and waits for one of them to move.
+pub(super) struct ReloadAckProbe {
+    url: String,
+    client: reqwest::Client,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+}
+
+impl ReloadAckProbe {
+    /// `None` when the operator has switched acceptance checking off.
+    ///
+    /// The kill switch exists because this gate is on the path that ships
+    /// config to every tenant's collector: a deployment where the api genuinely
+    /// cannot reach Vector's metrics port needs a way to keep deploying while
+    /// that is fixed, rather than having every deploy roll itself back. It is
+    /// deliberately loud — see `reload_outcome`.
+    pub(super) fn from_env() -> Option<Self> {
+        let timeout_secs = match std::env::var("VECTOR_RELOAD_ACK_TIMEOUT_SECS") {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(0) => return None,
+                Ok(secs) => secs,
+                Err(_) => {
+                    tracing::warn!(
+                        value = %raw,
+                        "VECTOR_RELOAD_ACK_TIMEOUT_SECS is not a number — using {}s",
+                        DEFAULT_RELOAD_ACK_TIMEOUT_SECS
+                    );
+                    DEFAULT_RELOAD_ACK_TIMEOUT_SECS
+                }
+            },
+            Err(_) => DEFAULT_RELOAD_ACK_TIMEOUT_SECS,
+        };
+
+        let url = std::env::var("VECTOR_METRICS_URL")
+            .unwrap_or_else(|_| DEFAULT_VECTOR_METRICS_URL.to_string());
+
+        Some(Self {
+            url,
+            client: metrics_client()?.clone(),
+            timeout: std::time::Duration::from_secs(timeout_secs),
+            poll_interval: std::time::Duration::from_secs(1),
+        })
+    }
+
+    /// Read the counters once. `None` means the endpoint is unreadable, which is
+    /// "no evidence", never "no reload".
+    pub(super) async fn read(&self) -> Option<ReloadCounters> {
+        match self.client.get(&self.url).send().await {
+            Ok(response) if response.status().is_success() => match response.text().await {
+                Ok(body) => Some(parse_reload_counters(&body)),
+                Err(e) => {
+                    tracing::debug!(url = %self.url, "Vector metrics body unreadable: {e}");
+                    None
+                }
+            },
+            Ok(response) => {
+                tracing::debug!(url = %self.url, status = %response.status(), "Vector metrics endpoint returned an error status");
+                None
+            }
+            Err(e) => {
+                tracing::debug!(url = %self.url, "Vector metrics endpoint unreachable: {e}");
+                None
+            }
+        }
+    }
+
+    /// Poll until one of the counters passes the pre-reload snapshot.
+    pub(super) async fn await_ack(&self, before: ReloadCounters) -> ReloadAck {
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let mut saw_rejection = false;
+
+        loop {
+            if let Some(now) = self.read().await {
+                // A success anywhere in the window outranks a failure seen
+                // earlier in it. One deploy writes many files, and a
+                // `--watch-config` Vector can fire on a half-written tree and
+                // reject it before firing again on the complete one. Whatever
+                // Vector did LAST is what it is running now, so bailing at the
+                // first rejection would roll back a config it went on to
+                // accept.
+                if counter_advanced(before.reloads, now.reloads) {
+                    return ReloadAck::Accepted;
+                }
+                if counter_advanced(before.config_failures, now.config_failures) {
+                    saw_rejection = true;
+                }
+            }
+
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::time::sleep(remaining.min(self.poll_interval)).await;
+        }
+
+        if saw_rejection {
+            ReloadAck::Rejected
+        } else {
+            ReloadAck::NotAcknowledged
+        }
+    }
+}
+
+/// Turn "what we managed to send" plus "what Vector said" into a verdict.
+///
+/// NAN-2305: the rule this encodes is that success has to be *evidenced*. The
+/// old code returned `Ok(())` from the bottom of `reload_vector` on the theory
+/// that `--watch-config` would cover an undelivered signal. That theory is
+/// untestable at the point it is made, and when it was wrong the caller had no
+/// way to find out — which made the rollback branch in log-source deploy
+/// unreachable in practice.
+///
+/// `delivered` names the mechanism that accepted the reload signal, or `None`
+/// when no explicit method worked (the normal case for the open-edition compose
+/// topology, where the api image has no docker CLI and Vector reloads from its
+/// own config watcher).
+pub(super) fn reload_outcome(
+    delivered: Option<&str>,
+    ack: ReloadAck,
+) -> Result<(), VectorConfigError> {
+    match ack {
+        ReloadAck::Accepted => {
+            tracing::info!(
+                delivery = delivered.unwrap_or("config watcher"),
+                "Vector acknowledged the config reload"
+            );
+            Ok(())
+        }
+        ReloadAck::Rejected => Err(VectorConfigError::ReloadFailed(
+            "Vector refused the new configuration (its configuration_failed error counter moved). \
+             It is still running the PREVIOUS topology, so anything this deploy added is receiving \
+             no events. Check `docker logs` / the vector pod for the rejected component."
+                .to_string(),
+        )),
+        ReloadAck::NotAcknowledged => Err(VectorConfigError::ReloadFailed(format!(
+            "Vector never acknowledged the config reload: neither its reload-success nor its \
+             config-failure counter moved within the acknowledgement window. The reload signal \
+             did not reach it (delivery: {}), or its config watcher is not watching the directory \
+             this config was written to.",
+            delivered.unwrap_or("none — relied on Vector's config watcher"),
+        ))),
+        ReloadAck::Unverifiable => match delivered {
+            // A delivered SIGHUP is real evidence that a reload was requested;
+            // we just cannot see the outcome. Downgrading this to an error would
+            // roll back working deploys on every host that cannot reach the
+            // metrics port, so it stays a success — a loud one.
+            Some(method) => {
+                tracing::warn!(
+                    delivery = method,
+                    "Reload signalled but NOT verified — Vector's metrics endpoint was unreadable, \
+                     so a rejected config would look exactly like this. Set VECTOR_METRICS_URL to \
+                     Vector's internal-metrics exporter to close this gap."
+                );
+                Ok(())
+            }
+            // Nothing sent, nothing observed. This is the case that used to
+            // return Ok(()) and manufacture a successful deployment out of
+            // an assumption.
+            None => Err(VectorConfigError::ReloadFailed(
+                "No reload was delivered to Vector and its metrics endpoint could not be read, so \
+                 there is no evidence the new configuration was ever loaded. Refusing to report \
+                 this deploy as live. Check that Vector is running and that VECTOR_METRICS_URL / \
+                 VECTOR_CONTAINER_NAME point at it."
+                    .to_string(),
+            )),
+        },
+        ReloadAck::VerificationDisabled => {
+            tracing::warn!(
+                delivery = delivered.unwrap_or("none — relied on Vector's config watcher"),
+                "Reload acceptance checking is disabled (VECTOR_RELOAD_ACK_TIMEOUT_SECS=0) — this \
+                 deploy is reported successful without any evidence Vector loaded it (NAN-2305)"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Run a subprocess under a hard deadline, killing it if it overruns.
+///
+/// NAN-2297: every one of these runs while the deploy mutex is held — and that
+/// is now a SINGLE mutex shared by parser, log-source and source-config
+/// deploys. An unbounded `docker exec` against a wedged daemon would hold it
+/// forever and block every deploy in the process, with no API-level timeout
+/// behind it. A deadline turns "the platform stops deploying until restart"
+/// into "this deploy failed".
+///
+/// `kill_on_drop` matters as much as the timeout: without it the child keeps
+/// running after we stop waiting, and a pile of stuck `docker exec`s
+/// accumulates across retries.
+pub(super) async fn run_bounded(
+    mut command: Command,
+    deadline: std::time::Duration,
+    what: &str,
+) -> std::io::Result<std::process::Output> {
+    command.kill_on_drop(true);
+    match tokio::time::timeout(deadline, command.output()).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::error!(
+                "{what} exceeded {}s and was killed — the deploy lock is held across this, \
+                 so an unbounded wait would stall every deploy",
+                deadline.as_secs(),
+            );
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("{what} timed out after {}s", deadline.as_secs()),
+            ))
+        }
+    }
+}
+
 pub(super) fn enrichment_lane_backpressure_violations(
     candidate_enrichment_toml: &str,
 ) -> Vec<String> {
@@ -357,6 +747,31 @@ impl VectorConfigManager {
         if !collisions.is_empty() {
             let detail = super::router::describe_collisions(&collisions);
             tracing::error!(collisions = collisions.len(), "{}", detail);
+            return Err(VectorConfigError::ValidationFailed(detail));
+        }
+
+        // NAN-2305: refuse before touching disk when two parsers collapse to
+        // one `safe_name`. Distinct from the NAN-2247 check above, which
+        // guards the source_type CLAIM: that one only catches this pair when
+        // neither carries match_values (the claim then falls back to
+        // safe_name). With match_values set the claims differ, the check
+        // passes, and the loop below still writes both to one
+        // `<safe_name>.toml` — and its disabled branch DELETES that same path,
+        // so an enabled source's config is removed by a disabled namesake
+        // purely on iteration order. The whole set is checked, not just the
+        // enabled parsers, because the delete branch is what makes a disabled
+        // row dangerous.
+        let identity_collisions = crate::vector_naming::find_identity_collisions(
+            log_parsers
+                .iter()
+                .map(|p| (p.id, Self::safe_name(&p.name), p.name.clone())),
+        );
+        if !identity_collisions.is_empty() {
+            let detail = crate::vector_naming::describe_identity_collisions(
+                "log source",
+                &identity_collisions,
+            );
+            tracing::error!(collisions = identity_collisions.len(), "{}", detail);
             return Err(VectorConfigError::ValidationFailed(detail));
         }
 
@@ -1575,27 +1990,32 @@ if otlp_time != "" {
         out
     }
 
-    /// Signal Vector to reload its configuration
+    /// Send Vector a reload signal, best effort.
     ///
-    /// Note: If Vector is running with --watch-config, it will auto-reload when files change.
-    /// This function is a fallback for deployments without --watch-config.
-    pub async fn reload_vector(&self) -> Result<(), VectorConfigError> {
-        // Give the filesystem a moment to sync (helps with Docker volume mounts)
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
+    /// Returns the mechanism that accepted the signal, or `None` when no
+    /// explicit method worked — which is the NORMAL case for the open-edition
+    /// compose topology, where the api image ships without a docker CLI and
+    /// Vector reloads from its own `--watch-config` watcher. `None` therefore
+    /// is not a failure on its own; it only becomes one when nothing
+    /// acknowledges the reload either (see [`reload_outcome`]).
+    async fn deliver_reload_signal(&self) -> Option<&'static str> {
         // Method 1: Docker exec (for containerized Vector without --watch-config)
         let container_name = std::env::var("VECTOR_CONTAINER_NAME")
             .unwrap_or_else(|_| "nanosiem-vector".to_string());
 
-        let docker_result = Command::new("docker")
-            .args(["exec", &container_name, "pkill", "-HUP", "vector"])
-            .output()
-            .await;
+        let mut reload_cmd = Command::new("docker");
+        reload_cmd.args(["exec", &container_name, "pkill", "-HUP", "vector"]);
+        let docker_result = run_bounded(
+            reload_cmd,
+            std::time::Duration::from_secs(15),
+            "docker exec pkill -HUP vector (reload)",
+        )
+        .await;
 
         if let Ok(output) = docker_result {
             if output.status.success() {
                 tracing::info!("Sent SIGHUP to Vector via docker exec");
-                return Ok(());
+                return Some("docker exec SIGHUP");
             }
             // Docker exec failed - Vector might be using --watch-config or not in Docker
             tracing::debug!(
@@ -1607,22 +2027,74 @@ if otlp_time != "" {
         // Method 2: Direct SIGHUP (for non-containerized Vector without --watch-config)
         #[cfg(unix)]
         {
-            let pkill_result = Command::new("pkill")
-                .args(["-HUP", "vector"])
-                .output()
-                .await;
+            // NAN-2305: this one was missed by the NAN-2297 sweep that put every
+            // other deploy-time subprocess under a deadline. It runs while the
+            // shared deploy mutex is held, so a `pkill` that never returns (a
+            // wedged process table, an unkillable target in uninterruptible
+            // sleep) stops every deploy in the process until restart.
+            let mut pkill = Command::new("pkill");
+            pkill.args(["-HUP", "vector"]);
+            let pkill_result = run_bounded(
+                pkill,
+                std::time::Duration::from_secs(5),
+                "pkill -HUP vector (reload)",
+            )
+            .await;
 
             if let Ok(output) = pkill_result {
                 if output.status.success() {
                     tracing::info!("Sent SIGHUP to local Vector process");
-                    return Ok(());
+                    return Some("local SIGHUP");
                 }
             }
         }
 
-        // If explicit reload methods fail, Vector should pick up changes via --watch-config
-        tracing::info!("Config written - Vector will auto-reload if using --watch-config");
-        Ok(())
+        tracing::debug!(
+            "No explicit reload method succeeded — relying on Vector's config watcher, which the \
+             acknowledgement check below will confirm or deny"
+        );
+        None
+    }
+
+    /// Signal Vector to reload its configuration and confirm that it did.
+    ///
+    /// NAN-2305: this used to end in an unconditional `Ok(())` with the comment
+    /// "Vector will auto-reload if using --watch-config". That made a failed
+    /// reload indistinguishable from a successful one, which in turn made the
+    /// rollback branches in the log-source and parser deploy paths unreachable.
+    /// The verdict now comes from Vector itself — see [`ReloadCounters`] for the
+    /// protocol and [`reload_outcome`] for how the cases are graded.
+    pub async fn reload_vector(&self) -> Result<(), VectorConfigError> {
+        let probe = ReloadAckProbe::from_env();
+
+        // Snapshot BEFORE anything else, including the filesystem-sync sleep.
+        // The config is already on disk by the time this is called and a
+        // `--watch-config` Vector can pick it up unprompted, so every
+        // millisecond between the write and this read is a window in which the
+        // acknowledgement we are about to wait for has already been counted.
+        // (Vector debounces config-file events by ~1s and `internal_metrics`
+        // only exports every `scrape_interval_secs`, so in practice the
+        // snapshot lands first — reading early is the only defence available
+        // from here, and it costs nothing.)
+        let before = match probe.as_ref() {
+            Some(probe) => probe.read().await,
+            None => None,
+        };
+
+        // Give the filesystem a moment to sync (helps with Docker volume mounts)
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let delivered = self.deliver_reload_signal().await;
+
+        let ack = match (probe.as_ref(), before) {
+            (Some(probe), Some(before)) => probe.await_ack(before).await,
+            // Configured but unreadable: no baseline means no comparison, and a
+            // missing baseline must not be read as a missing reload.
+            (Some(_), None) => ReloadAck::Unverifiable,
+            (None, _) => ReloadAck::VerificationDisabled,
+        };
+
+        reload_outcome(delivered, ack)
     }
 
     /// Deploy parsers and reload Vector (serialized via deploy lock)
@@ -1630,11 +2102,37 @@ if otlp_time != "" {
     /// Acquires the deploy mutex to prevent concurrent deploys from corrupting
     /// config or overwriting each other's backups. All config files are written
     /// atomically before a single reload signal is sent.
+    ///
+    /// Note the shape: unlike `LogSourceService::deploy` /
+    /// `ParserService::deploy_parser`, this writes STRAIGHT INTO the active tree
+    /// with no staging, no `vector validate`, and no backup to roll back to. The
+    /// reload gate (NAN-2305) now at least reports when Vector refuses the
+    /// result, but the previous config is gone by then. Callers that can afford
+    /// the full pipeline should use the staged path.
+    /// Callers that must take the lock BEFORE their first mutation of the
+    /// active tree (log-source deletion, NAN-2305) drive `deploy_parsers` and
+    /// `reload_vector` themselves under a [`Self::lock_deploys`] guard — the
+    /// mutex is not reentrant, so this wrapper would deadlock there.
     pub async fn deploy_and_reload(&self, parsers: &[Parser]) -> Result<(), VectorConfigError> {
         let _guard = self.deploy_lock.lock().await;
         self.deploy_parsers(parsers).await?;
         self.reload_vector().await?;
         Ok(())
+    }
+
+    /// Hold the deploy mutex across a caller-owned sequence.
+    ///
+    /// NAN-2297: the stage → validate → backup → promote → reload sequences in
+    /// `LogSourceService::deploy` and `ParserService::deploy_parser` are a single
+    /// critical section, but each step used to take (or skip) the lock on its
+    /// own. Two concurrent deploys therefore shared one staging directory and
+    /// could clean, promote, or — since NAN-2296 — DELETE each other's files.
+    ///
+    /// Returns an owned guard so callers can hold it across their whole
+    /// sequence. The mutex is not reentrant: anything called while holding this
+    /// must be a `*_locked` variant, never the public self-locking wrapper.
+    pub async fn lock_deploys(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.deploy_lock.clone().lock_owned().await
     }
 
     /// Render a complete parser tree without signaling a live Vector process.
@@ -1645,19 +2143,44 @@ if otlp_time != "" {
         self.deploy_parsers(parsers).await
     }
 
-    /// Check if Vector is healthy by querying its internal API or checking process status.
+    /// Is Vector alive? LIVENESS ONLY — this says nothing about which config it
+    /// is running.
     ///
-    /// Vector exposes a health endpoint at http://localhost:8686/health when
-    /// the API is enabled. Falls back to checking if the process is running.
+    /// NAN-2305: read that limitation literally. Every probe below is satisfied
+    /// by a Vector that REJECTED the config this deploy just published and kept
+    /// serving the previous topology — rejection is not a crash, the process
+    /// stays up and its endpoints stay green. Treating a pass here as "the
+    /// deploy is live" is what let a frozen pipeline sit behind a successful
+    /// deployment record. Acceptance is proven separately, and only, by the
+    /// reload-counter gate in [`Self::reload_vector`]; this answers the
+    /// narrower question that follows it — "did applying the config kill
+    /// Vector?".
     pub async fn check_vector_health(&self) -> bool {
-        // Method 1: Check Vector's API health endpoint (requires --api flag)
+        // Method 1: the internal-metrics exporter. Preferred over the two
+        // process checks because it proves Vector is still *serving*, not just
+        // that a PID exists, and over the curl below because it needs no curl
+        // binary in the api image and its URL is the one deployments already
+        // have to configure for the reload gate.
+        if let Some(probe) = ReloadAckProbe::from_env() {
+            if probe.read().await.is_some() {
+                return true;
+            }
+        }
+
+        // Method 2: Check Vector's API health endpoint (requires --api flag)
         let api_url = std::env::var("VECTOR_API_URL")
             .unwrap_or_else(|_| "http://localhost:8686/health".to_string());
 
-        if let Ok(output) = Command::new("curl")
-            .args(["-sf", "--max-time", "2", &api_url])
-            .output()
-            .await
+        // curl's own --max-time bounds the request, but not a curl that never
+        // execs or wedges before the transfer starts, so it gets a deadline too.
+        let mut curl = Command::new("curl");
+        curl.args(["-sf", "--max-time", "2", &api_url]);
+        if let Ok(output) = run_bounded(
+            curl,
+            std::time::Duration::from_secs(5),
+            "curl vector health endpoint",
+        )
+        .await
         {
             if output.status.success() {
                 return true;
@@ -1668,9 +2191,13 @@ if otlp_time != "" {
         let container_name = std::env::var("VECTOR_CONTAINER_NAME")
             .unwrap_or_else(|_| "nanosiem-vector".to_string());
 
-        if let Ok(output) = Command::new("docker")
-            .args(["exec", &container_name, "pgrep", "-x", "vector"])
-            .output()
+        let mut docker_health = Command::new("docker");
+        docker_health.args(["exec", &container_name, "pgrep", "-x", "vector"]);
+        if let Ok(output) = run_bounded(
+            docker_health,
+            std::time::Duration::from_secs(10),
+            "docker exec pgrep vector (health)",
+        )
             .await
         {
             if output.status.success() {
@@ -1681,7 +2208,15 @@ if otlp_time != "" {
         // Method 3: Check local process
         #[cfg(unix)]
         {
-            if let Ok(output) = Command::new("pgrep").args(["-x", "vector"]).output().await {
+            let mut pgrep = Command::new("pgrep");
+            pgrep.args(["-x", "vector"]);
+            if let Ok(output) = run_bounded(
+                pgrep,
+                std::time::Duration::from_secs(5),
+                "pgrep vector (health)",
+            )
+            .await
+            {
                 if output.status.success() {
                     return true;
                 }
@@ -1696,22 +2231,69 @@ if otlp_time != "" {
     /// After reload, polls Vector health for up to 10 seconds. If Vector becomes
     /// unhealthy (crash from bad config at runtime), automatically restores the
     /// backup config and reloads.
-    pub async fn deploy_and_verify(&self, parsers: &[Parser]) -> Result<(), VectorConfigError> {
-        let _guard = self.deploy_lock.lock().await;
-
-        // Backup current config before deploy
-        if let Err(e) = self.backup_current().await {
-            tracing::warn!(
-                "Failed to backup current config (continuing — may be first deploy): {}",
-                e
-            );
+    /// Reload Vector, verify health, and roll back to the existing backup if it
+    /// does not come up healthy.
+    ///
+    /// NAN-2300: this deliberately does NOT take a backup, and does NOT write
+    /// config. It replaced `deploy_and_verify`, which did both — and did them in
+    /// the wrong order relative to its caller. `ParserService::deploy_parser`
+    /// promoted the staged tree and only then called that helper, whose first
+    /// act was `backup_current()`. The backup therefore captured the config that
+    /// had just been published, so a failed health check "rolled back" to the
+    /// deployment that was failing. It also re-ran `deploy_parsers`, rewriting
+    /// the tree promotion had already published from the validated staging
+    /// snapshot.
+    ///
+    /// Splitting those responsibilities out makes the ordering the caller's, and
+    /// visible: back up BEFORE promoting, then call this. The old helper is gone
+    /// rather than deprecated so the broken sequence cannot be reintroduced by
+    /// reaching for a convenient-looking method.
+    ///
+    /// Assumes the caller holds the guard from [`Self::lock_deploys`] — the
+    /// mutex is not reentrant.
+    /// `backup` is the generation returned by the caller's `backup_current`, or
+    /// `None` when that snapshot failed. `None` means no rollback is attempted:
+    /// restoring a leftover from an earlier attempt is not a rollback, and when
+    /// that leftover is an empty first-install backup it deletes a live config.
+    pub async fn reload_and_verify_locked(
+        &self,
+        backup: Option<&super::backup::BackupGeneration>,
+    ) -> Result<(), VerifyFailure> {
+        // Single reload after all files are in place (fixes multi-file race).
+        // A reload that fails outright also warrants a rollback — the promoted
+        // config is on disk and Vector may pick it up later (--watch-config).
+        // This used to `?` straight out, leaving the new tree live while the
+        // caller recorded a rollback that never ran.
+        if let Err(reload_err) = self.reload_vector().await {
+            tracing::error!("Vector reload failed — rolling back to previous config");
+            let Some(backup) = backup else {
+                tracing::error!(
+                    "No snapshot was taken for this deploy — not rolling back. The promoted \
+                     config is live and manual intervention is required."
+                );
+                return Err(VerifyFailure {
+                    error: reload_err,
+                    rolled_back: false,
+                });
+            };
+            let rolled_back = match self.restore_backup(backup).await {
+                Ok(()) => {
+                    let _ = self.reload_vector().await;
+                    true
+                }
+                Err(restore_err) => {
+                    tracing::error!(
+                        "Rollback after failed reload also failed: {}. Manual intervention required.",
+                        restore_err
+                    );
+                    false
+                }
+            };
+            return Err(VerifyFailure {
+                error: reload_err,
+                rolled_back,
+            });
         }
-
-        // Write all config files
-        self.deploy_parsers(parsers).await?;
-
-        // Single reload after all files are written (fixes multi-file race)
-        self.reload_vector().await?;
 
         // Post-deploy health polling: check every 500ms for 10 seconds
         let mut healthy = false;
@@ -1728,15 +2310,30 @@ if otlp_time != "" {
         if !healthy {
             tracing::error!("Vector unhealthy after deploy — auto-rolling back to previous config");
 
-            // Restore backup
-            if let Err(restore_err) = self.restore_backup().await {
+            // Restore backup — only the one taken for this attempt.
+            let Some(backup) = backup else {
+                tracing::error!(
+                    "Vector unhealthy after deploy, and no snapshot was taken for this attempt — \
+                     not rolling back. Manual intervention required."
+                );
+                return Err(VerifyFailure {
+                    error: VectorConfigError::ReloadFailed(
+                        "Vector became unhealthy after config deploy, and no rollback target was recorded for this attempt. Check Vector logs and config manually.".to_string()
+                    ),
+                    rolled_back: false,
+                });
+            };
+            if let Err(restore_err) = self.restore_backup(backup).await {
                 tracing::error!(
                     "Auto-rollback failed: {}. Manual intervention required.",
                     restore_err
                 );
-                return Err(VectorConfigError::ReloadFailed(
-                    "Vector unhealthy after deploy and auto-rollback failed. Check Vector logs and config manually.".to_string()
-                ));
+                return Err(VerifyFailure {
+                    error: VectorConfigError::ReloadFailed(
+                        "Vector unhealthy after deploy and auto-rollback failed. Check Vector logs and config manually.".to_string()
+                    ),
+                    rolled_back: false,
+                });
             }
 
             // Reload with restored config
@@ -1754,9 +2351,12 @@ if otlp_time != "" {
                 );
             }
 
-            return Err(VectorConfigError::ReloadFailed(
-                "Vector became unhealthy after config deploy. Configuration has been automatically rolled back to the previous working state.".to_string()
-            ));
+            return Err(VerifyFailure {
+                error: VectorConfigError::ReloadFailed(
+                    "Vector became unhealthy after config deploy. Configuration has been automatically rolled back to the previous config.".to_string()
+                ),
+                rolled_back: true,
+            });
         }
 
         tracing::info!("Deploy verified — Vector is healthy with new config");
@@ -1769,5 +2369,9 @@ if otlp_time != "" {
     }
 }
 
+#[cfg(test)]
+mod deletion_tests;
+#[cfg(test)]
+mod reload_tests;
 #[cfg(test)]
 mod tests;

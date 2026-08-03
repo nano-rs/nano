@@ -52,17 +52,17 @@
 //! resurrect it. A later sweep that tries is refused and counted — see
 //! [`RecordOutcome::RefusedRevoked`].
 //!
-//! # Why this is its own repository
+//! # Why reads and revocation stay in their own repository
 //!
 //! [`crate::hunts::repository::HuntRepository`] is where suppression and lead
-//! dismissal live. Keeping knowledge out of that file is not tidiness: it is
-//! what makes the guard test above a cheap file-level scan rather than a
-//! call-graph analysis, and it means the type that can record a memory has no
-//! method that can hide a finding.
+//! dismissal live. Knowledge listing and revocation remain separate so neither
+//! can enter scoring or triage. The sole shared write helper accepts only a
+//! server-prepared fact and an existing transaction; NAN-2309 uses it to commit
+//! knowledge under the same fence as the report that established it.
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -202,6 +202,39 @@ pub struct HuntKnowledge {
 
     pub source_types: Vec<String>,
     pub source_types_complete: bool,
+}
+
+/// One durable fact carried inside a sweep report.
+///
+/// There is deliberately no `sweep_id`: the report path supplies it from the
+/// URL and reasserts the runner's lease and fence before this can be persisted.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct KnowledgeCandidate {
+    pub category: String,
+    pub subject: String,
+    pub fact: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub evidence_event_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_days: Option<i64>,
+}
+
+/// A fact after the server has normalized the claim and resolved its evidence.
+///
+/// This is the only knowledge shape the sweep-report transaction accepts. The
+/// provenance is derived from ClickHouse by [`crate::hunts::HuntService`], not
+/// supplied by the runner or agent.
+#[derive(Debug, Clone)]
+pub struct PreparedKnowledge {
+    pub category: String,
+    pub subject: String,
+    pub fact: String,
+    pub confidence: f64,
+    pub evidence_event_ids: Vec<String>,
+    pub ttl_days: i64,
+    pub provenance: SourceProvenance,
 }
 
 /// Record a fact. Reachable by a sweep key (`hunts:report`) and by nothing else.
@@ -527,12 +560,114 @@ pub(crate) fn build_revoke_sql(scope: &ArtifactScope) -> (String, bool) {
 /// Postgres access for `hunt_knowledge`.
 ///
 /// Separate from [`crate::hunts::repository::HuntRepository`] on purpose. That
-/// type owns lead dismissal and the single suppression insert; this one owns
-/// memory. Keeping them apart means the object that can record a memory has no
-/// method that can hide a finding, and it keeps the guard test a file scan.
+/// type owns lead dismissal and suppression; this one owns knowledge reads,
+/// standalone recording, and revocation. The sweep-report transaction reaches
+/// only [`record_prepared_in_tx`], which has no read or scoring surface.
 #[derive(Clone)]
 pub struct KnowledgeRepository {
     pool: PgPool,
+}
+
+/// Upsert one already-prepared fact through the caller's transaction.
+///
+/// The sweep-report path calls this only after it has locked and reasserted the
+/// runner fence. The standalone recording endpoint performs its own live-sweep
+/// check before calling it. Keeping the SQL here gives both paths one
+/// implementation of tombstones and reconfirmation.
+pub(crate) async fn record_prepared_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    sweep_id: Uuid,
+    prepared: &PreparedKnowledge,
+) -> Result<(RecordOutcome, HuntKnowledge), HuntError> {
+    let (source_types, complete) = prepared.provenance.clone().into_parts();
+    let expires_at = Utc::now() + Duration::days(prepared.ttl_days);
+
+    let recorded = sqlx::query(
+        r#"INSERT INTO hunt_knowledge
+             (category, subject, fact, confidence, learned_by_sweep_id,
+              confirmed_by_sweep_id, evidence_event_ids, expires_at,
+              source_types, source_types_complete)
+           VALUES ($1, $2, $3, $4::float8::numeric, $5, $5, $6, $7, $8, $9)
+           ON CONFLICT (category, subject, fact_digest) DO UPDATE
+              SET confirmed_at = NOW(),
+                  expires_at = GREATEST(hunt_knowledge.expires_at, EXCLUDED.expires_at),
+                  confidence = EXCLUDED.confidence,
+                  confirmed_by_sweep_id = EXCLUDED.confirmed_by_sweep_id,
+                  evidence_event_ids = ARRAY(
+                      SELECT DISTINCT e
+                        FROM unnest(hunt_knowledge.evidence_event_ids
+                                    || EXCLUDED.evidence_event_ids) e
+                       LIMIT 50
+                  ),
+                  observation_count = hunt_knowledge.observation_count
+                      + CASE WHEN EXCLUDED.confirmed_by_sweep_id
+                                  IS DISTINCT FROM hunt_knowledge.confirmed_by_sweep_id
+                             THEN 1 ELSE 0 END,
+                  source_types = ARRAY(
+                      SELECT DISTINCT s
+                        FROM unnest(hunt_knowledge.source_types
+                                    || EXCLUDED.source_types) s
+                  ),
+                  source_types_complete = hunt_knowledge.source_types_complete
+                      AND EXCLUDED.source_types_complete
+            WHERE hunt_knowledge.revoked_at IS NULL
+           RETURNING id, category, subject, fact, fact_digest,
+                     confidence::float8 AS confidence, learned_by_sweep_id,
+                     confirmed_by_sweep_id, evidence_event_ids, observation_count,
+                     relearn_attempts, last_relearn_attempt_at, learned_at,
+                     confirmed_at, expires_at, revoked_at, revoked_by, revoke_reason,
+                     source_types, source_types_complete"#,
+    )
+    .bind(&prepared.category)
+    .bind(&prepared.subject)
+    .bind(&prepared.fact)
+    .bind(prepared.confidence)
+    .bind(sweep_id)
+    .bind(&prepared.evidence_event_ids)
+    .bind(expires_at)
+    .bind(&source_types)
+    .bind(complete)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    if let Some(row) = recorded {
+        let knowledge = knowledge_from_row(&row)?;
+        let outcome = if knowledge.observation_count == 1 {
+            RecordOutcome::Learned
+        } else {
+            RecordOutcome::Reconfirmed
+        };
+        return Ok((outcome, knowledge));
+    }
+
+    // The upsert conflicted with an analyst-revoked tombstone. Count the
+    // attempt in this same transaction so it cannot be silently retried.
+    let tombstone = sqlx::query(
+        r#"UPDATE hunt_knowledge
+              SET relearn_attempts = relearn_attempts + 1,
+                  last_relearn_attempt_at = NOW()
+            WHERE category = $1 AND subject = $2
+              AND fact_digest = hunt_knowledge_fact_digest($3)
+              AND revoked_at IS NOT NULL
+           RETURNING id, category, subject, fact, fact_digest,
+                     confidence::float8 AS confidence, learned_by_sweep_id,
+                     confirmed_by_sweep_id, evidence_event_ids, observation_count,
+                     relearn_attempts, last_relearn_attempt_at, learned_at,
+                     confirmed_at, expires_at, revoked_at, revoked_by, revoke_reason,
+                     source_types, source_types_complete"#,
+    )
+    .bind(&prepared.category)
+    .bind(&prepared.subject)
+    .bind(&prepared.fact)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    let Some(row) = tombstone else {
+        return Err(HuntError::Conflict(
+            "knowledge row changed during recording; retry".to_string(),
+        ));
+    };
+    Ok((RecordOutcome::RefusedRevoked, knowledge_from_row(&row)?))
 }
 
 impl KnowledgeRepository {
@@ -578,9 +713,6 @@ impl KnowledgeRepository {
         ttl_days: i64,
         provenance: &SourceProvenance,
     ) -> Result<(RecordOutcome, HuntKnowledge), HuntError> {
-        let (source_types, complete) = provenance.clone().into_parts();
-        let expires_at = Utc::now() + Duration::days(ttl_days);
-
         let mut tx = self.pool.begin().await?;
 
         // Reassert the sweep is live. `FOR SHARE` rather than `FOR UPDATE`:
@@ -604,114 +736,18 @@ impl KnowledgeRepository {
             )));
         }
 
-        let recorded = sqlx::query(
-            r#"INSERT INTO hunt_knowledge
-                 (category, subject, fact, confidence, learned_by_sweep_id,
-                  confirmed_by_sweep_id, evidence_event_ids, expires_at,
-                  source_types, source_types_complete)
-               VALUES ($1, $2, $3, $4::float8::numeric, $5, $5, $6, $7, $8, $9)
-               ON CONFLICT (category, subject, fact_digest) DO UPDATE
-                  SET confirmed_at = NOW(),
-                      -- GREATEST, so a short-TTL recording can never SHORTEN
-                      -- the life of a fact another sweep vouched for longer.
-                      expires_at = GREATEST(hunt_knowledge.expires_at, EXCLUDED.expires_at),
-                      -- Latest claim wins, and deliberately does not accumulate.
-                      -- If repetition raised confidence, an adversary who can
-                      -- make a sweep re-record a fact could reach 1.0 by
-                      -- patience alone.
-                      confidence = EXCLUDED.confidence,
-                      confirmed_by_sweep_id = EXCLUDED.confirmed_by_sweep_id,
-                      evidence_event_ids = ARRAY(
-                          SELECT DISTINCT e
-                            FROM unnest(hunt_knowledge.evidence_event_ids
-                                        || EXCLUDED.evidence_event_ids) e
-                           LIMIT 50
-                      ),
-                      -- Only a DIFFERENT sweep counts, so repeating a fact
-                      -- inside one run cannot manufacture corroboration.
-                      observation_count = hunt_knowledge.observation_count
-                          + CASE WHEN EXCLUDED.confirmed_by_sweep_id
-                                      IS DISTINCT FROM hunt_knowledge.confirmed_by_sweep_id
-                                 THEN 1 ELSE 0 END,
-                      source_types = ARRAY(
-                          SELECT DISTINCT s
-                            FROM unnest(hunt_knowledge.source_types
-                                        || EXCLUDED.source_types) s
-                      ),
-                      -- Monotonic toward failure, matching SourceProvenance::merge:
-                      -- one incomplete contributor makes the union incomplete,
-                      -- and merging good data can never launder it back.
-                      source_types_complete = hunt_knowledge.source_types_complete
-                          AND EXCLUDED.source_types_complete
-                WHERE hunt_knowledge.revoked_at IS NULL
-               RETURNING id, category, subject, fact, fact_digest,
-                         confidence::float8 AS confidence, learned_by_sweep_id,
-                         confirmed_by_sweep_id, evidence_event_ids, observation_count,
-                         relearn_attempts, last_relearn_attempt_at, learned_at,
-                         confirmed_at, expires_at, revoked_at, revoked_by, revoke_reason,
-                         source_types, source_types_complete"#,
-        )
-        .bind(category)
-        .bind(subject)
-        .bind(fact)
-        .bind(confidence)
-        .bind(sweep_id)
-        .bind(evidence_event_ids)
-        .bind(expires_at)
-        .bind(&source_types)
-        .bind(complete)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        if let Some(row) = recorded {
-            let knowledge = knowledge_from_row(&row)?;
-            let outcome = if knowledge.observation_count == 1 {
-                RecordOutcome::Learned
-            } else {
-                RecordOutcome::Reconfirmed
-            };
-            tx.commit().await?;
-            return Ok((outcome, knowledge));
-        }
-
-        // Nothing came back, so the conflict landed on a tombstone. Count the
-        // attempt: silence here would let a sweep re-derive a rejected fact
-        // every night with nothing to show an analyst that it was happening.
-        //
-        // The digest is recomputed by the SAME database function the generated
-        // column uses, so this cannot drift from the row it means to find.
-        let tombstone = sqlx::query(
-            r#"UPDATE hunt_knowledge
-                  SET relearn_attempts = relearn_attempts + 1,
-                      last_relearn_attempt_at = NOW()
-                WHERE category = $1 AND subject = $2
-                  AND fact_digest = hunt_knowledge_fact_digest($3)
-                  AND revoked_at IS NOT NULL
-               RETURNING id, category, subject, fact, fact_digest,
-                         confidence::float8 AS confidence, learned_by_sweep_id,
-                         confirmed_by_sweep_id, evidence_event_ids, observation_count,
-                         relearn_attempts, last_relearn_attempt_at, learned_at,
-                         confirmed_at, expires_at, revoked_at, revoked_by, revoke_reason,
-                         source_types, source_types_complete"#,
-        )
-        .bind(category)
-        .bind(subject)
-        .bind(fact)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let Some(row) = tombstone else {
-            // The upsert matched nothing and there is no tombstone either, so
-            // the row vanished between the two statements. Rolling back and
-            // reporting a conflict is honest; inventing an outcome is not.
-            tx.rollback().await?;
-            return Err(HuntError::Conflict(
-                "knowledge row changed during recording; retry".to_string(),
-            ));
+        let prepared = PreparedKnowledge {
+            category: category.to_string(),
+            subject: subject.to_string(),
+            fact: fact.to_string(),
+            confidence,
+            evidence_event_ids: evidence_event_ids.to_vec(),
+            ttl_days,
+            provenance: provenance.clone(),
         };
-        let knowledge = knowledge_from_row(&row)?;
+        let result = record_prepared_in_tx(&mut tx, sweep_id, &prepared).await?;
         tx.commit().await?;
-        Ok((RecordOutcome::RefusedRevoked, knowledge))
+        Ok(result)
     }
 
     /// List knowledge under the caller's artifact scope.

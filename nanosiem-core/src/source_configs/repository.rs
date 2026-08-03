@@ -56,6 +56,17 @@ pub struct SourceConfigRepository {
 /// claim-to-route join correct. Unicode-aware `is_alphanumeric` is the
 /// canonical filter — must NOT be computed in SQL where regex character
 /// classes are ASCII-only and would drift on non-ASCII names.
+/// NAN-2305: the columns the generated-stem uniqueness guard needs, and
+/// nothing else — deliberately not `SourceConfiguration`, so the guard never
+/// pulls `connection_config` (which carries credential material) just to
+/// compare names.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SourceConfigIdentity {
+    pub id: Uuid,
+    pub name: String,
+    pub config_type: String,
+}
+
 fn route_safe_name(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
@@ -266,6 +277,35 @@ impl SourceConfigRepository {
         })
     }
 
+    /// NAN-2305: surface the generated-stem unique violation (migration 283)
+    /// as an actionable message rather than an opaque 500.
+    ///
+    /// Reachable past `SourceConfigService::identity_conflict` two ways: a
+    /// write racing another write, and a name whose ASCII-normalized form
+    /// collides while the Unicode-aware Rust check saw none (`Café` vs `Cafe`
+    /// — see the migration). Shared by the create and update paths so the two
+    /// cannot drift into reporting the same violation differently.
+    fn map_generated_stem_violation(
+        err: &sqlx::Error,
+        name: &str,
+    ) -> Option<SourceConfigRepositoryError> {
+        let sqlx::Error::Database(db_err) = err else {
+            return None;
+        };
+        // PG SQLSTATE 23505 = unique_violation.
+        if db_err.code().as_deref() != Some("23505")
+            || db_err.constraint() != Some("source_configurations_generated_vector_identity")
+        {
+            return None;
+        }
+        Some(SourceConfigRepositoryError::InvalidConfig(format!(
+            "the name '{name}' generates a Vector config filename that another source \
+             configuration already uses. Generated filenames lowercase the name and replace \
+             every non-alphanumeric character with '_'. Choose a name that differs by more \
+             than case, spacing or punctuation."
+        )))
+    }
+
     /// NAN-883: surface the partial-unique-index violation on `splunk_hec`
     /// as `Conflict` (→ HTTP 409) instead of a generic 500. The race
     /// window for the application-level list-then-insert in
@@ -287,10 +327,30 @@ impl SourceConfigRepository {
                         request.config_type
                     ));
                 }
+                if let Some(mapped) = Self::map_generated_stem_violation(&err, &request.name) {
+                    return mapped;
+                }
                 return SourceConfigRepositoryError::AlreadyExists(request.name.clone());
             }
         }
         SourceConfigRepositoryError::from(err)
+    }
+
+    /// NAN-2305: the identity columns of EVERY row, unpaginated.
+    ///
+    /// The generated-stem guard cannot use `list`: that caps at
+    /// `LIST_PAGE_MAX` and warns about truncation, so past the cap the check
+    /// would silently stop enforcing — the same shape of silent failure the
+    /// guard exists to prevent. Three narrow columns, so the unbounded read is
+    /// cheaper than the paginated one it replaces (no `connection_config`).
+    pub async fn list_identities(
+        &self,
+    ) -> Result<Vec<SourceConfigIdentity>, SourceConfigRepositoryError> {
+        Ok(sqlx::query_as::<_, SourceConfigIdentity>(
+            "SELECT id, name, config_type FROM source_configurations ORDER BY name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     /// Create a new source configuration
@@ -453,7 +513,18 @@ impl SourceConfigRepository {
         query_builder = query_builder.bind(request.expected_updated_at);
         query_builder = query_builder.bind(expected_credential_id);
 
-        match query_builder.fetch_optional(&self.pool).await? {
+        // NAN-2305: a rename racing another rename onto the same generated
+        // stem lands here as a unique violation; without the mapping it would
+        // surface as a 500 for something the operator fixes by renaming.
+        let updated = query_builder.fetch_optional(&self.pool).await.map_err(|e| {
+            request
+                .name
+                .as_deref()
+                .and_then(|name| Self::map_generated_stem_violation(&e, name))
+                .unwrap_or_else(|| SourceConfigRepositoryError::from(e))
+        })?;
+
+        match updated {
             Some(config) => Ok(config.into()),
             None => {
                 // The atomic UPDATE can miss because the row disappeared, the

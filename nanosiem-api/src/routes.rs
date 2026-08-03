@@ -2343,6 +2343,12 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/hunts/drafts", post(handlers::hunts::create_hunt_drafts))
         .route("/api/hunts/rule-ideas", get(handlers::hunts::list_rule_ideas))
+        // The report itself and the sanitized logo remain device-local. These
+        // static receipts carry hashes and bounded presentation metadata only.
+        .route(
+            "/api/hunts/report-branding-events",
+            post(handlers::hunts::record_hunt_report_branding),
+        )
         .route(
             "/api/hunts/rule-ideas/{id}/send",
             post(handlers::hunts::send_rule_idea),
@@ -2363,6 +2369,10 @@ pub fn create_router(state: AppState) -> Router {
             post(handlers::hunts::trigger_sweep),
         )
         .route("/api/hunts/{id}/toggle", post(handlers::hunts::toggle_hunt))
+        .route(
+            "/api/hunts/{id}/report-exports",
+            post(handlers::hunts::record_hunt_report_export),
+        )
         // Its own route rather than a PATCH field, like the toggle beside it:
         // `update_hunt` COALESCEs every column, so "manual only" — a real choice
         // — is inexpressible there and clearing a cadence was a silent no-op.

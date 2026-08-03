@@ -5,11 +5,9 @@
 use sqlx;
 use uuid::Uuid;
 
-use super::helpers::log_source_to_parser;
 use super::LogSourceService;
 use super::LogSourceServiceError;
 use crate::log_sources::types::{ListParams, LogSource, NewLogSource, SourceType, UpdateLogSource};
-use crate::parsers::Parser;
 
 /// NAN-2158: reject a `match_field` that is not a bare SQL identifier.
 ///
@@ -78,6 +76,41 @@ impl LogSourceService {
     }
 
     /// Create a new log source
+    /// NAN-2311: reject a name whose GENERATED Vector identifier is already
+    /// taken by another log source.
+    ///
+    /// `safe_name` maps every non-alphanumeric character to `_`, so "My Source",
+    /// "my-source" and "my_source" all become `my_source` — one filename, one
+    /// set of transform ids, one router route key. The table's `UNIQUE(name)`
+    /// happily accepts all three.
+    ///
+    /// NAN-2305 added this guard to `ParserService`, but `POST /api/log-sources`
+    /// goes through THIS service, so the guard never ran on the path the API
+    /// and UI actually use. Migration 283's unique index still stopped the
+    /// write, which meant the operator got `500 A database error occurred`
+    /// instead of being told which source holds the name. Verified against a
+    /// live tenant before this fix.
+    ///
+    /// Racy on its own (list-then-write); the index remains the backstop for
+    /// two concurrent creates. This runs first so the ordinary case gets a
+    /// message naming the conflict.
+    async fn ensure_generated_identity_free(
+        &self,
+        name: &str,
+        exclude: Option<Uuid>,
+    ) -> Result<(), LogSourceServiceError> {
+        let existing = self.repository().list_identities().await?;
+        match crate::vector_naming::generated_identity_conflict(
+            "log source",
+            name,
+            &existing,
+            exclude,
+        ) {
+            Some(detail) => Err(LogSourceServiceError::NameCollision(detail)),
+            None => Ok(()),
+        }
+    }
+
     pub async fn create(&self, new: NewLogSource) -> Result<LogSource, LogSourceServiceError> {
         // Validate source type
         if SourceType::from_str(&new.source_type).is_none() {
@@ -93,6 +126,10 @@ impl LogSourceService {
 
         // NAN-2158: `match_field` is a SQL column identifier, not a value.
         validate_match_field(new.match_field.as_deref())?;
+
+        // NAN-2311: UNIQUE(name) accepts `my-source` beside `My Source`; the
+        // generated Vector namespace does not.
+        self.ensure_generated_identity_free(&new.name, None).await?;
 
         // Create in database
         let log_source = self.repository().create(&new).await?;
@@ -133,6 +170,12 @@ impl LogSourceService {
                     source_type.clone(),
                 ));
             }
+        }
+
+        // NAN-2311: a RENAME can collide just as a create can. `exclude` is the
+        // row being renamed, so keeping its own name is not a self-conflict.
+        if let Some(ref name) = update.name {
+            self.ensure_generated_identity_free(name, Some(id)).await?;
         }
 
         // NAN-1197: an enrichment source's `normalize_vrl` is embedded verbatim
@@ -200,37 +243,109 @@ impl LogSourceService {
     pub async fn delete(&self, id: Uuid) -> Result<(), LogSourceServiceError> {
         let log_source = self.repository().find_by_id(id).await?;
         let log_source_name = log_source.name.clone();
-        let was_deployed = log_source.deployed;
 
-        // Delete from database first
-        self.repository().delete(id).await?;
-
-        // Clean up the config file for this log source
-        if let Err(e) = self
-            .vector_config
-            .remove_parser_config(&log_source_name)
-            .await
+        // NAN-2305: the active Vector tree is republished BEFORE the row goes,
+        // in one locked pass, and the parser TOML is no longer unlinked on its
+        // own.
+        //
+        // The old order was: delete the row, unlink the parser TOML while
+        // holding no lock, then call the self-locking redeploy. Between the
+        // unlink and the redeploy — a window that includes waiting for whatever
+        // deploy already held the mutex — `_combiner.toml` named a transform
+        // whose file no longer existed. Vector treats an input naming a missing
+        // component as fatal to the WHOLE config, so any reload in that window
+        // (a concurrent deploy's, or `--watch-config` reacting to the unlink
+        // itself) was rejected and Vector kept running the pre-delete topology.
+        // The redeploy's own failure was then only warned about and the
+        // deletion still reported success.
+        //
+        // Regenerating from the surviving sources does the removal as part of a
+        // coherent write: `deploy_parsers` prunes the orphaned parser file and
+        // rewrites the combiner and router in the same pass, so no intermediate
+        // state is ever visible on disk.
         {
-            tracing::warn!(
-                "Failed to remove Vector config for '{}': {}",
-                log_source_name,
-                e
-            );
-        }
+            let _deploy_guard = self.vector_config.lock_deploys().await;
 
-        // Redeploy to update combiner and router (removes references to deleted log source)
-        if was_deployed {
-            let enabled = self.list_enabled_for_deploy().await?;
-            let mut parsers: Vec<Parser> = enabled.into_iter().map(log_source_to_parser).collect();
-            self.resolve_dispatch_route_names(&mut parsers).await?;
+        // Regenerate the whole tree from the surviving sources, ALWAYS.
+        //
+        // NAN-2310: this used to be gated on `was_deployed`, with the other arm
+        // just unlinking the parser file on the reasoning that a
+        // never-deployed source has no live topology referencing it. That
+        // reasoning does not survive contact with the `deployed` flag, which
+        // `update` clears whenever a deployment-affecting field changes
+        // (`repository/crud.rs`: `deployed = CASE WHEN $18 THEN false ...`).
+        //
+        // So the ordinary sequence create -> publish -> edit the VRL -> delete
+        // left `deployed = false` while `_combiner.toml` and `_router.toml`
+        // still named the source's `<name>_output`. Unlinking only the parser
+        // file produced exactly the NAN-2296 failure: a dangling input that
+        // makes the ENTIRE Vector config unloadable, so every subsequent reload
+        // is rejected and the collector is frozen on its last good config.
+        // Reproduced on a live tenant: `vector validate` failed with
+        // `Input "…_output" for transform "db_parsers_combined" doesn't match
+        // any components`, and Vector logged `reload aborted`.
+        //
+        // Regeneration is the coherent operation in both cases: for a source
+        // that was live it rewrites the combiner and router without it, and for
+        // one that never deployed it is a no-op that still prunes any stale
+        // file. There is no case where unlinking alone is more correct, so the
+        // branch is gone rather than repaired.
+        {
+            // NAN-2304 gives us the canonical effective-deployed query (it also
+            // resolves dispatch route names internally). NAN-2305's `filter` is
+            // still required and must not be dropped in a merge: the row is
+            // deleted AFTER this regeneration, inside the deploy guard, so it is
+            // still present here — regenerating without the filter would write a
+            // config that still routes the source being deleted.
+            let parsers: Vec<_> = self
+                .effective_deployed_parsers()
+                .await?
+                .into_iter()
+                .filter(|parser| parser.id != id)
+                .collect();
 
-            if let Err(e) = self.vector_config.deploy_and_reload(&parsers).await {
-                tracing::warn!(
-                    "Failed to redeploy after deleting log source '{}': {}",
-                    log_source_name,
-                    e
-                );
+                // Fail closed. The row is still present, so the DB and the
+                // config still agree and the operator can retry — far better
+                // than a "deleted" source that the collector keeps routing to.
+                if let Err(e) = self.vector_config.deploy_parsers(&parsers).await {
+                    tracing::error!(
+                        "Refusing to delete log source '{}': could not regenerate the Vector \
+                         config without it: {}",
+                        log_source_name,
+                        e
+                    );
+                    return Err(LogSourceServiceError::VectorConfigError(e));
+                }
+
+                // Deliberately NOT fatal, unlike the write above: the on-disk
+                // tree is already correct and coherent at this point, so the
+                // worst case is that Vector keeps a now-unused route until the
+                // next reload. Blocking deletion behind a collector that is
+                // down or unreachable would be the worse failure.
+                if let Err(e) = self.vector_config.reload_vector().await {
+                    tracing::error!(
+                        "Vector config for deleted log source '{}' was written but Vector did not \
+                         confirm the reload — it may still be routing the deleted source until it \
+                         next reloads: {}",
+                        log_source_name,
+                        e
+                    );
+                }
             }
+
+            // Inside the guard, with the config already republished. Dropping
+            // the lock first would leave a window in which a concurrent deploy
+            // reads the still-present row, regenerates from it, and puts the
+            // source being deleted straight back into the config — the row then
+            // disappears underneath it and the collector is left routing a
+            // source nobody can manage.
+            //
+            // Config-before-row is also the safer order for the failure case:
+            // if this DELETE fails, the source is absent from the config but
+            // still in the database, so the next deploy restores it and the
+            // delete simply did not happen. The reverse leaves a deleted source
+            // live in the collector, which is what the old ordering did.
+            self.repository().delete(id).await?;
         }
 
         // Clean up orphaned routing rules that targeted this log source's source_type.

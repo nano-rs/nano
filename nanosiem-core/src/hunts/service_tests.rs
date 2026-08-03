@@ -283,6 +283,59 @@ async fn measurements_come_from_the_resolver_not_the_report() {
     );
 }
 
+#[tokio::test]
+async fn knowledge_is_normalized_and_provenance_is_server_derived() {
+    let svc = service(FakeResolver::new().with_event(
+        "evt-1",
+        "windows_security",
+        &[("user", "svc_backup")],
+    ));
+    let candidate = KnowledgeCandidate {
+        category: " Service Account ".to_string(),
+        subject: " SVC_Backup ".to_string(),
+        fact: " runs   nightly\n at 03:00 ".to_string(),
+        confidence: Some(0.8),
+        evidence_event_ids: vec!["evt-1".to_string(), "missing".to_string()],
+        ttl_days: Some(10_000),
+    };
+
+    let prepared = svc
+        .prepare_knowledge(&candidate, &ScopeSet::unrestricted())
+        .await
+        .expect("resolver succeeds")
+        .expect("valid fact is prepared");
+
+    assert_eq!(prepared.category, "service_account");
+    assert_eq!(prepared.subject, "svc_backup");
+    assert_eq!(prepared.fact, "runs nightly at 03:00");
+    assert_eq!(prepared.evidence_event_ids, vec!["evt-1"]);
+    assert_eq!(prepared.ttl_days, crate::hunts::MAX_TTL_DAYS);
+    assert_eq!(prepared.provenance.source_types(), &["windows_security".to_string()]);
+    assert!(
+        !prepared.provenance.is_complete(),
+        "one unresolved event must make the fact fail closed for scoped readers"
+    );
+}
+
+#[tokio::test]
+async fn malformed_knowledge_rejects_only_that_fact() {
+    let svc = service(FakeResolver::new());
+    let candidate = KnowledgeCandidate {
+        category: "not/a/category".to_string(),
+        subject: "svc_backup".to_string(),
+        fact: "nightly job".to_string(),
+        confidence: None,
+        evidence_event_ids: Vec::new(),
+        ttl_days: None,
+    };
+
+    let prepared = svc
+        .prepare_knowledge(&candidate, &ScopeSet::unrestricted())
+        .await
+        .expect("invalid claims are a per-fact refusal, not a report error");
+    assert!(prepared.is_none());
+}
+
 #[test]
 fn lookback_windows_are_parsed_and_clamped() {
     assert_eq!(parse_lookback("24h"), Duration::hours(24));

@@ -44,6 +44,7 @@ use crate::playbooks::models::{CreatePlaybookRequest, Playbook, PlaybookScope, P
 use crate::hunts::error::HuntError;
 use crate::hunts::evidence::ResolvedEvent;
 use crate::hunts::fingerprint::{derive as derive_fingerprint, CanonicalEntity, FingerprintInput};
+use crate::hunts::knowledge::{record_prepared_in_tx, PreparedKnowledge, RecordOutcome};
 use crate::hunts::models::*;
 use crate::hunts::report::{reconcile_outcome, BudgetLimits, BudgetUsage, TrailStep};
 use crate::hunts::scoring::{score, Contribution, ScoreInputs};
@@ -128,6 +129,11 @@ pub struct CommitInputs {
     /// dropped: a sweep whose candidates are all being rejected is broken, and
     /// a silent zero looks identical to a clean run.
     pub rejected: usize,
+    /// Durable facts already normalized and provenance-stamped by the service.
+    /// They commit under the same fence transaction as the report.
+    pub knowledge: Vec<PreparedKnowledge>,
+    /// Malformed or over-limit facts refused before the transaction.
+    pub knowledge_rejected: usize,
 }
 
 impl HuntRepository {
@@ -1159,6 +1165,20 @@ impl HuntRepository {
             .await?;
         }
 
+        // Knowledge is an OUTPUT of the sweep, never an INPUT to scoring. It
+        // lands only after every lead has been scored and persisted, but before
+        // the sweep is marked finished, under the same fence transaction.
+        let mut knowledge_recorded = 0usize;
+        let mut knowledge_rejected = inputs.knowledge_rejected;
+        for fact in &inputs.knowledge {
+            let (outcome, _) = record_prepared_in_tx(&mut tx, inputs.sweep_id, fact).await?;
+            if outcome == RecordOutcome::RefusedRevoked {
+                knowledge_rejected += 1;
+            } else {
+                knowledge_recorded += 1;
+            }
+        }
+
         // ---- 4. The sweep row ----------------------------------------------
         let outcome = reconcile_outcome(
             inputs.claimed_outcome.as_deref(),
@@ -1234,6 +1254,8 @@ impl HuntRepository {
             leads_created,
             candidates_rejected: inputs.rejected,
             evidence_attached,
+            knowledge_recorded,
+            knowledge_rejected,
         })
     }
 

@@ -115,15 +115,16 @@ pub use evidence::{
 pub use fingerprint::{
     derive as derive_fingerprint, CanonicalEntity, FingerprintInput, ValidatedSignal,
 };
-// NAN-2239. Knowledge is exported alongside the rest of the hunt runtime but is
-// deliberately NOT reachable from `HuntService`: the type that records a memory
-// must have no method that can hide a finding. See `hunts::knowledge`.
+// NAN-2239/NAN-2309. Knowledge has its own read/revoke repository. The one
+// write shared with `HuntService` is the prepared-fact helper used by the sweep
+// report transaction; it cannot read knowledge or affect lead scoring.
 pub use knowledge::{
     clamp_ttl_days, normalize_category, normalize_evidence_refs, normalize_fact,
-    normalize_subject, sanitize_confidence, HuntKnowledge, KnowledgeCategoryCount, KnowledgeRepository,
-    ListKnowledgeQuery, RecordKnowledgeRequest, RecordKnowledgeResponse, RecordOutcome,
-    RevokeKnowledgeRequest, MAX_CATEGORY_CHARS, MAX_CATEGORY_ROLLUP, MAX_EVIDENCE_REFS, MAX_FACT_CHARS,
-    MAX_REVOKE_REASON_CHARS, MAX_SUBJECT_CHARS, MAX_TTL_DAYS,
+    normalize_subject, sanitize_confidence, HuntKnowledge, KnowledgeCandidate,
+    KnowledgeCategoryCount, KnowledgeRepository, ListKnowledgeQuery, RecordKnowledgeRequest,
+    RecordKnowledgeResponse, RecordOutcome, RevokeKnowledgeRequest, MAX_CATEGORY_CHARS,
+    MAX_CATEGORY_ROLLUP, MAX_EVIDENCE_REFS, MAX_FACT_CHARS, MAX_REVOKE_REASON_CHARS,
+    MAX_SUBJECT_CHARS, MAX_TTL_DAYS,
 };
 pub use models::*;
 pub use recon::{

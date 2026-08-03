@@ -31,6 +31,12 @@ pub enum ParserServiceError {
     InvalidVrl(String),
     #[error("Invalid source type: {0}")]
     InvalidSourceType(String),
+    /// NAN-2305: the requested name is unique as a string but generates a
+    /// Vector identifier another log source already holds. Kept separate from
+    /// `RepositoryError(DuplicateName)` because the remedy differs — the names
+    /// are visibly different, so the message has to explain what they share.
+    #[error("{0}")]
+    NameCollision(String),
     #[error("Parser must be validated before enabling")]
     NotValidated,
     #[error("Vector config error: {0}")]
@@ -79,6 +85,17 @@ impl ParserService {
     /// NAN-948.
     pub fn deploy_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
         self.vector_config.deploy_lock()
+    }
+
+    /// Hand out the shared config manager so other services deploy through the
+    /// SAME instance — and therefore the same deploy mutex.
+    ///
+    /// NAN-2297: `LogSourceService` used to build its own `VectorConfigManager`,
+    /// so its lock was a different mutex from the one `ParserService` and
+    /// `SourceConfigService` share. Publishing a log source and deploying a
+    /// parser could interleave freely over one staging directory.
+    pub fn vector_config(&self) -> Arc<VectorConfigManager> {
+        Arc::clone(&self.vector_config)
     }
 
     fn repository(&self) -> ParserRepository {

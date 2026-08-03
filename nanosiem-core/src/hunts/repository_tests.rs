@@ -778,6 +778,40 @@ fn the_commit_path_reasserts_the_fence_before_it_writes_anything() {
 }
 
 #[test]
+fn knowledge_commits_after_lead_scoring_and_before_the_sweep_finishes() {
+    let commit = function_body(REPOSITORY_SOURCE, "pub async fn commit_sweep_report(");
+    let lead_loop = commit
+        .find("for prepared in &inputs.leads")
+        .expect("the report no longer processes prepared leads");
+    let knowledge_loop = commit
+        .find("for fact in &inputs.knowledge")
+        .expect("the report no longer processes prepared knowledge");
+    let knowledge_write = commit
+        .find("record_prepared_in_tx(&mut tx")
+        .expect("prepared knowledge is not written through the report transaction");
+    let finish = commit
+        .find("UPDATE hunt_sweeps")
+        .expect("the report no longer finishes its sweep");
+
+    assert!(
+        lead_loop < knowledge_loop && knowledge_loop < knowledge_write,
+        "knowledge reached the transaction before lead scoring; it must remain an output only"
+    );
+    assert!(
+        !commit[..knowledge_loop].contains("&inputs.knowledge"),
+        "knowledge is consulted before lead scoring finishes"
+    );
+    assert!(
+        knowledge_write < finish,
+        "knowledge is still written after the sweep loses its live lease"
+    );
+    assert!(
+        !commit.contains("INSERT INTO hunt_knowledge"),
+        "the report repository duplicated knowledge's tombstone/reconfirmation SQL"
+    );
+}
+
+#[test]
 fn the_runner_facing_read_is_not_artifact_scoped_but_the_analyst_one_is() {
     // A queued sweep has an empty manifest, so applying the artifact predicate
     // to the runner's own claim/commit path would make a source-scoped sweep key

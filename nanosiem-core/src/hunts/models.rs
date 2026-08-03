@@ -466,9 +466,10 @@ pub struct SubmitSweepReportRequest {
     #[serde(default)]
     pub wall_seconds: u64,
 
-    /// The narrow shape the agent is allowed to report: evidence ids, a
-    /// narrative, and the trail. No score, no fingerprint, no manifest, no
-    /// suppression — there is deliberately nowhere to put them.
+    /// The narrow shape the agent is allowed to report: evidence ids,
+    /// narratives, durable fact claims, and the trail. No score, no
+    /// fingerprint, no manifest, no suppression — there is deliberately
+    /// nowhere to put them.
     ///
     /// A NAMED field rather than a flattened one, so the boundary between the
     /// runner's measurements and the model's claims is visible in the wire
@@ -492,6 +493,10 @@ pub struct SweepReportAccepted {
     /// the sweep's principal could read. Surfaced rather than silently dropped.
     pub candidates_rejected: usize,
     pub evidence_attached: usize,
+    /// Durable facts learned or reconfirmed in the report transaction.
+    pub knowledge_recorded: usize,
+    /// Malformed, over-limit, or analyst-revoked facts that were not recorded.
+    pub knowledge_rejected: usize,
 }
 
 // =============================================================================
