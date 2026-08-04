@@ -350,7 +350,13 @@ pub async fn save_recon_profile(
             .details(serde_json::json!({
                 "census_rows": profile.census.as_array().map(|rows| rows.len()).unwrap_or(0),
                 "degraded": profile.degraded,
+                // Both authors, separately (NAN-2324). An audit record that
+                // kept only the server's half would lose the agent's stated
+                // reason entirely on an agent-only degradation — and the audit
+                // trail is the one place that has to be able to say what a
+                // caller claimed at the time it claimed it.
                 "degraded_detail": profile.degraded_detail,
+                "agent_notes": profile.agent_notes,
                 "source_types": profile.source_types,
                 "source_types_complete": profile.source_types_complete,
             }))

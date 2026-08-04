@@ -60,7 +60,7 @@ jobs:
         run: |
           docker compose up -d clickhouse vector
           echo "Waiting for ClickHouse + Vector to be ready..."
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             if curl -fsS http://localhost:8123/ping 2>/dev/null | grep -q 'Ok.' \
                && curl -fsS http://localhost:8686/health 2>/dev/null | grep -q '"ok":true'; then
               echo "ClickHouse + Vector are ready."

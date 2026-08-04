@@ -889,7 +889,23 @@ pub struct HuntProfile {
     pub huntable_surface: serde_json::Value,
     pub actor_weighting: serde_json::Value,
     pub degraded: bool,
+    /// The SERVER's record of what degraded during the run that produced this
+    /// row — its own probes, against its own recomputation of `census` and
+    /// `huntable_surface`. A statement about the stored artifact.
     pub degraded_detail: Option<String>,
+    /// What the recon AGENT reported about its OWN run (NAN-2324).
+    ///
+    /// Not a statement about `census` or `huntable_surface`: the server
+    /// recomputes both on save, so anything claimed here may have been
+    /// superseded by the recomputation stored alongside it — and on a real
+    /// profile it was, an agent's "all history depths are rollup floors (6d)"
+    /// sitting next to a census of measured 101-day depths.
+    ///
+    /// Kept because the agent sees things no server probe does (a source whose
+    /// `command_line` is populated on 1.1% of events is a real finding). Render
+    /// it ATTRIBUTED to the agent, never as a property of the profile.
+    #[serde(default)]
+    pub agent_notes: Option<String>,
     pub source_types: Vec<String>,
     pub source_types_complete: bool,
     #[serde(default, with = "typeid::user::opt")]
@@ -1040,7 +1056,14 @@ pub struct HuntSummary {
     /// (the screen is "Profile"; "recon" is the job that produces it).
     #[serde(rename = "profile_degraded")]
     pub recon_degraded: bool,
+    /// The SERVER's record. May be `None` while `recon_degraded` is true, when
+    /// only the agent's own probing failed — see `recon_agent_notes` (NAN-2324).
     pub recon_degraded_detail: Option<String>,
+    /// What the agent said about its own run. Carried alongside rather than
+    /// merged, so a consumer can attribute it; without it an agent-only
+    /// degradation reaches this summary as a warning that cannot say why.
+    #[serde(default)]
+    pub recon_agent_notes: Option<String>,
 
     /// Source types at least one ENABLED hunt requires that have produced no
     /// telemetry recently. A hunt whose required source is unhealthy is HELD

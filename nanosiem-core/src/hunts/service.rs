@@ -853,6 +853,7 @@ impl HuntService {
             last_recon_at: profile.as_ref().map(|p| p.created_at),
             recon_degraded: profile.as_ref().is_some_and(|p| p.degraded),
             recon_degraded_detail: profile.as_ref().and_then(|p| p.degraded_detail.clone()),
+            recon_agent_notes: profile.as_ref().and_then(|p| p.agent_notes.clone()),
             unhealthy_source_types: unhealthy_source_types.into_iter().collect(),
             blocked_hunts,
             unresolved_capabilities: unresolved_capabilities.into_iter().collect(),

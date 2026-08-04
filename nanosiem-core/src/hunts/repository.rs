@@ -3240,6 +3240,7 @@ fn profile_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntProfile, HuntErro
         actor_weighting: row.try_get("actor_weighting")?,
         degraded: row.try_get("degraded")?,
         degraded_detail: row.try_get("degraded_detail")?,
+        agent_notes: row.try_get("agent_notes")?,
         source_types: row.try_get("source_types")?,
         source_types_complete: row.try_get("source_types_complete")?,
         generated_by: row.try_get("generated_by")?,

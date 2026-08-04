@@ -1283,7 +1283,7 @@ fn a_body_cannot_report_a_degradation_and_then_deny_it() {
     let submission = sanitize_profile_request(request).expect("valid");
     assert!(submission.degraded);
     assert_eq!(
-        submission.degraded_detail.as_deref(),
+        submission.agent_notes.as_deref(),
         Some("okta went dark mid-run")
     );
 }
@@ -1475,14 +1475,14 @@ fn a_degraded_flag_always_arrives_with_a_reason() {
     let submission = sanitize_profile_request(bare).expect("valid");
     assert!(submission.degraded);
     assert!(
-        submission.degraded_detail.is_some(),
+        submission.agent_notes.is_some(),
         "a degraded profile with no reason is a badge that cannot explain itself"
     );
 
     // And the clean case stays clean — no invented reason on an undegraded save.
     let clean = sanitize_profile_request(save_request()).expect("valid");
     assert!(!clean.degraded);
-    assert_eq!(clean.degraded_detail, None);
+    assert_eq!(clean.agent_notes, None);
 }
 
 // =============================================================================
@@ -1893,4 +1893,85 @@ fn a_save_that_still_supplies_both_halves_is_unchanged() {
     );
     let error = sanitize_profile_request(oversized).expect_err("must reject");
     assert!(error.to_string().contains("census rows"), "{error}");
+}
+
+// ── NAN-2324: the two authors of a profile's prose ───────────────────────────
+
+/// A recon profile has TWO authors and they must not be conflated.
+///
+/// `degraded_detail` is the server's record of the run that produced the stored
+/// census and surface. The agent's prose is about the agent's OWN probing, which
+/// happened earlier and which the server's recomputation on save may have
+/// superseded — on the profile that motivated this, it had: the banner claimed
+/// "all history depths are rollup floors (6d)" while the census stored beside it
+/// recorded measured 101-day depths, because the agent's MCP-side probe timed
+/// out and the server's own probe then succeeded.
+///
+/// `sanitize_profile_request` is where the agent's half is bounded and where the
+/// flag/detail coherence rule lives, so it is where the shape can be pinned
+/// without a database.
+#[test]
+fn an_agents_detail_survives_sanitizing_as_its_own_value() {
+    let mut request = save_request();
+    request.degraded = Some(true);
+    request.degraded_detail =
+        Some("get_org_context was Forbidden, so no declared org context was available".into());
+
+    let submission = sanitize_profile_request(request).expect("valid submission");
+
+    assert!(submission.degraded);
+    // Carried verbatim rather than folded into a sentence about the census. The
+    // server's own record is produced separately in `save_profile` and the two
+    // land in different columns.
+    assert_eq!(
+        submission.agent_notes.as_deref(),
+        Some("get_org_context was Forbidden, so no declared org context was available")
+    );
+}
+
+/// The agent's half is bounded INDEPENDENTLY of the server's.
+///
+/// The old code joined them and truncated once at the end, so a verbose agent
+/// could push the server's own record off the end of the field — truncating the
+/// half the operator most needs. Separate columns mean separate caps, and this
+/// pins the agent's.
+#[test]
+fn a_verbose_agent_cannot_exceed_its_own_ceiling() {
+    let mut request = save_request();
+    request.degraded = Some(true);
+    request.degraded_detail = Some("z".repeat(NARRATIVE_MAX_BYTES * 3));
+
+    let submission = sanitize_profile_request(request).expect("valid submission");
+    let detail = submission.agent_notes.expect("detail survives");
+
+    assert!(
+        detail.len() <= NARRATIVE_MAX_BYTES,
+        "the agent's notes are rendered in a banner and the column has no CHECK; \
+         got {} bytes",
+        detail.len()
+    );
+}
+
+/// `degraded` without a reason is still not representable.
+///
+/// Splitting the field must not reopen the flag/detail disagreement that
+/// `DegradedLog::seal` exists to prevent: a warning badge that says something is
+/// wrong and cannot say what. The reason now lands in `agent_notes` rather than
+/// `degraded_detail`, but it still has to exist.
+#[test]
+fn a_flag_without_a_reason_still_gets_one() {
+    let mut request = save_request();
+    request.degraded = Some(true);
+    request.degraded_detail = None;
+
+    let submission = sanitize_profile_request(request).expect("valid submission");
+
+    assert!(submission.degraded);
+    assert!(
+        submission
+            .agent_notes
+            .as_deref()
+            .is_some_and(|d| d.contains("without a reason")),
+        "a degraded submission with no reason must be given one"
+    );
 }

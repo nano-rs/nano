@@ -1,0 +1,93 @@
+name: workflow lint
+
+# NAN-2325. A workflow file that GitHub cannot load does not fail loudly — it
+# fails INVISIBLY. `${{ runner.temp }}` in a job-level `env:` disabled the whole
+# release pipeline for four runs: each one reported `conclusion: failure` with
+# ZERO jobs, no logs to open, and the run named after the file path instead of
+# its `name:` field, because GitHub could not parse far enough to read it. The
+# YAML was valid the entire time, so a YAML linter would not have caught it.
+#
+# actionlint validates the things GitHub validates at load time — context
+# availability, expression syntax, `runs-on` labels, `uses` references — plus
+# shellcheck over every `run:` block. It reports the exact error against the
+# exact line, which is what nothing in this repo was doing.
+
+on:
+  # NO `paths:` filter on pull_request, deliberately. A path-filtered workflow
+  # does not report a check at all on PRs that miss the filter, and GitHub
+  # leaves a REQUIRED check that never reported pending forever — so the moment
+  # this became a required check it would block every PR that did not touch
+  # .github/. Making it required is the point, so it has to run everywhere. It
+  # is a ~15s job on a hosted runner; that is cheaper than the failure mode it
+  # exists to catch.
+  pull_request:
+  # On main a path filter is fine: this is not gating anything here, it is the
+  # post-merge confirmation that what landed still loads.
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+      - '.github/actions/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: actionlint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  actionlint:
+    name: actionlint
+    # GitHub-hosted on purpose. This gate exists to catch a broken workflow
+    # file, so it must not depend on the self-hosted fleet that a broken
+    # workflow file might be what is keeping busy.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # BOTH tools are pinned by version AND sha256. actionlint shells out to
+      # shellcheck for every `run:` block, so leaving shellcheck to whatever the
+      # mutable ubuntu-latest image ships would mean a runner-image bump could
+      # turn an unrelated PR red for a rule its author never saw. A gate that
+      # goes red on its own schedule is a gate people learn to bypass.
+      #
+      # Downloading and executing a binary in CI is a supply-chain step; a
+      # version tag is mutable, a digest is not. Update version + digest
+      # together.
+      - name: Install actionlint and shellcheck
+        env:
+          ACTIONLINT_VERSION: 1.7.7
+          ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+          SHELLCHECK_VERSION: 0.10.0
+          SHELLCHECK_SHA256: 6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/lint-bin"
+
+          curl -fsSL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar xzf actionlint.tar.gz actionlint
+          mv actionlint "${RUNNER_TEMP}/lint-bin/"
+
+          curl -fsSL -o shellcheck.tar.xz \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          echo "${SHELLCHECK_SHA256}  shellcheck.tar.xz" | sha256sum -c -
+          tar xJf shellcheck.tar.xz "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          mv "shellcheck-v${SHELLCHECK_VERSION}/shellcheck" "${RUNNER_TEMP}/lint-bin/"
+
+          "${RUNNER_TEMP}/lint-bin/actionlint" --version
+          "${RUNNER_TEMP}/lint-bin/shellcheck" --version
+
+      # No ignore list and no severity filter. The repo is clean as of NAN-2325,
+      # so anything this reports is something the PR added — keep it that way
+      # rather than growing a suppression file nobody revisits.
+      - name: Run actionlint
+        run: |
+          set -euo pipefail
+          "${RUNNER_TEMP}/lint-bin/actionlint" \
+            -color \
+            -shellcheck "${RUNNER_TEMP}/lint-bin/shellcheck"

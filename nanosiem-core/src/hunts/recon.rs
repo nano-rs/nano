@@ -1886,7 +1886,14 @@ pub struct ProfileSubmission {
     pub huntable_surface: Option<HuntableSurface>,
     pub actor_weighting: Vec<ActorWeight>,
     pub degraded: bool,
-    pub degraded_detail: Option<String>,
+    /// The body's `degraded_detail`, named for what it IS rather than for the
+    /// wire field it arrived on (NAN-2324): a claim by the AGENT about the
+    /// agent's own run. It lands in `hunt_profiles.agent_notes` and is never
+    /// merged into the server's `degraded_detail`, which describes the census
+    /// and surface this save recomputes. The wire field keeps its name for
+    /// compatibility; this one does not, because "detail" next to the server's
+    /// own detail is exactly how the two got concatenated in the first place.
+    pub agent_notes: Option<String>,
 }
 
 /// `POST /api/hunts/drafts`.
@@ -2159,7 +2166,7 @@ pub fn sanitize_profile_request(req: SaveProfileRequest) -> Result<ProfileSubmis
         huntable_surface,
         actor_weighting,
         degraded,
-        degraded_detail,
+        agent_notes: degraded_detail,
     })
 }
 
@@ -2545,6 +2552,11 @@ impl ReconService {
                 &provenance,
                 run_degraded,
                 degraded_detail.as_deref(),
+                // No agent ran, so there is nothing an agent claimed. NULL
+                // rather than an empty string: "the agent said nothing" and
+                // "there was no agent" are the same fact here, and neither is
+                // an observation to render.
+                None,
                 generated_by,
             )
             .await?;
@@ -2736,16 +2748,32 @@ impl ReconService {
             }
         };
 
+        // NAN-2324: the two authors are stored SEPARATELY, not concatenated.
+        //
+        // These halves describe different things. `server_detail` is about the
+        // census and surface THIS call just recomputed — the artifact being
+        // stored. The agent's half is about the agent's own probing, which
+        // happened earlier, through different code, and which the recomputation
+        // may have just superseded.
+        //
+        // Joining them with "; " made those indistinguishable and the page
+        // rendered the result as one warning about the census. On a real profile
+        // that meant "all history depths are rollup floors (6d)" displayed
+        // directly above a census column reading 101d — both written honestly,
+        // one of them stale, and nothing to say which.
+        //
+        // Each half keeps its own bound rather than sharing one: `seal()` caps
+        // the server's at DEGRADED_DETAIL_MAX_BYTES and `sanitize_narrative`
+        // caps the agent's at NARRATIVE_MAX_BYTES. The merged string used to be
+        // truncated ONCE at the end, which meant a verbose agent could push the
+        // server's own record off the end of the field — the record being
+        // truncated was the one the operator most needed.
         let (server_degraded, server_detail) = degraded.seal();
-        let detail = match (server_detail, submission.degraded_detail) {
-            (Some(server), Some(agent)) => {
-                let mut merged = format!("{server}; {agent}");
-                truncate_bytes(&mut merged, DEGRADED_DETAIL_MAX_BYTES);
-                Some(merged)
-            }
-            (Some(only), None) | (None, Some(only)) => Some(only),
-            (None, None) => None,
-        };
+        let agent_notes = submission.agent_notes;
+        // The FLAG stays monotonic. A run whose agent hit failures may have
+        // written a fingerprint and drafts that understate, even when the
+        // server's own recomputation was clean — so the warning survives even
+        // though the detail explaining it now sits in `agent_notes`.
         let profile_degraded = server_degraded || submission.degraded;
 
         // Rebuilt with the sealed flag so the per-row `degraded` stamps match
@@ -2764,7 +2792,8 @@ impl ReconService {
             &submission.actor_weighting,
             &provenance,
             profile_degraded,
-            detail.as_deref(),
+            server_detail.as_deref(),
+            agent_notes.as_deref(),
             generated_by,
         )
         .await
@@ -3334,7 +3363,11 @@ impl ReconService {
         actor_weighting: &[ActorWeight],
         provenance: &SourceProvenance,
         degraded: bool,
+        // `degraded_detail` is the SERVER's own record; `agent_notes` is what
+        // the agent claimed about its own run. Never merged — see NAN-2324 in
+        // `save_profile` for the profile that made the difference visible.
         degraded_detail: Option<&str>,
+        agent_notes: Option<&str>,
         generated_by: Option<Uuid>,
     ) -> Result<HuntProfile, HuntError> {
         let census_json = serde_json::to_value(census)
@@ -3351,11 +3384,12 @@ impl ReconService {
         let row = sqlx::query(
             "INSERT INTO hunt_profiles ( \
                 census, fingerprint, huntable_surface, actor_weighting, \
-                degraded, degraded_detail, source_types, source_types_complete, generated_by \
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                degraded, degraded_detail, agent_notes, source_types, \
+                source_types_complete, generated_by \
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
              RETURNING id, census, fingerprint, huntable_surface, actor_weighting, \
-                       degraded, degraded_detail, source_types, source_types_complete, \
-                       generated_by, runner_id, created_at",
+                       degraded, degraded_detail, agent_notes, source_types, \
+                       source_types_complete, generated_by, runner_id, created_at",
         )
         .bind(census_json)
         .bind(fingerprint_json)
@@ -3363,6 +3397,7 @@ impl ReconService {
         .bind(actors_json)
         .bind(degraded)
         .bind(degraded_detail)
+        .bind(agent_notes)
         .bind(provenance.source_types().to_vec())
         .bind(provenance.is_complete())
         .bind(generated_by)
@@ -3380,6 +3415,7 @@ impl ReconService {
             actor_weighting: row.try_get("actor_weighting")?,
             degraded: row.try_get("degraded")?,
             degraded_detail: row.try_get("degraded_detail")?,
+            agent_notes: row.try_get("agent_notes")?,
             source_types: row.try_get("source_types")?,
             source_types_complete: row.try_get("source_types_complete")?,
             generated_by: row.try_get("generated_by")?,
