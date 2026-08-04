@@ -6,7 +6,7 @@
  * Used in dashboard panel editor and other places needing query input
  */
 import React, { useRef, useEffect, useImperativeHandle, useCallback } from 'react';
-import { EditorState, Extension, Compartment } from '@codemirror/state';
+import { EditorState, Compartment, type Extension } from '@codemirror/state';
 import { EditorView, keymap, placeholder as placeholderExt } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { bracketMatching } from '@codemirror/language';

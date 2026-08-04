@@ -33,6 +33,9 @@ interface DateTimeRangePickerProps {
       trailing chevron for popover affordance. Used by surfaces that want
       the label fused into the same pill as the value (rule-test drawer). */
   labelPrefix?: string;
+  /** Extra classes for the portalled popover surface. Desktop Studios use this
+      to lift the picker above their modal backdrop. */
+  popoverClassName?: string;
   /** Optional hard cap on the selectable range, in days (NAN-742). When
       set: presets longer than the cap are hidden, and once the user has
       anchored a date in the custom calendar, dates more than `maxRangeDays`
@@ -63,7 +66,7 @@ function presetDurationDays(presetValue: string): number {
   }
 }
 
-export function DateTimeRangePicker({ value, onChange, className, variant = 'default', aiMode = false, align, defaultMode, labelPrefix, maxRangeDays }: DateTimeRangePickerProps) {
+export function DateTimeRangePicker({ value, onChange, className, variant = 'default', aiMode = false, align, defaultMode, labelPrefix, popoverClassName, maxRangeDays }: DateTimeRangePickerProps) {
   const [open, setOpen] = React.useState(false);
   const isMobile = useIsMobile();
   // Always show custom picker expanded by default (desktop), presets first on mobile
@@ -257,7 +260,8 @@ export function DateTimeRangePicker({ value, onChange, className, variant = 'def
       <PopoverContent
         className={cn(
           "p-0 bg-popover border-border-2 rounded-xl shadow-[0_40px_100px_rgba(0,0,0,0.6)] overflow-hidden",
-          isMobile ? "w-[calc(100vw-2rem)]" : "w-[560px] max-w-[calc(100vw-16px)]"
+          isMobile ? "w-[calc(100vw-2rem)]" : "w-[560px] max-w-[calc(100vw-16px)]",
+          popoverClassName,
         )}
         align={align || (isMobile ? "center" : "end")}
         sideOffset={8}

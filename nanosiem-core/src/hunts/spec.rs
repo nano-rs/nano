@@ -35,7 +35,9 @@
 
 use crate::playbooks::models::{ParsedStepTree, PlaybookFrontmatter, PlaybookKind, PlaybookStep};
 
+use super::capabilities::normalize_requirements;
 use super::report::BudgetLimits;
+use crate::playbooks::models::HuntTelemetryRequirements;
 
 /// Ceilings a repository-authored budget may not exceed.
 ///
@@ -116,6 +118,8 @@ pub enum HuntSpecError {
     InvalidSourceType(String),
     #[error("too many required_source_types ({0}); the ceiling is {MAX_SOURCE_TYPES}")]
     TooManySourceTypes(usize),
+    #[error("invalid telemetry requirements: {0}")]
+    InvalidTelemetry(String),
     #[error("invalid mitre_technique `{0}`: expected an ATT&CK id like T1021 or T1071.001")]
     InvalidTechnique(String),
     #[error("invalid mitre_tactic `{0}`")]
@@ -141,6 +145,7 @@ pub struct HuntSpecDraft {
     pub schedule_timezone: String,
     pub lookback_window: String,
     pub required_source_types: Vec<String>,
+    pub telemetry: HuntTelemetryRequirements,
     pub mitre_tactic: Option<String>,
     pub mitre_technique: Option<String>,
     pub budget: BudgetLimits,
@@ -206,6 +211,8 @@ impl HuntSpecDraft {
         };
 
         let required_source_types = normalize_source_types(&fm.required_source_types)?;
+        let telemetry =
+            normalize_requirements(&fm.telemetry).map_err(HuntSpecError::InvalidTelemetry)?;
         let mitre_technique = fm
             .mitre_technique
             .as_deref()
@@ -229,6 +236,7 @@ impl HuntSpecDraft {
             schedule_timezone,
             lookback_window,
             required_source_types,
+            telemetry,
             mitre_tactic,
             mitre_technique,
             budget,
@@ -371,9 +379,8 @@ fn normalize_technique(raw: &str) -> Result<String, HuntSpecError> {
     let mut parts = upper.splitn(2, '.');
     let base = parts.next().unwrap_or_default();
     let sub = parts.next();
-    let base_ok = base.len() == 5
-        && base.starts_with('T')
-        && base[1..].chars().all(|c| c.is_ascii_digit());
+    let base_ok =
+        base.len() == 5 && base.starts_with('T') && base[1..].chars().all(|c| c.is_ascii_digit());
     let sub_ok = match sub {
         None => true,
         Some(s) => s.len() == 3 && s.chars().all(|c| c.is_ascii_digit()),
@@ -390,9 +397,7 @@ fn normalize_tactic(raw: &str) -> Result<String, HuntSpecError> {
     let lower = raw.to_ascii_lowercase();
     if !lower.is_empty()
         && lower.len() <= 64
-        && lower
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c == '-')
+        && lower.chars().all(|c| c.is_ascii_lowercase() || c == '-')
     {
         Ok(lower)
     } else {

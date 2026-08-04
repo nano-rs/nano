@@ -593,6 +593,20 @@ fn deciding_a_rule_idea_authorizes_under_the_lock_not_before_it() {
 }
 
 #[test]
+fn rule_ideas_never_label_repository_opening_guidance_as_npl() {
+    let prose = "identity-plane writes that extend or entrench access\nwindow: 24h";
+    assert_eq!(rule_idea_seed_npl(prose), None);
+    assert_eq!(
+        rule_idea_seed_npl("candidate service accounts by naming convention and behaviour"),
+        None
+    );
+
+    let npl = r#"source_type="windows_security" | stats count by user"#;
+    assert_eq!(rule_idea_seed_npl(npl), Some(npl));
+    assert_eq!(rule_idea_seed_npl("source_type="), None);
+}
+
+#[test]
 fn every_artifact_table_read_is_scoped() {
     // The migration's CHECK constraints fail closed on WRITE; a SELECT needs
     // the predicate. If a table is added to 9000054 and read here without one,

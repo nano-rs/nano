@@ -34,18 +34,19 @@ use chrono::{Duration, Utc};
 use uuid::Uuid;
 
 use crate::auth::{ArtifactScope, ScopeSet};
+use crate::hunts::capabilities::{
+    evaluate_readiness, normalize_capability, normalize_requirements, readiness_candidates,
+};
 use crate::hunts::error::HuntError;
 use crate::hunts::evidence::{EvidenceResolver, ResolvedEvidence};
 use crate::hunts::fingerprint::{CanonicalEntity, ValidatedSignal};
 use crate::hunts::knowledge::{
-    clamp_ttl_days, normalize_category, normalize_evidence_refs, normalize_fact,
-    normalize_subject, sanitize_confidence, KnowledgeCandidate, PreparedKnowledge,
+    clamp_ttl_days, normalize_category, normalize_evidence_refs, normalize_fact, normalize_subject,
+    sanitize_confidence, KnowledgeCandidate, PreparedKnowledge,
 };
 use crate::hunts::models::*;
 use crate::hunts::report::{BudgetUsage, LeadCandidate, SweepReport};
-use crate::hunts::repository::{
-    CommitInputs, HuntRepository, PreparedLead, RuleIdeaVerdict,
-};
+use crate::hunts::repository::{CommitInputs, HuntRepository, PreparedLead, RuleIdeaVerdict};
 
 /// Entity types `hunt_leads_entity_type_check` accepts.
 ///
@@ -92,11 +93,13 @@ impl HuntService {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Hunt>, HuntError> {
-        self.repo.list_hunts(enabled_only, limit, offset).await
+        let hunts = self.repo.list_hunts(enabled_only, limit, offset).await?;
+        self.hydrate_telemetry_readiness(hunts).await
     }
 
     pub async fn get_hunt(&self, playbook_id: Uuid) -> Result<Hunt, HuntError> {
-        self.repo.get_hunt(playbook_id).await
+        let hunt = self.repo.get_hunt(playbook_id).await?;
+        self.hydrate_one_hunt(hunt).await
     }
 
     pub async fn create_hunt(
@@ -104,7 +107,11 @@ impl HuntService {
         req: &CreateHuntRequest,
         created_by: Option<Uuid>,
     ) -> Result<Hunt, HuntError> {
-        self.repo.create_hunt(req, created_by).await
+        let mut normalized = req.clone();
+        normalized.telemetry =
+            normalize_requirements(&req.telemetry).map_err(HuntError::Validation)?;
+        let hunt = self.repo.create_hunt(&normalized, created_by).await?;
+        self.hydrate_one_hunt(hunt).await
     }
 
     pub async fn update_hunt(
@@ -112,11 +119,111 @@ impl HuntService {
         playbook_id: Uuid,
         req: &UpdateHuntRequest,
     ) -> Result<Hunt, HuntError> {
-        self.repo.update_hunt(playbook_id, req).await
+        let mut normalized = req.clone();
+        normalized.telemetry = req
+            .telemetry
+            .as_ref()
+            .map(normalize_requirements)
+            .transpose()
+            .map_err(HuntError::Validation)?;
+        let hunt = self.repo.update_hunt(playbook_id, &normalized).await?;
+        self.hydrate_one_hunt(hunt).await
     }
 
     pub async fn archive_hunt(&self, playbook_id: Uuid) -> Result<(), HuntError> {
         self.repo.archive_hunt(playbook_id).await
+    }
+
+    pub async fn list_source_capability_bindings(
+        &self,
+    ) -> Result<Vec<SourceCapabilityBinding>, HuntError> {
+        self.repo.list_source_capability_bindings().await
+    }
+
+    pub async fn set_source_capability_binding(
+        &self,
+        request: &SetSourceCapabilityBindingRequest,
+        updated_by: Option<Uuid>,
+    ) -> Result<SourceCapabilityBinding, HuntError> {
+        let source_type = normalize_source_identity(&request.source_type)?;
+        let capability =
+            normalize_capability(&request.capability).map_err(HuntError::Validation)?;
+        let state = request.state.trim().to_ascii_lowercase();
+        if !matches!(state.as_str(), "mapped" | "ignored") {
+            return Err(HuntError::Validation(
+                "binding state must be `mapped` or `ignored`".into(),
+            ));
+        }
+        self.repo
+            .set_source_capability_binding(&source_type, &capability, &state, updated_by)
+            .await
+    }
+
+    pub async fn reset_source_capability_binding(
+        &self,
+        request: &ResetSourceCapabilityBindingRequest,
+    ) -> Result<bool, HuntError> {
+        let source_type = normalize_source_identity(&request.source_type)?;
+        let capability =
+            normalize_capability(&request.capability).map_err(HuntError::Validation)?;
+        self.repo
+            .reset_source_capability_binding(&source_type, &capability)
+            .await
+    }
+
+    async fn hydrate_one_hunt(&self, hunt: Hunt) -> Result<Hunt, HuntError> {
+        self.hydrate_telemetry_readiness(vec![hunt])
+            .await?
+            .pop()
+            .ok_or_else(|| HuntError::Internal("telemetry hydration lost a hunt".into()))
+    }
+
+    /// Resolve all rows with one binding read and one source-health probe. A
+    /// 500-hunt library must not perform 500 ClickHouse round trips merely to
+    /// draw its readiness chips.
+    async fn hydrate_telemetry_readiness(
+        &self,
+        mut hunts: Vec<Hunt>,
+    ) -> Result<Vec<Hunt>, HuntError> {
+        if hunts.is_empty() {
+            return Ok(hunts);
+        }
+        let bindings = self.repo.list_source_capability_bindings().await?;
+        let candidates: Vec<String> = hunts
+            .iter()
+            .flat_map(|hunt| {
+                readiness_candidates(&hunt.telemetry, &hunt.required_source_types, &bindings)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let evaluated_at = Utc::now();
+        let silent: BTreeSet<String> = if candidates.is_empty() {
+            BTreeSet::new()
+        } else {
+            self.resolver
+                .silent_source_types(&candidates, evaluated_at - Duration::hours(24))
+                .await?
+                .into_iter()
+                .map(|source| source.trim().to_ascii_lowercase())
+                .collect()
+        };
+        for hunt in &mut hunts {
+            let hunt_candidates: BTreeSet<String> =
+                readiness_candidates(&hunt.telemetry, &hunt.required_source_types, &bindings)
+                    .into_iter()
+                    .collect();
+            let hunt_silent: BTreeSet<String> =
+                silent.intersection(&hunt_candidates).cloned().collect();
+            hunt.telemetry_readiness = Some(evaluate_readiness(
+                &hunt.telemetry,
+                &hunt.required_source_types,
+                &bindings,
+                &hunt_silent,
+                evaluated_at,
+            ));
+        }
+        Ok(hunts)
     }
 
     pub async fn list_runners(&self) -> Result<Vec<HuntRunner>, HuntError> {
@@ -142,7 +249,9 @@ impl HuntService {
         granted: bool,
         actor: Option<Uuid>,
     ) -> Result<HuntRunner, HuntError> {
-        self.repo.set_runner_agy_waiver(runner_id, granted, actor).await
+        self.repo
+            .set_runner_agy_waiver(runner_id, granted, actor)
+            .await
     }
 
     // =========================================================================
@@ -170,7 +279,60 @@ impl HuntService {
         runner_id: Uuid,
         lease_seconds: Option<i64>,
     ) -> Result<Option<ClaimedSweep>, HuntError> {
-        self.repo.claim_next_sweep(runner_id, lease_seconds).await
+        // Skip a bounded batch of held work so one dead source does not block
+        // every healthy hunt queued behind it. Each skipped row is FINISHED as
+        // held under its lease fence before the next candidate is considered.
+        const MAX_HELD_PER_CLAIM: usize = 64;
+        for _ in 0..MAX_HELD_PER_CLAIM {
+            let Some(mut claimed) = self.repo.claim_next_sweep(runner_id, lease_seconds).await?
+            else {
+                return Ok(None);
+            };
+
+            let readiness = self.hydrate_one_hunt(claimed.hunt.clone()).await;
+            match readiness {
+                Ok(hunt)
+                    if hunt
+                        .telemetry_readiness
+                        .as_ref()
+                        .is_some_and(|state| state.ready) =>
+                {
+                    claimed.hunt = hunt;
+                    return Ok(Some(claimed));
+                }
+                Ok(hunt) => {
+                    let detail = hunt
+                        .telemetry_readiness
+                        .as_ref()
+                        .map(|state| state.blocking_reasons.join("; "))
+                        .filter(|detail| !detail.is_empty())
+                        .unwrap_or_else(|| "telemetry readiness could not be established".into());
+                    self.repo
+                        .complete_held_sweep(
+                            claimed.sweep.id,
+                            runner_id,
+                            claimed.runner_fence,
+                            &detail,
+                        )
+                        .await?;
+                }
+                Err(error) => {
+                    // Fail closed and close the lease honestly. Returning the
+                    // error here would strand the claimed row until expiry;
+                    // running anyway would turn an unavailable health probe
+                    // into an implicit permission to under-report.
+                    self.repo
+                        .complete_held_sweep(
+                            claimed.sweep.id,
+                            runner_id,
+                            claimed.runner_fence,
+                            &format!("telemetry readiness probe failed: {error}"),
+                        )
+                        .await?;
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub async fn list_sweeps(
@@ -224,13 +386,7 @@ impl HuntService {
 
         for candidate in report.candidates.iter().take(MAX_CANDIDATES_PER_REPORT) {
             match self
-                .prepare_candidate(
-                    candidate,
-                    &known_signals,
-                    window_start,
-                    window_end,
-                    scope,
-                )
+                .prepare_candidate(candidate, &known_signals, window_start, window_end, scope)
                 .await?
             {
                 Some(lead) => prepared.push(lead),
@@ -239,7 +395,10 @@ impl HuntService {
         }
         // Anything past the cap is a refusal, not an omission, and must be
         // counted so a sweep spraying candidates is visible.
-        rejected += report.candidates.len().saturating_sub(MAX_CANDIDATES_PER_REPORT);
+        rejected += report
+            .candidates
+            .len()
+            .saturating_sub(MAX_CANDIDATES_PER_REPORT);
 
         let mut knowledge = Vec::new();
         let mut knowledge_rejected = 0usize;
@@ -576,7 +735,8 @@ impl HuntService {
         playbook_id: Uuid,
         enabled: bool,
     ) -> Result<Hunt, HuntError> {
-        self.repo
+        let hunt = self
+            .repo
             .update_hunt(
                 playbook_id,
                 &UpdateHuntRequest {
@@ -584,7 +744,8 @@ impl HuntService {
                     ..Default::default()
                 },
             )
-            .await
+            .await?;
+        self.hydrate_one_hunt(hunt).await
     }
 
     /// Set or clear a hunt's cadence. `None` is manual-only, not "unchanged".
@@ -594,9 +755,11 @@ impl HuntService {
         schedule_cron: Option<&str>,
         schedule_timezone: Option<&str>,
     ) -> Result<Hunt, HuntError> {
-        self.repo
+        let hunt = self
+            .repo
             .set_hunt_schedule(playbook_id, schedule_cron, schedule_timezone)
-            .await
+            .await?;
+        self.hydrate_one_hunt(hunt).await
     }
 
     /// Compose the rail summary.
@@ -609,14 +772,71 @@ impl HuntService {
         let counts = self.repo.summary_counts(scope).await?;
         let profile = self.repo.latest_profile(scope).await?;
 
-        let required = self.repo.required_source_types().await?;
-        let unhealthy_source_types = if required.is_empty() {
-            Vec::new()
-        } else {
-            self.resolver
-                .silent_source_types(&required, Utc::now() - Duration::hours(24))
-                .await?
-        };
+        let enabled_hunts = self.list_hunts(true, 10_000, 0).await?;
+        let blocked_hunts = enabled_hunts
+            .iter()
+            .filter(|hunt| {
+                hunt.telemetry_readiness
+                    .as_ref()
+                    .is_some_and(|readiness| !readiness.ready)
+            })
+            .count() as i64;
+        let mut unhealthy_source_types = BTreeSet::new();
+        let mut unresolved_capabilities = BTreeSet::new();
+        for readiness in enabled_hunts
+            .iter()
+            .filter_map(|hunt| hunt.telemetry_readiness.as_ref())
+        {
+            let silent: BTreeSet<&str> = readiness
+                .silent_source_types
+                .iter()
+                .map(String::as_str)
+                .collect();
+            unhealthy_source_types.extend(
+                readiness
+                    .required_source_types
+                    .iter()
+                    .filter(|source| silent.contains(source.as_str()))
+                    .cloned(),
+            );
+            unhealthy_source_types.extend(
+                readiness
+                    .all_of
+                    .iter()
+                    .filter(|resolution| !resolution.satisfied)
+                    .flat_map(|resolution| resolution.source_types.iter())
+                    .filter(|source| silent.contains(source.as_str()))
+                    .cloned(),
+            );
+            unresolved_capabilities.extend(
+                readiness
+                    .all_of
+                    .iter()
+                    .filter(|resolution| !resolution.satisfied)
+                    .map(|resolution| resolution.capability.clone()),
+            );
+            if !readiness.one_of.is_empty()
+                && !readiness
+                    .one_of
+                    .iter()
+                    .any(|resolution| resolution.satisfied)
+            {
+                unresolved_capabilities.extend(
+                    readiness
+                        .one_of
+                        .iter()
+                        .map(|resolution| resolution.capability.clone()),
+                );
+                unhealthy_source_types.extend(
+                    readiness
+                        .one_of
+                        .iter()
+                        .flat_map(|resolution| resolution.source_types.iter())
+                        .filter(|source| silent.contains(source.as_str()))
+                        .cloned(),
+                );
+            }
+        }
 
         let (hunt_gaps, blind_techniques) = profile
             .as_ref()
@@ -633,11 +853,26 @@ impl HuntService {
             last_recon_at: profile.as_ref().map(|p| p.created_at),
             recon_degraded: profile.as_ref().is_some_and(|p| p.degraded),
             recon_degraded_detail: profile.as_ref().and_then(|p| p.degraded_detail.clone()),
-            unhealthy_source_types,
+            unhealthy_source_types: unhealthy_source_types.into_iter().collect(),
+            blocked_hunts,
+            unresolved_capabilities: unresolved_capabilities.into_iter().collect(),
             hunt_gaps,
             blind_techniques,
         })
     }
+}
+
+fn normalize_source_identity(raw: &str) -> Result<String, HuntError> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty()
+        || normalized.len() > 255
+        || normalized.chars().any(|character| character.is_control())
+    {
+        return Err(HuntError::Validation(
+            "source_type must be 1-255 printable characters".into(),
+        ));
+    }
+    Ok(normalized)
 }
 
 /// Count `gap` and `blind` techniques in a recon profile's huntable surface.

@@ -95,6 +95,7 @@
 //! [`ArtifactScope`](crate::auth::ArtifactScope) so a reader denied a source
 //! cannot recover its contents through a narrative.
 
+pub mod capabilities;
 pub mod error;
 pub mod evidence;
 pub mod fingerprint;
@@ -108,6 +109,10 @@ pub mod scoring;
 pub mod service;
 pub mod spec;
 
+pub use capabilities::{
+    evaluate_readiness, infer_source_capabilities, normalize_capability, normalize_requirements,
+    readiness_candidates, FieldObservation, InferredCapability, AUTOMATIC_BINDING_CONFIDENCE,
+};
 pub use error::HuntError;
 pub use evidence::{
     ClickHouseEvidenceResolver, EvidenceResolver, ResolvedEvent, ResolvedEvidence,

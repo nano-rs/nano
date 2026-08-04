@@ -34,13 +34,16 @@ function AlertDialogOverlay({
 function AlertDialogContent({
   className,
   ref,
+  overlayClassName,
   ...props
 }: React.ComponentPropsWithoutRef<typeof AlertDialogPrimitive.Content> & {
   ref?: React.Ref<React.ComponentRef<typeof AlertDialogPrimitive.Content>>;
+  /** Raise the portal overlay with the content when nested in a higher app layer. */
+  overlayClassName?: string;
 }) {
   return (
     <AlertDialogPortal>
-      <AlertDialogOverlay />
+      <AlertDialogOverlay className={overlayClassName} />
       <AlertDialogPrimitive.Content
         ref={ref}
         className={cn(

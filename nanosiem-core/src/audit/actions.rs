@@ -421,6 +421,10 @@ pub const HUNT_DRAFTS_CREATED: &str = "hunt_drafts_created";
 /// the row, so the audit log is the only durable record of who decided a fact
 /// the agent believed was wrong, and why.
 pub const HUNT_KNOWLEDGE_REVOKED: &str = "hunt_knowledge_revoked";
+/// An analyst confirmed or rejected an inferred source-to-capability binding.
+pub const HUNT_SOURCE_CAPABILITY_BOUND: &str = "hunt_source_capability_bound";
+/// An analyst removed their override, revealing recon's latest inference again.
+pub const HUNT_SOURCE_CAPABILITY_RESET: &str = "hunt_source_capability_reset";
 /// An analyst authorised one machine to run unattended sweeps on Antigravity
 /// (NAN-2264).
 ///

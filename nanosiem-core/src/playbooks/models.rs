@@ -61,9 +61,7 @@ impl PlaybookCategory {
 /// The default is deliberately `Response`: every pre-NAN-2238 file, and every
 /// file that says nothing, is a document a human follows. Becoming a process
 /// that executes has to be written down.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema,
-)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PlaybookKind {
     #[default]
@@ -568,6 +566,11 @@ pub struct PlaybookFrontmatter {
     /// across sweeps.
     #[serde(default)]
     pub required_source_types: Vec<String>,
+    /// Portable telemetry intent. Unlike `required_source_types`, these are
+    /// semantic capabilities which recon resolves onto this deployment's
+    /// concrete, customer-defined source type names.
+    #[serde(default)]
+    pub telemetry: HuntTelemetryRequirements,
     #[serde(default)]
     pub mitre_tactic: Option<String>,
     #[serde(default)]
@@ -575,6 +578,23 @@ pub struct PlaybookFrontmatter {
     /// Ceiling on what one sweep may spend. Not a prescribed method.
     #[serde(default)]
     pub budget: Option<HuntBudgetFrontmatter>,
+}
+
+/// Semantic telemetry a hunt needs, independent of how one deployment names
+/// its concrete sources.
+///
+/// `all_of` requires every capability. `one_of` is one alternative group: at
+/// least one member must resolve to live telemetry. `optional` enriches a hunt
+/// but never holds it. The deliberately small shape is portable in markdown,
+/// JSONB, OpenAPI, and the runner prompt without inventing a policy language.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct HuntTelemetryRequirements {
+    #[serde(default)]
+    pub all_of: Vec<String>,
+    #[serde(default)]
+    pub one_of: Vec<String>,
+    #[serde(default)]
+    pub optional: Vec<String>,
 }
 
 /// The `budget:` block of hunt frontmatter — the ceiling a sweep may spend,

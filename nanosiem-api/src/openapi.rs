@@ -278,10 +278,23 @@ pub fn swagger_ui() -> utoipa_swagger_ui::SwaggerUi {
     utoipa_swagger_ui::SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", build_openapi())
 }
 
-/// The path prefix that defines the desktop's hunting wire seam (NAN-2263).
-const DESKTOP_WIRE_PREFIX: &str = "/api/hunts";
+/// True for the API paths whose response shapes cross the desktop's typed
+/// hunting/playbook boundary.
+///
+/// Hunts remain a subtree; the library adds only its repository read and the
+/// one repository action the desktop exposes. Keeping the repository's edit,
+/// catalog and per-file import surfaces out of this contract avoids turning a
+/// focused drift gate into a second copy of the full OpenAPI document.
+fn is_desktop_wire_path(path: &str) -> bool {
+    path.starts_with("/api/hunts")
+        || matches!(
+            path,
+            "/api/playbook-repositories"
+                | "/api/playbook-repositories/{id}/sync-and-import"
+        )
+}
 
-/// Schemas included even though no `/api/hunts` path references them directly.
+/// Schemas included even though no selected desktop path references them directly.
 ///
 /// Both are the READ shapes behind columns the models declare as untyped
 /// `serde_json::Value`, so the `$ref` walk alone can never reach them:
@@ -297,15 +310,16 @@ const DESKTOP_WIRE_PREFIX: &str = "/api/hunts";
 const DESKTOP_WIRE_EXTRA_SCHEMAS: &[&str] = &["ParsedStepTree", "OrgFingerprint"];
 
 /// The scoped OpenAPI document the desktop's generated TypeScript wire types
-/// are built from (NAN-2263): every `/api/hunts` path plus the schemas
-/// transitively reachable from them.
+/// are built from (NAN-2263, NAN-2312): every `/api/hunts` path plus the
+/// repository collection and sync/import action,
+/// with the schemas transitively reachable from them.
 ///
 /// # Why a scoped spec rather than the whole thing
 ///
 /// * The full spec differs between the open and enterprise editions (meloD,
 ///   notebooks, cases…), so a committed copy of it could never be asserted
 ///   from both test matrices. The hunts surface is registered ungated and its
-///   models live in `nanosiem-core`, so this subtree is identical in both —
+///   playbook models live in `nanosiem-core`, so this seam is identical in both —
 ///   which is what lets the drift test run under either feature set.
 /// * The committed `docs/api/openapi.json` is refreshed on a different cadence
 ///   and for a different consumer (the docs RAG); coupling the desktop's
@@ -346,7 +360,7 @@ pub fn desktop_wire_spec() -> serde_json::Value {
         .as_object()
         .expect("spec has paths")
         .iter()
-        .filter(|(path, _)| path.starts_with(DESKTOP_WIRE_PREFIX))
+        .filter(|(path, _)| is_desktop_wire_path(path))
         .map(|(path, item)| (path.clone(), item.clone()))
         .collect();
 
@@ -382,8 +396,8 @@ pub fn desktop_wire_spec() -> serde_json::Value {
     serde_json::json!({
         "openapi": full["openapi"],
         "info": {
-            "title": "nano desktop wire seam — /api/hunts",
-            "description": "GENERATED — do not edit. The /api/hunts subtree of the nano API spec, plus transitively referenced schemas. Regenerate with: cargo run -p nanosiem-api --bin export_openapi -- --desktop-wire > nano-desktop/openapi/hunts-wire.json",
+            "title": "nano desktop hunting + playbook wire seam",
+            "description": "GENERATED — do not edit. The API paths used by nano-desktop's Hunting and Playbook Library surfaces, plus transitively referenced schemas. Regenerate with: cargo run -p nanosiem-api --bin export_openapi -- --desktop-wire > nano-desktop/openapi/hunts-wire.json",
             "version": full["info"]["version"],
         },
         "paths": paths,
@@ -888,7 +902,8 @@ mod tests {
         );
     }
 
-    /// NAN-2263 — the desktop's hunting TypeScript is GENERATED from
+    /// NAN-2263 / NAN-2312 — the desktop's hunting and playbook-library
+    /// TypeScript is GENERATED from
     /// `nano-desktop/openapi/hunts-wire.json`. If the server's wire shapes move
     /// and that file does not, the desktop compiles against a contract the
     /// server no longer honours — which is exactly how ~30 silent mismatches
@@ -909,8 +924,8 @@ mod tests {
         // file guarantees nothing).
         let path_count = generated["paths"].as_object().map_or(0, |m| m.len());
         assert!(
-            path_count >= 20,
-            "desktop wire spec collapsed to {path_count} paths — the /api/hunts filter broke"
+            path_count >= 22,
+            "desktop wire spec collapsed to {path_count} paths — the path filter broke"
         );
         for schema in [
             "Hunt",
@@ -930,6 +945,9 @@ mod tests {
             "CensusRow",
             "OrgFingerprint",
             "HuntableSurface",
+            "PlaybookRepository",
+            "ListPlaybookRepositoriesResponse",
+            "SyncAndImportResponse",
         ] {
             assert!(
                 generated["components"]["schemas"].get(schema).is_some(),
@@ -967,7 +985,7 @@ mod tests {
         // (preserve_order on/off) cannot fake drift.
         if committed != generated {
             panic!(
-                "nano-desktop/openapi/hunts-wire.json is STALE — the server's /api/hunts wire \
+                "nano-desktop/openapi/hunts-wire.json is STALE — the server's desktop wire \
                  contract moved. Regenerate the spec and the TypeScript it feeds:\n\n  \
                  cargo run -p nanosiem-api --bin export_openapi -- --desktop-wire > nano-desktop/openapi/hunts-wire.json\n  \
                  (cd nano-desktop && npm run generate:api-types)\n\n\

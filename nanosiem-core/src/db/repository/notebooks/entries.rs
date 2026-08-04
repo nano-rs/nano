@@ -87,7 +87,7 @@ impl NotebookRepository {
             FROM notebook_entries e
             LEFT JOIN users u ON e.created_by = u.id
             WHERE e.notebook_id = $1
-            ORDER BY e.created_at ASC
+            ORDER BY e.created_at ASC, e.id ASC
             LIMIT $2 OFFSET $3
             "#,
         )

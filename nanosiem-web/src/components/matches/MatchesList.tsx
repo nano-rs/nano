@@ -169,6 +169,8 @@ interface MatchesListProps {
   onFilterChange: (f: 'all' | 'alerts') => void;
   alertedMatchIds: Set<string>;
   loading: boolean;
+  /** Fill a bounded desktop pane instead of using the web page's sticky rail. */
+  contained?: boolean;
 }
 
 export function MatchesList({
@@ -179,6 +181,7 @@ export function MatchesList({
   onFilterChange,
   alertedMatchIds,
   loading,
+  contained = false,
 }: MatchesListProps) {
   const now = useMemo(() => new Date(), [views]);
 
@@ -197,7 +200,10 @@ export function MatchesList({
       // Stays pinned below the sticky tab bar while the detail pane scrolls.
       // `max-h` clamps at 80vh so the list always has an internal scrollbar
       // rather than trying to match the detail pane's height on long matches.
-      className="sticky top-9 self-start flex flex-col border-r border-border bg-card overflow-hidden min-h-0 max-h-[80vh]"
+      className={cn(
+        'flex min-h-0 flex-col overflow-hidden border-r border-border bg-card',
+        contained ? 'h-full w-full self-stretch' : 'sticky top-9 max-h-[80vh] self-start',
+      )}
     >
       {/* Filter tabs */}
       <div className="flex items-center gap-0.5 p-2 border-b border-border">

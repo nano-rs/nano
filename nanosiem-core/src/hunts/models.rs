@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::playbooks::models::HuntTelemetryRequirements;
 use crate::typeid;
 
 // =============================================================================
@@ -54,8 +55,10 @@ pub struct Hunt {
     pub status: String,
     pub tags: Vec<String>,
 
-    /// The nPL the sweep OPENS with. A starting point the agent may abandon.
-    /// The hunt's markdown body — its HYPOTHESIS, not its query.
+    /// The opening investigative seed. Repository-authored hunts carry prose
+    /// guidance here; recon drafts may carry executable nPL. In either case it
+    /// is a starting point the agent may abandon, never a query the UI may
+    /// blindly execute.
     ///
     /// Detail-only: populated by `get_hunt` and left `None` by `list_hunts`, so
     /// a 500-hunt library does not carry 500 markdown documents. Skipped from
@@ -65,7 +68,7 @@ pub struct Hunt {
     /// This was stored and never read back: `HUNT_SELECT` projected no `p.doc`,
     /// so every hunt reached the detail view with an undefined doc and rendered
     /// the "No doc — the nPL is the whole definition" fallback. A hunt IS its
-    /// hypothesis; a hunt reduced to its opening query is a saved search.
+    /// hypothesis; a hunt reduced to its opening seed is not a complete hunt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
     /// The cached step tree the playbook parser produces from `doc`. Detail-only
@@ -77,6 +80,13 @@ pub struct Hunt {
     pub schedule_cron: Option<String>,
     pub schedule_timezone: String,
     pub required_source_types: Vec<String>,
+    /// Portable intent from hunt frontmatter. Recon resolves these capabilities
+    /// onto this deployment's concrete source names.
+    pub telemetry: HuntTelemetryRequirements,
+    /// Server-evaluated readiness. Repositories leave this `None`; the service
+    /// populates it after resolving bindings and checking recent telemetry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_readiness: Option<HuntTelemetryReadiness>,
     pub mitre_tactic: Option<String>,
     pub mitre_technique: Option<String>,
     pub enabled: bool,
@@ -104,6 +114,70 @@ pub struct Hunt {
 
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// One environment-specific binding between a semantic capability and the
+/// source type a customer actually uses.
+///
+/// `origin = analyst` rows are durable overrides. Recon refreshes only
+/// `origin = inferred` rows, so a later name/schema inference can never erase a
+/// human decision. `state = ignored` is a negative override and is as important
+/// as a positive mapping: without it, a false-positive name match reappears on
+/// every profile run.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+pub struct SourceCapabilityBinding {
+    pub source_type: String,
+    pub capability: String,
+    pub state: String,
+    pub origin: String,
+    pub confidence: f64,
+    pub basis: String,
+    pub evidence: String,
+    pub last_observed_at: Option<DateTime<Utc>>,
+    pub updated_by: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// How one capability resolved in the current environment.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+pub struct CapabilityResolution {
+    pub capability: String,
+    /// Bindings at or above the automatic trust threshold.
+    pub source_types: Vec<String>,
+    /// The subset with telemetry in the readiness window.
+    pub live_source_types: Vec<String>,
+    pub satisfied: bool,
+}
+
+/// Server-owned answer to “can this hunt honestly run right now?”
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+pub struct HuntTelemetryReadiness {
+    pub ready: bool,
+    pub evaluated_at: DateTime<Utc>,
+    pub all_of: Vec<CapabilityResolution>,
+    pub one_of: Vec<CapabilityResolution>,
+    pub optional: Vec<CapabilityResolution>,
+    /// Legacy exact requirements, retained while existing hunt libraries move
+    /// to semantic capabilities.
+    pub required_source_types: Vec<String>,
+    pub live_required_source_types: Vec<String>,
+    pub silent_source_types: Vec<String>,
+    pub blocking_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct SetSourceCapabilityBindingRequest {
+    pub source_type: String,
+    pub capability: String,
+    /// `mapped` or `ignored`.
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ResetSourceCapabilityBindingRequest {
+    pub source_type: String,
+    pub capability: String,
 }
 
 /// The budget block as it appears in hunt frontmatter.
@@ -154,6 +228,8 @@ pub struct CreateHuntRequest {
     pub schedule_timezone: Option<String>,
     #[serde(default)]
     pub required_source_types: Vec<String>,
+    #[serde(default)]
+    pub telemetry: HuntTelemetryRequirements,
     #[serde(default)]
     pub mitre_tactic: Option<String>,
     #[serde(default)]
@@ -213,6 +289,8 @@ pub struct UpdateHuntRequest {
     pub schedule_timezone: Option<String>,
     #[serde(default)]
     pub required_source_types: Option<Vec<String>>,
+    #[serde(default)]
+    pub telemetry: Option<HuntTelemetryRequirements>,
     #[serde(default)]
     pub mitre_tactic: Option<String>,
     #[serde(default)]
@@ -969,6 +1047,11 @@ pub struct HuntSummary {
     /// rather than run partial, so this is the list that explains why a hunt is
     /// not producing.
     pub unhealthy_source_types: Vec<String>,
+    /// Enabled hunts whose hard telemetry contract is not currently ready.
+    pub blocked_hunts: i64,
+    /// Portable requirements with no live trusted binding. Unlike an unhealthy
+    /// source, these may be unresolved aliases rather than broken ingestion.
+    pub unresolved_capabilities: Vec<String>,
 
     /// From the latest recon profile's `huntable_surface`, which maps a
     /// technique id to `covered` | `gap` | `blind`. `gap` = we have the
@@ -1121,7 +1204,9 @@ mod wire_contract_tests {
             playbook_id: uuid::Uuid::nil(),
             title: "Service account interactive logon".to_string(),
             subtitle: Some("machine accounts logging on like people".to_string()),
-            doc: Some("## Hypothesis\nService accounts should not log on interactively.".to_string()),
+            doc: Some(
+                "## Hypothesis\nService accounts should not log on interactively.".to_string(),
+            ),
             steps: None,
             category: "identity".to_string(),
             status: "live".to_string(),
@@ -1130,6 +1215,8 @@ mod wire_contract_tests {
             schedule_cron: None,
             schedule_timezone: "UTC".to_string(),
             required_source_types: vec![],
+            telemetry: Default::default(),
+            telemetry_readiness: None,
             mitre_tactic: None,
             mitre_technique: None,
             enabled: false,
@@ -1184,9 +1271,16 @@ mod wire_contract_tests {
         // …and must be ABSENT, not null, when the list projection did not — so
         // "the list did not ask" stays distinguishable from "this hunt has no
         // doc", which is what the detail view's empty-state copy claims.
-        let listed = Hunt { doc: None, steps: None, ..hunt };
+        let listed = Hunt {
+            doc: None,
+            steps: None,
+            ..hunt
+        };
         let listed = serde_json::to_value(&listed).expect("serialises");
-        assert!(listed.get("doc").is_none(), "an absent doc must be omitted, not null");
+        assert!(
+            listed.get("doc").is_none(),
+            "an absent doc must be omitted, not null"
+        );
     }
 }
 

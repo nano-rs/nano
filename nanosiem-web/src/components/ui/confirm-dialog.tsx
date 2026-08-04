@@ -66,6 +66,8 @@ export interface ConfirmDialogProps {
   confirmIcon?: React.ReactNode;
   /** Extra classes on AlertDialogContent (e.g. a wider `max-w-lg`). */
   className?: string;
+  /** Raise the confirmation above a desktop Studio portal. */
+  layer?: 'default' | 'studio';
   /** Extra classes on the confirm button (for one-off colour overrides). */
   confirmClassName?: string;
 }
@@ -87,13 +89,16 @@ export function ConfirmDialog({
   icon,
   confirmIcon,
   className,
+  layer = 'default',
   confirmClassName,
 }: ConfirmDialogProps) {
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
       <AlertDialogContent
+        overlayClassName={layer === 'studio' ? '!z-[180]' : undefined}
         className={cn(
           'max-w-md gap-0 p-0 bg-card border-border text-foreground',
+          layer === 'studio' && '!z-[190]',
           className,
         )}
       >

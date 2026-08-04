@@ -5,7 +5,7 @@
 // callout remain placeholder-today; Fleet health was wired to real data in
 // NAN-612 (see /api/rules/fleet-health).
 
-import { useMemo } from 'react';
+import { useMemo, type ReactNode } from 'react';
 import { AlertTriangle, ArrowRight } from 'lucide-react';
 import type { DetectionRule, FleetHealthSummary, AlertVelocityBucket } from '@/lib/api/types';
 import { SEV_META, bandOf, type SeverityKey } from './helpers';
@@ -14,6 +14,9 @@ interface RulesOverviewProps {
   rules: DetectionRule[];
   silentCount: number;
   alerts24h: number;
+  /** Dense desktop treatment: keeps all four signals in view without pushing
+   *  the rule inventory below the fold on a short Tauri window. */
+  compact?: boolean;
   /**
    * Fleet-health rollup over the schedulable rule fleet (NAN-612).
    * Pass `null`/`undefined` while loading or on error — the Fleet health cell
@@ -63,7 +66,7 @@ function FleetMatrix({ rules }: { rules: DetectionRule[] }) {
 // of the hard-coded fake series. When no buckets are loaded yet (or when a
 // quiet tenant has zero alerts in the window), all bars render at the
 // minimum height (faint outline) — same shape, honest data.
-function VelocitySpark({ buckets }: { buckets?: AlertVelocityBucket[] | null }) {
+function VelocitySpark({ buckets, compact = false }: { buckets?: AlertVelocityBucket[] | null; compact?: boolean }) {
   // Server returns one bucket per hour over the requested window, but be
   // defensive about empty / missing data — fall back to 24 zeros so the
   // sparkline still occupies its layout slot.
@@ -73,7 +76,7 @@ function VelocitySpark({ buckets }: { buckets?: AlertVelocityBucket[] | null }) 
   }, [buckets]);
   const max = Math.max(...bars, 1);
   return (
-    <div className="flex items-end gap-[2px] h-[28px]">
+    <div className={`flex items-end gap-[2px] ${compact ? 'h-[18px]' : 'h-[28px]'}`}>
       {bars.map((v, i) => (
         <div
           key={i}
@@ -93,7 +96,7 @@ function VelocitySpark({ buckets }: { buckets?: AlertVelocityBucket[] | null }) 
   );
 }
 
-export function RulesOverview({ rules, silentCount, alerts24h, fleetHealth, velocity, onReviewSilent }: RulesOverviewProps) {
+export function RulesOverview({ rules, silentCount, alerts24h, fleetHealth, velocity, onReviewSilent, compact = false }: RulesOverviewProps) {
   const byBand = useMemo(() => {
     const acc: Record<string, number> = { firing: 0, active: 0, silent: 0, staging: 0, disabled: 0 };
     rules.forEach((r) => { acc[bandOf(r)]++; });
@@ -111,6 +114,22 @@ export function RulesOverview({ rules, silentCount, alerts24h, fleetHealth, velo
 
   const live = rules.filter((r) => r.mode === 'live' || r.mode === 'alerting').length;
   const total = rules.length || 1;
+
+  if (compact) {
+    return (
+      <CompactRulesOverview
+        live={live}
+        total={rules.length}
+        silentCount={silentCount}
+        alerts24h={alerts24h}
+        fleetHealth={fleetHealth ?? null}
+        velocity={velocity}
+        byBand={byBand}
+        bySev={bySev}
+        onReviewSilent={onReviewSilent}
+      />
+    );
+  }
 
   return (
     <div
@@ -227,6 +246,175 @@ export function RulesOverview({ rules, silentCount, alerts24h, fleetHealth, velo
   );
 }
 
+/**
+ * Desktop-sized overview. The full web dashboard's dot matrix is useful on a
+ * tall page, but hundreds of dim silent-rule dots consume most of a short
+ * desktop viewport while looking like blank space. This variant keeps the same
+ * four decisions in one scan line and leaves the inventory visible below it.
+ */
+function CompactRulesOverview({
+  live,
+  total,
+  silentCount,
+  alerts24h,
+  fleetHealth,
+  velocity,
+  byBand,
+  bySev,
+  onReviewSilent,
+}: {
+  live: number;
+  total: number;
+  silentCount: number;
+  alerts24h: number;
+  fleetHealth: FleetHealthSummary | null;
+  velocity?: AlertVelocityBucket[] | null;
+  byBand: Record<string, number>;
+  bySev: Record<SeverityKey, number>;
+  onReviewSilent?: () => void;
+}) {
+  const healthTotal = fleetHealth?.total ?? 0;
+  const hasHealth = fleetHealth != null && healthTotal > 0;
+  const healthPct = hasHealth
+    ? Math.round(((fleetHealth?.healthy ?? 0) / healthTotal) * 100)
+    : null;
+
+  return (
+    <div
+      className="overflow-hidden rounded-lg border border-border"
+      style={{ background: 'var(--border)', containerType: 'inline-size' }}
+      data-density="compact"
+    >
+      <div className="grid grid-cols-4 gap-px @max-[820px]:grid-cols-2 @max-[480px]:grid-cols-1">
+        <div className="min-w-0 bg-card px-3 py-2.5">
+          <OverviewLabel>Detection fleet</OverviewLabel>
+          <div className="mt-1 flex items-baseline gap-1.5">
+            <OverviewValue>{live}</OverviewValue>
+            <span className="text-[10.5px] text-muted-foreground">live</span>
+            <span className="text-muted-foreground/50">·</span>
+            <span className="font-mono text-[10px] text-muted-foreground tabular-nums">
+              {total} total
+            </span>
+          </div>
+          <div
+            className="mt-2 flex h-1 overflow-hidden rounded-full"
+            style={{ background: 'color-mix(in srgb, var(--foreground) 5%, transparent)' }}
+          >
+            {(['critical', 'high', 'medium', 'low'] as SeverityKey[]).map((key) => {
+              const width = ((bySev[key] || 0) / Math.max(total, 1)) * 100;
+              return width > 0
+                ? <span key={key} style={{ width: `${width}%`, background: SEV_META[key].color }} />
+                : null;
+            })}
+          </div>
+          <div className="mt-1.5 flex min-w-0 flex-wrap gap-x-2.5 gap-y-0.5 font-mono text-[9.5px] text-muted-foreground">
+            {(['critical', 'high', 'medium', 'low'] as SeverityKey[]).map((key) => {
+              const shortLabel = key === 'critical' ? 'crit' : key === 'medium' ? 'med' : key;
+              return (
+                <span key={key} className="inline-flex items-center gap-1 whitespace-nowrap">
+                  <span className="size-[5px] rounded-full" style={{ background: SEV_META[key].color }} />
+                  {bySev[key] || 0} {shortLabel}
+                </span>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="min-w-0 bg-card px-3 py-2.5">
+          <OverviewLabel>
+            <span className="size-[5px] rounded-full bg-destructive animate-pulse" />
+            Firing now
+          </OverviewLabel>
+          <div className="mt-1 flex items-end justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-baseline gap-1.5">
+                <OverviewValue>{byBand.firing}</OverviewValue>
+                <span className="text-[10.5px] text-muted-foreground">rules</span>
+              </div>
+              <div className="mt-1 font-mono text-[9.5px] text-muted-foreground whitespace-nowrap">
+                <span className="text-foreground tabular-nums">{alerts24h.toLocaleString()}</span> alerts · 24h
+              </div>
+            </div>
+            <VelocitySpark buckets={velocity} compact />
+          </div>
+        </div>
+
+        <div className="min-w-0 bg-card px-3 py-2.5">
+          <OverviewLabel>
+            <AlertTriangle className="size-3 text-warning" strokeWidth={2} />
+            Needs review
+          </OverviewLabel>
+          <div className="mt-1 flex items-baseline gap-1.5">
+            <OverviewValue>{silentCount}</OverviewValue>
+            <span className="text-[10.5px] text-muted-foreground">silent rules</span>
+          </div>
+          <div className="mt-1.5 flex min-w-0 items-center justify-between gap-2 text-[9.5px]">
+            <span className="truncate text-muted-foreground">No matches in 30+ days</span>
+            {silentCount > 0 && (
+              <button
+                type="button"
+                onClick={onReviewSilent}
+                className="inline-flex shrink-0 items-center gap-0.5 text-primary hover:underline"
+              >
+                Review <ArrowRight className="size-2.5" />
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="min-w-0 bg-card px-3 py-2.5">
+          <OverviewLabel>Fleet health</OverviewLabel>
+          <div className="mt-1 flex items-baseline gap-1.5">
+            <OverviewValue>{healthPct ?? '—'}</OverviewValue>
+            {healthPct != null && <span className="text-[12px] text-muted-foreground">%</span>}
+            {hasHealth && (
+              <span className="font-mono text-[9.5px] text-muted-foreground tabular-nums">
+                · {healthTotal} scheduled
+              </span>
+            )}
+          </div>
+          <div className="mt-1.5 flex items-center gap-3 font-mono text-[9.5px] text-muted-foreground">
+            <HealthDatum label="Healthy" value={hasHealth ? fleetHealth?.healthy ?? 0 : '—'} color="var(--success)" />
+            <HealthDatum label="Slow" value={hasHealth ? fleetHealth?.slow ?? 0 : '—'} color="var(--warning)" />
+            <HealthDatum label="Errors" value={hasHealth ? fleetHealth?.errors ?? 0 : '—'} color="var(--destructive)" />
+          </div>
+          {!hasHealth && (
+            <div className="mt-1 truncate text-[9.5px] text-muted-foreground/70">
+              No scheduled runs yet
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function OverviewLabel({ children }: { children: ReactNode }) {
+  return (
+    <div className="flex items-center gap-1.5 font-mono text-[9px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+      {children}
+    </div>
+  );
+}
+
+function OverviewValue({ children }: { children: ReactNode }) {
+  return (
+    <span className="text-[22px] font-semibold leading-none text-foreground tabular-nums">
+      {children}
+    </span>
+  );
+}
+
+function HealthDatum({ label, value, color }: { label: string; value: number | string; color: string }) {
+  return (
+    <span className="inline-flex min-w-0 items-center gap-1 whitespace-nowrap">
+      <span className="size-[5px] shrink-0 rounded-full" style={{ background: color }} />
+      <span className="truncate">{label}</span>
+      <span className="text-foreground tabular-nums">{value}</span>
+    </span>
+  );
+}
+
 // Tri-segment progress bar (green / amber / red) sized proportionally so a
 // reviewer can read the mix at a glance. Empty (pending) rules in the fleet
 // — those without a `last_run_at` — show as the empty remainder of the bar.
@@ -318,4 +506,3 @@ function FleetHealthCell({ fleetHealth }: { fleetHealth: FleetHealthSummary | nu
     </div>
   );
 }
-

@@ -245,8 +245,7 @@ fn a_response_playbook_is_not_promoted_to_a_hunt() {
 
 #[test]
 fn frontmatter_absent_entirely_is_not_a_hunt() {
-    let err = draft_from("# just a document\n\nno frontmatter here\n")
-        .expect_err("must refuse");
+    let err = draft_from("# just a document\n\nno frontmatter here\n").expect_err("must refuse");
     assert_eq!(err, HuntSpecError::MissingFrontmatter);
 }
 
@@ -324,10 +323,26 @@ category: identity
     assert_eq!(draft.schedule_timezone, "UTC");
     assert_eq!(draft.lookback_window, "24h");
     assert!(draft.required_source_types.is_empty());
+    assert_eq!(draft.telemetry, Default::default());
     assert_eq!(draft.budget.max_turns, 40);
     assert_eq!(draft.budget.max_tool_calls, 120);
     assert_eq!(draft.budget.max_rows, 5000);
     assert_eq!(draft.budget.max_wall_seconds, 900);
+}
+
+#[test]
+fn portable_telemetry_requirements_parse_and_normalize() {
+    let src = SERVICE_ACCOUNT_HUNT.replace(
+        "mitre_tactic: lateral-movement",
+        "telemetry:\n  all_of:\n    - Identity.Authentication\n  one_of:\n    - Endpoint.Process\n    - identity.admin_audit\n  optional:\n    - Network.DNS\nmitre_tactic: lateral-movement",
+    );
+    let draft = draft_from(&src).expect("portable telemetry parses");
+    assert_eq!(draft.telemetry.all_of, vec!["identity.authentication"]);
+    assert_eq!(
+        draft.telemetry.one_of,
+        vec!["endpoint.process", "identity.admin_audit"]
+    );
+    assert_eq!(draft.telemetry.optional, vec!["network.dns"]);
 }
 
 #[test]
@@ -339,7 +354,8 @@ fn a_malformed_cron_is_refused_at_import() {
 
 #[test]
 fn six_field_cron_is_accepted_too() {
-    let src = SERVICE_ACCOUNT_HUNT.replace(r#"schedule: "0 3 * * *""#, r#"schedule: "0 0 3 * * *""#);
+    let src =
+        SERVICE_ACCOUNT_HUNT.replace(r#"schedule: "0 3 * * *""#, r#"schedule: "0 0 3 * * *""#);
     let draft = draft_from(&src).expect("parses");
     assert_eq!(draft.schedule_cron.as_deref(), Some("0 0 3 * * *"));
 }
@@ -381,7 +397,8 @@ fn a_partial_budget_block_takes_defaults_for_the_rest() {
 #[test]
 fn lookback_accepts_minutes_hours_days_and_rejects_the_ambiguous_bare_number() {
     for (raw, expect) in [("45m", "45m"), ("6H", "6h"), ("7d", "7d")] {
-        let src = SERVICE_ACCOUNT_HUNT.replace("lookback_window: 24h", &format!("lookback_window: {raw}"));
+        let src = SERVICE_ACCOUNT_HUNT
+            .replace("lookback_window: 24h", &format!("lookback_window: {raw}"));
         assert_eq!(draft_from(&src).expect("parses").lookback_window, expect);
     }
 
@@ -453,13 +470,17 @@ fn a_source_type_with_sql_shaped_punctuation_is_refused() {
 
 #[test]
 fn technique_ids_are_uppercased_and_shape_checked() {
-    let src = SERVICE_ACCOUNT_HUNT.replace("mitre_technique: T1078.002", "mitre_technique: t1078.002");
+    let src =
+        SERVICE_ACCOUNT_HUNT.replace("mitre_technique: T1078.002", "mitre_technique: t1078.002");
     assert_eq!(
         draft_from(&src).expect("parses").mitre_technique.as_deref(),
         Some("T1078.002")
     );
 
-    let src = SERVICE_ACCOUNT_HUNT.replace("mitre_technique: T1078.002", "mitre_technique: lateral movement");
+    let src = SERVICE_ACCOUNT_HUNT.replace(
+        "mitre_technique: T1078.002",
+        "mitre_technique: lateral movement",
+    );
     assert!(matches!(
         draft_from(&src).expect_err("must refuse"),
         HuntSpecError::InvalidTechnique(_)

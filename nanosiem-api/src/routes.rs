@@ -2259,6 +2259,15 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/hunts/summary", get(handlers::hunts::hunts_summary))
         .route("/api/hunts", get(handlers::hunts::list_hunts))
         .route("/api/hunts", post(handlers::hunts::create_hunt))
+        .route(
+            "/api/hunts/source-capability-bindings",
+            get(handlers::hunts::list_source_capability_bindings)
+                .put(handlers::hunts::set_source_capability_binding),
+        )
+        .route(
+            "/api/hunts/source-capability-bindings/reset",
+            post(handlers::hunts::reset_source_capability_binding),
+        )
         .route("/api/hunts/runners", get(handlers::hunts::list_runners))
         .route("/api/hunts/runners", post(handlers::hunts::register_runner))
         .route(

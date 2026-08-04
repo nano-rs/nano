@@ -144,13 +144,14 @@ use std::time::Duration as StdDuration;
 use chrono::{DateTime, Duration, Timelike, Utc};
 use clickhouse::Client as ClickHouseClient;
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::auth::SourceProvenance;
 use crate::db::TableNames;
 use crate::extensions::{AiClient, AiMessage};
+use crate::hunts::capabilities::{infer_source_capabilities, FieldObservation};
 use crate::hunts::error::HuntError;
 use crate::hunts::models::HuntProfile;
 use crate::log_telemetry::repository::is_safe_source_type;
@@ -549,21 +550,21 @@ pub fn build_census(inputs: &CensusInputs, degraded: bool) -> Vec<CensusRow> {
                 .history
                 .as_ref()
                 .and_then(|h| h.get(&source_type).copied());
-            let (history_depth_days, history_basis) = match (&inputs.history, earliest, first_event_at)
-            {
-                (Some(_), Some(earliest), _) => (
-                    Some((inputs.observed_at - earliest).num_days().max(0)),
-                    HistoryBasis::Observed,
-                ),
-                // The probe ran and found nothing for this source: it genuinely
-                // has no history, which is not the same as "we did not look".
-                (Some(_), None, _) => (None, HistoryBasis::Unavailable),
-                (None, _, Some(first)) => (
-                    Some((inputs.observed_at - first).num_days().max(0)),
-                    HistoryBasis::RollupFloor,
-                ),
-                (None, _, None) => (None, HistoryBasis::Unavailable),
-            };
+            let (history_depth_days, history_basis) =
+                match (&inputs.history, earliest, first_event_at) {
+                    (Some(_), Some(earliest), _) => (
+                        Some((inputs.observed_at - earliest).num_days().max(0)),
+                        HistoryBasis::Observed,
+                    ),
+                    // The probe ran and found nothing for this source: it genuinely
+                    // has no history, which is not the same as "we did not look".
+                    (Some(_), None, _) => (None, HistoryBasis::Unavailable),
+                    (None, _, Some(first)) => (
+                        Some((inputs.observed_at - first).num_days().max(0)),
+                        HistoryBasis::RollupFloor,
+                    ),
+                    (None, _, None) => (None, HistoryBasis::Unavailable),
+                };
 
             let field_population = deep.map(field_population);
             let reporters = deep.and_then(reporter_fraction);
@@ -1174,11 +1175,13 @@ pub fn build_surface(
     let mut tactics: Vec<SurfaceTactic> = tactic_order
         .iter()
         .filter_map(|tactic| {
-            by_tactic.remove(&tactic.id).map(|techniques| SurfaceTactic {
-                id: tactic.id.clone(),
-                name: tactic.name.clone(),
-                techniques,
-            })
+            by_tactic
+                .remove(&tactic.id)
+                .map(|techniques| SurfaceTactic {
+                    id: tactic.id.clone(),
+                    name: tactic.name.clone(),
+                    techniques,
+                })
         })
         .collect();
     // Anything left over (the unassigned bucket, or a tactic id present on a
@@ -1334,7 +1337,12 @@ pub fn draft_for_gap(
     let source_type = technique
         .available_source_types
         .iter()
-        .max_by_key(|source| (volumes.get(*source).copied().unwrap_or(0), (*source).clone()))?
+        .max_by_key(|source| {
+            (
+                volumes.get(*source).copied().unwrap_or(0),
+                (*source).clone(),
+            )
+        })?
         .clone();
 
     let tactic_id = primary_tactic.map(|t| t.id.as_str()).unwrap_or("");
@@ -2002,7 +2010,9 @@ fn sanitize_surface(surface: &mut HuntableSurface) {
 fn sanitize_aggregates(aggregates: &mut FingerprintAggregates) {
     aggregates.mfa_event_share_pct = finite(aggregates.mfa_event_share_pct, 0.0, 100.0);
     aggregates.hour_of_day_events.truncate(24);
-    aggregates.dimensions.truncate(FINGERPRINT_DIMENSIONS.len().max(MAX_NOTES));
+    aggregates
+        .dimensions
+        .truncate(FINGERPRINT_DIMENSIONS.len().max(MAX_NOTES));
     for dimension in aggregates.dimensions.iter_mut() {
         dimension.column = sanitize_line(&dimension.column, IDENTIFIER_MAX_BYTES);
         dimension.plane = sanitize_line(&dimension.plane, IDENTIFIER_MAX_BYTES);
@@ -2038,9 +2048,21 @@ pub fn sanitize_profile_request(req: SaveProfileRequest) -> Result<ProfileSubmis
             req.census.as_ref().map(Vec::len).unwrap_or(0),
             MAX_CENSUS_ROWS,
         ),
-        ("surface techniques", technique_count, MAX_SURFACE_TECHNIQUES),
-        ("fingerprint planes", req.fingerprint.planes.len(), MAX_FINGERPRINT_PLANES),
-        ("actor weightings", req.actor_weighting.len(), MAX_ACTOR_WEIGHTS),
+        (
+            "surface techniques",
+            technique_count,
+            MAX_SURFACE_TECHNIQUES,
+        ),
+        (
+            "fingerprint planes",
+            req.fingerprint.planes.len(),
+            MAX_FINGERPRINT_PLANES,
+        ),
+        (
+            "actor weightings",
+            req.actor_weighting.len(),
+            MAX_ACTOR_WEIGHTS,
+        ),
     ] {
         if actual > cap {
             return Err(HuntError::Validation(format!(
@@ -2354,7 +2376,9 @@ impl Deadline {
 
     /// `None` when the budget is spent.
     fn allot(&self, requested: StdDuration) -> Option<StdDuration> {
-        let remaining = self.expires_at.saturating_duration_since(tokio::time::Instant::now());
+        let remaining = self
+            .expires_at
+            .saturating_duration_since(tokio::time::Instant::now());
         // A sub-second slice is not worth a round trip; treat it as spent so the
         // note says "skipped", which is true, instead of "timed out", which
         // would blame ClickHouse for our own budget.
@@ -2397,6 +2421,57 @@ impl DegradedLog {
         truncate_bytes(&mut detail, DEGRADED_DETAIL_MAX_BYTES);
         (true, Some(detail))
     }
+}
+
+/// Replace recon-owned inference rows while preserving analyst overrides.
+/// Both happen in the profile INSERT transaction, so a profile can never claim
+/// a census that its binding table did not observe.
+async fn refresh_inferred_source_capabilities(
+    tx: &mut Transaction<'_, Postgres>,
+    census: &[CensusRow],
+) -> Result<(), HuntError> {
+    sqlx::query("DELETE FROM hunt_source_capability_bindings WHERE origin = 'inferred'")
+        .execute(&mut **tx)
+        .await?;
+
+    for source in census {
+        let fields: Vec<FieldObservation<'_>> = source
+            .field_population
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|field| FieldObservation {
+                field: field.field.as_str(),
+                populated_pct: field.populated_pct,
+            })
+            .collect();
+        for binding in infer_source_capabilities(&source.source_type, &fields) {
+            sqlx::query(
+                r#"
+                INSERT INTO hunt_source_capability_bindings (
+                    source_type, capability, state, origin, confidence, basis,
+                    evidence, last_observed_at
+                ) VALUES ($1, $2, 'mapped', 'inferred', $3, $4, $5, $6)
+                ON CONFLICT (source_type, capability, origin) DO UPDATE
+                   SET state = 'mapped',
+                       confidence = EXCLUDED.confidence,
+                       basis = EXCLUDED.basis,
+                       evidence = EXCLUDED.evidence,
+                       last_observed_at = EXCLUDED.last_observed_at,
+                       updated_at = NOW()
+                "#,
+            )
+            .bind(&binding.source_type)
+            .bind(&binding.capability)
+            .bind(binding.confidence)
+            .bind(&binding.basis)
+            .bind(&binding.evidence)
+            .bind(source.last_event_at)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 impl ReconService {
@@ -3272,6 +3347,7 @@ impl ReconService {
             HuntError::Internal(format!("actor weighting serialization failed: {e}"))
         })?;
 
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "INSERT INTO hunt_profiles ( \
                 census, fingerprint, huntable_surface, actor_weighting, \
@@ -3290,8 +3366,11 @@ impl ReconService {
         .bind(provenance.source_types().to_vec())
         .bind(provenance.is_complete())
         .bind(generated_by)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+
+        refresh_inferred_source_capabilities(&mut tx, census).await?;
+        tx.commit().await?;
 
         Ok(HuntProfile {
             id: row.try_get("id")?,
@@ -3380,13 +3459,13 @@ impl ReconService {
         .await?;
 
         let inserted = sqlx::query(GENERATED_HUNT_SPEC_INSERT)
-        .bind(playbook_id)
-        .bind(&draft.sweep_query)
-        .bind(&draft.required_source_types)
-        .bind(draft.mitre_tactic.as_deref())
-        .bind(&draft.mitre_technique)
-        .execute(&mut *tx)
-        .await?;
+            .bind(playbook_id)
+            .bind(&draft.sweep_query)
+            .bind(&draft.required_source_types)
+            .bind(draft.mitre_tactic.as_deref())
+            .bind(&draft.mitre_technique)
+            .execute(&mut *tx)
+            .await?;
 
         if inserted.rows_affected() == 0 {
             // The unique index caught a draft that already exists for this
@@ -3457,7 +3536,10 @@ pub fn build_deep_probe_sql(
     recent_start: DateTime<Utc>,
     window_end: DateTime<Utc>,
 ) -> String {
-    let recent = format!("timestamp >= toDateTime64('{}', 6, 'UTC')", ch_ts(recent_start));
+    let recent = format!(
+        "timestamp >= toDateTime64('{}', 6, 'UTC')",
+        ch_ts(recent_start)
+    );
     let mut selects = vec![
         "lower(source_type) AS source_type".to_string(),
         format!("countIf({recent}) AS recent_events"),

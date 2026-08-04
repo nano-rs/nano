@@ -37,6 +37,7 @@ mod reports;
 mod runners;
 mod specs;
 mod sweeps;
+mod telemetry;
 pub mod types;
 
 pub use ideas::*;
@@ -47,6 +48,7 @@ pub use reports::*;
 pub use runners::*;
 pub use specs::*;
 pub use sweeps::*;
+pub use telemetry::*;
 pub use types::*;
 
 use std::sync::Arc;
@@ -130,6 +132,10 @@ pub(crate) fn artifact_scope(auth: &AuthContext) -> ArtifactScope {
         // Local report audit receipts (NAN-2306)
         record_hunt_report_export,
         record_hunt_report_branding,
+        // Portable telemetry bindings (NAN-2311)
+        list_source_capability_bindings,
+        set_source_capability_binding,
+        reset_source_capability_binding,
     ),
     components(schemas(
         ListHuntsResponse,
@@ -139,10 +145,18 @@ pub(crate) fn artifact_scope(auth: &AuthContext) -> ArtifactScope {
         ListHuntSuppressionsResponse,
         ListRuleIdeasResponse,
         ListKnowledgeResponse,
+        ListSourceCapabilityBindingsResponse,
+        ResetSourceCapabilityBindingResponse,
         ClaimSweepOutcome,
         ProfileResponse,
         nanosiem_core::hunts::Hunt,
         nanosiem_core::hunts::HuntBudget,
+        nanosiem_core::playbooks::models::HuntTelemetryRequirements,
+        nanosiem_core::hunts::HuntTelemetryReadiness,
+        nanosiem_core::hunts::CapabilityResolution,
+        nanosiem_core::hunts::SourceCapabilityBinding,
+        nanosiem_core::hunts::SetSourceCapabilityBindingRequest,
+        nanosiem_core::hunts::ResetSourceCapabilityBindingRequest,
         nanosiem_core::hunts::HuntSummary,
         nanosiem_core::hunts::ToggleHuntRequest,
         nanosiem_core::hunts::SetScheduleRequest,

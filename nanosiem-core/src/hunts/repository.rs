@@ -38,9 +38,6 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::auth::{ArtifactScope, SourceProvenance};
-use crate::hunts::spec::HuntSpecDraft;
-use serde_json::Value;
-use crate::playbooks::models::{CreatePlaybookRequest, Playbook, PlaybookScope, PlaybookStatus};
 use crate::hunts::error::HuntError;
 use crate::hunts::evidence::ResolvedEvent;
 use crate::hunts::fingerprint::{derive as derive_fingerprint, CanonicalEntity, FingerprintInput};
@@ -48,6 +45,9 @@ use crate::hunts::knowledge::{record_prepared_in_tx, PreparedKnowledge, RecordOu
 use crate::hunts::models::*;
 use crate::hunts::report::{reconcile_outcome, BudgetLimits, BudgetUsage, TrailStep};
 use crate::hunts::scoring::{score, Contribution, ScoreInputs};
+use crate::hunts::spec::HuntSpecDraft;
+use crate::playbooks::models::{CreatePlaybookRequest, Playbook, PlaybookScope, PlaybookStatus};
+use serde_json::Value;
 
 /// Column pairs the artifact-provenance predicate must be applied to, keyed by
 /// the table whose rows carry them.
@@ -63,7 +63,11 @@ pub const ARTIFACT_READ_SITES: &[(&str, &str, &str)] = &[
         "s.source_types_complete",
     ),
     ("hunt_profiles", "p.source_types", "p.source_types_complete"),
-    ("hunt_rule_ideas", "i.source_types", "i.source_types_complete"),
+    (
+        "hunt_rule_ideas",
+        "i.source_types",
+        "i.source_types_complete",
+    ),
 ];
 
 /// Longest lease a runner may hold. A runner that asked for a month would make
@@ -155,6 +159,7 @@ impl HuntRepository {
     const HUNT_SELECT: &'static str = r#"
         SELECT p.id AS playbook_id, p.title, p.subtitle, p.category, p.status, p.tags,
                h.sweep_query, h.schedule_cron, h.schedule_timezone, h.required_source_types,
+               h.telemetry_requirements,
                h.mitre_tactic, h.mitre_technique, h.enabled,
                h.budget_max_turns, h.budget_max_tool_calls, h.budget_max_rows,
                h.budget_max_wall_seconds, h.lookback_window, h.max_catchup_lookback,
@@ -197,6 +202,7 @@ impl HuntRepository {
         SELECT p.id AS playbook_id, p.title, p.subtitle, p.category, p.status, p.tags,
                p.doc, p.parsed_steps AS steps,
                h.sweep_query, h.schedule_cron, h.schedule_timezone, h.required_source_types,
+               h.telemetry_requirements,
                h.mitre_tactic, h.mitre_technique, h.enabled,
                h.budget_max_turns, h.budget_max_tool_calls, h.budget_max_rows,
                h.budget_max_wall_seconds, h.lookback_window, h.max_catchup_lookback,
@@ -255,6 +261,83 @@ impl HuntRepository {
         hunt_from_row(&row)
     }
 
+    /// Effective environment bindings. Analyst rows take precedence over an
+    /// inference for the same source/capability pair; both remain stored so
+    /// resetting an override immediately reveals the last recon inference.
+    pub async fn list_source_capability_bindings(
+        &self,
+    ) -> Result<Vec<SourceCapabilityBinding>, HuntError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT DISTINCT ON (source_type, capability)
+                   source_type, capability, state, origin, confidence, basis,
+                   evidence, last_observed_at, updated_by, created_at, updated_at
+              FROM hunt_source_capability_bindings
+             ORDER BY source_type, capability, (origin = 'analyst') DESC, updated_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(source_capability_binding_from_row)
+            .collect()
+    }
+
+    pub async fn set_source_capability_binding(
+        &self,
+        source_type: &str,
+        capability: &str,
+        state: &str,
+        updated_by: Option<Uuid>,
+    ) -> Result<SourceCapabilityBinding, HuntError> {
+        let evidence = if state == "mapped" {
+            "analyst confirmed this source provides the capability"
+        } else {
+            "analyst rejected the inferred capability"
+        };
+        let row = sqlx::query(
+            r#"
+            INSERT INTO hunt_source_capability_bindings (
+                source_type, capability, state, origin, confidence, basis,
+                evidence, updated_by
+            ) VALUES ($1, $2, $3, 'analyst', 1.0, 'analyst_override', $4, $5)
+            ON CONFLICT (source_type, capability, origin) DO UPDATE
+               SET state = EXCLUDED.state,
+                   confidence = 1.0,
+                   basis = 'analyst_override',
+                   evidence = EXCLUDED.evidence,
+                   updated_by = EXCLUDED.updated_by,
+                   updated_at = NOW()
+            RETURNING source_type, capability, state, origin, confidence, basis,
+                      evidence, last_observed_at, updated_by, created_at, updated_at
+            "#,
+        )
+        .bind(source_type)
+        .bind(capability)
+        .bind(state)
+        .bind(evidence)
+        .bind(updated_by)
+        .fetch_one(&self.pool)
+        .await?;
+        source_capability_binding_from_row(&row)
+    }
+
+    pub async fn reset_source_capability_binding(
+        &self,
+        source_type: &str,
+        capability: &str,
+    ) -> Result<bool, HuntError> {
+        let deleted = sqlx::query(
+            "DELETE FROM hunt_source_capability_bindings \
+              WHERE source_type = $1 AND capability = $2 AND origin = 'analyst'",
+        )
+        .bind(source_type)
+        .bind(capability)
+        .execute(&self.pool)
+        .await?;
+        Ok(deleted.rows_affected() > 0)
+    }
+
     pub async fn create_hunt(
         &self,
         req: &CreateHuntRequest,
@@ -290,15 +373,15 @@ impl HuntRepository {
             r#"
             INSERT INTO hunt_specs (
                 playbook_id, sweep_query, schedule_cron, schedule_timezone,
-                required_source_types, mitre_tactic, mitre_technique,
+                required_source_types, telemetry_requirements, mitre_tactic, mitre_technique,
                 budget_max_turns, budget_max_tool_calls, budget_max_rows,
                 budget_max_wall_seconds, lookback_window, max_catchup_lookback
             )
             VALUES (
                 $1, $2, $3, COALESCE($4, 'UTC'),
-                $5, $6, $7,
-                COALESCE($8, 40), COALESCE($9, 120), COALESCE($10, 5000),
-                COALESCE($11, 900), COALESCE($12, '24h'), COALESCE($13, '72h')
+                $5, $6, $7, $8,
+                COALESCE($9, 40), COALESCE($10, 120), COALESCE($11, 5000),
+                COALESCE($12, 900), COALESCE($13, '24h'), COALESCE($14, '72h')
             )
             "#,
         )
@@ -307,6 +390,9 @@ impl HuntRepository {
         .bind(req.schedule_cron.as_deref())
         .bind(req.schedule_timezone.as_deref())
         .bind(normalize_sources(&req.required_source_types))
+        .bind(serde_json::to_value(&req.telemetry).map_err(|error| {
+            HuntError::Validation(format!("invalid telemetry requirements: {error}"))
+        })?)
         .bind(req.mitre_tactic.as_deref())
         .bind(req.mitre_technique.as_deref())
         .bind(budget.max_turns)
@@ -329,7 +415,9 @@ impl HuntRepository {
     ) -> Result<Hunt, HuntError> {
         if let Some(query) = &req.sweep_query {
             if query.trim().is_empty() {
-                return Err(HuntError::Validation("sweep_query must not be empty".into()));
+                return Err(HuntError::Validation(
+                    "sweep_query must not be empty".into(),
+                ));
             }
         }
         let budget = req.budget_values();
@@ -369,15 +457,16 @@ impl HuntRepository {
                    schedule_cron = COALESCE($3, schedule_cron),
                    schedule_timezone = COALESCE($4, schedule_timezone),
                    required_source_types = COALESCE($5, required_source_types),
-                   mitre_tactic = COALESCE($6, mitre_tactic),
-                   mitre_technique = COALESCE($7, mitre_technique),
-                   enabled = COALESCE($8, enabled),
-                   budget_max_turns = COALESCE($9, budget_max_turns),
-                   budget_max_tool_calls = COALESCE($10, budget_max_tool_calls),
-                   budget_max_rows = COALESCE($11, budget_max_rows),
-                   budget_max_wall_seconds = COALESCE($12, budget_max_wall_seconds),
-                   lookback_window = COALESCE($13, lookback_window),
-                   max_catchup_lookback = COALESCE($14, max_catchup_lookback),
+                   telemetry_requirements = COALESCE($6, telemetry_requirements),
+                   mitre_tactic = COALESCE($7, mitre_tactic),
+                   mitre_technique = COALESCE($8, mitre_technique),
+                   enabled = COALESCE($9, enabled),
+                   budget_max_turns = COALESCE($10, budget_max_turns),
+                   budget_max_tool_calls = COALESCE($11, budget_max_tool_calls),
+                   budget_max_rows = COALESCE($12, budget_max_rows),
+                   budget_max_wall_seconds = COALESCE($13, budget_max_wall_seconds),
+                   lookback_window = COALESCE($14, lookback_window),
+                   max_catchup_lookback = COALESCE($15, max_catchup_lookback),
                    updated_at = NOW()
              WHERE playbook_id = $1
             "#,
@@ -386,7 +475,20 @@ impl HuntRepository {
         .bind(req.sweep_query.as_deref().map(str::trim))
         .bind(req.schedule_cron.as_deref())
         .bind(req.schedule_timezone.as_deref())
-        .bind(req.required_source_types.as_ref().map(|s| normalize_sources(s)))
+        .bind(
+            req.required_source_types
+                .as_ref()
+                .map(|s| normalize_sources(s)),
+        )
+        .bind(
+            req.telemetry
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|error| {
+                    HuntError::Validation(format!("invalid telemetry requirements: {error}"))
+                })?,
+        )
         .bind(req.mitre_tactic.as_deref())
         .bind(req.mitre_technique.as_deref())
         .bind(req.enabled)
@@ -588,11 +690,12 @@ impl HuntRepository {
         window_start: DateTime<Utc>,
         window_end: DateTime<Utc>,
     ) -> Result<HuntSweep, HuntError> {
-        let version: Option<i32> =
-            sqlx::query_scalar("SELECT current_version FROM playbooks WHERE id = $1 AND kind = 'hunt'")
-                .bind(playbook_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let version: Option<i32> = sqlx::query_scalar(
+            "SELECT current_version FROM playbooks WHERE id = $1 AND kind = 'hunt'",
+        )
+        .bind(playbook_id)
+        .fetch_optional(&self.pool)
+        .await?;
         let version = version.ok_or(HuntError::NotFound(playbook_id))?;
 
         let row = sqlx::query(
@@ -707,6 +810,64 @@ impl HuntRepository {
             runner_fence: fence,
             lease_expires_at,
         }))
+    }
+
+    /// Finish a freshly claimed sweep without starting an agent because its
+    /// hard telemetry contract cannot currently be satisfied.
+    pub async fn complete_held_sweep(
+        &self,
+        sweep_id: Uuid,
+        runner_id: Uuid,
+        runner_fence: i64,
+        detail: &str,
+    ) -> Result<(), HuntError> {
+        let mut tx = self.pool.begin().await?;
+        let playbook_id: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            UPDATE hunt_sweeps
+               SET status = 'finished',
+                   outcome = 'held',
+                   outcome_detail = $4,
+                   turns_used = 0,
+                   tool_calls_used = 0,
+                   rows_read = 0,
+                   rows_truncated = FALSE,
+                   trail = '[]'::jsonb,
+                   source_types = '{}',
+                   source_types_complete = FALSE,
+                   finished_at = NOW(),
+                   lease_expires_at = NULL
+             WHERE id = $1
+               AND runner_id = $2
+               AND runner_fence = $3
+               AND status IN ('leased', 'running')
+               AND lease_expires_at > NOW()
+            RETURNING playbook_id
+            "#,
+        )
+        .bind(sweep_id)
+        .bind(runner_id)
+        .bind(runner_fence)
+        .bind(truncate_chars(detail, MAX_OUTCOME_DETAIL_CHARS))
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(playbook_id) = playbook_id else {
+            tx.rollback().await?;
+            return Err(HuntError::LeaseLost(format!(
+                "held readiness decision for sweep {sweep_id} lost its lease"
+            )));
+        };
+
+        sqlx::query(
+            "UPDATE hunt_specs \
+                SET last_attempt_at = NOW(), updated_at = NOW() \
+              WHERE playbook_id = $1",
+        )
+        .bind(playbook_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Analyst-facing sweep list.
@@ -1033,7 +1194,10 @@ impl HuntRepository {
             let (manifest, complete) = prepared.provenance.clone().into_parts();
             sweep_sources.extend(manifest.iter().cloned());
 
-            let narrative = prepared.narrative.as_deref().map(truncate_chars_fn(MAX_NARRATIVE_CHARS));
+            let narrative = prepared
+                .narrative
+                .as_deref()
+                .map(truncate_chars_fn(MAX_NARRATIVE_CHARS));
             // Stored WITH the provenance of what each referential factor looked
             // at, so a later reader's scope can be applied to the explanation
             // without re-running a check whose answer must not vary by reader.
@@ -1049,12 +1213,13 @@ impl HuntRepository {
             // is no unique index to lean on because a lead's identity is
             // (sweep, fingerprint) only for THIS purpose — across sweeps the
             // same fingerprint recurring is the signal, not a duplicate.
-            let existing: Option<Uuid> =
-                sqlx::query_scalar("SELECT id FROM hunt_leads WHERE sweep_id = $1 AND fingerprint = $2")
-                    .bind(inputs.sweep_id)
-                    .bind(&fingerprint)
-                    .fetch_optional(&mut *tx)
-                    .await?;
+            let existing: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM hunt_leads WHERE sweep_id = $1 AND fingerprint = $2",
+            )
+            .bind(inputs.sweep_id)
+            .bind(&fingerprint)
+            .fetch_optional(&mut *tx)
+            .await?;
 
             let lead_id: Uuid = match existing {
                 Some(id) => {
@@ -1219,7 +1384,12 @@ impl HuntRepository {
         )
         .bind(inputs.sweep_id)
         .bind(outcome)
-        .bind(inputs.note.as_deref().map(truncate_chars_fn(MAX_OUTCOME_DETAIL_CHARS)))
+        .bind(
+            inputs
+                .note
+                .as_deref()
+                .map(truncate_chars_fn(MAX_OUTCOME_DETAIL_CHARS)),
+        )
         .bind(clamp_i32(inputs.usage.turns as i64))
         .bind(clamp_i32(inputs.usage.tool_calls as i64))
         .bind(clamp_i32(inputs.usage.rows_read.min(i32::MAX as u64) as i64))
@@ -1262,11 +1432,13 @@ impl HuntRepository {
     /// Record that this lead contributes to a rule idea, creating the INERT
     /// idea row if this shape has not been seen before.
     ///
-    /// What a sweep may create here is deliberately minimal: `proposed_npl` is
-    /// the hunt's OWN `sweep_query`, read from `hunt_specs` inside the commit
-    /// transaction, and the name is composed from the hunt title plus the
-    /// corroborated entity type. No agent prose reaches this table, because a
-    /// rule idea is one human click away from a detection rule and
+    /// What a sweep may create here is deliberately minimal: `proposed_npl` may
+    /// come only from a structurally valid nPL opening stored on the hunt, read
+    /// inside the commit transaction, and the name is composed from the hunt
+    /// title plus the corroborated entity type. Repository hunts intentionally
+    /// store prose guidance in the same legacy column, so those openings do not
+    /// create a detection candidate. No agent prose reaches this table, because
+    /// a rule idea is one human click away from a detection rule and
     /// attacker-influenced text must not have a path into one.
     ///
     /// The counters stay at zero. They are a cache; the gate is computed from
@@ -1284,6 +1456,10 @@ impl HuntRepository {
         manifest: &[String],
         complete: bool,
     ) -> Result<(), HuntError> {
+        let Some(proposed_npl) = rule_idea_seed_npl(sweep_query) else {
+            return Ok(());
+        };
+
         // Named from the CORROBORATED entity, not from the narrative. The value
         // is the same one already stored on `hunt_leads.entity_value` and shown
         // on the bench, so this adds no new exposure — but it does make the
@@ -1319,7 +1495,7 @@ impl HuntRepository {
         .bind(playbook_id)
         .bind(fingerprint)
         .bind(truncate_chars(&name, 200))
-        .bind(truncate_chars(sweep_query, 16_384))
+        .bind(truncate_chars(proposed_npl, 16_384))
         .bind(prepared.mitre_technique.as_deref())
         .bind(manifest.to_vec())
         .bind(complete)
@@ -1560,10 +1736,11 @@ impl HuntRepository {
         };
 
         if let Some(case_id) = row.try_get::<Option<Uuid>, _>("promoted_case_id")? {
-            let case_number: i32 = sqlx::query_scalar("SELECT case_number FROM cases WHERE id = $1")
-                .bind(case_id)
-                .fetch_one(&mut *tx)
-                .await?;
+            let case_number: i32 =
+                sqlx::query_scalar("SELECT case_number FROM cases WHERE id = $1")
+                    .bind(case_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
             tx.commit().await?;
             return Ok(PromoteLeadResponse {
                 lead_id,
@@ -1810,7 +1987,9 @@ impl HuntRepository {
     ) -> Result<Vec<HuntSuppression>, HuntError> {
         let mut sql = String::from("SELECT s.* FROM hunt_suppressions s WHERE 1 = 1");
         if !include_revoked {
-            sql.push_str(" AND s.revoked_at IS NULL AND (s.expires_at IS NULL OR s.expires_at > NOW())");
+            sql.push_str(
+                " AND s.revoked_at IS NULL AND (s.expires_at IS NULL OR s.expires_at > NOW())",
+            );
         }
         let scoped = !scope.is_unrestricted();
         if scoped {
@@ -1880,7 +2059,10 @@ impl HuntRepository {
         reason: &str,
         ttl_days: i64,
     ) -> Result<Option<HuntSuppression>, HuntError> {
-        let ttl = ttl_days.clamp(MIN_AGENT_SUPPRESSION_TTL_DAYS, MAX_AGENT_SUPPRESSION_TTL_DAYS);
+        let ttl = ttl_days.clamp(
+            MIN_AGENT_SUPPRESSION_TTL_DAYS,
+            MAX_AGENT_SUPPRESSION_TTL_DAYS,
+        );
         let row = sqlx::query(
             "INSERT INTO hunt_suppressions \
                  (fingerprint, reason, origin, created_by_sweep_id, origin_lead_id, \
@@ -2178,7 +2360,11 @@ impl HuntRepository {
         )
         .bind(idea_id)
         .bind(&final_state)
-        .bind(note.map(str::trim).filter(|n| !n.is_empty()).map(truncate_chars_fn(500)))
+        .bind(
+            note.map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(truncate_chars_fn(500)),
+        )
         .execute(&mut *tx)
         .await?;
 
@@ -2397,15 +2583,15 @@ impl HuntRepository {
             INSERT INTO hunt_specs (
                 playbook_id, sweep_query,
                 schedule_cron, schedule_timezone, lookback_window,
-                required_source_types, mitre_tactic, mitre_technique,
+                required_source_types, telemetry_requirements, mitre_tactic, mitre_technique,
                 budget_max_turns, budget_max_tool_calls,
                 budget_max_rows, budget_max_wall_seconds
             ) VALUES (
                 $1, $2,
                 $3, $4, $5,
-                $6, $7, $8,
-                $9, $10,
-                $11, $12
+                $6, $7, $8, $9,
+                $10, $11,
+                $12, $13
             )
             "#,
         )
@@ -2415,6 +2601,9 @@ impl HuntRepository {
         .bind(&draft.schedule_timezone)
         .bind(&draft.lookback_window)
         .bind(&draft.required_source_types)
+        .bind(serde_json::to_value(&draft.telemetry).map_err(|error| {
+            HuntError::Validation(format!("invalid telemetry requirements: {error}"))
+        })?)
         .bind(&draft.mitre_tactic)
         .bind(&draft.mitre_technique)
         .bind(draft.budget.max_turns as i32)
@@ -2763,7 +2952,11 @@ fn build_rule_idea_lock_sql(scope: &ArtifactScope) -> (String, bool) {
 /// own WHERE could disagree with the rows it claims to describe — and, worse,
 /// could drop the artifact-scope predicate and turn the header count into an
 /// oracle for how many denied leads exist.
-fn push_leads_filter(sql: &mut String, query: &ListLeadsQuery, scope: &ArtifactScope) -> (usize, bool) {
+fn push_leads_filter(
+    sql: &mut String,
+    query: &ListLeadsQuery,
+    scope: &ArtifactScope,
+) -> (usize, bool) {
     sql.push_str(" WHERE 1 = 1");
     let mut param = 1usize;
     if query.playbook_id.is_some() {
@@ -2834,9 +3027,8 @@ fn build_leads_count_sql(query: &ListLeadsQuery, scope: &ArtifactScope) -> (Stri
     // The JOIN is kept identical to `LEAD_SELECT` (playbook_id is a NOT NULL
     // FK, so it never changes the row count) so the two statements stay
     // textually parallel and a future filter on `p.*` cannot break only one.
-    let mut sql = String::from(
-        "SELECT COUNT(*) FROM hunt_leads l JOIN playbooks p ON p.id = l.playbook_id",
-    );
+    let mut sql =
+        String::from("SELECT COUNT(*) FROM hunt_leads l JOIN playbooks p ON p.id = l.playbook_id");
     let (_, scoped) = push_leads_filter(&mut sql, query, scope);
     (sql, scoped)
 }
@@ -2862,6 +3054,14 @@ fn hunt_from_row(row: &sqlx::postgres::PgRow) -> Result<Hunt, HuntError> {
         schedule_cron: row.try_get("schedule_cron")?,
         schedule_timezone: row.try_get("schedule_timezone")?,
         required_source_types: row.try_get("required_source_types")?,
+        telemetry: serde_json::from_value(row.try_get("telemetry_requirements")?).map_err(
+            |error| {
+                HuntError::Internal(format!(
+                    "stored telemetry requirements are invalid: {error}"
+                ))
+            },
+        )?,
+        telemetry_readiness: None,
         mitre_tactic: row.try_get("mitre_tactic")?,
         mitre_technique: row.try_get("mitre_technique")?,
         enabled: row.try_get("enabled")?,
@@ -2879,6 +3079,24 @@ fn hunt_from_row(row: &sqlx::postgres::PgRow) -> Result<Hunt, HuntError> {
         auto_promote: row.try_get("auto_promote")?,
         generated_from_profile: row.try_get("generated_from_profile")?,
         generated_at: row.try_get("generated_at")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn source_capability_binding_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<SourceCapabilityBinding, HuntError> {
+    Ok(SourceCapabilityBinding {
+        source_type: row.try_get("source_type")?,
+        capability: row.try_get("capability")?,
+        state: row.try_get("state")?,
+        origin: row.try_get("origin")?,
+        confidence: row.try_get("confidence")?,
+        basis: row.try_get("basis")?,
+        evidence: row.try_get("evidence")?,
+        last_observed_at: row.try_get("last_observed_at")?,
+        updated_by: row.try_get("updated_by")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -2955,7 +3173,9 @@ fn lead_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntLead, HuntError> {
         sweep_id: row.try_get("sweep_id")?,
         playbook_id: row.try_get("playbook_id")?,
         playbook_version: row.try_get("playbook_version")?,
-        hunt_title: row.try_get::<Option<String>, _>("hunt_title").unwrap_or(None),
+        hunt_title: row
+            .try_get::<Option<String>, _>("hunt_title")
+            .unwrap_or(None),
         entity_type: row.try_get("entity_type")?,
         entity_value: row.try_get("entity_value")?,
         mitre_technique: row.try_get("mitre_technique")?,
@@ -3065,7 +3285,9 @@ fn validate_hunt_text(title: &str, category: &str, sweep_query: &str) -> Result<
         return Err(HuntError::Validation("title must not be empty".into()));
     }
     if sweep_query.trim().is_empty() {
-        return Err(HuntError::Validation("sweep_query must not be empty".into()));
+        return Err(HuntError::Validation(
+            "sweep_query must not be empty".into(),
+        ));
     }
     // Mirrors `playbooks_category_check`. Rejecting here turns a 500 from a
     // constraint violation into an actionable 400.
@@ -3076,6 +3298,28 @@ fn validate_hunt_text(title: &str, category: &str, sweep_query: &str) -> Result<
         )));
     }
     Ok(())
+}
+
+/// Return a hunt opening only when it is safe to present as proposed nPL.
+///
+/// nPL deliberately accepts bare keyword searches, so parsing alone cannot
+/// distinguish `powershell` the query from `look for unusual PowerShell` the
+/// authoring instruction. Rule ideas are detection candidates, not a place to
+/// guess. Require both a successful parse and explicit query structure; a
+/// conservative false negative here merely keeps hunting, while a false
+/// positive puts prose into the rule editor under an executable label.
+fn rule_idea_seed_npl(opening: &str) -> Option<&str> {
+    let opening = opening.trim();
+    let lower = opening.to_ascii_lowercase();
+    let has_query_structure = opening
+        .chars()
+        .any(|ch| matches!(ch, '|' | '=' | '>' | '<'))
+        || lower.starts_with("search ")
+        || lower.contains(" in (");
+    if !has_query_structure || crate::query::parse_query(opening).is_err() {
+        return None;
+    }
+    Some(opening)
 }
 
 /// Map a server-computed score onto a case severity when the analyst does not
@@ -3204,7 +3448,6 @@ mod enable_switch_tests {
             bounded(production, "async fn insert_spec"),
         );
         let import_fn = import_fn.as_str();
-
 
         let offenders: Vec<String> = import_fn
             .lines()

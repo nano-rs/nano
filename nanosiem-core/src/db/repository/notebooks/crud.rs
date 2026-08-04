@@ -256,6 +256,67 @@ impl NotebookRepository {
         Ok(results)
     }
 
+    /// One updated-at-ordered page of every notebook visible to the user.
+    pub async fn list_for_user_page(
+        &self,
+        user_id: Uuid,
+        status: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<NotebookSummary>, NotebookRepositoryError> {
+        let results = sqlx::query_as::<_, NotebookSummary>(
+            r#"
+            SELECT DISTINCT
+                n.*,
+                u.name as owner_name,
+                COALESCE(ec.entry_count, 0) as entry_count
+            FROM notebooks n
+            LEFT JOIN users u ON n.owner_id = u.id
+            LEFT JOIN notebook_shares ns ON ns.notebook_id = n.id
+            LEFT JOIN user_groups ug ON ug.group_id = ns.shared_with_group_id AND ug.user_id = $1
+            LEFT JOIN (
+                SELECT notebook_id, COUNT(*) as entry_count
+                FROM notebook_entries
+                GROUP BY notebook_id
+            ) ec ON ec.notebook_id = n.id
+            WHERE (
+                   n.owner_id = $1
+                OR (n.case_id IS NULL AND n.visibility = 'public')
+                OR ns.shared_with_user_id = $1
+                OR ug.user_id IS NOT NULL
+                OR (
+                    n.case_id IS NOT NULL
+                    AND EXISTS (
+                        SELECT 1 FROM cases c
+                        WHERE c.id = n.case_id
+                          AND (
+                              c.created_by = $1
+                              OR c.assigned_to = $1
+                              OR c.visibility = 'public'
+                              OR (c.visibility = 'group' AND EXISTS (
+                                  SELECT 1 FROM case_groups cg
+                                  JOIN user_groups cug ON cug.group_id = cg.group_id
+                                  WHERE cg.case_id = c.id AND cug.user_id = $1
+                              ))
+                          )
+                    )
+                )
+            )
+              AND ($2 = 'all' OR n.status = $2)
+            ORDER BY n.updated_at DESC, n.id DESC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(user_id)
+        .bind(status)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(results)
+    }
+
     /// List only the user's own notebooks
     pub async fn list_owned_by_user(
         &self,
@@ -279,6 +340,43 @@ impl NotebookRepository {
             "#,
         )
         .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(results)
+    }
+
+    /// One updated-at-ordered page of notebooks owned by the user.
+    pub async fn list_owned_by_user_page(
+        &self,
+        user_id: Uuid,
+        status: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<NotebookSummary>, NotebookRepositoryError> {
+        let results = sqlx::query_as::<_, NotebookSummary>(
+            r#"
+            SELECT
+                n.*,
+                u.name as owner_name,
+                COALESCE(ec.entry_count, 0) as entry_count
+            FROM notebooks n
+            LEFT JOIN users u ON n.owner_id = u.id
+            LEFT JOIN (
+                SELECT notebook_id, COUNT(*) as entry_count
+                FROM notebook_entries
+                GROUP BY notebook_id
+            ) ec ON ec.notebook_id = n.id
+            WHERE n.owner_id = $1
+              AND ($2 = 'all' OR n.status = $2)
+            ORDER BY n.updated_at DESC, n.id DESC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(user_id)
+        .bind(status)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
 
@@ -311,6 +409,46 @@ impl NotebookRepository {
             "#,
         )
         .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(results)
+    }
+
+    /// One updated-at-ordered page of notebooks shared with the user.
+    pub async fn list_shared_with_user_page(
+        &self,
+        user_id: Uuid,
+        status: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<NotebookSummary>, NotebookRepositoryError> {
+        let results = sqlx::query_as::<_, NotebookSummary>(
+            r#"
+            SELECT DISTINCT
+                n.*,
+                u.name as owner_name,
+                COALESCE(ec.entry_count, 0) as entry_count
+            FROM notebooks n
+            LEFT JOIN users u ON n.owner_id = u.id
+            LEFT JOIN notebook_shares ns ON ns.notebook_id = n.id
+            LEFT JOIN user_groups ug ON ug.group_id = ns.shared_with_group_id AND ug.user_id = $1
+            LEFT JOIN (
+                SELECT notebook_id, COUNT(*) as entry_count
+                FROM notebook_entries
+                GROUP BY notebook_id
+            ) ec ON ec.notebook_id = n.id
+            WHERE n.owner_id != $1
+              AND (ns.shared_with_user_id = $1 OR ug.user_id IS NOT NULL)
+              AND ($2 = 'all' OR n.status = $2)
+            ORDER BY n.updated_at DESC, n.id DESC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(user_id)
+        .bind(status)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
 
