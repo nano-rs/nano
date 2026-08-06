@@ -100,6 +100,15 @@ fn is_public_endpoint(path: &str) -> bool {
     // identity endpoint) is retired — AD identity now flows through the
     // nano_enrich lane. No identity-provider path is auth-exempt anymore.
 
+    // NAN-1931: internal Vector config generation delivery. The caller is the
+    // Vector pod's config-consumer sidecar, not a user; the handlers enforce
+    // their own `Bearer <VECTOR_AUTH_TOKEN>` shared-secret check and are
+    // disabled (404) when the token is not provisioned, so exempting the
+    // prefix here never exposes an unauthenticated surface.
+    if path.starts_with("/api/internal/vector-config/") {
+        return true;
+    }
+
     // Demo session public endpoints (only exist on DEPLOYMENT_MODE=demo deployments):
     // - POST /api/demo/session (create session)
     // - POST /api/demo/session/{token}/claim (claim one-time link)
@@ -709,6 +718,18 @@ mod tests {
         assert!(!is_public_endpoint("/api/auth/oidc/settings"));
         assert!(!is_public_endpoint("/api/auth/oidc/azure/delete"));
         assert!(!is_public_endpoint("/api/auth/oidc/"));
+
+        // NAN-1931: internal Vector config delivery is session-auth-exempt
+        // (the handlers gate on VECTOR_AUTH_TOKEN themselves)...
+        assert!(is_public_endpoint(
+            "/api/internal/vector-config/current/manifest"
+        ));
+        assert!(is_public_endpoint(
+            "/api/internal/vector-config/generations/47/files/configs/a.toml"
+        ));
+        // ...but nothing else under /api/internal/ inherits the exemption.
+        assert!(!is_public_endpoint("/api/internal/vector-config"));
+        assert!(!is_public_endpoint("/api/internal/other"));
 
         assert!(!is_public_endpoint("/api/search"));
         assert!(!is_public_endpoint("/api/rules"));

@@ -8,39 +8,9 @@ use tracing::{debug, info};
 
 use super::sql_helpers::escape_question_marks_in_strings;
 use super::types::ClickHouseExecutor;
-use crate::db::dual_pool::on_cluster_clause;
+use crate::db::dual_pool::{on_cluster_clause, system_processes_source};
 use crate::search::{parse_clickhouse_error, SearchError};
 use crate::sql_hygiene::escape_sql_string;
-
-/// NAN-1728 (H2): the ClickHouse cluster name for `clusterAllReplicas(...)`
-/// wrapping of `system.processes`, or `None` on single-node / open-core.
-///
-/// `KILL QUERY` and `system.processes` are **node-local** — they only see
-/// queries initiated on the connected node. On a cluster the cancel/progress
-/// connection is LB'd and can land on a different node than the search's
-/// initiator, so the running-check finds 0 rows and progress reads `None`.
-/// Reading env `CLICKHOUSE_CLUSTER` matches [`on_cluster_clause`]'s source (the
-/// deploy sets it only on clustered ClickHouse); when unset/empty every query
-/// below emits the exact pre-cluster `system.processes` SQL — a pure no-op.
-fn cluster_name() -> Option<String> {
-    std::env::var("CLICKHOUSE_CLUSTER")
-        .ok()
-        .map(|c| c.trim().to_string())
-        .filter(|c| !c.is_empty())
-}
-
-/// The `system.processes` source expression: `clusterAllReplicas('<cluster>',
-/// system.processes)` in cluster mode (sees every replica), plain
-/// `system.processes` on single-node (byte-identical to the pre-cluster form).
-fn processes_source() -> String {
-    match cluster_name() {
-        Some(c) => format!(
-            "clusterAllReplicas('{}', system.processes)",
-            escape_sql_string(&c)
-        ),
-        None => "system.processes".to_string(),
-    }
-}
 
 impl ClickHouseExecutor {
     /// Cancel a running query by its query_id
@@ -79,7 +49,7 @@ impl ClickHouseExecutor {
         // below is skipped, leaving a runaway hunt un-cancellable from the UI.
         let check_sql = format!(
             "SELECT count() as cnt FROM {} WHERE query_id IN ({})",
-            processes_source(),
+            system_processes_source(),
             id_list
         );
 
@@ -161,7 +131,7 @@ impl ClickHouseExecutor {
         // progress and is taken first below.
         let sql = format!(
             "SELECT read_rows, total_rows_approx, elapsed FROM {} WHERE query_id = '{}'",
-            processes_source(),
+            system_processes_source(),
             escaped_id
         );
 

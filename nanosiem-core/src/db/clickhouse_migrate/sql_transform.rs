@@ -191,6 +191,72 @@ impl ClickHouseMigrator {
         sql.replace("{dist_suffix}", suffix)
     }
 
+    /// Resolve the source behind the migration-owned `cluster_processes` view.
+    /// The view is created by the admin migrator and runs with definer security,
+    /// so only this DDL needs ClickHouse's broad REMOTE privilege. Runtime reads
+    /// are confined to the view's narrow projection.
+    pub(super) fn substitute_system_processes_source(
+        sql: &str,
+        cluster_name: Option<&str>,
+    ) -> String {
+        let source = match cluster_name.map(str::trim).filter(|name| !name.is_empty()) {
+            Some(cluster) => format!(
+                "clusterAllReplicas('{}', system.processes)",
+                Self::escape_for_string_literal(cluster)
+            ),
+            None => "system.processes".to_string(),
+        };
+        sql.replace("{system_processes_source}", &source)
+    }
+
+    /// Resolve the access-control DDL clause used by migration 173. Explicit
+    /// clusters need the grant on every node. Replicated databases (including
+    /// ClickHouse Cloud) replicate access metadata themselves and must not be
+    /// forced through the explicit-cluster syntax.
+    pub(super) fn substitute_grant_on_cluster(
+        sql: &str,
+        cluster_name: Option<&str>,
+        default_db: &str,
+        is_cloud: bool,
+    ) -> String {
+        let clause = cluster_name
+            .map(str::trim)
+            .filter(|cluster| !cluster.is_empty())
+            .filter(|cluster| !is_cloud && *cluster != default_db)
+            .map(|cluster| {
+                format!(
+                    " ON CLUSTER '{}'",
+                    Self::escape_for_string_literal(cluster)
+                )
+            })
+            .unwrap_or_default();
+        sql.replace("{grant_on_cluster}", &clause)
+    }
+
+    /// Resolve the identities used by security-definer migrations. Deployments
+    /// may rename both users, so hardcoding `nanosiem_admin` would strand BYOC
+    /// installs even though the migrator connected successfully as their admin.
+    pub(super) fn substitute_clickhouse_users(sql: &str) -> String {
+        let runtime = std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "nanosiem".into());
+        let admin = std::env::var("CLICKHOUSE_ADMIN_USER").unwrap_or_else(|_| runtime.clone());
+        Self::substitute_clickhouse_users_with(sql, &admin, &runtime)
+    }
+
+    pub(super) fn substitute_clickhouse_users_with(
+        sql: &str,
+        admin: &str,
+        runtime: &str,
+    ) -> String {
+        sql.replace(
+            "{clickhouse_admin_user}",
+            &crate::sql_hygiene::escape_sql_identifier(admin),
+        )
+        .replace(
+            "{clickhouse_runtime_user}",
+            &crate::sql_hygiene::escape_sql_identifier(runtime),
+        )
+    }
+
     /// NAN-2346: resolve `{prevalence_cache_cells}` / `{prevalence_cache_cells_ip}`
     /// — the `SIZE_IN_CELLS` of the three prevalence CACHE dicts — so a small box
     /// can size them to its own memory instead of inheriting a fleet-wide constant.
@@ -214,7 +280,7 @@ impl ClickHouseMigrator {
     /// point lookup on the local `*_prevalence_final` (~326 KiB per miss). Against
     /// the pre-162 per-miss `uniqMerge` fan-out a small cache meant NAN-706 CPU
     /// pinning and 6000 ms dict-source timeouts falling back to the 9999 "common"
-    /// default (NAN-1761 #2). Since these placeholders only ever appear in ≥172
+    /// default (NAN-1761 #2). Since these placeholders only ever appear in ≥173
     /// bodies, that ordering is structural.
     ///
     /// Unset, both resolve to today's literals (5,000,000 for ip — the NAN-706

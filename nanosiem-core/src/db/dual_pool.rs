@@ -463,6 +463,27 @@ pub fn on_cluster_clause() -> String {
     format_on_cluster(std::env::var("CLICKHOUSE_CLUSTER").ok().as_deref())
 }
 
+/// The least-privilege read source for runtime `system.processes` consumers.
+///
+/// `clusterAllReplicas(..., system.processes)` requires the broad ClickHouse
+/// `REMOTE` privilege. The runtime user deliberately does not hold it. Clustered
+/// deployments instead read the migration-owned, SQL SECURITY DEFINER view,
+/// whose projection contains only the process fields nano needs. Single-node
+/// installs retain the direct system-table path required by `KILL QUERY`.
+pub fn system_processes_source() -> &'static str {
+    system_processes_source_for_cluster(
+        std::env::var("CLICKHOUSE_CLUSTER").ok().as_deref(),
+    )
+}
+
+pub(crate) fn system_processes_source_for_cluster(cluster: Option<&str>) -> &'static str {
+    if cluster.map(str::trim).is_some_and(|value| !value.is_empty()) {
+        "cluster_processes"
+    } else {
+        "system.processes"
+    }
+}
+
 /// NAN-1728 (P1) decision (pure, testable): given the current
 /// `CLICKHOUSE_CLUSTER` env value and the cluster name probed from
 /// `system.clusters`, return `Some(name)` when we should SET the env — i.e. the
@@ -1258,6 +1279,141 @@ mod tests {
             format_on_cluster(Some("  nanosiem_cluster  ")),
             " ON CLUSTER `nanosiem_cluster`"
         );
+    }
+
+    #[test]
+    fn system_processes_reads_use_the_definer_view_only_on_clusters() {
+        assert_eq!(system_processes_source_for_cluster(None), "system.processes");
+        assert_eq!(
+            system_processes_source_for_cluster(Some("   ")),
+            "system.processes"
+        );
+        assert_eq!(
+            system_processes_source_for_cluster(Some("nanosiem_cluster")),
+            "cluster_processes"
+        );
+    }
+
+    /// Read an enterprise-only deploy surface at RUNTIME (NAN-2353).
+    ///
+    /// These live under `deploy/`, which `tools/sync-to-nano-mirror.sh` strips
+    /// outright. `include_str!` resolves at COMPILE time, so pointing one at a
+    /// stripped path makes this crate unbuildable in the mirror tree and fails
+    /// `sync-mirror` — which runs AFTER the build has already published GHCR
+    /// `:latest`. That strands the public `images.lock` a release behind, and
+    /// `install.sh` (defaulting to `NANO_VERSION=latest`) then rejects a fresh
+    /// install on a digest mismatch. Exactly the NAN-2169 chain; this test
+    /// reproduced it on v0.1.697.
+    ///
+    /// `None` ONLY when the file is genuinely absent. Every other IO error
+    /// panics: `cargo test` captures stderr on passing tests, so `.ok()` here
+    /// would quietly turn the assertions below into a green half-check the day
+    /// these manifests move or get renamed inside the enterprise tree.
+    fn enterprise_deploy_surface(relative_path: &str) -> Option<String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(relative_path);
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => Some(contents),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => panic!("failed to read {}: {e}", path.display()),
+        }
+    }
+
+    #[test]
+    fn shipped_runtime_users_get_process_reads_without_remote() {
+        // Safe as a compile-time include: only `clickhouse/_archive` is
+        // stripped, not `clickhouse/` itself.
+        let users_d = include_str!("../../../clickhouse/users.d/nanosiem-users.xml");
+
+        // users.d ships in BOTH editions, so its half of the contract is
+        // asserted unconditionally — the skip below must never cover it.
+        let users_runtime = users_d
+            .split_once("<nanosiem>")
+            .and_then(|(_, rest)| rest.split_once("</nanosiem>"))
+            .map(|(section, _)| section)
+            .expect("users.d runtime section");
+        assert!(
+            users_d.contains("GRANT SELECT ON system.processes"),
+            "users.d must preserve local KILL/progress visibility"
+        );
+        assert!(
+            users_d.contains("GRANT SELECT ON nanosiem.cluster_processes"),
+            "users.d must grant the narrow clustered process view"
+        );
+        assert!(
+            !users_runtime.contains("GRANT REMOTE"),
+            "users.d must not grant REMOTE to the runtime user"
+        );
+
+        let (Some(generic), Some(aws), Some(rackspace)) = (
+            enterprise_deploy_surface("deploy/k8s/clickhouse/clickhouse.yaml"),
+            enterprise_deploy_surface("deploy/k8s/aws-db/clickhouse.yaml.tpl"),
+            enterprise_deploy_surface("deploy/k8s/rackspace-db/clickhouse.yaml.tpl"),
+        ) else {
+            // Open-core / mirror tree: `deploy/` is absent by design. The
+            // users.d assertions above already ran.
+            return;
+        };
+        let (generic, aws, rackspace) = (generic.as_str(), aws.as_str(), rackspace.as_str());
+
+        // users.d is asserted above, unconditionally — only the deploy-only
+        // surfaces belong here.
+        let surfaces = [
+            ("generic k8s", generic),
+            ("aws", aws),
+            ("rackspace", rackspace),
+        ];
+
+        for (name, config) in surfaces {
+            assert!(
+                config.contains("GRANT SELECT ON system.processes"),
+                "{name} must preserve local KILL/progress visibility"
+            );
+            assert!(
+                config.contains("GRANT SELECT ON nanosiem.cluster_processes"),
+                "{name} must grant the narrow clustered process view"
+            );
+        }
+
+        let aws_runtime = aws
+            .split_once("        nanosiem:\n")
+            .and_then(|(_, rest)| rest.split_once("        nanosiem_admin:\n"))
+            .map(|(section, _)| section)
+            .expect("AWS runtime section");
+        let rackspace_runtime = rackspace
+            .split_once("        nanosiem:\n")
+            .and_then(|(_, rest)| rest.split_once("        nanosiem_admin:\n"))
+            .map(|(section, _)| section)
+            .expect("Rackspace runtime section");
+        for (name, runtime_section) in [("aws", aws_runtime), ("rackspace", rackspace_runtime)] {
+            assert!(
+                !runtime_section.contains("GRANT REMOTE"),
+                "{name} must not grant REMOTE to the runtime user"
+            );
+        }
+        assert!(
+            !generic.contains("GRANT REMOTE ON *.* TO nanosiem;"),
+            "generic k8s must not grant REMOTE to the runtime user"
+        );
+
+        // The migration identity owns the DEFINER view and must be able to fan
+        // out its source plus reconcile SELECT for already-created users.
+        for (name, config) in [
+            ("generic k8s", generic),
+            ("aws", aws),
+            ("rackspace", rackspace),
+        ] {
+            assert!(
+                config.contains("GRANT REMOTE, CLUSTER ON *.*"),
+                "{name} admin must be able to execute clustered DEFINER DDL"
+            );
+            assert!(
+                config.contains("GRANT SELECT ON system.processes")
+                    && config.contains("WITH GRANT OPTION"),
+                "{name} admin must reconcile the runtime process grants"
+            );
+        }
     }
 
     #[test]

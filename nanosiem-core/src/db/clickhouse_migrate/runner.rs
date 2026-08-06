@@ -148,6 +148,25 @@ impl ClickHouseMigrator {
         // target always matches wrapper existence.
         let migration_sql = Self::substitute_dist_suffix(&migration_sql, cluster_name.is_some());
 
+        // NAN-2330: the admin-owned process view reads the local system table on
+        // single-node, and fans out only inside its SQL SECURITY DEFINER body on
+        // clusters. The runtime user therefore never needs REMOTE.
+        let migration_sql =
+            Self::substitute_system_processes_source(&migration_sql, cluster_name);
+
+        // NAN-2330: access-control DDL places ON CLUSTER immediately after
+        // GRANT. Keep that special syntax explicit to this migration instead of
+        // changing every historical GRANT transformed by the migrator.
+        let migration_sql = Self::substitute_grant_on_cluster(
+            &migration_sql,
+            cluster_name,
+            &self.database,
+            is_cloud,
+        );
+
+        // NAN-2330: security-definer DDL follows the configured admin/runtime
+        // identities, including renamed BYOC users, with identifier quoting.
+        let migration_sql = Self::substitute_clickhouse_users(&migration_sql);
         // NAN-2346: size the prevalence CACHE dicts' SIZE_IN_CELLS to the box.
         // Unset, this resolves to the historical literals, so only tenants whose
         // generated .env carries the vars change behavior.

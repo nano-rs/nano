@@ -20,15 +20,15 @@ use uuid::Uuid;
 const MANIFEST_VERSION: u32 = 1;
 const RENDERER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_SNAPSHOT_FILES: usize = 10_000;
-const MAX_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
+pub(super) const MAX_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_SNAPSHOT_PATH_BYTES: usize = 4 * 1024 * 1024;
-const MAX_PROTOCOL_FILE_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const MAX_PROTOCOL_FILE_BYTES: usize = 16 * 1024 * 1024;
 const LOCAL_GENERATION_RETENTION: usize = 3;
-const MANIFEST_FILE: &str = "_manifest.json";
+pub(super) const MANIFEST_FILE: &str = "_manifest.json";
 const CHECKSUMS_FILE: &str = "_checksums.sha256";
 const ENVELOPE_FILE: &str = "_envelope.json";
 const ENVELOPE_SIGNATURE_FILE: &str = "_envelope.sig";
-const READY_FILE: &str = ".ready";
+pub(super) const READY_FILE: &str = ".ready";
 
 #[derive(Debug, Error)]
 pub enum VectorConfigPublicationError {
@@ -271,6 +271,12 @@ impl VectorConfigPublisher {
             config_dir: config_dir.as_ref().to_path_buf(),
             node_id: node_id.into(),
         }
+    }
+
+    /// Root directory the publisher materializes ready generations into. The
+    /// internal HTTP delivery endpoint (NAN-1931) serves from here.
+    pub fn publications_root(&self) -> PathBuf {
+        self.config_dir.join("publications")
     }
 
     pub async fn source_revision(&self) -> Result<i64, VectorConfigPublicationError> {
@@ -1338,7 +1344,7 @@ async fn collect_materialized_tree(
     Ok(Some((files, directories)))
 }
 
-async fn read_bounded_regular_file(
+pub(super) async fn read_bounded_regular_file(
     path: &Path,
     maximum: usize,
 ) -> Result<Option<Vec<u8>>, VectorConfigPublicationError> {
@@ -1367,7 +1373,7 @@ async fn read_bounded_regular_file(
     Ok(Some(bytes))
 }
 
-fn normalized_relative_path(path: &Path) -> Option<String> {
+pub(super) fn normalized_relative_path(path: &Path) -> Option<String> {
     let mut parts = Vec::new();
     for component in path.components() {
         let Component::Normal(part) = component else {
@@ -1389,7 +1395,7 @@ fn is_reserved_materialization_path(path: &str) -> bool {
     ) || path.starts_with(".ready-")
 }
 
-fn is_safe_manifest_path(path: &str) -> bool {
+pub(super) fn is_safe_manifest_path(path: &str) -> bool {
     !path.contains('\\') && !path.chars().any(char::is_control)
 }
 
@@ -1525,7 +1531,7 @@ fn collect_regular_files(
     Ok(())
 }
 
-fn validate_relative_path(path: &Path) -> Result<(), VectorConfigPublicationError> {
+pub(super) fn validate_relative_path(path: &Path) -> Result<(), VectorConfigPublicationError> {
     if path.as_os_str().is_empty()
         || path
             .components()

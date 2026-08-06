@@ -1234,6 +1234,114 @@ mod tests {
         );
     }
 
+    #[test]
+    fn system_processes_view_source_resolves_per_topology() {
+        let sql = "SELECT * FROM {system_processes_source}";
+        assert_eq!(
+            ClickHouseMigrator::substitute_system_processes_source(sql, None),
+            "SELECT * FROM system.processes"
+        );
+        assert_eq!(
+            ClickHouseMigrator::substitute_system_processes_source(
+                sql,
+                Some("nanosiem_cluster")
+            ),
+            "SELECT * FROM clusterAllReplicas('nanosiem_cluster', system.processes)"
+        );
+        assert_eq!(
+            ClickHouseMigrator::substitute_system_processes_source(sql, Some("  ")),
+            "SELECT * FROM system.processes"
+        );
+    }
+
+    #[test]
+    fn process_grants_fan_out_only_on_explicit_clusters() {
+        let sql = "GRANT{grant_on_cluster} SELECT ON system.processes TO nanosiem";
+        assert_eq!(
+            ClickHouseMigrator::substitute_grant_on_cluster(
+                sql,
+                Some("nanosiem_cluster"),
+                "nanosiem",
+                false,
+            ),
+            "GRANT ON CLUSTER 'nanosiem_cluster' SELECT ON system.processes TO nanosiem"
+        );
+        assert_eq!(
+            ClickHouseMigrator::substitute_grant_on_cluster(
+                sql,
+                Some("nanosiem"),
+                "nanosiem",
+                false,
+            ),
+            "GRANT SELECT ON system.processes TO nanosiem"
+        );
+        assert_eq!(
+            ClickHouseMigrator::substitute_grant_on_cluster(
+                sql,
+                Some("default"),
+                "nanosiem",
+                true,
+            ),
+            "GRANT SELECT ON system.processes TO nanosiem"
+        );
+    }
+
+    #[test]
+    fn security_definer_users_are_configurable_and_identifier_quoted() {
+        let sql = "DEFINER = {clickhouse_admin_user}; GRANT SELECT TO {clickhouse_runtime_user}";
+        assert_eq!(
+            ClickHouseMigrator::substitute_clickhouse_users_with(
+                sql,
+                "byoc-admin",
+                "tenant`runtime"
+            ),
+            "DEFINER = `byoc-admin`; GRANT SELECT TO `tenant\\`runtime`"
+        );
+    }
+
+    #[test]
+    fn cluster_processes_migration_exposes_only_the_required_projection() {
+        let migration = include_str!("../../../../clickhouse/173_cluster_processes.sql");
+        for required in [
+            "CREATE OR REPLACE VIEW cluster_processes",
+            "SQL SECURITY DEFINER",
+            "{clickhouse_admin_user}",
+            "{clickhouse_runtime_user}",
+            "{system_processes_source}",
+            "{grant_on_cluster}",
+            "SELECT ON system.processes",
+            "SELECT ON cluster_processes",
+            "normalizeQuery(query)",
+            "query_snippet",
+        ] {
+            assert!(migration.contains(required), "migration missing {required}");
+        }
+        assert!(
+            !migration.contains("\n    query,\n"),
+            "the definer view must not expose raw query text"
+        );
+        assert!(
+            !migration.contains("GRANT REMOTE"),
+            "REMOTE must remain admin-only through the view body"
+        );
+        assert!(
+            !migration.contains("VIEW nanosiem.cluster_processes"),
+            "the migration must resolve the configured client database"
+        );
+    }
+
+    #[test]
+    fn historical_grants_are_not_globally_rewritten() {
+        let sql = "GRANT SELECT ON nanosiem.cluster_processes TO nanosiem";
+        let result = ClickHouseMigrator::transform_for_cluster(
+            sql,
+            "nanosiem_cluster",
+            "nanosiem",
+            false,
+        );
+        assert_eq!(result, sql);
+        }
+
     // ── NAN-2346: box-sized prevalence CACHE dict SIZE_IN_CELLS ──
 
     /// Unset vars must reproduce the historical literals exactly. This is the

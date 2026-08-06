@@ -197,6 +197,7 @@ fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         handlers::observability_synthetics::ObservabilitySyntheticsApiDoc::openapi(),
         handlers::observability_metric_monitors::ObservabilityMetricMonitorsApiDoc::openapi(),
         handlers::system::SystemApiDoc::openapi(),
+        handlers::vector_config_delivery::VectorConfigDeliveryApiDoc::openapi(),
     ];
 
     // Enterprise-only sub-docs. Their handler modules (`melod`, `notebooks`,
@@ -609,10 +610,16 @@ mod tests {
         // NAN-2306 added 2 shared hunt-report audit receipt templates:
         // /api/hunts/report-branding-events and /api/hunts/{id}/report-exports.
         // PDF bytes and branding remain device-local; both paths count in both editions.
+        // NAN-1931 adds 2 shared path templates (internal Vector config
+        // generation delivery for the managed consumer sidecar):
+        //   GET /api/internal/vector-config/current/manifest
+        //   GET /api/internal/vector-config/generations/{generation}/files/{path}
+        // Counted in both editions — the delivery endpoint is not gated.
+        // Enterprise floor 562 + 2 = 564; open floor 444 + 2 = 446.
         #[cfg(feature = "enterprise")]
-        let min_paths = 562;
+        let min_paths = 564;
         #[cfg(not(feature = "enterprise"))]
-        let min_paths = 444;
+        let min_paths = 446;
 
         assert!(
             path_count >= min_paths,

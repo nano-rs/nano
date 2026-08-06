@@ -64,6 +64,7 @@ utoipa-swagger-ui.workspace = true
 default = []
 [dev-dependencies]
 proptest.workspace = true
+tempfile = "3.25"
 
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("enterprise"))'] }

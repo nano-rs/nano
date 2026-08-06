@@ -327,6 +327,18 @@ pub fn create_router(state: AppState) -> Router {
         // Build edition + capability flags (public; the SPA hits this on boot
         // before login to decide which surfaces to render). NAN-745.
         .route("/api/capabilities", get(handlers::capabilities::get_capabilities))
+        // Internal Vector config generation delivery (NAN-1931). Exempt from
+        // user-session auth (middleware::auth::is_public_endpoint) — the
+        // handlers enforce the in-cluster VECTOR_AUTH_TOKEN bearer themselves
+        // and are disabled (404) when no token is provisioned.
+        .route(
+            "/api/internal/vector-config/current/manifest",
+            get(handlers::vector_config_delivery::get_current_manifest),
+        )
+        .route(
+            "/api/internal/vector-config/generations/{generation}/files/{*path}",
+            get(handlers::vector_config_delivery::get_generation_file),
+        )
         // Setup endpoints (public - for first-run setup)
         .route("/api/setup/status", get(handlers::setup::get_setup_status))
         .route(

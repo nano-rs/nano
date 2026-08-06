@@ -76,6 +76,9 @@
              system.processes (verified on 26.4) — without this grant, cancel
              has silently failed with ACCESS_DENIED since inception. -->
         <query>GRANT SELECT ON system.processes</query>
+        <!-- NAN-2330: clustered process visibility without granting REMOTE to
+             the runtime user. Migration 172 owns this narrow DEFINER view. -->
+        <query>GRANT SELECT ON nanosiem.cluster_processes</query>
       </grants>
     </nanosiem>
 

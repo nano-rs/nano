@@ -5,6 +5,98 @@ use crate::auth::ScopeSet;
 use crate::search::query_processing::enforce_source_scope;
 
 impl SearchService {
+    /// Admission-gated wrapper around [`SearchService::search_streaming`]
+    /// (NAN-2039).
+    ///
+    /// The SSE streaming path previously called `search_streaming` directly,
+    /// bypassing the admission boundary that both the synchronous and the
+    /// async batch paths go through ([`search_with_admission`] /
+    /// [`search_async_with_admission`]): it never acquired a permit, never
+    /// entered the per-user / global queue, and never installed the
+    /// per-priority ClickHouse settings (`max_execution_time`, priority, …). A
+    /// caller with search access could therefore open unbounded parallel SSE
+    /// searches that ran outside the concurrency limits and with default CH
+    /// limits.
+    ///
+    /// This mirrors [`search_with_admission`] exactly:
+    /// - apply the priority's admit delay so Interactive wins the admit race;
+    /// - acquire a permit, held for the WHOLE stream — `search_streaming` runs
+    ///   to completion (it awaits every ClickHouse chunk and forwards all
+    ///   events) before returning, so `_permit` drops only when the stream
+    ///   finishes, freeing the slot then;
+    /// - run streaming on a clone whose `active_ch_settings` carry the
+    ///   priority's ClickHouse limits (the streaming chunk + count + histogram
+    ///   queries all read `active_ch_settings`).
+    ///
+    /// With no admission controller wired up it falls back to the direct path,
+    /// preserving pre-NAN-2039 behavior for un-migrated deployments.
+    ///
+    /// [`search_with_admission`]: SearchService::search_with_admission
+    /// [`search_async_with_admission`]: SearchService::search_async_with_admission
+    pub async fn search_streaming_with_admission(
+        &self,
+        request: SearchRequest,
+        event_tx: tokio::sync::mpsc::Sender<crate::search::streaming::SearchStreamEvent>,
+        user_id: uuid::Uuid,
+        priority: super::admission::QueryPriority,
+        scope: &ScopeSet,
+    ) {
+        use crate::search::streaming::SearchStreamEvent;
+
+        // Lower-priority requests yield briefly before claiming a slot so
+        // Interactive requests win the initial admit burst (see
+        // `search_with_admission` / NAN-709).
+        if let Some(delay) = priority.admit_delay() {
+            tokio::time::sleep(delay).await;
+        }
+
+        // No controller wired up → no gating, stream directly. Preserves the
+        // pre-NAN-2039 behavior for code paths / deployments without admission.
+        let Some(controller) = self.admission_controller.clone() else {
+            self.search_streaming(request, event_tx, scope).await;
+            return;
+        };
+
+        let job_id = uuid::Uuid::now_v7().to_string();
+        // NAN-2039 (codex P1): when global admission is saturated, `acquire`
+        // parks this request in the queue for up to the acquire timeout. If the
+        // SSE client disconnects while we are queued, only `event_rx` is
+        // dropped — this detached worker would otherwise keep holding its queue
+        // slot for the full timeout, making live searches wait or fail with
+        // `QueueFull`. Race the acquire against the sender closing (the receiver
+        // is dropped when the SSE response is dropped) and, on disconnect,
+        // release the queue slot via `cancel_queued` and bail.
+        let _permit = tokio::select! {
+            biased;
+            _ = event_tx.closed() => {
+                controller.cancel_queued(&job_id).await;
+                return;
+            }
+            result = controller.acquire(&job_id, user_id, priority) => match result {
+                Ok(permit) => permit,
+                Err(e) => {
+                    // Admission denied (per-user / global cap or queue timeout):
+                    // send a terminal error event instead of silently running
+                    // the stream unadmitted. Mirrors the batch path's
+                    // `SearchError::AdmissionDenied`.
+                    let _ = event_tx
+                        .send(SearchStreamEvent::Error {
+                            code: "ADMISSION_DENIED".to_string(),
+                            message: e.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            }
+        };
+
+        let mut service = self.clone();
+        service.active_ch_settings = Some(priority.to_ch_settings());
+        // `_permit` is held across the whole stream and drops when
+        // `search_streaming` returns (stream complete), freeing the slot.
+        service.search_streaming(request, event_tx, scope).await;
+    }
+
     /// Execute a streaming search, sending events through an mpsc channel.
     ///
     /// For streamable queries (non-aggregate, no lookup/prevalence/tree/asset post-processing),
@@ -258,25 +350,10 @@ impl SearchService {
                 interval.tick().await;
 
                 if let Some(ref client) = ch_client {
-                    // NAN-1728 (H2): `system.processes` is node-local. On a cluster
-                    // the poll connection is LB'd and can land on a different node
-                    // than the search's initiator, so a plain read returns no row
-                    // and progress silently stalls at 0. Wrap in `clusterAllReplicas`
-                    // when `CLICKHOUSE_CLUSTER` is set (matching `on_cluster_clause`'s
-                    // source) so the initiator's row is found on whichever node it
-                    // ran; on single-node / open-core the env is unset and the SQL is
-                    // byte-identical to the pre-cluster `system.processes` read.
-                    let progress_source = match std::env::var("CLICKHOUSE_CLUSTER")
-                        .ok()
-                        .map(|c| c.trim().to_string())
-                        .filter(|c| !c.is_empty())
-                    {
-                        Some(cluster) => format!(
-                            "clusterAllReplicas('{}', system.processes)",
-                            crate::sql_hygiene::escape_sql_string(&cluster)
-                        ),
-                        None => "system.processes".to_string(),
-                    };
+                    // NAN-2330: cluster fan-out is performed by the narrow
+                    // SQL SECURITY DEFINER view. The runtime key never receives
+                    // ClickHouse's broad REMOTE privilege.
+                    let progress_source = crate::db::dual_pool::system_processes_source();
                     let progress_sql = format!(
                         "SELECT read_rows, total_rows_approx, elapsed \
                          FROM {} WHERE query_id = '{}'",

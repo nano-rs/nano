@@ -22,3 +22,4 @@ pub use vector_config::{
     SnapshotBundle, VectorConfigError, VectorConfigManager, VectorConfigPublicationError,
     VectorConfigPublisher,
 };
+pub use vector_config::delivery as vector_config_delivery;

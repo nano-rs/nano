@@ -18,6 +18,7 @@
 
 mod backup;
 mod credentials;
+pub mod delivery;
 mod deploy;
 mod parser_config;
 mod publication;

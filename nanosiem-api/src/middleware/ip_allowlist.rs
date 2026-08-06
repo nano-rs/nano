@@ -59,6 +59,14 @@ pub async fn ip_allowlist_middleware(
         }
     }
 
+    // NAN-1931: the Vector config-consumer sidecar is in-cluster
+    // infrastructure, like the probes above — a tenant-configured UI/API
+    // allowlist must not be able to freeze config delivery to Vector. The
+    // endpoints carry their own VECTOR_AUTH_TOKEN bearer gate.
+    if path.starts_with("/api/internal/vector-config/") {
+        return next.run(request).await;
+    }
+
     // Extract ConnectInfo from request extensions (set by into_make_service_with_connect_info)
     let connect_info = request
         .extensions()

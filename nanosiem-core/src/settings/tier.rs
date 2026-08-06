@@ -174,10 +174,60 @@ pub struct TierLimits {
     pub max_slos: Option<u32>,
 }
 
+/// Env var carrying a contractual monthly AI credit ceiling (NAN-2347).
+pub const AI_CREDITS_CEILING_ENV: &str = "NANO_AI_CREDITS_PER_MONTH";
+
+/// Parse a ceiling value: a positive integer number of credits.
+///
+/// Zero and garbage are treated as unset rather than as "block all AI" — a
+/// platform typo must degrade to today's unlimited behavior, not take every
+/// AI feature down. Parsed through `i32` because `increment_ai_credits`
+/// compares and stores the counter as PostgreSQL INTEGER — a value past
+/// `i32::MAX` would wrap negative there and reject the very first request.
+fn parse_ai_credits_ceiling(raw: &str) -> Option<u32> {
+    raw.trim().parse::<i32>().ok().filter(|v| *v > 0).map(|v| v as u32)
+}
+
+/// Contractual AI credit ceiling for the otherwise-unlimited tiers.
+///
+/// Managed enterprise deployments are sold with a monthly AI request ceiling
+/// (10 credits = one full-model request), but Enterprise/Unrestricted default
+/// to `ai_credits_per_month: None`, which makes `increment_ai_credits` a
+/// no-op — the contract was unenforceable. The platform sets this env var at
+/// provision time; it applies only to tiers whose default is unlimited, since
+/// the metered tiers already carry their own caps.
+///
+/// **Test pollution warning**: reads process-wide env state — see the note on
+/// `allow_local()` in `tiering/validation.rs`. Tests cover the pure pieces
+/// (`parse_ai_credits_ceiling`, `for_tier_with_ceiling`) instead of toggling
+/// the var.
+fn env_ai_credits_ceiling() -> Option<u32> {
+    std::env::var(AI_CREDITS_CEILING_ENV)
+        .ok()
+        .and_then(|v| parse_ai_credits_ceiling(&v))
+}
+
 impl TierLimits {
     /// Get the default limits for a given tier.
     /// These are the hardcoded defaults; DB values can override for Enterprise.
     pub fn for_tier(tier: OrganizationTier) -> Self {
+        Self::for_tier_with_ceiling(tier, env_ai_credits_ceiling())
+    }
+
+    /// `for_tier` with the env ceiling passed explicitly.
+    ///
+    /// Applied here rather than at the enforcement callsites so every path
+    /// that resolves limits — the DB-merge in `get_limits`, the no-row
+    /// fallback, direct `for_tier` callers — inherits the ceiling.
+    fn for_tier_with_ceiling(tier: OrganizationTier, ceiling: Option<u32>) -> Self {
+        let mut limits = Self::tier_defaults(tier);
+        if limits.ai_credits_per_month.is_none() {
+            limits.ai_credits_per_month = ceiling;
+        }
+        limits
+    }
+
+    fn tier_defaults(tier: OrganizationTier) -> Self {
         match tier {
             OrganizationTier::Unrestricted => Self {
                 tier,
@@ -639,6 +689,21 @@ impl TierSettings {
         }
 
         Ok(count)
+    }
+
+    /// Resolve the current tier limit and charge `cost` credits in one call
+    /// (NAN-2348). The convenience wrapper for charge sites that don't
+    /// already hold `TierLimits` — background agents and the `| ai` pipe.
+    ///
+    /// `Err(AiRateLimitExceeded)` means the monthly ceiling is reached and
+    /// the caller must skip its model call; any other error means the limit
+    /// could not be resolved or recorded, and callers should fail closed
+    /// (skip) rather than run unmetered.
+    pub async fn charge_ai_credits(&self, cost: i32) -> Result<(), TierError> {
+        let limits = self.get_tier_limits().await?;
+        self.increment_ai_credits(cost, limits.ai_credits_per_month)
+            .await?;
+        Ok(())
     }
 
     /// Get AI credits used for the current month
@@ -1124,9 +1189,51 @@ pub fn check_model_access(model: &str, model_tier: &AiModelTier) -> Result<(), T
 mod tests {
     use super::*;
 
+    // NAN-2347: the contractual AI credit ceiling for unlimited tiers.
+
+    #[test]
+    fn test_ai_ceiling_parse_accepts_positive_integers_only() {
+        assert_eq!(parse_ai_credits_ceiling("5000000"), Some(5_000_000));
+        assert_eq!(parse_ai_credits_ceiling(" 42 "), Some(42));
+        // Zero and garbage degrade to unset, never to "block all AI".
+        assert_eq!(parse_ai_credits_ceiling("0"), None);
+        assert_eq!(parse_ai_credits_ceiling(""), None);
+        assert_eq!(parse_ai_credits_ceiling("unlimited"), None);
+        assert_eq!(parse_ai_credits_ceiling("-1"), None);
+        assert_eq!(parse_ai_credits_ceiling("5e6"), None);
+        // The counter is a PostgreSQL INTEGER — past-i32 values would wrap
+        // negative in increment_ai_credits and reject the first request.
+        assert_eq!(parse_ai_credits_ceiling("2147483647"), Some(2_147_483_647));
+        assert_eq!(parse_ai_credits_ceiling("2147483648"), None);
+        assert_eq!(parse_ai_credits_ceiling("4294967295"), None);
+    }
+
+    #[test]
+    fn test_ai_ceiling_caps_only_the_unlimited_tiers() {
+        let ceiling = Some(5_000_000);
+        // Enterprise and Unrestricted default to unlimited — they get the cap.
+        for tier in [OrganizationTier::Enterprise, OrganizationTier::Unrestricted] {
+            let limits = TierLimits::for_tier_with_ceiling(tier, ceiling);
+            assert_eq!(limits.ai_credits_per_month, Some(5_000_000), "{tier:?}");
+        }
+        // Metered tiers keep their own tier caps.
+        let hobby = TierLimits::for_tier_with_ceiling(OrganizationTier::Hobby, ceiling);
+        assert_eq!(hobby.ai_credits_per_month, Some(3_000));
+        let pro = TierLimits::for_tier_with_ceiling(OrganizationTier::Pro, ceiling);
+        assert_eq!(pro.ai_credits_per_month, Some(400_000));
+    }
+
+    #[test]
+    fn test_ai_ceiling_unset_preserves_unlimited() {
+        let limits = TierLimits::for_tier_with_ceiling(OrganizationTier::Enterprise, None);
+        assert_eq!(limits.ai_credits_per_month, None);
+    }
+
     #[test]
     fn test_unrestricted_has_no_limits() {
-        let limits = TierLimits::for_tier(OrganizationTier::Unrestricted);
+        // via for_tier_with_ceiling(None): a NANO_AI_CREDITS_PER_MONTH set in
+        // the test environment must not flip the default-limit assertions.
+        let limits = TierLimits::for_tier_with_ceiling(OrganizationTier::Unrestricted, None);
         assert_eq!(limits.max_data_sources, None);
         assert_eq!(limits.max_detection_rules, None);
         assert_eq!(limits.max_team_members, None);
@@ -1239,7 +1346,8 @@ mod tests {
 
     #[test]
     fn test_enterprise_unlimited() {
-        let limits = TierLimits::for_tier(OrganizationTier::Enterprise);
+        // via for_tier_with_ceiling(None) — same env-independence as above.
+        let limits = TierLimits::for_tier_with_ceiling(OrganizationTier::Enterprise, None);
         assert_eq!(limits.max_data_sources, None);
         assert_eq!(limits.max_team_members, None);
         assert!(limits.sso_enabled);

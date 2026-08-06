@@ -170,6 +170,12 @@ impl AiMonitor {
 
         // Test the provider connection through the injected, on-prem-aware
         // checker — NOT a hardcoded public endpoint. (NAN-1231)
+        //
+        // NAN-2348: deliberately NOT charged against the AI credit budget —
+        // a 10-token connectivity ping every 5 minutes is BAU monitoring;
+        // charging it would pollute the counter (~1.7k credits/month of
+        // noise) and pausing it at the ceiling would blind provider health
+        // exactly when a budget conversation is underway.
         match checker
             .check(&provider.provider, &api_key, &provider.config)
             .await

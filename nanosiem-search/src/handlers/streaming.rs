@@ -8,7 +8,10 @@ use axum::{
     response::sse::{Event, Sse},
 };
 use futures::stream::Stream;
-use nanosiem_core::{SearchRequest, SearchResponse, search::SearchStreamEvent};
+use nanosiem_core::{
+    SearchRequest, SearchResponse,
+    search::{QueryPriority, SearchStreamEvent},
+};
 use std::convert::Infallible;
 
 use crate::error::ErrorResponse;
@@ -69,6 +72,15 @@ pub async fn search_stream(
         super::search::reserve_query_owner(&state, request_id, auth.credential_principal_id())
             .await?;
     }
+
+    // NAN-2039: admission keys on the USER, not the credential principal
+    // reserved above. The batch path draws the same distinction — it reserves
+    // ownership under `credential_principal_id()` and then binds
+    // `auth.claims.sub` for `search_with_admission` (handlers/search.rs) — and
+    // the two must not drift: ownership has to match what `cancel_search`
+    // compares, while the admission caps are per-user, so an analyst holding
+    // several API keys shares one budget rather than one per credential.
+    let user_id = auth.claims.sub;
 
     // Create event channel
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<SearchStreamEvent>(64);
@@ -148,9 +160,25 @@ pub async fn search_stream(
         let search_service = state.search.clone();
         let event_tx_clone = event_tx.clone();
         let scope_for_search = scope.clone();
+        // NAN-2039: route the live stream through admission control (the same
+        // boundary the batch `search()` path uses via `search_with_admission`)
+        // so parallel SSE searches are bounded by the per-user / global caps
+        // and run with the priority's ClickHouse limits — previously
+        // `search_streaming` was called directly and bypassed both. Priority is
+        // derived exactly as the batch path does.
+        let priority = match request.priority.as_deref() {
+            Some("analytics") => QueryPriority::Analytics,
+            _ => QueryPriority::Interactive,
+        };
         tokio::spawn(async move {
             search_service
-                .search_streaming(request, event_tx_clone, &scope_for_search)
+                .search_streaming_with_admission(
+                    request,
+                    event_tx_clone,
+                    user_id,
+                    priority,
+                    &scope_for_search,
+                )
                 .await;
         });
     }

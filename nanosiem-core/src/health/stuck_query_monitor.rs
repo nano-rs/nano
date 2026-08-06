@@ -19,6 +19,7 @@ use serde::Deserialize;
 use tracing::{debug, warn};
 
 use super::types::StuckQueryStatus;
+use crate::db::dual_pool::system_processes_source_for_cluster;
 
 /// Cluster name from the `CLICKHOUSE_CLUSTER` env — same deploy-level signal
 /// `FeedMonitor` / retention use. `system.processes` is per-node, so on a
@@ -65,15 +66,14 @@ impl StuckQueryMonitor {
     /// Probe SQL. `normalizeQuery` strips literals so the snippet is safe to
     /// put in a notification (no log content / search terms leak into it).
     fn probe_sql(cluster: Option<&str>, threshold_secs: u64) -> String {
-        let source = match cluster {
-            Some(c) => format!(
-                "clusterAllReplicas('{}', system.processes)",
-                c.replace('\'', "\\'")
-            ),
-            None => "system.processes".to_string(),
+        let source = system_processes_source_for_cluster(cluster);
+        let snippet = if source == "cluster_processes" {
+            "query_snippet"
+        } else {
+            "substring(normalizeQuery(query), 1, 200) AS query_snippet"
         };
         format!(
-            "SELECT query_id, user, elapsed, substring(normalizeQuery(query), 1, 200) AS query_snippet \
+            "SELECT query_id, user, elapsed, {snippet} \
              FROM {source} WHERE is_cancelled = 1 AND elapsed > {threshold_secs}"
         )
     }
@@ -159,12 +159,13 @@ mod tests {
     }
 
     #[test]
-    fn probe_fans_out_via_cluster_all_replicas_when_clustered() {
+    fn clustered_probe_uses_the_definer_view() {
         let sql = StuckQueryMonitor::probe_sql(Some("nano"), 900);
         assert!(
-            sql.contains("clusterAllReplicas('nano', system.processes)"),
+            sql.contains("FROM cluster_processes"),
             "got: {sql}"
         );
+        assert!(!sql.contains("clusterAllReplicas"), "got: {sql}");
         assert!(sql.contains("elapsed > 900"), "got: {sql}");
     }
 
@@ -174,5 +175,11 @@ mod tests {
         // carry query literals (search terms, log content).
         let sql = StuckQueryMonitor::probe_sql(None, 600);
         assert!(sql.contains("normalizeQuery(query)"), "got: {sql}");
+
+        // The clustered view performs that normalization as its definer, so the
+        // runtime user never receives the raw query text through the view.
+        let clustered = StuckQueryMonitor::probe_sql(Some("nano"), 600);
+        assert!(clustered.contains("query_snippet"), "got: {clustered}");
+        assert!(!clustered.contains("normalizeQuery(query)"), "got: {clustered}");
     }
 }

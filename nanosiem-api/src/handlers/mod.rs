@@ -139,6 +139,7 @@ pub mod system;
 pub mod tuning;
 pub mod upload;
 pub mod users;
+pub mod vector_config_delivery;
 
 pub use alerts::*;
 pub use api_keys::*;

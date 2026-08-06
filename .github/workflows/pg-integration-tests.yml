@@ -163,6 +163,12 @@ jobs:
           #
           # DB-backed suites stay listed explicitly below: they are #[ignore]d,
           # so this line does not run them, and several need --test-threads=1.
+          # NAN-2225: migration_seed_parity builds BOTH migration paths in
+          # throwaway databases of its own and diffs the seeded RBAC state. It is
+          # the only thing that can catch a pre-baseline seed that 177 fails to
+          # replay — the NAN-2212 / NAN-2218 / NAN-2221 class, all of which were
+          # found by humans reading migrations rather than by CI. Single-threaded:
+          # it sets NANOSIEM_MIGRATION_MODE in the process env to force each path.
           #
           # IMPORTANT: the `bash -c '...'` body below MUST stay apostrophe-free.
           # An apostrophe closes the single-quoted -c string, so everything after
@@ -180,6 +186,7 @@ jobs:
             "$RUST_IMAGE" \
             bash -euo pipefail -c '
               cargo test --workspace --lib --tests --no-fail-fast -- --test-threads=1
+              cargo test -p nanosiem-core --test migration_seed_parity -- --ignored --test-threads=1
               cargo test -p nanosiem-core --test api_key_rate_limit_integration -- --ignored
               cargo test -p nanosiem-api-lib --test grant_authority_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-core --test source_scope_integration -- --ignored
