@@ -119,14 +119,14 @@ pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
 pub const DEFAULT_BATCH_SIZE: i64 = 200;
 
 /// How long past `lease_expires_at` a sweep is left alone before the scheduler
-/// takes it away from its runner.
+/// marks it abandoned.
 ///
-/// Not zero, and not for politeness: [`super::repository::HuntRepository::claim_next_sweep`]
-/// already re-claims expired leases, so a runner that is merely slow to poll
-/// gets to pick its own work back up and FINISH it. Reclaiming instantly would
-/// win that race and convert recoverable sweeps into abandoned ones. The
-/// scheduler is the backstop for the case no runner is coming.
-pub const DEFAULT_RECLAIM_GRACE_SECS: i64 = 300;
+/// Zero by default because the report transaction requires an unexpired lease:
+/// once the database clock reaches the boundary, no late result can commit.
+/// Runner claims select queued rows only; otherwise a report timeout turns into
+/// an unbounded replay loop. The setting remains configurable for operators who
+/// deliberately want a delayed terminal-state transition, not as retry time.
+pub const DEFAULT_RECLAIM_GRACE_SECS: i64 = 0;
 
 /// How many expired leases one tick will reclaim.
 pub const DEFAULT_RECLAIM_BATCH: i64 = 200;
@@ -145,8 +145,9 @@ const RECLAIM_OUTCOME: &str = "error";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HuntSchedulerConfig {
-    /// Master switch. `HUNT_SCHEDULER_ENABLED=false` leaves hunts manual-only
-    /// without having to disable each one.
+    /// Cadence switch. `HUNT_SCHEDULER_ENABLED=false` leaves hunts manual-only
+    /// without having to disable each one. Lease cleanup still runs so a failed
+    /// manual attempt cannot remain `leased` forever.
     pub enabled: bool,
     pub poll_interval_secs: u64,
     pub batch_size: i64,
@@ -596,6 +597,13 @@ impl HuntScheduler {
                 tick.errors += 1;
                 warn!(%error, "Hunt lease reclamation failed; continuing with slot issuance");
             }
+        }
+
+        // The switch disables NEW scheduled work, not lease hygiene. Manual
+        // sweeps still run while cadence is off, and a dead manual runner must
+        // still become an honest terminal attempt after its lease expires.
+        if !self.config.enabled {
+            return Ok(tick);
         }
 
         let due = self.load_due_hunts(now).await?;
@@ -1084,8 +1092,7 @@ impl HuntScheduler {
     /// Run until cancelled. Start from `start_leader_schedulers` — see the type
     /// docs on single-issuer.
     pub async fn run(&self, shutdown: &ShutdownToken) {
-        if !self.config.enabled {
-            info!("Hunt scheduler disabled (HUNT_SCHEDULER_ENABLED=false); hunts stay manual-only");
+        if shutdown.is_cancelled() {
             return;
         }
 
@@ -1108,8 +1115,15 @@ impl HuntScheduler {
             poll_interval_secs = self.config.poll_interval_secs,
             batch_size = self.config.batch_size,
             reclaim_grace_secs = self.config.reclaim_grace_secs,
+            cadence_enabled = self.config.enabled,
             "Hunt scheduler started (leader-only)"
         );
+        if !self.config.enabled {
+            info!(
+                "Scheduled hunt cadence disabled (HUNT_SCHEDULER_ENABLED=false); \
+                 manual hunts and expired-lease cleanup remain active"
+            );
+        }
 
         loop {
             if shutdown.is_cancelled() {

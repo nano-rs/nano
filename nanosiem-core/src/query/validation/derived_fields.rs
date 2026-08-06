@@ -7,7 +7,9 @@
 //! references in downstream pipeline stages even though they don't exist in
 //! the UDM schema.
 
-use crate::query::ast::{AggFunc, Aggregation, Command, Query, RexMode, SearchExpr};
+use crate::query::ast::{
+    AggFunc, Aggregation, Command, EvalExpression, Query, RexMode, SearchExpr,
+};
 use std::collections::HashSet;
 
 /// Collect all field names created by pipeline commands in a query.
@@ -40,9 +42,28 @@ fn collect_fields_from_expr(expr: &SearchExpr) -> Vec<String> {
         SearchExpr::Not(inner) | SearchExpr::Group(inner) => {
             fields.extend(collect_fields_from_expr(inner));
         }
+        SearchExpr::EvalPredicate(expression) => {
+            collect_fields_from_eval_expr(expression, &mut fields);
+        }
         _ => {}
     }
     fields
+}
+
+fn collect_fields_from_eval_expr(expr: &EvalExpression, fields: &mut Vec<String>) {
+    match expr {
+        EvalExpression::Field(field) => fields.push(field.clone()),
+        EvalExpression::Literal(_) => {}
+        EvalExpression::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_fields_from_eval_expr(arg, fields);
+            }
+        }
+        EvalExpression::BinaryOp { left, right, .. } => {
+            collect_fields_from_eval_expr(left, fields);
+            collect_fields_from_eval_expr(right, fields);
+        }
+    }
 }
 
 fn collect_derived_fields_recursive(query: &Query, fields: &mut HashSet<String>) {

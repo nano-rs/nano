@@ -6,7 +6,7 @@
 //! handling UDM fields, JSON metadata fields, wildcards, regex, and
 //! case-insensitive matching.
 
-use super::eval_functions::eval_expression_to_sql;
+use super::eval_functions::{eval_expression_to_sql, typed_eval_expression_to_sql};
 use super::helpers::*;
 use super::{ClickHouseSqlGenerator, SUBSEARCH_RESULT_LIMIT};
 use crate::query::ast::*;
@@ -346,7 +346,108 @@ fn build_optimized_regex_sql(
     }
 }
 
+/// Validate a CIDR literal without normalizing it. ClickHouse otherwise raises
+/// a runtime error for malformed prefixes, turning a bad hunt into a 500.
+fn validate_cidr_literal(cidr: &str) -> Result<(), SqlGenError> {
+    let mut parts = cidr.split('/');
+    let address = parts.next().unwrap_or_default();
+    let prefix = parts.next().unwrap_or_default();
+    if address.is_empty() || prefix.is_empty() || parts.next().is_some() {
+        return Err(SqlGenError::InvalidQuery(format!(
+            "invalid CIDR literal '{cidr}'"
+        )));
+    }
+
+    let address = address
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| SqlGenError::InvalidQuery(format!("invalid CIDR address in '{cidr}'")))?;
+    if !prefix.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(SqlGenError::InvalidQuery(format!(
+            "invalid CIDR prefix in '{cidr}'"
+        )));
+    }
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|_| SqlGenError::InvalidQuery(format!("invalid CIDR prefix in '{cidr}'")))?;
+    let max_prefix = if address.is_ipv4() { 32 } else { 128 };
+    if prefix > max_prefix {
+        return Err(SqlGenError::InvalidQuery(format!(
+            "CIDR prefix /{prefix} is out of range for {address}"
+        )));
+    }
+
+    Ok(())
+}
+
 impl ClickHouseSqlGenerator {
+    /// Whether `field` is an IP-valued security entity under the active schema.
+    ///
+    /// OCSF's UDM-compatible aliases (for example `src_ip`) resolve to a
+    /// differently named promoted column (`src_endpoint.ip`), so checking only
+    /// the token's direct metadata misses them. Inspect the resolved physical
+    /// column as well as the logical token.
+    fn field_is_ip(&self, field: &str) -> bool {
+        use crate::schema::{EntityType, FieldResolution, FieldType};
+
+        let is_ip = |name: &str| {
+            self.profile.entity_type(name) == Some(EntityType::Ip)
+                || self.profile.field_type(name) == Some(FieldType::IpAddress)
+        };
+
+        if is_ip(field) {
+            return true;
+        }
+
+        match self.profile.resolve(field) {
+            FieldResolution::ExplicitColumn(column) | FieldResolution::Alias(column) => {
+                is_ip(&column)
+            }
+            _ => false,
+        }
+    }
+
+    /// Lower Splunk-style IP-field CIDR equality to ClickHouse network
+    /// membership. `None` means this comparison is not CIDR syntax.
+    ///
+    /// `field!=cidr` deliberately retains the non-empty guard outside the
+    /// negation. Splunk's `!=` only matches events where the field exists,
+    /// whereas outer `NOT field=cidr` negates the entire guarded equality and
+    /// therefore also matches missing/empty fields.
+    fn generate_cidr_equality_filter(
+        &self,
+        field: &str,
+        op: &Comparator,
+        value: &Value,
+    ) -> Result<Option<String>, SqlGenError> {
+        if !matches!(op, Comparator::Eq | Comparator::Ne) || !self.field_is_ip(field) {
+            return Ok(None);
+        }
+
+        let Value::String(cidr) = value else {
+            return Ok(None);
+        };
+        if !cidr.contains('/') {
+            return Ok(None);
+        }
+
+        validate_cidr_literal(cidr)?;
+        let field_expr = self.filter_field_expr(field, "String");
+        let membership = format!(
+            "isIPAddressInRange({}, '{}')",
+            field_expr,
+            escape_string(cidr)
+        );
+        let predicate = if *op == Comparator::Eq {
+            membership
+        } else {
+            format!("NOT {}", membership)
+        };
+        Ok(Some(format!(
+            "(length({}) > 0 AND {})",
+            field_expr, predicate
+        )))
+    }
+
     /// Whether `field` is numeric under the active profile OR is a numeric column
     /// of the active OTLP dataset (`duration_ns`, `value`, …) (NAN-1534). For the
     /// default logs dataset the dataset set is empty, so this is exactly
@@ -548,6 +649,9 @@ impl ClickHouseSqlGenerator {
             SearchExpr::BooleanFunction(function) => {
                 // Standalone boolean function predicate: isnull(user), like(field, pattern), etc.
                 eval_expression_to_sql(self, function)
+            }
+            SearchExpr::EvalPredicate(expression) => {
+                typed_eval_expression_to_sql(self, expression)
             }
             SearchExpr::FieldFunctionFilter {
                 field,
@@ -1007,6 +1111,13 @@ impl ClickHouseSqlGenerator {
         // NAN-1555: profile-aware so spans keep `service_name` (not the UDM
         // `cloud_service` alias); logs byte-identical via the free alias map.
         let field = self.canonicalize_field(field);
+
+        // Splunk treats equality against CIDR notation as network membership
+        // for IP fields. This must run before the known/JSON routing split so
+        // OCSF UDM aliases receive the same behavior as native promoted fields.
+        if let Some(sql) = self.generate_cidr_equality_filter(field, op, value)? {
+            return Ok(sql);
+        }
 
         // Check if it's a UDM field (direct column) or metadata field (JSON)
         if self.profile.is_known_field(field) {
@@ -2278,6 +2389,9 @@ impl ClickHouseSqlGenerator {
                 }
             }
             SearchExpr::BooleanFunction(function) => eval_expression_to_sql(self, function),
+            SearchExpr::EvalPredicate(expression) => {
+                typed_eval_expression_to_sql(self, expression)
+            }
             SearchExpr::FieldFunctionFilter {
                 field,
                 op,

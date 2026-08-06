@@ -423,6 +423,9 @@ fn validate_search_expr_fields(
         SearchExpr::BooleanFunction(function) => {
             validate_eval_expr_fields(function, errors, derived, profile);
         }
+        SearchExpr::EvalPredicate(expression) => {
+            validate_eval_expr_fields(expression, errors, derived, profile);
+        }
         SearchExpr::LiteralComparison { .. } => {
             // Literal comparisons don't reference fields
         }
@@ -1753,6 +1756,22 @@ mod tests {
             0,
             "quoted output alias + downstream derived ref must pass: {:?}",
             errors
+        );
+    }
+
+    #[test]
+    fn nan2331_arithmetic_where_accepts_upstream_stats_aliases() {
+        let query = parse_query(
+            "* | stats min(timestamp) as first_seen, max(timestamp) as last_seen, \
+             count() as event_count by user | where event_count > 5 AND \
+             (last_seen - first_seen) >= 300",
+        )
+        .unwrap();
+        let errors = validate_query_fields(&query);
+
+        assert!(
+            errors.is_empty(),
+            "stats aliases referenced by arithmetic where must validate: {errors:?}"
         );
     }
 }

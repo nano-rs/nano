@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import {
   AlertTriangle, Check, CheckCircle, Code as CodeIcon, Copy, Download,
@@ -38,6 +38,13 @@ const TABS = [
 ] as const;
 export type MarketplaceDrawerTab = typeof TABS[number]['id'];
 type TabId = MarketplaceDrawerTab;
+
+/** How long to keep polling an open drawer after triggering a sync (NAN-2343). */
+const SYNC_WATCH_MS = 30_000;
+/** Gap between those polls. */
+const SYNC_POLL_MS = 2_500;
+/** Absolute cap, so a sync wedged in `in_progress` cannot poll forever. */
+const SYNC_WATCH_MAX_MS = 5 * 60_000;
 
 interface MarketplaceDrawerProps {
   slug: string | null;
@@ -77,6 +84,9 @@ export function MarketplaceDrawer({
   const [loading, setLoading] = useState(false);
   const [tab, setTab] = useState<TabId>('config');
   const [credentials, setCredentials] = useState<Record<string, string>>({});
+  // Stored values as loaded from the server, so a save can submit only the
+  // fields the operator actually changed (NAN-2343).
+  const [pristineCredentials, setPristineCredentials] = useState<Record<string, string>>({});
   const [showSecrets, setShowSecrets] = useState<Record<string, boolean>>({});
   const [savingCreds, setSavingCreds] = useState(false);
   const [credsDirty, setCredsDirty] = useState(false);
@@ -87,20 +97,121 @@ export function MarketplaceDrawer({
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [checkingDelete, setCheckingDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  // Bumped on each sync trigger to (re)arm the watch interval (NAN-2343).
+  const [syncWatchToken, setSyncWatchToken] = useState(0);
 
   useEffect(() => {
     if (!slug || !open) return;
     setLoading(true);
     setCredentials({});
+    setPristineCredentials({});
     setShowSecrets({});
     setCredsDirty(false);
     setDeleteOpen(false);
     setTab(initialTab);
     api.marketplace.getCatalogEntry(slug)
-      .then(setEntry)
+      .then(loaded => {
+        setEntry(loaded);
+        void hydrateReadableCredentials(loaded);
+      })
       .catch(() => toast({ title: 'Error', description: 'Failed to load details', variant: 'destructive' }))
       .finally(() => setLoading(false));
+    // hydrateReadableCredentials is stable for a given render pass and depends
+    // only on setters; including it would re-run this loader on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slug, open, toast, initialTab]);
+
+  // Show the operator what is actually stored, for credential fields that are
+  // not secrets.
+  //
+  // NAN-2343: unmasking `download_url` (migration 285) is only half the fix —
+  // the input's value comes from `credentials`, which starts empty, so a
+  // configured entry still rendered a placeholder and the saved string stayed
+  // unreadable. That was the whole reason the legacy /enrichments/ipinfo_lite
+  // page had to exist, and this PR retires it.
+  //
+  // Native sources keep their operational values in their own tables, not in
+  // `marketplace_catalog.credentials_encrypted` (which is deliberately never
+  // serialized), so read them from the enrichment sources API. Fields still
+  // declared `secret` are intentionally NOT hydrated — those stay write-only.
+  const hydrateReadableCredentials = async (loaded: MarketplaceCatalogEntry) => {
+    const readable = (loaded.credential_fields ?? []).filter(f => f.field_type !== 'secret');
+    if (!loaded.native_source_id || readable.length === 0) return;
+    try {
+      const sources = await api.listEnrichmentSources();
+      const source = sources.find(s => s.id === loaded.native_source_id);
+      if (!source) return;
+      const stored: Record<string, string> = {};
+      if (readable.some(f => f.name === 'download_url') && source.download_url) {
+        stored.download_url = source.download_url;
+      }
+      if (Object.keys(stored).length === 0) return;
+      setPristineCredentials(stored);
+      setCredentials(prev => ({ ...stored, ...prev }));
+    } catch {
+      // Requires enrichments:view, which a marketplace-only operator may lack.
+      // Falling back to an empty field is the pre-existing behaviour, so this
+      // degrades rather than breaking the drawer.
+    }
+  };
+
+  // Re-read this drawer's own entry. `onUpdated()` only refreshes the parent
+  // catalog list, which the drawer does not read from (NAN-2343).
+  const refreshEntry = useCallback(async () => {
+    if (!slug) return;
+    try {
+      setEntry(await api.marketplace.getCatalogEntry(slug));
+    } catch {
+      // Keep the last-known entry; a transient refresh failure should not blank
+      // an open drawer or raise a toast the operator did not ask for.
+    }
+  }, [slug]);
+
+  // Follow a freshly triggered sync to a terminal state. A sync can finish (or
+  // fail) either side of the refresh in `handleSync`, so poll rather than
+  // assume a single read lands after the outcome.
+  //
+  // A fixed interval with a hard deadline, deliberately not a chain of
+  // timeouts keyed on `entry`: that shape stalls permanently if one refresh
+  // throws (no state change, so nothing reschedules) and conversely never
+  // stops while `is_syncing` stays true. `refreshEntry` swallows its errors,
+  // so a transient failure just means one missed tick (NAN-2343).
+  useEffect(() => {
+    if (!open || !slug || !syncWatchToken) return;
+    const deadline = Date.now() + SYNC_WATCH_MS;
+    const poll = setInterval(() => {
+      if (Date.now() >= deadline && !entryRef.current?.is_syncing) {
+        clearInterval(poll);
+        return;
+      }
+      void refreshEntry();
+    }, SYNC_POLL_MS);
+    const hardStop = setTimeout(() => clearInterval(poll), SYNC_WATCH_MAX_MS);
+    return () => {
+      clearInterval(poll);
+      clearTimeout(hardStop);
+    };
+  }, [open, slug, syncWatchToken, refreshEntry]);
+
+  // Latest entry for the interval above, which must not re-subscribe per poll.
+  const entryRef = useRef<MarketplaceCatalogEntry | null>(null);
+  useEffect(() => {
+    entryRef.current = entry;
+  }, [entry]);
+
+  // Always-current handle on the save routine.
+  //
+  // NAN-2343: the ⌘↵ listener below is (deliberately) only re-installed when
+  // `open`/`credsDirty` change, but `handleSaveCredentials` closes over
+  // `credentials`. `credsDirty` flips true on the *first* keystroke and never
+  // flips again while editing, so the listener kept forever whichever snapshot
+  // existed at that first change — pressing ⌘↵ after typing a URL persisted
+  // the single character typed first. Routing through a ref keeps the listener
+  // stable while the behaviour it invokes stays current.
+  const saveCredentialsRef = useRef<(() => Promise<void>) | null>(null);
+  useEffect(() => {
+    saveCredentialsRef.current = handleSaveCredentials;
+  });
 
   // ⌘↵ to apply (Esc handled by Sheet itself)
   useEffect(() => {
@@ -108,12 +219,11 @@ export function MarketplaceDrawer({
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
         e.preventDefault();
-        void handleSaveCredentials();
+        void saveCredentialsRef.current?.();
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, credsDirty]);
 
   const generateToken = () => {
@@ -149,6 +259,13 @@ export function MarketplaceDrawer({
       // away — the polling effect waits for a positive signal that never
       // arrives.
       onUpdated();
+      // NAN-2343: `onUpdated` refreshes the *parent* catalog; this drawer holds
+      // its own `entry` and would otherwise sit on pre-sync state until closed
+      // and reopened. That is why a sync which fails immediately — a malformed
+      // URL fails before any network I/O — left "Data sync is running" on
+      // screen indefinitely while the failure was already recorded.
+      setSyncWatchToken(t => t + 1);
+      await refreshEntry();
     } catch {
       toast({ title: 'Error', description: 'Failed to trigger sync', variant: 'destructive' });
     } finally {
@@ -262,14 +379,42 @@ export function MarketplaceDrawer({
     if (!entry) return;
     setSavingCreds(true);
     try {
-      const updated = await api.marketplace.configureEnrichment(entry.slug, { credentials });
+      // Submit only what the operator actually changed. `credentials` is now
+      // pre-filled with readable stored values (see `hydrateReadableCredentials`),
+      // so posting it wholesale would re-send an untouched download URL and
+      // re-queue a multi-million-row sync for a save that changed nothing
+      // (NAN-2343).
+      const changed = Object.fromEntries(
+        Object.entries(credentials).filter(([k, v]) => v !== (pristineCredentials[k] ?? '')),
+      );
+      if (Object.keys(changed).length === 0) {
+        setCredsDirty(false);
+        toast({ title: 'No changes', description: 'Credentials are unchanged' });
+        return;
+      }
+      const updated = await api.marketplace.configureEnrichment(entry.slug, { credentials: changed });
       setEntry(updated);
       setCredsDirty(false);
-      setCredentials({});
+      // Keep readable values on screen after saving; what was just written is
+      // now the pristine baseline. Write-only secrets stay cleared.
+      setPristineCredentials(prev => ({ ...prev, ...changed }));
+      setCredentials(prev =>
+        Object.fromEntries(Object.entries(prev).filter(([k]) => k in pristineCredentials)),
+      );
       onUpdated();
       toast({ title: 'Credentials saved', description: 'Credentials have been encrypted and stored' });
-    } catch {
-      toast({ title: 'Error', description: 'Failed to save credentials', variant: 'destructive' });
+    } catch (err) {
+      // NAN-2343: the server now rejects a malformed download URL with 422 and
+      // names the field and reason. Swallowing that into a generic "Failed to
+      // save" was the difference between the operator fixing a typo in seconds
+      // and filing a support ticket, so show what the server said.
+      const description = err instanceof Error && err.message
+        ? err.message
+        : 'Failed to save credentials';
+      toast({ title: 'Could not save credentials', description, variant: 'destructive' });
+      // Leave the edit in place and still dirty — the operator needs the bad
+      // value on screen to correct it, and clearing it would repeat the
+      // original sin of hiding what was actually submitted.
     } finally {
       setSavingCreds(false);
     }
@@ -686,7 +831,15 @@ function ConfigTab(props: ConfigTabProps) {
                   <Input
                     id={`cred-${field.name}`}
                     type={field.field_type === 'secret' && !showSecrets[field.name] ? 'password' : 'text'}
-                    placeholder={entry.has_credentials ? '••••••••' : (field.help || `Enter ${field.label}`)}
+                    // Only a write-only secret gets the mask placeholder. A
+                    // readable field that is empty is genuinely unset, and
+                    // showing dots there is what let a missing/!malformed URL
+                    // masquerade as "configured" (NAN-2343).
+                    placeholder={
+                      entry.has_credentials && field.field_type === 'secret'
+                        ? '••••••••'
+                        : (field.help || `Enter ${field.label}`)
+                    }
                     value={credentials[field.name] || ''}
                     onChange={(e) => {
                       setCredentials(prev => ({ ...prev, [field.name]: e.target.value }));
@@ -783,15 +936,35 @@ function ConfigTab(props: ConfigTabProps) {
           </p>
         ) : (
           <>
-            <Button
-              size="sm"
-              className="h-8 rounded-md"
-              onClick={() => handleToggleEnabled(!entry.enabled)}
-              disabled={entry.requires_credential === 'required' && !entry.has_credentials}
-            >
-              <Zap className="w-[12px] h-[12px] mr-1" />
-              {entry.enabled ? 'Apply changes' : 'Activate'}
-            </Button>
+            {/*
+              This slot carries "Activate" and nothing else.
+
+              It was a bare enable/disable toggle *labelled* "Apply changes"
+              while enabled, so the obvious button to press after editing a
+              credential discarded the edit and deactivated the integration
+              (NAN-2343). Making it save instead removed the trap but left two
+              buttons for one action — and since the inline "Save credentials"
+              only renders while dirty, the one still on screen after a save
+              was the permanently greyed-out one, reading as unfinished work
+              (NAN-2345).
+
+              Saving belongs to the button beside the fields: it is adjacent to
+              what it acts on, it works whether or not the integration is
+              enabled, and it appears only when there is something to save.
+              Enable/disable belongs to the Switch above. Nothing is left for
+              an enabled entry to "apply" here.
+            */}
+            {!entry.enabled && (
+              <Button
+                size="sm"
+                className="h-8 rounded-md"
+                onClick={() => handleToggleEnabled(true)}
+                disabled={entry.requires_credential === 'required' && !entry.has_credentials}
+              >
+                <Zap className="w-[12px] h-[12px] mr-1" />
+                Activate
+              </Button>
+            )}
             {isDataFeed(entry) && (
               egressBlocked ? (
                 <Link to="/settings/airgap-import">

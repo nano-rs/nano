@@ -148,6 +148,11 @@ impl ClickHouseMigrator {
         // target always matches wrapper existence.
         let migration_sql = Self::substitute_dist_suffix(&migration_sql, cluster_name.is_some());
 
+        // NAN-2346: size the prevalence CACHE dicts' SIZE_IN_CELLS to the box.
+        // Unset, this resolves to the historical literals, so only tenants whose
+        // generated .env carries the vars change behavior.
+        let migration_sql = Self::substitute_prevalence_cache_cells(&migration_sql);
+
         // Sanitize entire migration SQL for CH Cloud before splitting into statements.
         // This strips incompatible settings/index types so the core DDL executes cleanly.
         let migration_sql = if is_cloud {
@@ -437,6 +442,10 @@ impl ClickHouseMigrator {
         // substitute_dist_suffix. `cluster_name.is_some()` is the same signal
         // that gates wrapper creation.
         let sql = Self::substitute_dist_suffix(&sql, cluster_name.is_some());
+        // NAN-2346: box-sized prevalence CACHE dict SIZE_IN_CELLS. Must run on the
+        // init.sql path too — a fresh bootstrap creates these dicts from init.sql,
+        // never from the numbered migration.
+        let sql = Self::substitute_prevalence_cache_cells(&sql);
 
         // Sanitize for cloud if needed
         let sql = if is_cloud {

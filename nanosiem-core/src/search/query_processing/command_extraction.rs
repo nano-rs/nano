@@ -5,8 +5,9 @@
 //! This module provides functions to extract and analyze commands from parsed query ASTs.
 
 use crate::query::{
-    AggFunc, Command, Comparator, InputLookupFormat, PrevalenceCondition,
-    PrevalenceTimeWindow as AstTimeWindow, Query, SearchExpr, UrlTemplate, Value,
+    AggFunc, BinaryOperator, Command, Comparator, EvalExpression, InputLookupFormat,
+    PrevalenceCondition, PrevalenceTimeWindow as AstTimeWindow, Query, SearchExpr, UrlTemplate,
+    Value,
 };
 
 /// Extract the base query (before any pipe commands) from a piped query string.
@@ -489,13 +490,65 @@ fn search_expr_has_filter(expr: &SearchExpr) -> bool {
                     | Comparator::NotEndsWith
             )
         }
-        SearchExpr::And(left, right) | SearchExpr::Or(left, right) => {
+        // An intersection is narrowed when either side is narrowed. A union is
+        // narrowed only when both sides are: `* OR x` still matches every row.
+        SearchExpr::And(left, right) => {
             search_expr_has_filter(left) || search_expr_has_filter(right)
         }
-        SearchExpr::Not(inner) | SearchExpr::Group(inner) => search_expr_has_filter(inner),
+        SearchExpr::Or(left, right) => {
+            search_expr_has_filter(left) && search_expr_has_filter(right)
+        }
+        // Negating a selective predicate can produce its broad complement, so
+        // it is not evidence that an OOM-sensitive command is bounded.
+        SearchExpr::Not(_) => false,
+        SearchExpr::Group(inner) => search_expr_has_filter(inner),
         SearchExpr::BooleanFunction { .. } => true,
+        SearchExpr::EvalPredicate(expression) => eval_predicate_has_filter(expression),
         _ => false,
     }
+}
+
+/// Admit only the arithmetic predicate family whose narrowing intent is
+/// structurally clear: a range comparison between the difference of two
+/// distinct fields and a finite numeric bound.
+///
+/// This guard is a hard rejection protecting memory-sensitive commands. An
+/// unknown or merely plausible expression must therefore fail closed. In
+/// particular, accepting every comparison would let identities such as
+/// `(bytes_in - bytes_in) = 0` claim to narrow an otherwise unfiltered search.
+fn eval_predicate_has_filter(expression: &EvalExpression) -> bool {
+    let EvalExpression::BinaryOp { left, op, right } = expression else {
+        return false;
+    };
+    if !matches!(
+        op,
+        BinaryOperator::Gt | BinaryOperator::Lt | BinaryOperator::Gte | BinaryOperator::Lte
+    ) {
+        return false;
+    }
+
+    (distinct_field_difference(left) && finite_numeric_literal(right))
+        || (finite_numeric_literal(left) && distinct_field_difference(right))
+}
+
+fn distinct_field_difference(expression: &EvalExpression) -> bool {
+    matches!(
+        expression,
+        EvalExpression::BinaryOp {
+            left,
+            op: BinaryOperator::Sub,
+            right,
+        } if matches!(
+            (&**left, &**right),
+            (EvalExpression::Field(left), EvalExpression::Field(right))
+                if crate::query::normalize_field_name(left)
+                    != crate::query::normalize_field_name(right)
+        )
+    )
+}
+
+fn finite_numeric_literal(expression: &EvalExpression) -> bool {
+    matches!(expression, EvalExpression::Literal(Value::Number(value)) if value.is_finite())
 }
 
 /// Check if the query contains any aggregation commands (stats, timechart, top, rare, streamstats)
@@ -1962,6 +2015,64 @@ mod tests {
         // Negation filters don't narrow the dataset — should still be caught
         let query = parse_query("source_type!=audit | dedup src_ip").unwrap();
         assert_eq!(detect_oom_risk(&query), Some(OomRisk::UnboundedDedup));
+    }
+
+    #[test]
+    fn test_oom_distinct_field_difference_with_range_is_meaningful() {
+        let query = parse_query("(bytes_in - bytes_out) >= 300 | dedup id").unwrap();
+        assert_eq!(detect_oom_risk(&query), None);
+    }
+
+    #[test]
+    fn test_oom_arithmetic_identity_does_not_bypass_guard() {
+        for npl in [
+            "((bytes_in - bytes_in) = 0) | dedup id",
+            "((source_port - src_port) >= 0) | dedup id",
+        ] {
+            let query = parse_query(npl).unwrap();
+            assert_eq!(
+                detect_oom_risk(&query),
+                Some(OomRisk::UnboundedDedup),
+                "alias identity unexpectedly bypassed guard: {npl}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_oom_match_all_or_arithmetic_filter_does_not_bypass_guard() {
+        let query = parse_query("* OR ((bytes_in - bytes_out) >= 300) | dedup id").unwrap();
+        assert_eq!(detect_oom_risk(&query), Some(OomRisk::UnboundedDedup));
+    }
+
+    #[test]
+    fn test_oom_or_requires_both_branches_to_narrow() {
+        let query = parse_query(
+            "((bytes_in - bytes_out) >= 300) OR ((src_port - dest_port) > 10) | dedup id",
+        )
+        .unwrap();
+        assert_eq!(detect_oom_risk(&query), None);
+    }
+
+    #[test]
+    fn test_oom_not_does_not_inherit_narrowing_from_its_child() {
+        let query = parse_query("NOT source_type=firewall | dedup src_ip").unwrap();
+        assert_eq!(detect_oom_risk(&query), Some(OomRisk::UnboundedDedup));
+    }
+
+    #[test]
+    fn test_oom_unknown_eval_predicate_shapes_fail_closed() {
+        for npl in [
+            "((bytes_in - bytes_out) = 0) | dedup id",
+            "((bytes_in + bytes_out) >= 300) | dedup id",
+            "((bytes_in - 1) >= 300) | dedup id",
+        ] {
+            let query = parse_query(npl).unwrap();
+            assert_eq!(
+                detect_oom_risk(&query),
+                Some(OomRisk::UnboundedDedup),
+                "unexpectedly admitted {npl}"
+            );
+        }
     }
 
     // ----- NAN-708: panel command validation + cost classification -----

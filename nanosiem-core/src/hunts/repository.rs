@@ -71,8 +71,8 @@ pub const ARTIFACT_READ_SITES: &[(&str, &str, &str)] = &[
 ];
 
 /// Longest lease a runner may hold. A runner that asked for a month would make
-/// failover impossible: the reclaim path only reassigns a sweep whose lease has
-/// EXPIRED, so an unbounded lease is an unbounded outage for that hunt.
+/// failure visibility impossible: the scheduler cannot mark an abandoned sweep
+/// honestly until its lease expires.
 pub const MAX_LEASE_SECONDS: i64 = 3600;
 /// Default when a runner does not ask. Comfortably above `budget_max_wall_seconds`'s
 /// 900s default so a normal sweep never has to renew.
@@ -725,8 +725,14 @@ impl HuntRepository {
         sweep_from_row(&row)
     }
 
-    /// Claim the oldest queued sweep for `runner_id`, or reclaim one whose
-    /// lease expired.
+    /// Claim the oldest queued sweep for `runner_id`.
+    ///
+    /// Expired leases deliberately do NOT re-enter this path. The scheduler
+    /// owns their terminal transition to `abandoned`; letting a poller claim an
+    /// expired row here made an ambiguous report timeout execute the entire
+    /// agent sweep again every lease, forever. A later scheduled slot is the
+    /// retry for a recurring hunt. A failed manual sweep stays failed and
+    /// visible rather than silently spending the analyst's budget again.
     ///
     /// The `FOR UPDATE SKIP LOCKED` is what lets several runners poll
     /// concurrently without serializing on the same head-of-queue row: a
@@ -757,7 +763,6 @@ impl HuntRepository {
             r#"
             SELECT id FROM hunt_sweeps
              WHERE status = 'queued'
-                OR (status IN ('leased', 'running') AND lease_expires_at <= NOW())
              ORDER BY created_at ASC
              LIMIT 1
              FOR UPDATE SKIP LOCKED

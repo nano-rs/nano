@@ -79,6 +79,12 @@ mod funnel_view;
 /// searches stay exact; larger windows become a fast PK-order sample. Per-field
 /// drill-in (`get_field_values`) stays exact and unbounded.
 pub(crate) const FIELD_STATS_ROW_CAP: usize = 100_000;
+
+/// Hard ceiling for rows produced by an SQL aggregation before caller-facing
+/// pagination. This is deliberately separate from `SearchRequest.limit`: the
+/// former bounds high-cardinality grouped output, while the latter selects a
+/// page from within that bounded output.
+pub(super) const AGGREGATE_OUTPUT_CAP: usize = 1_000_000;
 mod histogram;
 mod ioc_lookup_resolve;
 mod lateral;
@@ -751,6 +757,9 @@ pub struct SearchService {
     admission_controller: Option<std::sync::Arc<super::admission::AdmissionController>>,
     /// Per-query ClickHouse settings (set by admission-controlled path, consumed by execute)
     active_ch_settings: Option<super::admission::ClickHouseQuerySettings>,
+    /// Deployment-sized ceiling for per-query ClickHouse memory overrides.
+    /// Priority tiers may ask for less, but never more than this value.
+    query_memory_ceiling_bytes: Option<u64>,
     /// Internal server-side output limits for unattended execution. Presence
     /// also suppresses the interactive count companion when the caller does
     /// not consume `total_count`.
@@ -1004,6 +1013,7 @@ impl SearchService {
             job_store: std::sync::Arc::new(super::jobs::InMemoryJobStore::new()),
             admission_controller: None,
             active_ch_settings: None,
+            query_memory_ceiling_bytes: super::admission::query_memory_ceiling_from_env(),
             active_execution_limits: None,
             ai_client: std::sync::Arc::new(NoopAiClient),
             cloud_risk: std::sync::Arc::new(NoopCloudRiskProvider),
@@ -1070,6 +1080,7 @@ impl SearchService {
             job_store: std::sync::Arc::new(super::jobs::InMemoryJobStore::new()),
             admission_controller: None,
             active_ch_settings: None,
+            query_memory_ceiling_bytes: super::admission::query_memory_ceiling_from_env(),
             active_execution_limits: None,
             ai_client: std::sync::Arc::new(NoopAiClient),
             cloud_risk: std::sync::Arc::new(NoopCloudRiskProvider),
@@ -1153,6 +1164,13 @@ impl SearchService {
         &self,
     ) -> Option<&std::sync::Arc<super::admission::AdmissionController>> {
         self.admission_controller.as_ref()
+    }
+
+    fn ch_settings_for_priority(
+        &self,
+        priority: super::admission::QueryPriority,
+    ) -> super::admission::ClickHouseQuerySettings {
+        priority.to_ch_settings_with_memory_ceiling(self.query_memory_ceiling_bytes)
     }
 
     /// Get a shared reference to the query limits for use in config polling

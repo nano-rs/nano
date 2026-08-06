@@ -29,6 +29,14 @@ export CLICKHOUSE_URL="http://localhost:8123"
 export CLICKHOUSE_DATABASE="nanosiem"
 export CLICKHOUSE_USER="nanosiem"
 export CLICKHOUSE_PASSWORD="nanosiem"
+# NAN-2001: the two read-only raw-SQL feature identities. DualPool is fail-closed
+# — the API/search/jobs services refuse to boot without these. They match the CH
+# users that clickhouse/users.d creates via `from_env` (the compose CH env
+# defaults CLICKHOUSE_RAWSQL_PASSWORD to ${CLICKHOUSE_PASSWORD}=nanosiem, so the
+# CH-side password and these must agree). Exported so the app services inherit
+# them (and re-listed per-service below to match this script's explicit style).
+export CLICKHOUSE_RAWSQL_PASSWORD="${CLICKHOUSE_RAWSQL_PASSWORD:-nanosiem}"
+export CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD="${CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD:-nanosiem}"
 
 # Authentication settings
 # JWT_SECRET must be the same across all services for token validation
@@ -332,6 +340,8 @@ CLICKHOUSE_URL="$CLICKHOUSE_URL" \
 CLICKHOUSE_DATABASE="$CLICKHOUSE_DATABASE" \
 CLICKHOUSE_USER="$CLICKHOUSE_USER" \
 CLICKHOUSE_PASSWORD="$CLICKHOUSE_PASSWORD" \
+CLICKHOUSE_RAWSQL_PASSWORD="$CLICKHOUSE_RAWSQL_PASSWORD" \
+CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD="$CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD" \
 CLICKHOUSE_ADMIN_USER="${CLICKHOUSE_ADMIN_USER:-nanosiem_admin}" \
 CLICKHOUSE_ADMIN_PASSWORD="${CLICKHOUSE_ADMIN_PASSWORD:-nanosiem_admin_secret}" \
 RUST_LOG="${RUST_LOG:-info}" \
@@ -347,6 +357,8 @@ CLICKHOUSE_URL="$CLICKHOUSE_URL" \
 CLICKHOUSE_DATABASE="$CLICKHOUSE_DATABASE" \
 CLICKHOUSE_USER="$CLICKHOUSE_USER" \
 CLICKHOUSE_PASSWORD="$CLICKHOUSE_PASSWORD" \
+CLICKHOUSE_RAWSQL_PASSWORD="$CLICKHOUSE_RAWSQL_PASSWORD" \
+CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD="$CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD" \
 JWT_SECRET="$JWT_SECRET" \
 AUTH_ENABLED="$AUTH_ENABLED" \
 NANOSIEM_ENCRYPTION_KEY="$NANOSIEM_ENCRYPTION_KEY" \
@@ -358,6 +370,15 @@ RUST_LOG=info \
 SEARCH_PID=$!
 echo -e "${GREEN}✓${NC} Search Service started (PID: $SEARCH_PID)"
 
+# NAN-2202: the jobs service runs the leader schedulers that PUSH to Vector —
+# identity sync onto the enrichment lane, and collector runs onto the ingest lane.
+# Both default to the in-cluster hostname `http://vector:8080/`, which does not
+# resolve for a native dev process, so every push failed with a bare connection
+# error. The API block below has always set these; jobs never did.
+#
+# Keep comments OUT of the `VAR=x \` chain below: a comment terminates the
+# command, so everything above it degrades to plain shell assignments the child
+# never sees. `bash -n` does not catch it.
 # Start Jobs Service (background tasks: detection, enrichment, tuning, cleanup)
 echo -e "\n${YELLOW}Starting Jobs Service on port 3003...${NC}"
 DATABASE_URL="$DATABASE_URL" \
@@ -365,6 +386,8 @@ CLICKHOUSE_URL="$CLICKHOUSE_URL" \
 CLICKHOUSE_DATABASE="$CLICKHOUSE_DATABASE" \
 CLICKHOUSE_USER="$CLICKHOUSE_USER" \
 CLICKHOUSE_PASSWORD="$CLICKHOUSE_PASSWORD" \
+CLICKHOUSE_RAWSQL_PASSWORD="$CLICKHOUSE_RAWSQL_PASSWORD" \
+CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD="$CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD" \
 JWT_SECRET="$JWT_SECRET" \
 AUTH_ENABLED="$AUTH_ENABLED" \
 NANOSIEM_ENCRYPTION_KEY="$NANOSIEM_ENCRYPTION_KEY" \
@@ -384,6 +407,8 @@ AIRGAP_MODE="$AIRGAP_MODE" \
 NANO_TIER="$NANO_TIER" \
 JOBS_PORT=3003 \
 LEADER_ELECTION_ENABLED=true \
+VECTOR_INGEST_URL="${VECTOR_INGEST_URL:-http://localhost:8080/}" \
+VECTOR_AUTH_TOKEN="${VECTOR_AUTH_TOKEN:-nanosiem-default-token}" \
 RUST_LOG="${RUST_LOG:-info}" \
 ./target/$TARGET_DIR/nanosiem-jobs 2>&1 | tee "$LOG_DIR/jobs.log" &
 JOBS_PID=$!
@@ -396,6 +421,8 @@ CLICKHOUSE_URL="$CLICKHOUSE_URL" \
 CLICKHOUSE_DATABASE="$CLICKHOUSE_DATABASE" \
 CLICKHOUSE_USER="$CLICKHOUSE_USER" \
 CLICKHOUSE_PASSWORD="$CLICKHOUSE_PASSWORD" \
+CLICKHOUSE_RAWSQL_PASSWORD="$CLICKHOUSE_RAWSQL_PASSWORD" \
+CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD="$CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD" \
 JWT_SECRET="$JWT_SECRET" \
 AUTH_ENABLED="$AUTH_ENABLED" \
 NANOSIEM_ENCRYPTION_KEY="$NANOSIEM_ENCRYPTION_KEY" \

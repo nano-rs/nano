@@ -246,15 +246,17 @@ fn walk_search_expr(
             negated,
             connector: connector.map(String::from),
         }),
-        SearchExpr::BooleanFunction(function) => out.push(Predicate {
-            kind: PredicateKind::BooleanFunction,
-            field: None,
-            operator: None,
-            value: Some(format!("{:?}", function)),
-            values: vec![],
-            negated,
-            connector: connector.map(String::from),
-        }),
+        SearchExpr::BooleanFunction(function) | SearchExpr::EvalPredicate(function) => {
+            out.push(Predicate {
+                kind: PredicateKind::BooleanFunction,
+                field: None,
+                operator: None,
+                value: Some(format!("{:?}", function)),
+                values: vec![],
+                negated,
+                connector: connector.map(String::from),
+            })
+        }
         SearchExpr::LiteralComparison { left, op, right } => out.push(Predicate {
             kind: PredicateKind::Literal,
             field: Some(left.clone()),

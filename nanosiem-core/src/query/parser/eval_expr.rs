@@ -27,6 +27,15 @@ pub(super) fn eval_expression(input: &str) -> ParseResult<'_, EvalExpression> {
     logical_or_expr(input)
 }
 
+/// Parse one comparison predicate without consuming search-level `AND`/`OR`.
+///
+/// `where` uses this narrower entry point when bridging computed predicates
+/// into the eval grammar. Keeping logical composition in the search grammar
+/// preserves ordinary field filters as index-aware `SearchExpr` nodes.
+pub(super) fn eval_predicate_expression(input: &str) -> ParseResult<'_, EvalExpression> {
+    comparison_expr(input)
+}
+
 /// Parse logical OR expressions (|| or OR)
 fn logical_or_expr(input: &str) -> ParseResult<'_, EvalExpression> {
     let (input, first) = logical_and_expr(input)?;

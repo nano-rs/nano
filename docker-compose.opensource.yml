@@ -193,6 +193,14 @@ services:
       POSTGRES_DICT_HOST: postgres
       POSTGRES_DICT_PASSWORD: ${POSTGRES_PASSWORD}
       RUST_LOG: ${RUST_LOG:-info}
+      # NAN-2346: SIZE_IN_CELLS for the three prevalence CACHE dicts. The migrator
+      # resolves the {prevalence_cache_cells*} placeholders in clickhouse/init.sql
+      # and migration 172. COMPLEX_KEY_CACHE preallocates its whole cell array at
+      # the first dictGet and CH rounds up to a power of two, so 5,000,000 burns
+      # ~320 MiB to hold single-digit rows. Defaults below reproduce the historical
+      # literals exactly — override in .env on a memory-tight box.
+      NANO_PREVALENCE_CACHE_CELLS: ${NANO_PREVALENCE_CACHE_CELLS:-1000000}
+      NANO_PREVALENCE_CACHE_CELLS_IP: ${NANO_PREVALENCE_CACHE_CELLS_IP:-5000000}
     depends_on:
       postgres:
         condition: service_healthy

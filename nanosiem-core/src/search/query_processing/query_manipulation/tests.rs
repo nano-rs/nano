@@ -562,6 +562,7 @@ fn test_scope_gate_multi_member_on_every_scan() {
     for npl in [
         "error",
         "error | stats count by src_ip | sort -count | head 10",
+        "error | stats min(timestamp) as first_seen, max(timestamp) as last_seen by user | where (last_seen - first_seen) >= 300",
         r#"error | join type=inner user [search source_type="audit"]"#,
         r#"error | append [search source_type="insider"]"#,
         r#"user IN [search source_type="audit" | return user]"#,

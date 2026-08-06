@@ -11,7 +11,7 @@ use tracing::debug;
 use super::super::traits::SqlExecutor;
 use super::sql_helpers::{
     build_count_query, escape_question_marks_in_strings, inject_limit_offset, is_aggregation_query,
-    BoundedCountInput,
+    wrap_aggregation_with_pagination, wrap_query_for_count, BoundedCountInput,
 };
 use super::types::ClickHouseExecutor;
 use crate::search::{parse_clickhouse_error, SearchError, StreamingChunk};
@@ -50,6 +50,22 @@ pub(crate) fn paged_total_estimate(offset: usize, returned: usize, limit: usize)
     }
 }
 
+/// Extract and remove the aggregate page's in-band window count. An empty page
+/// has no row on which ClickHouse can attach the window value; callers detect
+/// `None` and issue the count-only fallback in that exceptional case.
+fn take_aggregation_total(results: &mut [serde_json::Value]) -> Option<u64> {
+    let total_count = results
+        .first()
+        .and_then(|row| row.get("_total_count"))
+        .and_then(serde_json::Value::as_u64);
+    for row in results {
+        if let Some(object) = row.as_object_mut() {
+            object.remove("_total_count");
+        }
+    }
+    total_count
+}
+
 impl ClickHouseExecutor {
     /// Execute a SQL query with a custom query_id for cancellation support
     ///
@@ -76,10 +92,7 @@ impl ClickHouseExecutor {
                 query_id
             );
 
-            let combined_sql = format!(
-                "SELECT *, count(*) OVER () as _total_count FROM ({}) as subquery LIMIT {} OFFSET {}",
-                sql, limit, offset
-            );
+            let combined_sql = wrap_aggregation_with_pagination(sql, limit, offset);
 
             let mut results = if let Some(limits) = execution_limits {
                 self.execute_dynamic_query_with_execution_limits(
@@ -95,17 +108,18 @@ impl ClickHouseExecutor {
                     .await?
             };
 
-            let total_count = results
-                .first()
-                .and_then(|row| row.get("_total_count"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-
-            for row in &mut results {
-                if let Some(obj) = row.as_object_mut() {
-                    obj.remove("_total_count");
+            let total_count = match take_aggregation_total(&mut results) {
+                Some(total_count) => total_count,
+                None => {
+                    // `count(*) OVER()` has nowhere to attach its value when
+                    // OFFSET is past the final group. Recount only that empty
+                    // exceptional page; normal aggregate pages stay one query.
+                    let count_sql = wrap_query_for_count(sql);
+                    let count_qid = format!("{query_id}-aggregate-count");
+                    self.execute_count_query_with_options(&count_sql, Some(&count_qid), None)
+                        .await?
                 }
-            }
+            };
 
             Ok((results, total_count))
         } else {
@@ -184,10 +198,7 @@ impl ClickHouseExecutor {
         if is_aggregation_query(sql) {
             debug!("Detected aggregation query with settings, using full scan");
 
-            let combined_sql = format!(
-                "SELECT *, count(*) OVER () as _total_count FROM ({}) as subquery LIMIT {} OFFSET {}",
-                sql, limit, offset
-            );
+            let combined_sql = wrap_aggregation_with_pagination(sql, limit, offset);
 
             let mut results = if let Some(limits) = execution_limits {
                 self.execute_dynamic_query_with_execution_limits(
@@ -203,17 +214,19 @@ impl ClickHouseExecutor {
                     .await?
             };
 
-            let total_count = results
-                .first()
-                .and_then(|row| row.get("_total_count"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-
-            for row in &mut results {
-                if let Some(obj) = row.as_object_mut() {
-                    obj.remove("_total_count");
+            let total_count = match take_aggregation_total(&mut results) {
+                Some(total_count) => total_count,
+                None => {
+                    let count_sql = wrap_query_for_count(sql);
+                    let count_qid = format!("{query_id}-aggregate-count");
+                    self.execute_count_query_with_options(
+                        &count_sql,
+                        Some(&count_qid),
+                        Some(settings),
+                    )
+                    .await?
                 }
-            }
+            };
 
             Ok((results, total_count))
         } else {
@@ -300,13 +313,15 @@ impl ClickHouseExecutor {
                     "max_execution_time",
                     &settings.max_execution_time.to_string(),
                 )
-                .with_option(
-                    "max_memory_usage",
-                    &settings.max_memory_usage_bytes.to_string(),
-                )
                 .with_option("max_threads", &settings.max_threads.to_string())
                 .with_option("priority", &settings.priority.to_string())
                 .with_option("queue_max_wait_ms", &settings.queue_max_wait_ms.to_string());
+            if let Some(max_memory_usage_bytes) = settings.max_memory_usage_bytes {
+                query_builder = query_builder.with_option(
+                    "max_memory_usage",
+                    &max_memory_usage_bytes.to_string(),
+                );
+            }
         }
 
         let mut cursor = query_builder
@@ -452,24 +467,17 @@ impl SqlExecutor for ClickHouseExecutor {
             // These need all data to produce correct results, so we can't optimize with early LIMIT
             debug!("Detected aggregation query, using full scan with count(*) OVER()");
 
-            let combined_sql = format!(
-                "SELECT *, count(*) OVER () as _total_count FROM ({}) as subquery LIMIT {} OFFSET {}",
-                sql, limit, offset
-            );
+            let combined_sql = wrap_aggregation_with_pagination(sql, limit, offset);
 
             let mut results = self.fetch_rows(&combined_sql, preserve_columns).await?;
 
-            let total_count = results
-                .first()
-                .and_then(|row| row.get("_total_count"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-
-            for row in &mut results {
-                if let Some(obj) = row.as_object_mut() {
-                    obj.remove("_total_count");
+            let total_count = match take_aggregation_total(&mut results) {
+                Some(total_count) => total_count,
+                None => {
+                    let count_sql = wrap_query_for_count(sql);
+                    self.execute_count_query(&count_sql).await?
                 }
-            }
+            };
 
             Ok((results, total_count))
         } else {

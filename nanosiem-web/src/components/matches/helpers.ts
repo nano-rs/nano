@@ -65,6 +65,76 @@ function ocsfField(e: Record<string, unknown>, key: string): string | undefined 
   return stringField(e, key) || nestedField(e, key);
 }
 
+// Backend entity-type vocabulary → the UI's `EntityType`. The server emits
+// `ip` / `hostname` / `user` / `email` / `hash` / `domain` / `cloud_account`
+// (see `FindingEvent::infer_entity_type`); anything unrecognised — present or
+// future — falls to `other`, which still renders the label, just with the
+// generic glyph and a free-text pivot.
+const ENTITY_TYPE_TOKENS: Record<string, EntityType> = {
+  ip: 'ip',
+  ipv4: 'ip',
+  ipv6: 'ip',
+  ip_address: 'ip',
+  host: 'host',
+  hostname: 'host',
+  device: 'host',
+  asset: 'host',
+  user: 'user',
+  username: 'user',
+  account: 'user',
+  email: 'user',
+  identity: 'user',
+  role: 'role',
+  service: 'service',
+};
+
+const IPV4 = /^\d{1,3}(?:\.\d{1,3}){3}$/;
+// Hex groups only, and at least two colons — one colon is a `key:value`-ish
+// identifier (`add:cafe` is all hex), not an address.
+const IPV6 = /^[0-9a-f]{0,4}(?::[0-9a-f]{0,4}){2,7}$/i;
+
+function isIpValue(v: string): boolean {
+  return IPV4.test(v) || IPV6.test(v);
+}
+
+// Type an explicit entity value that arrived without a declared type. Unlike
+// the backend's equivalent this defaults to `other`, NOT `user`: an untyped
+// `WORKSTATION-7` guessed as a user would pivot to `user="WORKSTATION-7"` and
+// silently return nothing, where `other` free-text searches and finds it.
+function entityTypeFromValue(v: string): EntityType {
+  if (isIpValue(v)) return 'ip';
+  if (v.includes('@')) return 'user';
+  if (v.includes('.')) return 'host';
+  return 'other';
+}
+
+function entityTypeFromToken(raw: string | undefined): EntityType | undefined {
+  if (!raw) return undefined;
+  return ENTITY_TYPE_TOKENS[raw.trim().toLowerCase()] ?? 'other';
+}
+
+// An explicitly declared subject — a `<value>` + `<value>_type` pair — read
+// from either the canonical envelope (`_match_entity`, NAN-2341) or the row's
+// own `entity` / `entity_type` columns. Derived datasets project the latter:
+// `dataset=risk` rows are `entity`, `entity_type`, `score_24h`, … and carry no
+// UDM/OCSF column at all, which is why risk-notable matches rendered as
+// `unknown`. Reading the raw pair as well as the envelope keeps this working
+// against an API that predates the envelope field.
+function declaredEntity(
+  e: Record<string, unknown>,
+  valueKey: string,
+  typeKey: string,
+): MatchEntity | undefined {
+  const value = stringField(e, valueKey);
+  if (!value) return undefined;
+  return {
+    id: value,
+    label: value,
+    type: entityTypeFromToken(stringField(e, typeKey)) ?? entityTypeFromValue(value),
+    raw: value,
+  };
+}
+
 // Entity extraction — a match fires against a grouping key (user, IP, host).
 // We don't know which one the rule grouped by without parsing the query, so we
 // prefer identity-ish fields first, then fall back to network identifiers.
@@ -77,10 +147,16 @@ export function extractEntity(
   }
   const e = events[0];
 
+  // A dataset that names its own subject beats every heuristic below.
+  const declared = declaredEntity(e, 'entity', 'entity_type');
+  if (declared) return declared;
+
   const arn = nestedField(e, 'user_identity.arn');
   if (arn) {
     const label = arn.split('/').pop() || arn;
-    const isRole = arn.includes(':role/');
+    // `assumed-role/` counts: an STS session ARN
+    // (`arn:aws:sts::…:assumed-role/Role/session`) never contains `:role/`.
+    const isRole = arn.includes(':role/') || arn.includes(':assumed-role/');
     const isService = label.includes('-service') || label.includes('lambda-') || label.includes('ci-');
     return {
       id: arn,
@@ -110,6 +186,13 @@ export function extractEntity(
     if (host) return { id: host, label: host, type: 'host', raw: host };
     if (ip) return { id: ip, label: ip, type: 'ip', raw: ip };
   }
+
+  // Server-resolved subject (NAN-2341). Sits BELOW the schema-aware resolver on
+  // purpose: the envelope's own fallbacks are the hardcoded UDM/OCSF lists
+  // below, so preferring it earlier would shadow a profile-promoted entity
+  // field the resolver knows about and the server doesn't (NAN-1296).
+  const envelope = declaredEntity(e, '_match_entity', '_match_entity_type');
+  if (envelope) return envelope;
 
   // NAN-1241: fall back to the OCSF promoted (dotted) entity columns when the
   // UDM names are absent (OCSF rows). UDM rows hit the UDM name first, so UDM
@@ -209,7 +292,25 @@ export function extractIp(e: Record<string, unknown>): string | undefined {
     || stringField(e, 'sourceIPAddress')
     || stringField(e, 'dest_ip')
     || ocsfField(e, 'src_endpoint.ip')
-    || ocsfField(e, 'dst_endpoint.ip');
+    || ocsfField(e, 'dst_endpoint.ip')
+    // A declared IP-typed subject is an IP (NAN-2341) — without this, risk
+    // matches over IP entities counted "0 IPs" while displaying one per row.
+    || declaredIp(e, 'entity', 'entity_type')
+    || declaredIp(e, '_match_entity', '_match_entity_type');
+}
+
+// The declared entity, but only when it is actually an IP — a declared type of
+// `ip` OR (absent a declared type) a value shaped like one.
+function declaredIp(
+  e: Record<string, unknown>,
+  valueKey: string,
+  typeKey: string,
+): string | undefined {
+  const value = stringField(e, valueKey);
+  if (!value) return undefined;
+  const declared = stringField(e, typeKey);
+  const isIp = declared ? entityTypeFromToken(declared) === 'ip' : isIpValue(value);
+  return isIp ? value : undefined;
 }
 
 // Aggregate detection — NAN-830 moved this server-side via `_match_kind`.

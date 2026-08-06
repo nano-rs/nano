@@ -518,6 +518,26 @@ fn evaluate_function_call(
         // ============================================================
         // Math Functions
         // ============================================================
+        "min" | "max" => {
+            let mut values = args.iter().map(|arg| evaluate_eval_expression(arg, row));
+            let first = values.next()??;
+            values.try_fold(first, |best, candidate| {
+                let candidate = candidate?;
+                let ordering = match (best.as_f64(), candidate.as_f64()) {
+                    (Some(left), Some(right)) => left.partial_cmp(&right),
+                    _ => match (best.as_str(), candidate.as_str()) {
+                        (Some(left), Some(right)) => Some(left.cmp(right)),
+                        _ => None,
+                    },
+                }?;
+                let take_candidate = if name.eq_ignore_ascii_case("min") {
+                    ordering.is_gt()
+                } else {
+                    ordering.is_lt()
+                };
+                Some(if take_candidate { candidate } else { best })
+            })
+        }
         "abs" => {
             let arg = args
                 .first()
@@ -608,5 +628,28 @@ fn evaluate_function_call(
         }
 
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod nan2331_scalar_min_max_tests {
+    use super::*;
+
+    #[test]
+    fn evaluates_case_insensitive_scalar_min_max() {
+        let row = serde_json::Map::new();
+        let expression = EvalExpression::FunctionCall {
+            name: "MAX".to_string(),
+            args: vec![
+                EvalExpression::Literal(Value::Number(1.0)),
+                EvalExpression::Literal(Value::Number(3.0)),
+                EvalExpression::Literal(Value::Number(2.0)),
+            ],
+        };
+
+        assert_eq!(
+            evaluate_eval_expression(&expression, &row),
+            Some(serde_json::json!(3.0))
+        );
     }
 }

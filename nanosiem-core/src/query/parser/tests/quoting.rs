@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! NAN-2241: nPL string-literal quoting — what each delimiter carries, and the
-//! diagnostic for the `\"` trap.
+//! NAN-2241/NAN-2328: nPL string-literal quoting — what each delimiter carries,
+//! plus fail-only compatibility for SPL's familiar `\"` spelling.
 //!
 //! The grammar deliberately has no backslash escape for quotes (NAN-1157), so
 //! `"C:\Windows\System32\"` parses as a path rather than an unterminated
-//! string. The cost is that `\"` looks like an escape and is not one. A regex
-//! containing double quotes must therefore be written single-quoted.
+//! string. A query that already parses keeps those semantics. If parsing fails
+//! at an unambiguous SPL-style escaped quote, the top level retries after
+//! expressing that literal with nPL's other delimiter.
 
 use crate::query::{parse_query, Command, Query, SearchExpr, Value};
 
@@ -80,33 +81,45 @@ fn double_quoted_string_still_ends_at_the_first_quote() {
 }
 
 // ---------------------------------------------------------------------------
-// The `\"` diagnostic
+// SPL-compatible `\"` recovery
 // ---------------------------------------------------------------------------
 
 #[test]
-fn escaped_double_quotes_produce_a_diagnostic_naming_the_problem() {
+fn spl_escaped_double_quotes_in_rex_are_accepted() {
     let npl = r#"source_type=gws_token | rex field=message "\"name\":\"app_name\"" | head 1"#;
-    let err = parse_query(npl).expect_err("`\\\"` cannot parse — it is not an escape");
+    assert_eq!(rex_pattern(npl), r#""name":"app_name""#);
+}
 
-    // Before NAN-2241 this said: "Unknown command 'name'. Did you mean 'rename'?"
-    let message = err.message.to_lowercase();
-    assert!(
-        message.contains(r#"\""#) && message.contains("escape"),
-        "the message must name `\\\"` as a non-escape: {}",
-        err.message
-    );
-    assert!(
-        message.contains("single"),
-        "the message must point at single-quoted strings: {}",
-        err.message
-    );
+#[test]
+fn spl_escaped_rex_recovery_stops_before_later_quoted_clauses() {
+    // The compatibility scanner must use SPL's actual unescaped closing quote,
+    // not the last quote in the query. Otherwise the later where value is
+    // swallowed into the rex pattern.
+    let npl = r#"source_type=windows_sysmon signature_id=22 | rex field=message "\"QueryName\":\"(?<qname>[^\"]+)\"" | where qname="example.com" | head 40"#;
+    assert_eq!(rex_pattern(npl), r#""QueryName":"(?<qname>[^"]+)""#);
+}
 
-    // ...and hand back the corrected query text.
-    assert!(
-        err.suggestions.iter().any(|s| s.replacement
-            == r#"'"name":"app_name"'"#),
-        "expected a single-quoted rewrite, got {:?}",
-        err.suggestions
+#[test]
+fn spl_escaped_recovery_repairs_every_rex_stage_in_one_pipeline() {
+    let npl = r#"source_type=limacharlie_edr event_type=network_summary | rex field=message "\"IS_OUTGOING\":(?<outg>\d+)" | rex field=message "\"FILE_PATH\":\"(?<fpath>[^\"]+)\"" | stats count by fpath, outg | sort -count"#;
+    let parsed =
+        parse_query(npl).unwrap_or_else(|e| panic!("multi-rex SPL query must parse: {e:?}"));
+    fn collect_rex(query: &Query, patterns: &mut Vec<String>) {
+        if let Query::Piped { source, command } = query {
+            collect_rex(source, patterns);
+            if let Command::Rex { pattern, .. } = command {
+                patterns.push(pattern.clone());
+            }
+        }
+    }
+    let mut patterns = Vec::new();
+    collect_rex(&parsed, &mut patterns);
+    assert_eq!(
+        patterns,
+        vec![
+            r#""IS_OUTGOING":(?<outg>\d+)"#.to_string(),
+            r#""FILE_PATH":"(?<fpath>[^"]+)""#.to_string(),
+        ]
     );
 }
 

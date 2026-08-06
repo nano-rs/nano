@@ -559,8 +559,12 @@ mod rescue {
 // the rescue; pure-decorate enrich and common-direction filters do NOT.
 // ---------------------------------------------------------------------------
 mod decorated_filter {
-    use super::super::decorated_filter_rescue_threshold;
-    use crate::query::{Command, Comparator, SearchExpr, Value};
+    use super::super::{decorated_filter_rescue_threshold, PREVALENCE_DICT_HOST_COUNT_CUTOFF};
+    use crate::query::{
+        parse_query, BinaryOperator, Command, Comparator, EvalAssignment, EvalExpression,
+        SearchExpr, Value,
+    };
+    use crate::search::query_processing::extract_post_prevalence_commands;
 
     fn where_cmd(field: &str, op: Comparator, value: Value) -> Command {
         Command::Where {
@@ -722,6 +726,68 @@ mod decorated_filter {
             ),
         };
         assert_eq!(decorated_filter_rescue_threshold(&[and_with_not], 3), Some(5));
+    }
+
+    #[test]
+    fn prevalence_arithmetic_predicate_gets_conservative_rescue() {
+        let query =
+            parse_query("* | prevalence enrich=true | where (last_seen - first_seen) >= 300")
+                .unwrap();
+        let post = extract_post_prevalence_commands(&query);
+        assert_eq!(
+            decorated_filter_rescue_threshold(&post.commands, 3),
+            Some(PREVALENCE_DICT_HOST_COUNT_CUTOFF - 1)
+        );
+    }
+
+    #[test]
+    fn ordinary_arithmetic_predicate_does_not_trigger_prevalence_rescue() {
+        let query =
+            parse_query("* | prevalence enrich=true | where (source_port - destination_port) >= 0")
+                .unwrap();
+        let post = extract_post_prevalence_commands(&query);
+        assert_eq!(decorated_filter_rescue_threshold(&post.commands, 3), None);
+    }
+
+    #[test]
+    fn eval_alias_carries_prevalence_dependency_into_where() {
+        let commands = [
+            Command::Eval {
+                assignments: vec![EvalAssignment {
+                    field: "age".into(),
+                    expression: EvalExpression::BinaryOp {
+                        left: Box::new(EvalExpression::Field("last_seen".into())),
+                        op: BinaryOperator::Sub,
+                        right: Box::new(EvalExpression::Field("first_seen".into())),
+                    },
+                }],
+            },
+            where_cmd("age", Comparator::Gte, Value::Number(300.0)),
+        ];
+        assert_eq!(
+            decorated_filter_rescue_threshold(&commands, 3),
+            Some(PREVALENCE_DICT_HOST_COUNT_CUTOFF - 1)
+        );
+    }
+
+    #[test]
+    fn eval_alias_reassignment_clears_stale_prevalence_dependency() {
+        let commands = [
+            Command::Eval {
+                assignments: vec![EvalAssignment {
+                    field: "age".into(),
+                    expression: EvalExpression::Field("last_seen".into()),
+                }],
+            },
+            Command::Eval {
+                assignments: vec![EvalAssignment {
+                    field: "age".into(),
+                    expression: EvalExpression::Field("bytes_in".into()),
+                }],
+            },
+            where_cmd("age", Comparator::Gte, Value::Number(300.0)),
+        ];
+        assert_eq!(decorated_filter_rescue_threshold(&commands, 3), None);
     }
 }
 

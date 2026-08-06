@@ -66,6 +66,14 @@ services:
       CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD:-nanosiem_admin_secret}
       CLICKHOUSE_SELF_USER: nanosiem
       RUST_LOG: ${RUST_LOG:-info}
+      # NAN-2346: SIZE_IN_CELLS for the three prevalence CACHE dicts. The migrator
+      # resolves the {prevalence_cache_cells*} placeholders in clickhouse/init.sql
+      # and migration 172. COMPLEX_KEY_CACHE preallocates its whole cell array at
+      # the first dictGet and CH rounds up to a power of two, so 5,000,000 burns
+      # ~320 MiB to hold single-digit rows. Defaults below reproduce the historical
+      # literals exactly — override in .env on a memory-tight box.
+      NANO_PREVALENCE_CACHE_CELLS: ${NANO_PREVALENCE_CACHE_CELLS:-1000000}
+      NANO_PREVALENCE_CACHE_CELLS_IP: ${NANO_PREVALENCE_CACHE_CELLS_IP:-5000000}
     depends_on:
       postgres:
         condition: service_healthy
@@ -285,7 +293,31 @@ services:
     restart: unless-stopped
 
   vector:
-    image: timberio/vector:latest-alpine
+    # Pinned, not `latest-alpine`: a floating tag silently drifts local dev away
+    # from what managed runs, and the committed bundle is only known-good against
+    # specific versions. 0.56 matches the managed pin (nano-main types.ts).
+    #
+    # Do NOT bump to 0.57+ without reading this. 0.57 disables environment
+    # variable interpolation by default (deliberate security change). Opt back in
+    # with --dangerously-allow-env-var-interpolation, or pre-render values so no
+    # runtime interpolation is needed.
+    #
+    # The hazard is asymmetric, and `vector validate` does NOT catch the bad half:
+    #   numeric  max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}  -> TOML parse
+    #            error, Vector refuses to start. Loud, you notice immediately.
+    #   string   valid_tokens = ["${VECTOR_AUTH_TOKEN}"]          -> validates
+    #            CLEAN and uses the literal text `${VECTOR_AUTH_TOKEN}` as the
+    #            accepted token. Silent. The real token stops working and a
+    #            guessable public string starts working.
+    #
+    # So validating a new version is necessary but not sufficient — a passing
+    # `vector validate` on 0.57 is exactly what the silent failure looks like.
+    # Validate anyway (catches the NAN-1260 class, e.g. api.playground removed in
+    # 0.55), then separately confirm env-driven values resolve at runtime:
+    #   docker run --rm -e VECTOR_AUTH_TOKEN=x -e VECTOR_BATCH_MAX_BYTES=1 \
+    #     -v "$PWD/config/vector:/etc/vector" timberio/vector:<ver> validate \
+    #     --no-environment --config-dir /etc/vector
+    image: timberio/vector:0.56.0-alpine
     container_name: nanosiem-vector
     security_opt:
       - no-new-privileges:true

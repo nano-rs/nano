@@ -162,6 +162,11 @@ pub enum SearchExpr {
     /// Standalone boolean function predicate: isnull(field), like(field, pattern), cidrmatch(cidr, ip), etc.
     /// Used in `| where` for functions that return a boolean without needing op + value
     BooleanFunction(EvalExpression),
+    /// Arithmetic/computed predicate used by piped `where` clauses, for example
+    /// `(last_seen - first_seen) >= 300`. Ordinary field filters deliberately
+    /// stay in the variants above so their index-aware SQL generation is
+    /// unchanged.
+    EvalPredicate(EvalExpression),
     /// Literal string comparison: "value" = "value"
     /// Used for parameter expansion checks like "$user"="*"
     LiteralComparison {

@@ -520,7 +520,8 @@ pub struct FieldValueInfo {
     pub value: String,
     /// Number of events with this value
     pub count: u64,
-    /// Percentage of total (0-100)
+    /// Percentage of the event count covered by the returned top values
+    /// (0-100), not necessarily of the full matching event population.
     pub percentage: f64,
 }
 

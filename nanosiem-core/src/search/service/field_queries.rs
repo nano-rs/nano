@@ -63,7 +63,7 @@ impl SearchService {
             .map_err(|e| SearchError::AdmissionDenied(e.to_string()))?;
 
         let mut service = self.clone();
-        service.active_ch_settings = Some(priority.to_ch_settings());
+        service.active_ch_settings = Some(service.ch_settings_for_priority(priority));
         // _permit drops at end of scope, freeing the slot.
         service
             .get_field_stats_for_query(
@@ -480,6 +480,11 @@ impl SearchService {
         })
     }
 
+    /// Discovery window for the context-free ext-key enumeration (NAN-2174).
+    /// See the fallback branch in [`Self::get_ext_field_names`] for why this is
+    /// the real bound on the scan and why it must stay small.
+    pub(crate) const EXT_FIELD_NAMES_DISCOVERY_WINDOW_MINUTES: u32 = 15;
+
     /// Get ext field names that exist in the data, scoped to the active search.
     ///
     /// NAN-1510: when `query` + `time_range` are given, enumeration is scoped to
@@ -488,8 +493,8 @@ impl SearchService {
     /// actually return. Previously enumeration was time-window-only (NAN-1505),
     /// so a filtered search listed ext keys from other source types in the window
     /// that then expanded empty ("Values loaded on demand", no entries).
-    /// Fallbacks: time-only when no query (historical window), `now()-3h` when
-    /// neither (the context-free syntax-highlighter path).
+    /// Fallbacks: time-only when no query (historical window), a short recent
+    /// window (NAN-2174) when neither — the context-free syntax-highlighter path.
     /// `scope` (NAN-1799): the deny-set exclusion is ANDed into EVERY branch of
     /// the scan predicate below — including the time-only and `now()-3h`
     /// fallbacks, which previously applied NO source gate at all, leaking
@@ -557,7 +562,25 @@ impl SearchService {
                 }
             }
             (_, Some(tr)) => time_only(tr),
-            _ => "timestamp >= now() - INTERVAL 3 HOUR".to_string(),
+            // NAN-2174: the context-free highlighter path (no query, no range)
+            // is what a bare `/search` mount hits. This window is the ONLY thing
+            // bounding the read — the executor's per-source slice caps what gets
+            // aggregated, not what gets scanned — so it must stay narrow.
+            //
+            // Was 3h, which on Saturn is 2.44M rows / 903 MiB of `ext` and 500'd
+            // on `max_execution_time`. 15 minutes reads 187k rows / 256 MiB there
+            // (1.07s) and returns the IDENTICAL key set — verified by
+            // set-differencing the 3h and 15m results both ways, both empty.
+            //
+            // Trade-off: a source emitting less than ~1 row per 15 minutes may
+            // not contribute keys here. That is a soft miss on a best-effort
+            // prefetch (the frontend `.catch`es this, and results-driven
+            // `availableFields` also feeds highlighting), and strictly better
+            // than the hard 500 that returned no keys at all.
+            _ => format!(
+                "timestamp >= now() - INTERVAL {} MINUTE",
+                Self::EXT_FIELD_NAMES_DISCOVERY_WINDOW_MINUTES
+            ),
         };
 
         // NAN-1799: append the caller's source-scope exclusion to whichever

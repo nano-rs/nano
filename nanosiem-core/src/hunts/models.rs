@@ -516,8 +516,8 @@ pub struct ClaimedSweep {
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 pub struct ClaimSweepRequest {
     /// How long the runner is asking to hold the sweep. Clamped server-side —
-    /// a runner that asks for a 30-day lease would make failover impossible,
-    /// because reclaim only reassigns a sweep whose lease has EXPIRED.
+    /// a runner that asks for a 30-day lease would hide an abandoned attempt for
+    /// 30 days because the scheduler can only close it after expiry.
     #[serde(default)]
     pub lease_seconds: Option<i64>,
 }

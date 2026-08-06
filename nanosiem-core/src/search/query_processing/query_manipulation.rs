@@ -433,6 +433,7 @@ fn gate_search_expr(expr: &SearchExpr, deny_set: &BTreeSet<String>) -> SearchExp
         | SearchExpr::FieldFunctionFilter { .. }
         | SearchExpr::InList { .. }
         | SearchExpr::BooleanFunction(_)
+        | SearchExpr::EvalPredicate(_)
         | SearchExpr::LiteralComparison { .. }
         | SearchExpr::IocMatch { .. } => expr.clone(),
     }
@@ -618,6 +619,7 @@ fn expr_subsearches_gated(expr: &SearchExpr, deny_set: &BTreeSet<String>) -> boo
         | SearchExpr::FieldFunctionFilter { .. }
         | SearchExpr::InList { .. }
         | SearchExpr::BooleanFunction(_)
+        | SearchExpr::EvalPredicate(_)
         | SearchExpr::LiteralComparison { .. }
         | SearchExpr::IocMatch { .. } => true,
     }

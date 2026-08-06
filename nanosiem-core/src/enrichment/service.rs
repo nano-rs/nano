@@ -19,7 +19,7 @@ use tracing::{info, instrument, warn};
 use super::repository::{EnrichmentRepository, EnrichmentRepositoryError};
 use super::types::*;
 use crate::db::dual_pool::{on_cluster_clause, TableNames};
-use crate::inputlookup::SsrfValidator;
+use crate::inputlookup::{SsrfError, SsrfValidator};
 
 #[derive(Error, Debug)]
 pub enum EnrichmentError {
@@ -178,14 +178,29 @@ impl Default for IpEnrichmentCache {
 /// is re-validated and returned for `ClientBuilder::resolve_to_addrs`. Pinning
 /// closes the DNS-rebinding window between resolution and reqwest's
 /// connect-time lookup.
+///
+/// NAN-2343: a malformed URL and a policy rejection are reported differently.
+/// `SsrfError::InvalidUrl` means `Url::parse` failed — the string is not a URL
+/// at all — which happens *before* any scheme, blocked-domain, IP-class or DNS
+/// check runs. Attributing that to "the SSRF check" sent a customer (and us)
+/// hunting a security regression over what was a malformed saved value, so the
+/// configuration case gets a message that names the real problem and the
+/// action. Every other variant is a genuine policy rejection and keeps the
+/// SSRF wording.
 async fn validate_and_resolve_ipinfo_url(
     url_str: &str,
 ) -> Result<(url::Url, Vec<std::net::SocketAddr>), EnrichmentError> {
     SsrfValidator::http_allowed_validator()
         .validate_and_resolve(url_str)
         .await
-        .map_err(|e| {
-            EnrichmentError::DownloadError(format!("URL rejected by SSRF check before fetch: {}", e))
+        .map_err(|e| match e {
+            SsrfError::InvalidUrl(reason) => EnrichmentError::DownloadError(format!(
+                "configured download URL is not a valid URL ({reason}) — \
+                 re-enter it, including the https:// prefix"
+            )),
+            other => EnrichmentError::DownloadError(format!(
+                "URL rejected by SSRF check before fetch: {other}"
+            )),
         })
 }
 
@@ -248,10 +263,19 @@ impl EnrichmentService {
         // Load source from database to get URL and download config
         let source = self.repository.get_source(source_id).await?;
 
-        // Get URL from service config override or database
-        let url = match &self.config.ipinfo_lite_url {
-            Some(url) => url.clone(),
-            None => source.download_url.ok_or_else(|| {
+        // The stored URL wins; the in-process override is only a fallback for
+        // deployments that configure the service directly without a row.
+        //
+        // NAN-2343: this precedence used to be reversed, and the override is
+        // written by exactly one code path — the native configure handler —
+        // and never invalidated. So once an operator had configured IPinfo on
+        // that page, every later change made through the marketplace updated
+        // the database and was then ignored for the rest of the process
+        // lifetime, silently reappearing on the next restart. The database is
+        // the surface both write paths agree on, so it is the source of truth.
+        let url = match source.download_url {
+            Some(url) => url,
+            None => self.config.ipinfo_lite_url.clone().ok_or_else(|| {
                 EnrichmentError::SourceNotConfigured("IPinfo Lite URL not configured".to_string())
             })?,
         };

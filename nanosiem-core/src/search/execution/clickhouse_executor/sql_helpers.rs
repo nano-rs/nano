@@ -69,6 +69,17 @@ pub fn wrap_query_with_pagination(sql: &str, limit: usize, offset: usize) -> Str
     )
 }
 
+/// Page the rows produced by an aggregation while counting the complete grouped
+/// result. The input SQL must remain free of caller pagination so its GROUP BY /
+/// window functions see every matching event; user-authored limits such as
+/// `| head` remain inside `sql` as query semantics.
+pub(crate) fn wrap_aggregation_with_pagination(sql: &str, limit: usize, offset: usize) -> String {
+    format!(
+        "SELECT *, count(*) OVER () as _total_count FROM ({}) as subquery LIMIT {} OFFSET {}",
+        sql, limit, offset
+    )
+}
+
 /// Wrap a raw SQL query in a subquery and count the resulting rows.
 ///
 /// This avoids brittle clause extraction from arbitrary user SQL.
@@ -242,6 +253,94 @@ mod tests {
             wrapped,
             "SELECT * FROM (SELECT * FROM logs ORDER BY timestamp DESC -- not allowed at validation time) AS subquery LIMIT 100 OFFSET 200"
         );
+    }
+
+    /// NAN-2344: request pagination belongs outside the aggregation. A limit in
+    /// the grouped input would either cap the groups before `_total_count` or,
+    /// if pushed into stage 0, corrupt the aggregate itself.
+    #[test]
+    fn aggregation_pagination_is_outer_only() {
+        let aggregate =
+            "SELECT dest_ip, count(*) AS count FROM logs GROUP BY dest_ip ORDER BY count DESC";
+        let wrapped = wrap_aggregation_with_pagination(aggregate, 60, 0);
+
+        assert_eq!(
+            wrapped,
+            format!(
+                "SELECT *, count(*) OVER () as _total_count FROM ({aggregate}) as subquery LIMIT 60 OFFSET 0"
+            )
+        );
+        assert_eq!(
+            wrapped.matches("LIMIT 60").count(),
+            1,
+            "request limit must occur only on the returned group page: {wrapped}"
+        );
+    }
+
+    /// Reproduce the NAN-2344 hunt contract: `request.limit=60` caps returned
+    /// `dest_ip` groups, while generated SQL retains its distinct 1M aggregate
+    /// output ceiling and consumes the full matching event set before grouping.
+    #[test]
+    fn stats_by_dest_ip_request_limit_caps_only_returned_groups() {
+        use crate::query::{parse_query, ClickHouseSqlGenerator, QueryOptions, TimeRange};
+
+        let range = TimeRange {
+            start: "2024-01-01T00:00:00Z".parse().unwrap(),
+            end: "2024-01-02T00:00:00Z".parse().unwrap(),
+        };
+        let aggregate = ClickHouseSqlGenerator::new()
+            .generate_with_options(
+                &parse_query("* | stats count by dest_ip").unwrap(),
+                &range,
+                &QueryOptions {
+                    limit: Some(ClickHouseSqlGenerator::DEFAULT_RESULT_LIMIT),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(aggregate.contains("GROUP BY dest_ip"), "{aggregate}");
+        assert!(
+            aggregate.contains(&format!(
+                "LIMIT {} SETTINGS",
+                ClickHouseSqlGenerator::DEFAULT_RESULT_LIMIT
+            )),
+            "generated aggregation must retain its internal output cap: {aggregate}"
+        );
+        assert!(
+            !aggregate.contains("LIMIT 60"),
+            "request.limit must not become the aggregation safety cap: {aggregate}"
+        );
+
+        let paged = wrap_aggregation_with_pagination(&aggregate, 60, 0);
+        assert!(paged.ends_with("LIMIT 60 OFFSET 0"), "{paged}");
+        assert_eq!(
+            paged.matches("LIMIT 60").count(),
+            1,
+            "request.limit must occur only at the outer returned-group page: {paged}"
+        );
+        assert_eq!(
+            paged
+                .matches(&format!(
+                    "LIMIT {}",
+                    ClickHouseSqlGenerator::DEFAULT_RESULT_LIMIT
+                ))
+                .count(),
+            1,
+            "the internal aggregate-output cap must survive outer pagination: {paged}"
+        );
+    }
+
+    #[test]
+    fn aggregation_pagination_preserves_inner_head_and_sort() {
+        let aggregate = "SELECT dest_ip, count(*) AS count FROM logs GROUP BY dest_ip ORDER BY count DESC LIMIT 10";
+        let wrapped = wrap_aggregation_with_pagination(aggregate, 60, 20);
+
+        assert!(
+            wrapped.contains("ORDER BY count DESC LIMIT 10) as subquery"),
+            "user sort/head semantics must remain inside the aggregate: {wrapped}"
+        );
+        assert!(wrapped.ends_with("LIMIT 60 OFFSET 20"), "{wrapped}");
     }
 
     #[test]

@@ -22,12 +22,14 @@ use crate::sql_hygiene::escape_sql_string;
 /// on demo) blew past the execution cap and the swallowed-error read loop turned the
 /// timeout into a silent `200 []` (NAN-1177).
 ///
-/// The window is bounded to 3h — `distinctJSONPaths` cost scales with rows scanned,
-/// and on a continuously-ingesting tenant 3h surfaces the full key set (verified 80/80
-/// on demo, 0.75s) while keeping ~13x headroom under `max_execution_time`. Paths are
+/// `distinctJSONPaths` cost scales with rows SCANNED, so the caller's window is what
+/// keeps this cheap — see `SearchService::EXT_FIELD_NAMES_DISCOVERY_WINDOW_MINUTES`
+/// for the context-free path. Neither the per-source slice below nor the output
+/// `LIMIT 512` bounds the read; only the predicate does (NAN-2174). Paths are
 /// dotted (`a.b.c`); the query-bar tokenizer matches bare identifiers, so each is
 /// reduced to its top-level segment — the same key form the results-driven field list
-/// registers. The cap keeps this best-effort, fire-and-forget query from ever hanging.
+/// registers. `max_execution_time` keeps this best-effort, fire-and-forget query from
+/// ever hanging.
 fn build_ext_field_names_sql(table: &str, json_col: &str, nested: bool, where_predicate: &str) -> String {
     // NAN-1241: the dynamic-JSON column is `ext` under UDM, `event` under OCSF.
     //
@@ -48,27 +50,48 @@ fn build_ext_field_names_sql(table: &str, json_col: &str, nested: bool, where_pr
     // `where_predicate` is the bare predicate (no `WHERE` keyword) scoping the
     // scan. NAN-1510: the service passes the SAME query+time predicate the
     // per-field value fetch uses, so the enumerated keys match what expanding a
-    // field can actually return (a time-only or `now()-3h` predicate is used for
-    // the historical-window / highlighter fallbacks).
+    // field can actually return (a time-only or short-recent-window predicate is
+    // used for the historical-window / highlighter fallbacks).
     //
-    // NAN-1653: bound the scan to the most-recent `EXT_FIELD_NAMES_ROW_CAP` rows.
-    // `distinctJSONPaths` reads every matched row, and `LIMIT 512` only caps the
-    // OUTPUT names — so on a busy tenant a wide window (e.g. 3.7M rows/3h on
-    // Saturn) blows past `max_execution_time` and 500s the row-expand. The table
-    // is sorted by `timestamp`, so `ORDER BY timestamp DESC LIMIT N` reads only
-    // the tail — key discovery over the most recent N rows is representative for
-    // highlighting/picker, and the query can't run away regardless of window
-    // width. `max_execution_time` remains as the last-resort backstop.
+    // NAN-2174: `ORDER BY timestamp DESC LIMIT N` does NOT bound this scan.
+    //
+    // NAN-1653 added that clause believing the table was sorted by `timestamp`,
+    // so the limit would read only the tail. The actual sort key is
+    // `(source_type, timestamp, src_host, src_ip, cityHash64(id))` — `timestamp`
+    // is the SECOND element, so `ORDER BY timestamp` is not a sort-key prefix,
+    // read-in-order cannot apply, and ClickHouse must read every matched row,
+    // materialize its JSON tail, and SORT before the limit takes effect. The cap
+    // only limited what reached `distinctJSONPaths`, never what was read.
+    //
+    // Measured on Saturn (2.44M rows / 903 MiB of `ext` in a 3h window), with
+    // `use_query_cache=0, use_query_condition_cache=0`:
+    //
+    //   ORDER BY timestamp DESC LIMIT 100000  11.72s  2,989,700 rows  4197 MiB
+    //   LIMIT 5000 BY source_type              6.02s  2,454,045 rows  3442 MiB
+    //   ... same, over a 15-minute window      1.07s    187,667 rows   256 MiB
+    //
+    // All three return the identical 107 keys (set-differenced both ways, empty).
+    // The 11.72s exceeded `max_execution_time = 10`, which is what 500'd
+    // `/api/fields/ext` on a bare `/search` mount.
+    //
+    // So: drop the sort entirely and take a per-source-type slice instead.
+    // `source_type` LEADS the sort key, so `LIMIT n BY source_type` needs no
+    // sort node at all (verified via EXPLAIN: `LimitBy` over `ReadFromMergeTree`,
+    // versus `Sorting (Sorting for ORDER BY)` before). It also gives every source
+    // equal representation rather than a primary-key-order head, which is the
+    // sampling skew NAN-1177 hit (24 of 80 keys from a plain inner LIMIT).
+    //
+    // The read is bounded by the WINDOW, not by this limit — see the caller's
+    // narrow discovery-window fallback. `max_execution_time` stays as backstop.
     format!(
         "SELECT DISTINCT {name_expr} AS name \
          FROM ( \
              SELECT arrayJoin(distinctJSONPaths({json_col})) AS path \
              FROM ( \
-                 SELECT {json_col} \
+                 SELECT {json_col}, source_type \
                  FROM {table} \
                  WHERE {where_predicate} \
-                 ORDER BY timestamp DESC \
-                 LIMIT {EXT_FIELD_NAMES_ROW_CAP} \
+                 LIMIT {EXT_FIELD_NAMES_ROWS_PER_SOURCE} BY source_type \
              ) \
          ) \
          WHERE name != '' \
@@ -78,10 +101,15 @@ fn build_ext_field_names_sql(table: &str, json_col: &str, nested: bool, where_pr
     )
 }
 
-/// Most-recent-row cap for the ext-field-names discovery scan (NAN-1653). Mirrors
-/// the field-stats picker's 100k bound so the "what keys exist?" query stays
-/// cheap and can't time out on high-volume tenants.
-const EXT_FIELD_NAMES_ROW_CAP: usize = 100_000;
+/// Per-`source_type` row slice for the ext-field-names discovery scan (NAN-2174,
+/// replacing NAN-1653's ineffective global row cap).
+///
+/// Chosen so every source contributes keys even when one type dominates volume —
+/// on Saturn `windows_sysmon` outnumbers `audit` by ~100,000:1 in a 15-minute
+/// window, and a global head-limit in primary-key order would starve the quiet
+/// ones. Present in both profiles' log tables (`logs` and `ocsf_logs`), so this
+/// is profile-agnostic.
+const EXT_FIELD_NAMES_ROWS_PER_SOURCE: usize = 5_000;
 
 /// Quote a column name for use as a *reference* inside `toString(...)` / `uniq(...)`.
 ///
@@ -890,17 +918,53 @@ mod tests {
         assert!(!ocsf_sql.contains("splitByChar"), "sql: {ocsf_sql}");
         assert!(ocsf_sql.contains("SELECT DISTINCT path AS name"), "sql: {ocsf_sql}");
 
-        // Bounded four ways: short recent window, a most-recent-row scan cap
-        // (NAN-1653 — the load-bearing one; distinctJSONPaths reads every row),
-        // the result cap, and a hard server-side execution cap so a slow
-        // ClickHouse can never hang the request.
+        // The predicate the caller passed is what bounds the READ (NAN-2174);
+        // the clauses below bound the aggregate, the result, and the runtime.
         assert!(sql.contains("INTERVAL 3 HOUR"), "sql: {sql}");
+
+        // NAN-2174: per-source slice, and CRUCIALLY no global sort.
+        //
+        // NAN-1653 used `ORDER BY timestamp DESC LIMIT 100000`, believing the
+        // table was sorted by `timestamp` so the limit would read only the tail.
+        // The sort key is `(source_type, timestamp, ...)` — `timestamp` is the
+        // second element, so that ORDER BY is not a prefix, read-in-order cannot
+        // apply, and ClickHouse read + sorted the WHOLE window before limiting.
+        // Measured on Saturn: 11.72s / 2,989,700 rows / 4197 MiB, over the 10s
+        // `max_execution_time`, which 500'd `/api/fields/ext` on a bare
+        // `/search` mount. The same query as a per-source slice over a 15-minute
+        // window: 1.07s / 187,667 rows / 256 MiB, returning the identical 107
+        // keys (set-differenced both ways, both empty).
+        //
+        // Re-adding any global `ORDER BY` to the inner scan reintroduces the
+        // sort node and the outage, so pin its absence.
         assert!(
-            sql.contains("ORDER BY timestamp DESC LIMIT 100000"),
-            "inner scan must be row-bounded (NAN-1653): {sql}"
+            sql.contains("LIMIT 5000 BY source_type"),
+            "inner scan must take a per-source slice (NAN-2174): {sql}"
         );
+        assert!(
+            !sql.contains("ORDER BY timestamp"),
+            "inner scan must NOT globally sort — `timestamp` is not a sort-key \
+             prefix, so this forces a full read+sort (NAN-2174): {sql}"
+        );
+        // The per-source slice needs `source_type` projected in the inner SELECT.
+        assert!(sql.contains("source_type"), "sql: {sql}");
+
         assert!(sql.contains("LIMIT 512"), "sql: {sql}");
         assert!(sql.contains("max_execution_time"), "sql: {sql}");
+    }
+
+    /// NAN-2174: the context-free discovery window is the only thing bounding
+    /// the read, so guard it against creeping back up. 3h was 2.44M rows / 903
+    /// MiB of `ext` on Saturn and timed out; 15m is 187k rows / 256 MiB and
+    /// returns the same key set.
+    #[test]
+    fn ext_field_names_discovery_window_stays_narrow() {
+        use crate::search::service::SearchService;
+        assert!(
+            SearchService::EXT_FIELD_NAMES_DISCOVERY_WINDOW_MINUTES <= 30,
+            "discovery window must stay narrow — it is the only bound on the \
+             scan (NAN-2174)"
+        );
     }
 
     /// UDM byte-identical guard: for bare snake_case columns the field-stats SQL

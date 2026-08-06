@@ -134,3 +134,85 @@ fn a_hunts_only_repository_refuses_response_playbooks_and_vice_versa() {
     assert!(repo_accepts_kind(&both, "response"));
     assert!(repo_accepts_kind(&both, "hunt"));
 }
+
+// NAN-2332: `category` is free-form in frontmatter but CHECK-constrained in
+// the catalog table. Before the fix an unrecognised value failed the INSERT,
+// the error was discarded, and the file was still counted as added/updated —
+// so the playbook vanished while the sync reported success.
+
+#[test]
+fn an_unknown_category_is_nulled_and_the_row_records_why() {
+    let (category, status, error) = resolve_category(
+        Some("soc-ops".to_string()),
+        "success",
+        None,
+    );
+
+    // Nulled so the INSERT satisfies the CHECK and the row actually lands:
+    // browsable and visibly broken beats absent with no diagnostic.
+    assert_eq!(category, None);
+    assert_eq!(status, "failed");
+
+    // The message has to name the offending value AND the accepted set — the
+    // author is looking at their own file wondering why it did not appear.
+    let error = error.expect("an unknown category must record a parse error");
+    assert!(error.contains("soc-ops"), "must name the bad value: {error}");
+    assert!(error.contains("identity"), "must list the accepted set: {error}");
+    assert!(error.contains("email"), "must list the accepted set: {error}");
+}
+
+#[test]
+fn every_documented_category_passes_through_untouched() {
+    // The six values the catalog CHECK accepts. If this list and the CHECK
+    // ever diverge, valid playbooks start getting marked failed.
+    for valid in ["identity", "endpoint", "cloud", "data", "network", "email"] {
+        let (category, status, error) =
+            resolve_category(Some(valid.to_string()), "success", None);
+        assert_eq!(category, Some(valid.to_string()), "{valid} must survive");
+        assert_eq!(status, "success", "{valid} must not be marked failed");
+        assert!(error.is_none(), "{valid} must not record an error");
+    }
+}
+
+#[test]
+fn mixed_case_category_is_canonicalized_to_lowercase() {
+    // `PlaybookCategory::parse` folds case, but the CHECK constraint does not
+    // — it is a literal `IN ('identity', …)`. Writing the author's original
+    // casing back would parse as valid here and STILL fail the constraint,
+    // reproducing the exact silent failure this function exists to prevent.
+    for written in ["Identity", "IDENTITY", "IdEnTiTy"] {
+        let (category, status, error) =
+            resolve_category(Some(written.to_string()), "success", None);
+        assert_eq!(
+            category,
+            Some("identity".to_string()),
+            "`{written}` must be stored canonically, not as written"
+        );
+        assert_eq!(status, "success", "`{written}` is a valid category");
+        assert!(error.is_none());
+    }
+}
+
+#[test]
+fn an_absent_category_is_not_an_error() {
+    // `category` is optional. A playbook that omits it is not broken.
+    let (category, status, error) = resolve_category(None, "success", None);
+    assert_eq!(category, None);
+    assert_eq!(status, "success");
+    assert!(error.is_none());
+}
+
+#[test]
+fn an_existing_parse_failure_is_never_masked() {
+    // When the frontmatter split fails, `fm` is None so `category` is None on
+    // that path. The original failure and its message must survive intact —
+    // overwriting them with a category complaint would hide the real cause.
+    let (category, status, error) = resolve_category(
+        None,
+        "failed",
+        Some("missing closing --- delimiter".to_string()),
+    );
+    assert_eq!(category, None);
+    assert_eq!(status, "failed");
+    assert_eq!(error.as_deref(), Some("missing closing --- delimiter"));
+}

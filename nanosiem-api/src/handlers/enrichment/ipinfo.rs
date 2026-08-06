@@ -30,7 +30,8 @@ use crate::{error::ApiError, state::AppState};
     request_body = ConfigureEnrichmentRequest,
     responses(
         (status = 200, description = "IPinfo configured successfully", body = serde_json::Value),
-        (status = 400, description = "Invalid URL or SSRF prevention"),
+        // NAN-2343: ApiError::ValidationError renders 422, not 400.
+        (status = 422, description = "Invalid URL or SSRF prevention"),
         (status = 403, description = "Forbidden - missing permission"),
     )
 )]

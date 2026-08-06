@@ -77,25 +77,82 @@ impl QueryPriority {
         match self {
             QueryPriority::Detection | QueryPriority::NearRealtime => ClickHouseQuerySettings {
                 max_execution_time: 30,
-                max_memory_usage_bytes: 5 * 1024 * 1024 * 1024, // 5 GB
+                max_memory_usage_bytes: Some(5 * 1024 * 1024 * 1024), // 5 GB
                 max_threads: 8,
                 priority: 1,
                 queue_max_wait_ms: 5000,
             },
             QueryPriority::Interactive => ClickHouseQuerySettings {
                 max_execution_time: 300,
-                max_memory_usage_bytes: 20 * 1024 * 1024 * 1024, // 20 GB
+                max_memory_usage_bytes: Some(20 * 1024 * 1024 * 1024), // 20 GB
                 max_threads: 16,
                 priority: 3,
                 queue_max_wait_ms: 60000,
             },
             QueryPriority::Analytics => ClickHouseQuerySettings {
                 max_execution_time: 3600,
-                max_memory_usage_bytes: 50 * 1024 * 1024 * 1024, // 50 GB
+                max_memory_usage_bytes: Some(50 * 1024 * 1024 * 1024), // 50 GB
                 max_threads: 32,
                 priority: 5,
                 queue_max_wait_ms: 120000,
             },
+        }
+    }
+
+    /// Returns ClickHouse query settings capped to the memory budget advertised
+    /// by the deployment. Priority tiers still control timeout, threads, and
+    /// their preferred memory budget; the ceiling only prevents a request from
+    /// raising `max_memory_usage` above what that ClickHouse pod can provide.
+    /// Without a ceiling, the deployment's ClickHouse user profile stays in
+    /// control.
+    pub fn to_ch_settings_with_memory_ceiling(
+        &self,
+        memory_ceiling_bytes: Option<u64>,
+    ) -> ClickHouseQuerySettings {
+        let mut settings = self.to_ch_settings();
+        settings.max_memory_usage_bytes = memory_ceiling_bytes.map(|ceiling| {
+            settings
+                .max_memory_usage_bytes
+                .expect("priority memory budgets are always defined")
+                .min(ceiling)
+        });
+        settings
+    }
+}
+
+/// Deployment-provided ceiling for per-query ClickHouse memory overrides.
+pub(crate) const CLICKHOUSE_QUERY_MAX_MEMORY_ENV: &str =
+    "CLICKHOUSE_QUERY_MAX_MEMORY_BYTES";
+
+pub(crate) fn query_memory_ceiling_from_env() -> Option<u64> {
+    let raw = match std::env::var(CLICKHOUSE_QUERY_MAX_MEMORY_ENV) {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => return None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::warn!(
+                env = CLICKHOUSE_QUERY_MAX_MEMORY_ENV,
+                "Ignoring non-Unicode ClickHouse query memory ceiling"
+            );
+            return None;
+        }
+    };
+
+    match raw.trim().parse::<u64>() {
+        Ok(value) if value > 0 => {
+            tracing::info!(
+                env = CLICKHOUSE_QUERY_MAX_MEMORY_ENV,
+                memory_ceiling_bytes = value,
+                "ClickHouse per-query memory overrides will honor deployment ceiling"
+            );
+            Some(value)
+        }
+        _ => {
+            tracing::warn!(
+                env = CLICKHOUSE_QUERY_MAX_MEMORY_ENV,
+                value = %raw,
+                "Ignoring invalid ClickHouse query memory ceiling; expected a positive byte count"
+            );
+            None
         }
     }
 }
@@ -129,8 +186,9 @@ impl std::str::FromStr for QueryPriority {
 pub struct ClickHouseQuerySettings {
     /// Maximum execution time in seconds
     pub max_execution_time: u32,
-    /// Maximum memory usage in bytes
-    pub max_memory_usage_bytes: u64,
+    /// Maximum memory usage in bytes. `None` leaves the deployment's ClickHouse
+    /// user profile in control instead of raising its configured limit.
+    pub max_memory_usage_bytes: Option<u64>,
     /// Maximum parallel threads
     pub max_threads: u32,
     /// ClickHouse scheduler priority (1=highest)
@@ -791,6 +849,38 @@ mod tests {
         let analytics = QueryPriority::Analytics.to_ch_settings();
         assert_eq!(analytics.max_execution_time, 3600);
         assert_eq!(analytics.priority, 5);
+    }
+
+    #[test]
+    fn deployment_memory_ceiling_only_clamps_memory() {
+        let ceiling = 3 * 1024 * 1024 * 1024;
+        let analytics = QueryPriority::Analytics
+            .to_ch_settings_with_memory_ceiling(Some(ceiling));
+
+        assert_eq!(analytics.max_memory_usage_bytes, Some(ceiling));
+        assert_eq!(analytics.max_execution_time, 3600);
+        assert_eq!(analytics.max_threads, 32);
+        assert_eq!(analytics.priority, 5);
+        assert_eq!(analytics.queue_max_wait_ms, 120_000);
+    }
+
+    #[test]
+    fn deployment_memory_ceiling_never_raises_priority_budget() {
+        let generous_ceiling = 100 * 1024 * 1024 * 1024;
+        let detection = QueryPriority::Detection
+            .to_ch_settings_with_memory_ceiling(Some(generous_ceiling));
+        let legacy = QueryPriority::Detection.to_ch_settings();
+
+        assert_eq!(
+            detection.max_memory_usage_bytes,
+            legacy.max_memory_usage_bytes
+        );
+        assert_eq!(
+            QueryPriority::Interactive
+                .to_ch_settings_with_memory_ceiling(None)
+                .max_memory_usage_bytes,
+            None
+        );
     }
 
     /// NAN-709: only Analytics yields before claiming an admit slot. Detection

@@ -364,20 +364,22 @@ impl SearchService {
 
         let is_aggregation = query_has_aggregation(query);
 
-        let limit = if is_aggregation {
-            // Aggregation output rows (GROUP BY groups) — use a high cap.
-            // The CTE base stage scans all events regardless; this limits output rows only.
-            1_000_000
+        let page_limit = request
+            .limit
+            .unwrap_or(self.config.default_limit)
+            .min(self.config.max_limit);
+        // Keep the same two-limit contract as buffered search: generated
+        // aggregate SQL has an independent high-cardinality safety ceiling,
+        // while request.limit is applied by an outer wrapper to the rows sent.
+        let generator_limit = if is_aggregation {
+            AGGREGATE_OUTPUT_CAP
         } else {
-            request
-                .limit
-                .unwrap_or(self.config.default_limit)
-                .min(self.config.max_limit)
+            page_limit
         };
         let options = QueryOptions {
             use_cache: request.use_cache,
             table_view: request.table_view,
-            limit: Some(limit),
+            limit: Some(generator_limit),
             unordered: false,
         };
 
@@ -496,6 +498,7 @@ impl SearchService {
 
         let mut batch_index: u32 = 0;
         let mut cumulative_count: u64 = 0;
+        let mut aggregate_total_count: Option<u64> = None;
         let mut chunks_queried: usize = 0;
 
         // Aggregation queries run a single query across the full time range —
@@ -509,7 +512,7 @@ impl SearchService {
             };
 
         for (chunk_idx, (chunk_start, chunk_end)) in chunk_ranges.iter().enumerate() {
-            let remaining = limit.saturating_sub(cumulative_count as usize);
+            let remaining = page_limit.saturating_sub(cumulative_count as usize);
             if remaining == 0 {
                 break;
             }
@@ -539,9 +542,12 @@ impl SearchService {
             // is intentionally not applied here (offset-based pagination is only
             // meaningful for the non-streaming path).
             let paginated_sql = if is_aggregation {
-                // Aggregation SQL already has its own structure (CTE with GROUP BY);
-                // don't inject LIMIT — ClickHouse streams the grouped output directly.
-                chunk_sql.clone()
+                // The generated LIMIT is the internal aggregate-output cap.
+                // Apply the caller page outside it and carry the bounded total
+                // in-band so normal pages remain one ClickHouse query.
+                super::execution::clickhouse_executor::wrap_aggregation_with_pagination(
+                    &chunk_sql, remaining, 0,
+                )
             } else {
                 debug_assert!(
                     request.offset.unwrap_or(0) == 0,
@@ -586,7 +592,11 @@ impl SearchService {
             let mut chunk_errored = false;
             while let Some(chunk) = chunk_rx.recv().await {
                 match chunk {
-                    StreamingChunk::Rows(rows) => {
+                    StreamingChunk::Rows(mut rows) => {
+                        if is_aggregation {
+                            aggregate_total_count =
+                                take_aggregation_total(&mut rows).or(aggregate_total_count);
+                        }
                         let count = rows.len() as u64;
                         cumulative_count += count;
                         if event_tx
@@ -636,7 +646,7 @@ impl SearchService {
             }
 
             // If we've hit the limit, stop querying further chunks
-            if cumulative_count as usize >= limit {
+            if cumulative_count as usize >= page_limit {
                 break;
             }
         }
@@ -656,7 +666,7 @@ impl SearchService {
                 .unwrap_or(cumulative_count)
                 .min(self.config.max_limit as u64)
         } else {
-            cumulative_count
+            aggregate_total_count.unwrap_or(cumulative_count)
         };
 
         // Collect histogram from the parallel task spawned before chunk streaming
@@ -826,6 +836,24 @@ impl SearchService {
     }
 }
 
+/// Remove the executor's in-band aggregate total before rows cross the SSE API.
+/// Every non-empty page carries the same window count, so reading the first is
+/// sufficient and keeps aggregate pages to one ClickHouse query.
+fn take_aggregation_total(rows: &mut [serde_json::Value]) -> Option<u64> {
+    let mut total_count = None;
+    for row in rows {
+        if let Some(object) = row.as_object_mut() {
+            if total_count.is_none() {
+                total_count = object
+                    .get("_total_count")
+                    .and_then(serde_json::Value::as_u64);
+            }
+            object.remove("_total_count");
+        }
+    }
+    total_count
+}
+
 /// Gate for the `PARTIAL_TIME_RANGE` warning.
 ///
 /// The warning fires only when the scan stopped before covering every daily
@@ -844,7 +872,7 @@ fn should_emit_partial_time_range_warning(
 
 #[cfg(test)]
 mod tests {
-    use super::should_emit_partial_time_range_warning as gate;
+    use super::{should_emit_partial_time_range_warning as gate, take_aggregation_total};
 
     const MAX: usize = 1_000_000;
 
@@ -887,6 +915,17 @@ mod tests {
         // Aggregation sets chunks_queried_all=true unconditionally
         // (see execute_streaming_path) so this branch is unreachable for it.
         assert!(!gate(true, u64::MAX, MAX));
+    }
+
+    #[test]
+    fn streaming_aggregation_uses_in_band_total_without_leaking_it() {
+        let mut rows = vec![
+            serde_json::json!({ "dest_ip": "10.0.0.1", "count": 9, "_total_count": 73 }),
+            serde_json::json!({ "dest_ip": "10.0.0.2", "count": 8, "_total_count": 73 }),
+        ];
+
+        assert_eq!(take_aggregation_total(&mut rows), Some(73));
+        assert!(rows.iter().all(|row| row.get("_total_count").is_none()));
     }
 
     #[test]

@@ -757,6 +757,7 @@ pub async fn field_values(
 
     // NAN-2028: returns log-derived field values — same search:execute gate.
     require_search_execute(&auth)?;
+    validate_field_values_limit(request.limit)?;
     // NAN-1799: the service injects the composed deny-set into the nPL path
     // itself — no more pre-rewrite of the query here.
     let scope = effective_scope(&auth);
@@ -773,7 +774,11 @@ pub async fn field_values(
     // field, time range, limit, and dataset, with the caller's effective
     // deny-set folded in by `companion_key` (NAN-1799).
     let cache_key = crate::cache::SearchResultCache::companion_key(
-        "fvalues",
+        // NAN-2344: response metadata now distinguishes returned top-N
+        // coverage from the full population. Version the cache namespace so a
+        // rolling deploy never asks the new response type to deserialize the
+        // older, ambiguous shape.
+        "fvalues-v2",
         &[
             request.field.as_bytes(),
             query.as_bytes(),
@@ -810,13 +815,7 @@ pub async fn field_values(
     record_search_query("field_values", duration_ms, result.is_ok());
 
     let values = result?;
-    let total_count: u64 = values.iter().map(|v| v.count).sum();
-
-    let response = FieldValuesResponse {
-        field: request.field,
-        values,
-        total_count,
-    };
+    let response = field_values_response(request.field, values, request.limit);
     if let Some(cache) = state.result_cache.as_ref() {
         let cache = cache.clone();
         let resp = response.clone();
@@ -841,6 +840,7 @@ pub struct FieldValuesRequest {
     pub end: chrono::DateTime<chrono::Utc>,
     /// Maximum number of values to return (default 100)
     #[serde(default = "default_field_values_limit")]
+    #[schema(minimum = 1, maximum = 1000)]
     pub limit: usize,
     /// Per-query dataset selector (NAN-1559): `logs` (default), `spans`,
     /// `metrics`, or `risk`. Drill-in must resolve the field and base source
@@ -854,6 +854,18 @@ fn default_field_values_limit() -> usize {
     100
 }
 
+const MAX_FIELD_VALUES_LIMIT: usize = 1_000;
+
+fn validate_field_values_limit(limit: usize) -> Result<(), SearchError> {
+    if (1..=MAX_FIELD_VALUES_LIMIT).contains(&limit) {
+        Ok(())
+    } else {
+        Err(SearchError::BadRequest(format!(
+            "field-values limit must be between 1 and {MAX_FIELD_VALUES_LIMIT}"
+        )))
+    }
+}
+
 /// Response for field values
 #[derive(Debug, Clone, Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct FieldValuesResponse {
@@ -861,8 +873,40 @@ pub struct FieldValuesResponse {
     pub field: String,
     /// Top values with counts
     pub values: Vec<FieldValueInfo>,
-    /// Total count across all values
+    /// Number of top values returned in `values`.
+    pub returned_value_count: usize,
+    /// Event count covered by the returned top values. This is NOT the total
+    /// event population when more distinct values exist beyond the requested
+    /// top-N.
+    pub covered_event_count: u64,
+    /// True when the response filled the requested top-N and additional
+    /// distinct values may exist. Conservative: an exact-cardinality tie at
+    /// the limit also reports true because proving completeness needs another
+    /// full aggregation.
+    pub may_have_more_values: bool,
+    /// Backwards-compatible alias of `covered_event_count`.
+    ///
+    /// This field historically sounded like the full matching population even
+    /// though it only summed the returned top values. New clients should use
+    /// the explicit fields above.
     pub total_count: u64,
+}
+
+fn field_values_response(
+    field: String,
+    values: Vec<FieldValueInfo>,
+    requested_limit: usize,
+) -> FieldValuesResponse {
+    let returned_value_count = values.len();
+    let covered_event_count = values.iter().map(|value| value.count).sum();
+    FieldValuesResponse {
+        field,
+        values,
+        returned_value_count,
+        covered_event_count,
+        may_have_more_values: requested_limit > 0 && returned_value_count >= requested_limit,
+        total_count: covered_event_count,
+    }
 }
 
 /// Request for async field stats
@@ -910,6 +954,8 @@ pub struct FieldStatsResponse {
 
 #[cfg(test)]
 mod field_values_endpoint_tests {
+    use nanosiem_core::search::FieldValueInfo;
+
     /// NAN-2149: the search drill-in endpoint must keep delegating field
     /// resolution to SearchService. Resolving a column in the handler would
     /// bypass the shared OCSF class-split/enum display expression and diverge
@@ -940,6 +986,54 @@ mod field_values_endpoint_tests {
             !body.contains("field_access_expr"),
             "the endpoint must not grow its own schema-resolution path"
         );
+    }
+
+    #[test]
+    fn field_values_names_top_n_coverage_without_claiming_population_completeness() {
+        let response = super::field_values_response(
+            "dest_ip".to_string(),
+            vec![
+                FieldValueInfo {
+                    value: "10.1.1.1".to_string(),
+                    count: 9,
+                    percentage: 52.9,
+                },
+                FieldValueInfo {
+                    value: "10.1.1.2".to_string(),
+                    count: 8,
+                    percentage: 47.1,
+                },
+            ],
+            2,
+        );
+
+        assert_eq!(response.returned_value_count, 2);
+        assert_eq!(response.covered_event_count, 17);
+        assert_eq!(response.total_count, response.covered_event_count);
+        assert!(response.may_have_more_values);
+    }
+
+    #[test]
+    fn a_short_field_values_page_is_known_complete() {
+        let response = super::field_values_response(
+            "dest_ip".to_string(),
+            vec![FieldValueInfo {
+                value: "10.1.1.1".to_string(),
+                count: 9,
+                percentage: 100.0,
+            }],
+            40,
+        );
+
+        assert!(!response.may_have_more_values);
+    }
+
+    #[test]
+    fn field_values_limit_is_bounded_before_query_execution() {
+        assert!(super::validate_field_values_limit(1).is_ok());
+        assert!(super::validate_field_values_limit(1_000).is_ok());
+        assert!(super::validate_field_values_limit(0).is_err());
+        assert!(super::validate_field_values_limit(1_001).is_err());
     }
 }
 

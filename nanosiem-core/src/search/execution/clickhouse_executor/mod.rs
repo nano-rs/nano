@@ -25,6 +25,8 @@ pub use sql_helpers::{
     wrap_query_with_pagination,
 };
 pub(crate) use paginated::is_first_page;
-pub(crate) use sql_helpers::{raw_sql_needs_skip_index_guard, BoundedCountInput};
+pub(crate) use sql_helpers::{
+    raw_sql_needs_skip_index_guard, wrap_aggregation_with_pagination, BoundedCountInput,
+};
 pub use types::{ClickHouseExecutor, ClickHouseLogReadRow};
 pub(crate) use types::with_query_options;

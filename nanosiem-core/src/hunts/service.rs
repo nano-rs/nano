@@ -29,8 +29,10 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 
 use chrono::{Duration, Utc};
+use futures::{stream, StreamExt, TryStreamExt};
 use uuid::Uuid;
 
 use crate::auth::{ArtifactScope, ScopeSet};
@@ -66,6 +68,22 @@ pub const MAX_CANDIDATES_PER_REPORT: usize = 50;
 /// a ClickHouse evidence lookup, so this is both a storage and cross-database
 /// work bound on attacker-influenceable model output.
 pub const MAX_KNOWLEDGE_PER_REPORT: usize = 50;
+
+/// Bound the cross-database preparation fan-out. A report may carry up to 50
+/// leads and 50 facts; resolving them serially can put otherwise healthy reports
+/// behind an edge request ceiling, while firing all of them at once would
+/// turn one model-authored report into a ClickHouse thundering herd.
+const REPORT_PREPARATION_CONCURRENCY: usize = 4;
+
+/// Prevalence and prior-history are optional scoring inputs, never provenance.
+/// A slow probe must therefore fail toward NO rarity/novelty bonus and let the
+/// corroborated lead commit. Without this bound, one slow window scan can hold
+/// the whole report open past the edge timeout; the lease then expires and the
+/// otherwise-finished sweep is reclaimed.
+#[cfg(not(test))]
+const OPTIONAL_SCORING_PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+#[cfg(test)]
+const OPTIONAL_SCORING_PROBE_TIMEOUT: StdDuration = StdDuration::from_millis(50);
 
 #[derive(Clone)]
 pub struct HuntService {
@@ -381,37 +399,63 @@ impl HuntService {
             .unwrap_or_else(|| Utc::now() - Duration::days(1));
         let window_end = context.window_end.unwrap_or_else(Utc::now);
 
+        let candidate_count = report.candidates.len();
+        let candidate_inputs: Vec<LeadCandidate> = report
+            .candidates
+            .iter()
+            .take(MAX_CANDIDATES_PER_REPORT)
+            .cloned()
+            .collect();
+        let prepared_candidates: Vec<Option<PreparedLead>> = stream::iter(candidate_inputs)
+            .map(|candidate| {
+                let known_signals = &known_signals;
+                async move {
+                    self.prepare_candidate(
+                        &candidate,
+                        known_signals,
+                        window_start,
+                        window_end,
+                        scope,
+                    )
+                    .await
+                }
+            })
+            .buffered(REPORT_PREPARATION_CONCURRENCY)
+            .try_collect()
+            .await?;
         let mut prepared = Vec::new();
         let mut rejected = 0usize;
-
-        for candidate in report.candidates.iter().take(MAX_CANDIDATES_PER_REPORT) {
-            match self
-                .prepare_candidate(candidate, &known_signals, window_start, window_end, scope)
-                .await?
-            {
+        for candidate in prepared_candidates {
+            match candidate {
                 Some(lead) => prepared.push(lead),
                 None => rejected += 1,
             }
         }
         // Anything past the cap is a refusal, not an omission, and must be
         // counted so a sweep spraying candidates is visible.
-        rejected += report
-            .candidates
-            .len()
-            .saturating_sub(MAX_CANDIDATES_PER_REPORT);
+        rejected += candidate_count.saturating_sub(MAX_CANDIDATES_PER_REPORT);
 
+        let knowledge_count = report.knowledge.len();
+        let knowledge_inputs: Vec<KnowledgeCandidate> = report
+            .knowledge
+            .iter()
+            .take(MAX_KNOWLEDGE_PER_REPORT)
+            .cloned()
+            .collect();
+        let prepared_knowledge: Vec<Option<PreparedKnowledge>> = stream::iter(knowledge_inputs)
+            .map(|candidate| async move { self.prepare_knowledge(&candidate, scope).await })
+            .buffered(REPORT_PREPARATION_CONCURRENCY)
+            .try_collect()
+            .await?;
         let mut knowledge = Vec::new();
         let mut knowledge_rejected = 0usize;
-        for candidate in report.knowledge.iter().take(MAX_KNOWLEDGE_PER_REPORT) {
-            match self.prepare_knowledge(candidate, scope).await? {
+        for candidate in prepared_knowledge {
+            match candidate {
                 Some(fact) => knowledge.push(fact),
                 None => knowledge_rejected += 1,
             }
         }
-        knowledge_rejected += report
-            .knowledge
-            .len()
-            .saturating_sub(MAX_KNOWLEDGE_PER_REPORT);
+        knowledge_rejected += knowledge_count.saturating_sub(MAX_KNOWLEDGE_PER_REPORT);
 
         self.repo
             .commit_sweep_report(CommitInputs {
@@ -531,20 +575,65 @@ impl HuntService {
             .filter_map(|s| ValidatedSignal::validate(s, known_signals))
             .collect();
 
-        let prevalence = self
-            .resolver
-            .asset_prevalence(
+        // These probes affect SCORE only. Evidence resolution above is still
+        // mandatory and any failure there aborts the report: provenance may
+        // never be guessed. Prevalence/novelty have an explicitly safe unknown
+        // state, so run them together under a hard deadline and degrade toward
+        // an ordinary score when ClickHouse cannot answer promptly.
+        let prevalence_probe = tokio::time::timeout(
+            OPTIONAL_SCORING_PROBE_TIMEOUT,
+            self.resolver.asset_prevalence(
                 entity.entity_type(),
                 entity.value(),
                 window_start,
                 window_end,
                 scope,
-            )
-            .await?;
-        let first_seen_in_window = !self
-            .resolver
-            .had_prior_history(entity.entity_type(), entity.value(), window_start, scope)
-            .await?;
+            ),
+        );
+        let history_probe = tokio::time::timeout(
+            OPTIONAL_SCORING_PROBE_TIMEOUT,
+            self.resolver.had_prior_history(
+                entity.entity_type(),
+                entity.value(),
+                window_start,
+                scope,
+            ),
+        );
+        let (prevalence_result, history_result) = tokio::join!(prevalence_probe, history_probe);
+        let prevalence = match prevalence_result {
+            Ok(Ok(value)) => value,
+            Ok(Err(_)) => {
+                tracing::warn!(
+                    entity_type = entity.entity_type(),
+                    "hunt report prevalence probe failed; scoring it as unmeasured"
+                );
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    entity_type = entity.entity_type(),
+                    "hunt report prevalence probe timed out; scoring it as unmeasured"
+                );
+                None
+            }
+        };
+        let first_seen_in_window = match history_result {
+            Ok(Ok(had_prior_history)) => !had_prior_history,
+            Ok(Err(_)) => {
+                tracing::warn!(
+                    entity_type = entity.entity_type(),
+                    "hunt report prior-history probe failed; withholding novelty bonus"
+                );
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    entity_type = entity.entity_type(),
+                    "hunt report prior-history probe timed out; withholding novelty bonus"
+                );
+                false
+            }
+        };
 
         // Keep only the events that actually mention the corroborated entity.
         //

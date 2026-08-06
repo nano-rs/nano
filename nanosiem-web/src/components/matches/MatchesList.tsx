@@ -9,24 +9,28 @@
 import { useMemo } from 'react';
 import { Filter } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { relTime, type MatchView } from './helpers';
+import { extractEventTime, relTime, type MatchView } from './helpers';
 
-// Event burst sparkline — bins events by time into 8 buckets.
+// Event burst sparkline — bins events by time into 8 buckets. Reads times
+// through `extractEventTime` so it honours the canonical `_match_event_time`
+// and the aggregate-window fields, not just the three raw key names (NAN-2341);
+// renders nothing when no event carries a time, rather than painting a flat
+// baseline that reads as "a burst happened here".
 function BurstSpark({ view, width = 72, height = 16 }: { view: MatchView; width?: number; height?: number }) {
   const bins = 8;
   const counts = Array(bins).fill(0) as number[];
   const first = view.firstSeen.getTime();
   const range = Math.max(view.lastSeen.getTime() - first, 1);
+  let timed = 0;
   for (const e of view.events) {
-    const raw = (e as Record<string, unknown>)['timestamp']
-      ?? (e as Record<string, unknown>)['eventTime']
-      ?? (e as Record<string, unknown>)['ingest_time'];
-    if (typeof raw !== 'string') continue;
-    const t = new Date(raw.includes('Z') || raw.includes('+') ? raw : raw.replace(' ', 'T') + 'Z').getTime();
-    if (!Number.isFinite(t)) continue;
-    const idx = Math.min(bins - 1, Math.floor(((t - first) / range) * bins));
+    const parsed = extractEventTime(e as Record<string, unknown>);
+    const t = parsed?.getTime();
+    if (t === undefined || !Number.isFinite(t)) continue;
+    timed++;
+    const idx = Math.min(bins - 1, Math.max(0, Math.floor(((t - first) / range) * bins)));
     counts[idx]++;
   }
+  if (timed === 0) return null;
   const max = Math.max(...counts, 1);
   const barW = width / bins - 1;
   return (

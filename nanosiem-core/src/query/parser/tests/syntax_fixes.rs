@@ -219,3 +219,118 @@ fn trailing_backslash_value_is_literal() {
     let q2 = parse_query(r#"file_path="a\\b""#).expect("escaped-backslash parses");
     assert_eq!(first_str(&q2).as_deref(), Some(r"a\b"));
 }
+
+// ---------------------------------------------------------------------------
+// NAN-2331: SPL permits arithmetic/computed predicates in `where`. Keep the
+// existing SearchExpr representation for ordinary filters and bridge only the
+// arithmetic leaf to EvalExpression.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn arithmetic_where_after_stats_parses() {
+    assert_parses(
+        "* | stats min(timestamp) as first_seen, max(timestamp) as last_seen, \
+         count() as event_count, dc(src_ip) as unique_ips by user | \
+         where event_count > 5 AND unique_ips >= 2 AND \
+         (last_seen - first_seen) >= 300",
+    );
+}
+
+#[test]
+fn scalar_min_max_arithmetic_where_parses() {
+    assert_parses(
+        "* | stats min(timestamp) as first_seen, max(timestamp) as last_seen by user | \
+         where (max(last_seen) - min(first_seen)) < 900",
+    );
+}
+
+#[test]
+fn arithmetic_comparison_variants_and_split_where_stages_parse() {
+    for comparator in [">", "<", ">=", "<=", "=", "!="] {
+        assert_parses(&format!(
+            "* | stats min(timestamp) as first_seen, max(timestamp) as last_seen by user \
+             | where (last_seen - first_seen) {comparator} 300"
+        ));
+    }
+
+    assert_parses(
+        "* | stats min(timestamp) as first_seen, max(timestamp) as last_seen, \
+         count() as event_count by user | where event_count > 5 \
+         | where (last_seen - first_seen) >= 300",
+    );
+}
+
+#[test]
+fn arithmetic_on_the_right_side_parses() {
+    use crate::query::{Command, Query, SearchExpr};
+
+    let parsed = parse_query("* | where last_seen < now() - INTERVAL 15 MINUTE").unwrap();
+    match parsed {
+        Query::Piped {
+            command: Command::Where { condition },
+            ..
+        } => assert!(
+            matches!(condition, SearchExpr::FieldFunctionFilter { .. }),
+            "existing field/function comparisons must keep their AST path: {condition:?}"
+        ),
+        other => panic!("expected piped where query, got {other:?}"),
+    }
+}
+
+#[test]
+fn simple_where_keeps_the_index_aware_ast_variant() {
+    use crate::query::{Command, Query, SearchExpr};
+
+    let parsed = parse_query("* | where source_type=windows_sysmon").unwrap();
+    match parsed {
+        Query::Piped {
+            command: Command::Where { condition },
+            ..
+        } => assert!(
+            matches!(condition, SearchExpr::FieldFilter { .. }),
+            "ordinary filters must not route through EvalPredicate: {condition:?}"
+        ),
+        other => panic!("expected piped where query, got {other:?}"),
+    }
+}
+
+#[test]
+fn arithmetic_where_uses_eval_predicate_only_for_the_computed_leaf() {
+    use crate::query::{Command, PrettyPrint, Query, SearchExpr};
+
+    fn variant_counts(expr: &SearchExpr) -> (usize, usize) {
+        match expr {
+            SearchExpr::EvalPredicate(_) => (1, 0),
+            SearchExpr::FieldFilter { .. } => (0, 1),
+            SearchExpr::And(left, right) | SearchExpr::Or(left, right) => {
+                let left = variant_counts(left);
+                let right = variant_counts(right);
+                (left.0 + right.0, left.1 + right.1)
+            }
+            SearchExpr::Not(inner) | SearchExpr::Group(inner) => variant_counts(inner),
+            _ => (0, 0),
+        }
+    }
+
+    let parsed = parse_query(
+        "* | where event_count > 5 AND (last_seen - first_seen) >= 300 AND \
+         unique_ips >= 2",
+    )
+    .unwrap();
+    match &parsed {
+        Query::Piped {
+            command: Command::Where { condition },
+            ..
+        } => {
+            assert!(matches!(condition, SearchExpr::And(_, _)));
+            assert_eq!(variant_counts(condition), (1, 2));
+        }
+        other => panic!("expected piped where query, got {other:?}"),
+    }
+
+    let printed = parsed.pretty_print();
+    let reparsed = parse_query(&printed).unwrap_or_else(|error| {
+        panic!("pretty-printed query did not reparse: {printed}: {error:?}")
+    });
+    assert_eq!(reparsed, parsed, "pretty-print round trip changed the AST");
+}

@@ -112,6 +112,23 @@ const MIGRATION_162: &str = include_str!(concat!(
     "/../clickhouse/162_prevalence_dicts_read_final.sql"
 ));
 
+/// NAN-2346 replaced the hardcoded `SIZE_IN_CELLS` literals with the
+/// `{prevalence_cache_cells*}` placeholders so a small box can size the three
+/// prevalence CACHE dicts to its own memory. `COMPLEX_KEY_CACHE` preallocates its
+/// whole cell array at first `dictGet` and CH rounds the count up to a power of
+/// two, so `5000000` allocated 2^23 cells ≈ 320 MiB to hold (measured) 2 elements;
+/// the trio cost ~400 MiB on every box. On a 4 GB tenant that was a quarter of
+/// CH's budget and left `ip_enrichment_dict` unable to build its IP_TRIE — it sat
+/// `LOADED` with `element_count 0`, silently serving enrichment defaults.
+///
+/// This SUPERSEDES migration 162 as the canonical body for `PUSHDOWN_DICTS`; 162
+/// stays immutable history, exactly as 153 does. Everything else in the bodies is
+/// byte-identical to 162 — only the SIZE_IN_CELLS literal moved.
+const MIGRATION_172: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../clickhouse/172_prevalence_dict_cache_cells_by_box.sql"
+));
+
 /// NAN-1732 P2-C deduplicated the enrichment refresh MVs: the SELECT now wraps
 /// its source in an `argMax(col, version) GROUP BY namespace, …` subquery so a
 /// re-ingested key does not fan out into duplicate staging rows.
@@ -559,6 +576,7 @@ fn migration_133_matches_init_definitions() {
     let mig148_dicts = create_dictionary_statements(MIGRATION_148);
     let mig153_dicts = create_dictionary_statements(MIGRATION_153);
     let mig162_dicts = create_dictionary_statements(MIGRATION_162);
+    let mig172_dicts = create_dictionary_statements(MIGRATION_172);
 
     // Migration 136 must redefine exactly the dicts it claims to (catches an
     // accidental extra/missing CREATE OR REPLACE).
@@ -609,19 +627,45 @@ fn migration_133_matches_init_definitions() {
         expected_pushdown,
         "migration 162 redefines a different dict set than PUSHDOWN_DICTS"
     );
+    // NAN-2346: same pin for 172, which is now canonical. A partial cutover would
+    // leave some dicts sized by the box and others on the fleet-wide literal.
+    assert_eq!(
+        mig172_dicts.keys().map(String::as_str).collect::<Vec<_>>(),
+        expected_pushdown,
+        "migration 172 redefines a different dict set than PUSHDOWN_DICTS"
+    );
     for name in PUSHDOWN_DICTS {
-        let canonical = mig162_dicts.get(*name);
+        let canonical = mig172_dicts.get(*name);
         assert_eq!(
             canonical,
             udm_dicts.get(*name),
-            "{name} differs between migration 162 and clickhouse/init.sql"
+            "{name} differs between migration 172 and clickhouse/init.sql"
         );
         assert_eq!(
             canonical,
             ocsf_dicts.get(*name),
-            "{name} differs between migration 162 and clickhouse/ocsf/init.sql"
+            "{name} differs between migration 172 and clickhouse/ocsf/init.sql"
         );
-        let query = source_query(canonical.expect("pushdown dict in 162"))
+        // NAN-2346: 172 must be 162's body with ONLY the SIZE_IN_CELLS literal
+        // parameterised. Comparing the two with the placeholders resolved to the
+        // historical defaults proves no other clause drifted in the copy, and
+        // proves the unset path stays byte-identical to what 162 deployed.
+        //
+        // The literals are hardcoded here on purpose rather than imported from
+        // sql_transform: this assertion IS the statement that an unset
+        // NANO_PREVALENCE_CACHE_CELLS* must reproduce exactly what 162 deployed.
+        // If someone changes the runtime default, this test SHOULD fail — that
+        // change would silently resize every k8s / BYOC / open-core install.
+        let restored = canonical
+            .expect("pushdown dict in 172")
+            .replace("{prevalence_cache_cells_ip}", "5000000")
+            .replace("{prevalence_cache_cells}", "1000000");
+        assert_eq!(
+            Some(&restored),
+            mig162_dicts.get(*name),
+            "{name} in migration 172 differs from migration 162 by more than SIZE_IN_CELLS"
+        );
+        let query = source_query(canonical.expect("pushdown dict in 172"))
             .expect("pushdown dict has a QUERY source");
         // NAN-1440, the invariant that actually matters: a pushdown source must
         // NEVER read a staging table. The full-keyspace staging rewrite OOMed

@@ -353,6 +353,9 @@ fn collect_fields_from_search_expr(
         SearchExpr::BooleanFunction(function) => {
             collect_fields_from_eval_expr(function, fields, profile);
         }
+        SearchExpr::EvalPredicate(expression) => {
+            collect_fields_from_eval_expr(expression, fields, profile);
+        }
         SearchExpr::LiteralComparison { .. } => {
             // Literal comparisons don't reference any fields
         }

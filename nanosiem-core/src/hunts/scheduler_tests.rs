@@ -522,11 +522,27 @@ fn window_sizing_uses_the_hunt_configured_strings() {
 // =============================================================================
 
 #[test]
-fn the_scheduler_is_on_by_default_and_switchable_off() {
+fn scheduled_cadence_is_on_by_default_and_switchable_off() {
     let defaults = HuntSchedulerConfig::default();
     assert!(defaults.enabled);
     assert_eq!(defaults.poll_interval_secs, DEFAULT_POLL_INTERVAL_SECS);
     assert_eq!(defaults.reclaim_grace_secs, DEFAULT_RECLAIM_GRACE_SECS);
+}
+
+#[test]
+fn disabled_cadence_still_reclaims_expired_manual_sweeps() {
+    // `enabled` is the cadence switch, not a lease-hygiene switch. Pin the
+    // ordering so a future early return cannot leave manual-only deployments
+    // with sweeps that say `leased` forever.
+    let source = include_str!("scheduler.rs");
+    let start = source.find("pub async fn tick(").unwrap();
+    let end = source[start..].find("async fn process_hunt(").unwrap() + start;
+    let tick = &source[start..end];
+    let reclaim = tick.find("reclaim_expired_leases").unwrap();
+    let cadence_gate = tick.find("if !self.config.enabled").unwrap();
+    let due_hunts = tick.find("load_due_hunts").unwrap();
+    assert!(reclaim < cadence_gate);
+    assert!(cadence_gate < due_hunts);
 }
 
 #[test]
@@ -572,6 +588,6 @@ async fn a_cancelled_scheduler_stops_without_touching_postgres() {
 
     tokio::time::timeout(std::time::Duration::from_secs(2), scheduler.start(shutdown))
         .await
-        .expect("a disabled scheduler must return immediately")
+        .expect("a cancelled scheduler must return immediately")
         .expect("the task must not panic");
 }

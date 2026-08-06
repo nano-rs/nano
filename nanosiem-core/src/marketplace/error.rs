@@ -32,6 +32,16 @@ pub enum MarketplaceError {
     #[error("Credential required for this enrichment")]
     CredentialRequired,
 
+    /// A supplied credential field failed validation before being persisted.
+    ///
+    /// NAN-2343: carries the field name so the UI can attach the message to the
+    /// offending input instead of showing a bare toast. Previously a malformed
+    /// `download_url` was stored verbatim and only surfaced at sync time as a
+    /// "URL rejected by SSRF check" failure, which named the wrong cause and
+    /// gave the operator nothing to correct.
+    #[error("Invalid value for '{field}': {reason}")]
+    InvalidCredential { field: String, reason: String },
+
     #[error("Git operation failed: {0}")]
     GitError(String),
 
@@ -60,6 +70,7 @@ impl MarketplaceError {
             MarketplaceError::AlreadyInstalled(_) => 409,
             MarketplaceError::InvalidUrl(_) => 400,
             MarketplaceError::CredentialRequired => 400,
+            MarketplaceError::InvalidCredential { .. } => 422,
             MarketplaceError::GitError(_) => 502,
             MarketplaceError::ManifestParseError(_) => 422,
             MarketplaceError::SyncInProgress(_) => 409,

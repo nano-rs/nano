@@ -16,7 +16,7 @@ use nom::{
 };
 use regex;
 
-use super::eval_expr::eval_expression;
+use super::eval_expr::{eval_expression, eval_predicate_expression};
 use super::values::{comparator, field_name, filter_value, quoted_string};
 use super::ParseResult;
 use crate::query::ast::*;
@@ -177,6 +177,7 @@ fn primary_expr(input: &str) -> ParseResult<'_, SearchExpr> {
     // function_call_expr (func(args) op value) must come before boolean_function_expr (func(args))
     // since the former is more specific; boolean_function_expr catches the standalone case
     alt((
+        arithmetic_predicate_expr,
         grouped_expr,
         // `ioc=` / `ioc in [...]` / `ioc in feed("arg")` are special-cased ahead
         // of the generic field/in-list filters so the `ioc` pseudo-field expands
@@ -197,6 +198,68 @@ fn primary_expr(input: &str) -> ParseResult<'_, SearchExpr> {
         keyword_search,
     ))
     .parse(input)
+}
+
+/// Parse one parenthesized arithmetic predicate in a piped `where` clause.
+///
+/// The regular search-expression grammar intentionally owns ordinary filters
+/// (`field=value`, `field>5`, IOC terms, and so on) because those variants feed
+/// index-aware SQL generation. SPL also permits computed predicates such as
+/// `(last_seen - first_seen) >= 300`; those already fit the eval-expression
+/// grammar, but not `SearchExpr::FieldFilter`. Use the comparison-only eval
+/// entry point and require arithmetic beneath its root comparator so it cannot
+/// consume adjacent normal filters. The opening parenthesis keeps existing
+/// field/function comparisons on their established index-aware variants.
+fn arithmetic_predicate_expr(input: &str) -> ParseResult<'_, SearchExpr> {
+    if !input.trim_start().starts_with('(') {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
+
+    let (remaining, expression) = eval_predicate_expression(input)?;
+    if eval_contains_arithmetic(&expression) && eval_is_boolean(&expression) {
+        Ok((remaining, SearchExpr::EvalPredicate(expression)))
+    } else {
+        Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Verify,
+        )))
+    }
+}
+
+fn eval_contains_arithmetic(expr: &EvalExpression) -> bool {
+    match expr {
+        EvalExpression::BinaryOp { left, op, right } => {
+            matches!(
+                op,
+                BinaryOperator::Add
+                    | BinaryOperator::Sub
+                    | BinaryOperator::Mul
+                    | BinaryOperator::Div
+                    | BinaryOperator::Mod
+            ) || eval_contains_arithmetic(left)
+                || eval_contains_arithmetic(right)
+        }
+        EvalExpression::FunctionCall { args, .. } => args.iter().any(eval_contains_arithmetic),
+        EvalExpression::Field(_) | EvalExpression::Literal(_) => false,
+    }
+}
+
+fn eval_is_boolean(expr: &EvalExpression) -> bool {
+    matches!(
+        expr,
+        EvalExpression::BinaryOp {
+            op: BinaryOperator::Eq
+                | BinaryOperator::Ne
+                | BinaryOperator::Gt
+                | BinaryOperator::Lt
+                | BinaryOperator::Gte
+                | BinaryOperator::Lte,
+            ..
+        }
+    )
 }
 
 /// Parse quoted string comparison: "value" = "value" or "value" != "value"

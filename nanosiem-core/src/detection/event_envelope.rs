@@ -14,6 +14,8 @@
 //! - `_match_event_time` — RFC 3339 timestamp string, best-effort
 //! - `_match_event_label` — one-line human label (always present)
 //! - `_match_kind` — `"raw"`, `"aggregate"`, or `"sequence"`
+//! - `_match_entity` / `_match_entity_type` — the row's subject, when one
+//!   resolves (NAN-2341)
 //!
 //! The heuristics mirror what the frontend has accumulated across NAN-822 /
 //! NAN-826 / NAN-829. Moving them server-side means future regressions get
@@ -24,6 +26,8 @@ use serde_json::{Map, Value};
 pub const MATCH_EVENT_TIME: &str = "_match_event_time";
 pub const MATCH_EVENT_LABEL: &str = "_match_event_label";
 pub const MATCH_KIND: &str = "_match_kind";
+pub const MATCH_ENTITY: &str = "_match_entity";
+pub const MATCH_ENTITY_TYPE: &str = "_match_entity_type";
 
 /// Inject canonical `_match_*` envelope fields on the event in-place. Only
 /// operates on JSON objects; arrays / scalars are left untouched.
@@ -37,6 +41,10 @@ pub fn normalize_match_event(event: &mut Value) {
     }
     if let Some(label) = pick_label(obj, kind) {
         obj.insert(MATCH_EVENT_LABEL.into(), Value::String(label));
+    }
+    if let Some((entity, entity_type)) = pick_entity(obj) {
+        obj.insert(MATCH_ENTITY.into(), Value::String(entity));
+        obj.insert(MATCH_ENTITY_TYPE.into(), Value::String(entity_type));
     }
     obj.insert(
         MATCH_KIND.into(),
@@ -165,6 +173,116 @@ fn pick_label(obj: &Map<String, Value>, kind: Kind) -> Option<String> {
     }
 
     Some(semantic_raw_label(obj).unwrap_or_else(|| "Matched event".into()))
+}
+
+/// Entity picker (NAN-2341) — the subject a match fired against, as
+/// `(value, type)`. Returns `None` when the row carries no recognisable
+/// subject, so `_match_entity` is absent rather than `"unknown"`.
+///
+/// Precedence mirrors the frontend's `extractEntity` (identity before network
+/// identifier) so injecting the envelope can't reshuffle what an existing
+/// match already displays. The one addition ahead of it: an EXPLICIT
+/// `entity` / `entity_type` pair. Derived datasets project exactly that pair —
+/// `dataset=risk` rows are `entity`, `entity_type`, `score_24h`, … and carry
+/// no UDM/OCSF column at all, which is why risk-notable matches used to render
+/// as `unknown`.
+///
+/// The value is emitted RAW. Display shortening (an ARN down to its last
+/// segment, say) stays a frontend concern — this is the identifier a pivot
+/// query has to filter on.
+fn pick_entity(obj: &Map<String, Value>) -> Option<(String, String)> {
+    if let Some(entity) = str_field(obj, "entity") {
+        let declared = str_field(obj, "entity_type")
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty());
+        let ty = declared.unwrap_or_else(|| entity_type_from_value(entity).to_string());
+        return Some((entity.to_string(), ty));
+    }
+
+    if let Some(arn) = str_field(obj, "user_identity.arn") {
+        // `assumed-role/` counts: an STS session ARN
+        // (`arn:aws:sts::…:assumed-role/Role/session`) never contains `:role/`.
+        let ty = if arn.contains(":role/") || arn.contains(":assumed-role/") {
+            "role"
+        } else {
+            "user"
+        };
+        return Some((arn.to_string(), ty.to_string()));
+    }
+
+    for (keys, ty) in [
+        (&["user", "actor.user.name", "user.name"][..], "user"),
+        (
+            &[
+                "src_host",
+                "hostname",
+                "dest_host",
+                "device.hostname",
+                "src_endpoint.hostname",
+                "dst_endpoint.hostname",
+            ][..],
+            "hostname",
+        ),
+        (
+            &[
+                "src_ip",
+                "dest_ip",
+                "src_endpoint.ip",
+                "dst_endpoint.ip",
+            ][..],
+            "ip",
+        ),
+    ] {
+        if let Some(value) = first_str(obj, keys) {
+            return Some((value.to_string(), ty.to_string()));
+        }
+    }
+
+    None
+}
+
+/// Value-shape entity typing, for an explicit `entity` with no `entity_type`.
+/// Same vocabulary as `FindingEvent::infer_entity_type_from_value`, but the
+/// `@` test runs BEFORE the dotted-hostname test — `dan@corp.local` contains a
+/// dot too, and it is an email, not a host.
+fn entity_type_from_value(entity: &str) -> &'static str {
+    if entity.parse::<std::net::IpAddr>().is_ok() {
+        return "ip";
+    }
+    if entity.contains('@') {
+        return "email";
+    }
+    if entity.len() >= 32 && entity.chars().all(|c| c.is_ascii_hexdigit()) {
+        return "hash";
+    }
+    if entity.contains('.') && !entity.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return "hostname";
+    }
+    "user"
+}
+
+/// Risk-dataset row label (NAN-2341) — `dataset=risk` projects one row per
+/// scored entity (`entity`, `score_24h`, `score_7d`, `last_rule_name`, …) with
+/// none of the action/file/auth fields `semantic_raw_label` reads, so these
+/// rows all fell through to the generic `"Matched event"`. Lead with the
+/// window that actually carries the score, then name the rule that last
+/// contributed to it.
+fn risk_row_label(obj: &Map<String, Value>) -> Option<String> {
+    if str_field(obj, "entity").is_none() {
+        return None;
+    }
+    let (score, window) = [("score_24h", "24h"), ("score_7d", "7d")]
+        .iter()
+        .find_map(|(key, window)| {
+            numeric_field(obj, key)
+                .filter(|n| n.is_finite())
+                .map(|n| (n, *window))
+        })?;
+    let label = format!("risk {} ({window})", format_count(score));
+    match str_field(obj, "last_rule_name") {
+        Some(rule) => Some(format!("{label} · {}", truncate(rule, 72))),
+        None => Some(label),
+    }
 }
 
 fn sequence_step_count(obj: &Map<String, Value>) -> usize {
@@ -319,6 +437,9 @@ fn semantic_raw_label(obj: &Map<String, Value>) -> Option<String> {
     if let Some(message) = first_str(obj, &["message", "signature", "alert_name"]) {
         return Some(truncate(message, 96));
     }
+    if let Some(risk) = risk_row_label(obj) {
+        return Some(risk);
+    }
     first_str(obj, &["source_type"])
         .map(|source| format!("{} event", source.replace(['_', '-'], " ")))
 }
@@ -449,261 +570,5 @@ fn format_count(n: f64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn normalize(v: Value) -> Value {
-        let mut v = v;
-        normalize_match_event(&mut v);
-        v
-    }
-
-    fn field<'a>(v: &'a Value, key: &str) -> &'a str {
-        v.get(key)
-            .and_then(|x| x.as_str())
-            .unwrap_or_else(|| panic!("missing {}", key))
-    }
-
-    #[test]
-    fn raw_cloudtrail_event_uses_canonical_fields() {
-        let v = normalize(json!({
-            "timestamp": "2026-05-16T18:00:14.000Z",
-            "eventName": "ConsoleLogin",
-            "src_ip": "10.0.0.1",
-            "_nano_detected_at": "2026-05-16T18:00:15.000Z",
-        }));
-        assert_eq!(field(&v, MATCH_KIND), "raw");
-        assert_eq!(field(&v, MATCH_EVENT_TIME), "2026-05-16T18:00:14.000Z");
-        assert_eq!(field(&v, MATCH_EVENT_LABEL), "ConsoleLogin");
-    }
-
-    #[test]
-    fn underscore_prefixed_aggregate_works() {
-        let v = normalize(json!({
-            "_first_seen": "2026-05-16 14:20:28.000000",
-            "_last_seen": "2026-05-16 14:35:10.000000",
-            "_nano_detected_at": "2026-05-16T14:35:20.000Z",
-            "denied_count": 1582,
-            "unique_actions": 110,
-        }));
-        assert_eq!(field(&v, MATCH_KIND), "aggregate");
-        assert_eq!(field(&v, MATCH_EVENT_TIME), "2026-05-16 14:35:10.000000");
-        assert_eq!(field(&v, MATCH_EVENT_LABEL), "1,582 denied count");
-    }
-
-    #[test]
-    fn user_aliased_aggregate_works() {
-        let v = normalize(json!({
-            "first_seen": "2026-05-16T17:45:21.000000Z",
-            "last_seen": "2026-05-16T18:00:14.000000Z",
-            "_nano_detected_at": "2026-05-16T18:00:19.772Z",
-            "actions_attempted": "getsecretvalue, deletesecurity, ...",
-            "denied_count": 1000000,
-            "unique_actions": 76,
-        }));
-        assert_eq!(field(&v, MATCH_KIND), "aggregate");
-        assert_eq!(field(&v, MATCH_EVENT_TIME), "2026-05-16T18:00:14.000000Z");
-        // actions_attempted wins over count-based derivation
-        assert_eq!(
-            field(&v, MATCH_EVENT_LABEL),
-            "getsecretvalue, deletesecurity, ..."
-        );
-    }
-
-    #[test]
-    fn aggregate_with_only_counts_falls_back_to_largest() {
-        let v = normalize(json!({
-            "first_seen": "2026-05-16 14:20:28.000000",
-            "last_seen": "2026-05-16 14:35:10.000000",
-            "failure_count": 12,
-            "success_count": 8,
-        }));
-        assert_eq!(field(&v, MATCH_KIND), "aggregate");
-        assert_eq!(field(&v, MATCH_EVENT_LABEL), "12 failure count");
-    }
-
-    #[test]
-    fn aggregate_with_only_actions_attempted() {
-        let v = normalize(json!({
-            "actions_attempted": "PutObject, DeleteObject",
-        }));
-        assert_eq!(field(&v, MATCH_KIND), "aggregate");
-        assert_eq!(field(&v, MATCH_EVENT_LABEL), "PutObject, DeleteObject");
-    }
-
-    #[test]
-    fn aggregate_with_no_summary_fields_uses_generic_fallback() {
-        let v = normalize(json!({
-            "first_seen": "2026-05-16 14:20:28.000000",
-            "last_seen": "2026-05-16 14:35:10.000000",
-            "user": "intern01",
-        }));
-        assert_eq!(field(&v, MATCH_KIND), "aggregate");
-        assert_eq!(field(&v, MATCH_EVENT_LABEL), "stats aggregate");
-    }
-
-    #[test]
-    fn sequence_row_gets_step_and_duration_summary() {
-        let v = normalize(json!({
-            "timestamp": "2026-07-24T15:00:00Z",
-            "user": "alice",
-            "step1_url": "https://search.example/",
-            "step2_file_path": "C:\\Users\\alice\\Downloads\\search_term.zip",
-            "step3_process_name": "wscript.exe",
-            "step4_dest_host": "low-prevalence.example",
-            "step5_process_name": "powershell.exe",
-            "sequence_duration_seconds": 64,
-            "risk_score": 95,
-        }));
-        assert_eq!(field(&v, MATCH_KIND), "sequence");
-        assert_eq!(field(&v, MATCH_EVENT_LABEL), "5-step sequence · 64s");
-    }
-
-    #[test]
-    fn malformed_negative_sequence_duration_is_omitted() {
-        let v = normalize(json!({
-            "step1_user": "alice",
-            "step2_process_name": "powershell.exe",
-            "sequence_duration_seconds": -42,
-        }));
-        assert_eq!(field(&v, MATCH_KIND), "sequence");
-        assert_eq!(field(&v, MATCH_EVENT_LABEL), "2-step sequence");
-    }
-
-    #[test]
-    fn aggregate_alias_without_time_markers_is_recognized() {
-        let v = normalize(json!({
-            "src_host": "WS-ENG-003",
-            "hits": 12,
-            "commands": ["whoami.exe", "net.exe"],
-        }));
-        assert_eq!(field(&v, MATCH_KIND), "aggregate");
-        assert_eq!(field(&v, MATCH_EVENT_LABEL), "12 hits");
-    }
-
-    #[test]
-    fn aggregate_array_summary_is_compact() {
-        let v = normalize(json!({
-            "first_seen": "2026-07-24T15:00:00Z",
-            "last_seen": "2026-07-24T15:01:00Z",
-            "operations": ["DeleteBucket", "DeleteObject", "StopLogging", "DeleteTrail"],
-        }));
-        assert_eq!(
-            field(&v, MATCH_EVENT_LABEL),
-            "DeleteBucket, DeleteObject, StopLogging, …"
-        );
-    }
-
-    #[test]
-    fn projected_process_row_uses_process_name() {
-        let v = normalize(json!({
-            "timestamp": "2026-07-24T15:00:00Z",
-            "user": "alice",
-            "process_name": "powershell.exe",
-            "command_line": "powershell.exe -enc ...",
-        }));
-        assert_eq!(field(&v, MATCH_KIND), "raw");
-        assert_eq!(field(&v, MATCH_EVENT_LABEL), "powershell.exe");
-    }
-
-    #[test]
-    fn projected_file_row_uses_action_and_basename() {
-        let v = normalize(json!({
-            "file_action": "created",
-            "file_path": "C:\\Users\\alice\\Downloads\\search_term.zip",
-        }));
-        assert_eq!(field(&v, MATCH_EVENT_LABEL), "created · search_term.zip");
-    }
-
-    #[test]
-    fn projected_auth_row_uses_result_and_type() {
-        let v = normalize(json!({
-            "auth_result": "failed",
-            "auth_type": "RDP",
-            "user": "alice",
-        }));
-        assert_eq!(field(&v, MATCH_EVENT_LABEL), "failed RDP authentication");
-    }
-
-    #[test]
-    fn nested_ocsf_network_row_gets_request_summary() {
-        let v = normalize(json!({
-            "http_request": {
-                "http_method": "GET",
-                "url": {
-                    "hostname": "low-prevalence.example"
-                }
-            }
-        }));
-        assert_eq!(field(&v, MATCH_EVENT_LABEL), "GET · low-prevalence.example");
-    }
-
-    #[test]
-    fn source_type_is_the_last_data_driven_fallback() {
-        let v = normalize(json!({
-            "source_type": "windows_sysmon"
-        }));
-        assert_eq!(field(&v, MATCH_EVENT_LABEL), "windows sysmon event");
-    }
-
-    #[test]
-    fn empty_event_gets_non_empty_fallback() {
-        let v = normalize(json!({}));
-        assert_eq!(field(&v, MATCH_KIND), "raw");
-        assert!(v.get(MATCH_EVENT_TIME).is_none());
-        assert_eq!(field(&v, MATCH_EVENT_LABEL), "Matched event");
-    }
-
-    #[test]
-    fn nano_detected_at_does_not_become_event_time() {
-        // No other timestamp fields — `_nano_detected_at` is excluded both
-        // from the direct list and the loose scan (preserves NAN-739).
-        let v = normalize(json!({
-            "_nano_detected_at": "2026-05-16T18:00:19.000Z",
-            "src_ip": "10.0.0.1",
-            "eventName": "S3Read",
-        }));
-        assert!(v.get(MATCH_EVENT_TIME).is_none());
-        assert_eq!(field(&v, MATCH_EVENT_LABEL), "S3Read");
-        assert_eq!(field(&v, MATCH_KIND), "raw");
-    }
-
-    #[test]
-    fn loose_scan_picks_latest_user_aliased_time() {
-        let v = normalize(json!({
-            "bucket_start": "2026-05-16T10:00:00.000Z",
-            "bucket_end":   "2026-05-16T11:00:00.000Z",
-            "eventName": "Probe",
-        }));
-        assert_eq!(field(&v, MATCH_EVENT_TIME), "2026-05-16T11:00:00.000Z");
-    }
-
-    #[test]
-    fn non_object_event_is_left_untouched() {
-        let mut v = json!([1, 2, 3]);
-        normalize_match_event(&mut v);
-        assert_eq!(v, json!([1, 2, 3]));
-    }
-
-    #[test]
-    fn single_last_seen_field_alone_does_not_trigger_aggregate() {
-        // Some upstream agents emit a `last_seen` on raw events. We require
-        // BOTH first_seen and last_seen together to call it an aggregate.
-        let v = normalize(json!({
-            "timestamp": "2026-05-16T18:00:14.000Z",
-            "last_seen": "2026-05-16T18:00:14.000Z",
-            "eventName": "GenericEvent",
-        }));
-        assert_eq!(field(&v, MATCH_KIND), "raw");
-        assert_eq!(field(&v, MATCH_EVENT_LABEL), "GenericEvent");
-    }
-
-    #[test]
-    fn format_count_renders_thousands() {
-        assert_eq!(format_count(1582.0), "1,582");
-        assert_eq!(format_count(1_000_000.0), "1,000,000");
-        assert_eq!(format_count(42.0), "42");
-        assert_eq!(format_count(0.0), "0");
-    }
-}
+#[path = "event_envelope_tests.rs"]
+mod event_envelope_tests;

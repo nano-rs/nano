@@ -195,7 +195,11 @@ pub struct EnrichmentMarketplaceRepo {
 }
 
 /// A unified marketplace catalog entry
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow, utoipa::ToSchema)]
+///
+/// `Default` exists so tests can build an entry by naming only the couple of
+/// fields under test instead of all ~40 (NAN-2343). It is not a meaningful
+/// runtime value — every production entry comes from a `FromRow` decode.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, FromRow, utoipa::ToSchema)]
 pub struct MarketplaceCatalogEntry {
     #[serde(with = "typeid::catalog")]
     #[schema(value_type = String)]

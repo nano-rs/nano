@@ -5,6 +5,15 @@
 use super::ClickHouseMigrator;
 use regex::Regex;
 
+/// `SIZE_IN_CELLS` for `ip_prevalence_dict` when `NANO_PREVALENCE_CACHE_CELLS_IP`
+/// is unset — the NAN-706 bump, preserved so un-provisioned installs are
+/// byte-identical. See `substitute_prevalence_cache_cells`.
+pub(super) const DEFAULT_PREVALENCE_CACHE_CELLS_IP: u32 = 5_000_000;
+
+/// `SIZE_IN_CELLS` for `domain_prevalence_dict` / `hash_prevalence_dict` when
+/// `NANO_PREVALENCE_CACHE_CELLS` is unset.
+pub(super) const DEFAULT_PREVALENCE_CACHE_CELLS: u32 = 1_000_000;
+
 impl ClickHouseMigrator {
     /// Strip `--` line comments from SQL.
     ///
@@ -180,6 +189,72 @@ impl ClickHouseMigrator {
     pub(super) fn substitute_dist_suffix(sql: &str, is_clustered: bool) -> String {
         let suffix = if is_clustered { "_distributed" } else { "" };
         sql.replace("{dist_suffix}", suffix)
+    }
+
+    /// NAN-2346: resolve `{prevalence_cache_cells}` / `{prevalence_cache_cells_ip}`
+    /// — the `SIZE_IN_CELLS` of the three prevalence CACHE dicts — so a small box
+    /// can size them to its own memory instead of inheriting a fleet-wide constant.
+    ///
+    /// `COMPLEX_KEY_CACHE` preallocates its ENTIRE cell array at the first
+    /// `dictGet`, regardless of how many keys are ever resident, and ClickHouse
+    /// rounds `SIZE_IN_CELLS` UP to the next power of two. The hardcoded 5,000,000
+    /// therefore allocates 2^23 cells; measured at ~40 B/cell that is 320 MiB, and
+    /// the three dicts together preallocate ~400 MiB. (In-repo comments citing
+    /// "~80 B/row" are wrong — 320.02 MiB / 2^23 is exactly 40.0 B/cell.)
+    ///
+    /// That budget buys nothing in practice: `therange` held 2 / 8 / 1 elements,
+    /// and `org` — the central aggregator, ~12M dictionary queries — holds 1 each
+    /// at a 99.6–99.99% hit rate. On a 4 GB hobby box (CH capped at 1.6 GiB before
+    /// NAN-2346) those 400 MiB were a quarter of the server's whole budget, enough
+    /// that `ip_enrichment_dict` could not build its ~3.4M-range IP_TRIE and sat
+    /// `LOADED` with `element_count 0` — silently serving enrichment defaults while
+    /// ingest looked perfectly healthy.
+    ///
+    /// Shrinking is only safe from migration 162 onward, where the SOURCE became a
+    /// point lookup on the local `*_prevalence_final` (~326 KiB per miss). Against
+    /// the pre-162 per-miss `uniqMerge` fan-out a small cache meant NAN-706 CPU
+    /// pinning and 6000 ms dict-source timeouts falling back to the 9999 "common"
+    /// default (NAN-1761 #2). Since these placeholders only ever appear in ≥172
+    /// bodies, that ordering is structural.
+    ///
+    /// Unset, both resolve to today's literals (5,000,000 for ip — the NAN-706
+    /// bump — and 1,000,000 for domain/hash), so k8s, BYOC, dev compose and
+    /// open-core installs stay byte-identical; only tenants whose generated `.env`
+    /// carries the vars get a smaller cache. Values are validated as `u32` for the
+    /// same reason `{clickhouse_self_port}` is: they are spliced naked into the
+    /// DDL, so a non-numeric value would surface as a confusing CH parse error far
+    /// from the misconfiguration site.
+    pub(super) fn substitute_prevalence_cache_cells(sql: &str) -> String {
+        let ip_cells = std::env::var("NANO_PREVALENCE_CACHE_CELLS_IP")
+            .unwrap_or_else(|_| DEFAULT_PREVALENCE_CACHE_CELLS_IP.to_string());
+        let cells = std::env::var("NANO_PREVALENCE_CACHE_CELLS")
+            .unwrap_or_else(|_| DEFAULT_PREVALENCE_CACHE_CELLS.to_string());
+        Self::substitute_prevalence_cache_cells_with(sql, &ip_cells, &cells)
+    }
+
+    /// Env-free variant exposed for tests, mirroring
+    /// `substitute_clickhouse_self_vars_with` so behavior can be exercised without
+    /// `cargo test`'s parallel env races.
+    pub(super) fn substitute_prevalence_cache_cells_with(
+        sql: &str,
+        ip_cells: &str,
+        cells: &str,
+    ) -> String {
+        for (name, value) in [
+            ("NANO_PREVALENCE_CACHE_CELLS_IP", ip_cells),
+            ("NANO_PREVALENCE_CACHE_CELLS", cells),
+        ] {
+            match value.parse::<u32>() {
+                Ok(0) => panic!("{name} must be greater than 0, got {value:?}"),
+                Ok(_) => {}
+                Err(_) => panic!("{name} must be a valid u32, got {value:?}"),
+            }
+        }
+        // The closing brace disambiguates the two names, so replacement order is
+        // not load-bearing; longest-first is kept as defensive style in case a
+        // future placeholder is added without one.
+        sql.replace("{prevalence_cache_cells_ip}", ip_cells)
+            .replace("{prevalence_cache_cells}", cells)
     }
 
     /// Substitute PostgreSQL connection details in dictionary SOURCE blocks.

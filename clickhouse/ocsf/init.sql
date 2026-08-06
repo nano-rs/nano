@@ -1421,7 +1421,7 @@ SOURCE(CLICKHOUSE(
            GROUP BY file_hash'
 ))
 LIFETIME(MIN 900 MAX 1800)
-LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 1000000));
+LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS {prevalence_cache_cells}));
 
 CREATE OR REPLACE DICTIONARY nanosiem.domain_prevalence_dict
 (
@@ -1447,7 +1447,7 @@ SOURCE(CLICKHOUSE(
            GROUP BY domain'
 ))
 LIFETIME(MIN 900 MAX 1800)
-LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 1000000));
+LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS {prevalence_cache_cells}));
 
 CREATE OR REPLACE DICTIONARY nanosiem.ip_prevalence_dict
 (
@@ -1473,7 +1473,7 @@ SOURCE(CLICKHOUSE(
            GROUP BY ip'
 ))
 LIFETIME(MIN 900 MAX 1800)
-LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 5000000));
+LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS {prevalence_cache_cells_ip}));
 
 -- -----------------------------------------------------------------------------
 -- Prevalence aggregation tables + chained summary MVs (agg -> summary).

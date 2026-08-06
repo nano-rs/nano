@@ -199,7 +199,9 @@ pub async fn get_catalog_entry(
     request_body = InstallRequest,
     responses(
         (status = 200, description = "Enrichment installed", body = MarketplaceCatalogEntry),
-        (status = 400, description = "Credential required"),
+        // NAN-2343: both of these are ApiError::ValidationError, which renders
+        // 422 — "Credential required" was documented as 400 and never was.
+        (status = 422, description = "Credential required, or a credential value failed validation"),
         (status = 409, description = "Already installed"),
     ),
     security(("api_key" = []))
@@ -276,6 +278,10 @@ pub async fn uninstall_enrichment(
     request_body = ConfigureRequest,
     responses(
         (status = 200, description = "Enrichment configured", body = MarketplaceCatalogEntry),
+        // NAN-2343: a credential value that fails validation (e.g. a
+        // download_url that is not a parseable http/https URL) is rejected
+        // here rather than persisted and surfaced later as a sync failure.
+        (status = 422, description = "A credential value failed validation"),
         (status = 404, description = "Not found"),
     ),
     security(("api_key" = []))

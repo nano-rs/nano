@@ -771,6 +771,11 @@ impl From<nanosiem_core::MarketplaceError> for ApiError {
             MarketplaceError::InvalidUrl(url) => {
                 ApiError::ValidationError(format!("Invalid URL: {}", url))
             }
+            // NAN-2343: 422 with the field name in the message so the operator
+            // sees what to correct at save time, not a sync failure hours later.
+            MarketplaceError::InvalidCredential { field, reason } => {
+                ApiError::ValidationError(format!("Invalid value for '{}': {}", field, reason))
+            }
             _ => ApiError::InternalError(err.to_string()),
         }
     }

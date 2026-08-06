@@ -1234,6 +1234,63 @@ mod tests {
         );
     }
 
+    // ── NAN-2346: box-sized prevalence CACHE dict SIZE_IN_CELLS ──
+
+    /// Unset vars must reproduce the historical literals exactly. This is the
+    /// property that keeps k8s, BYOC, CH Cloud, dev compose and open-core installs
+    /// byte-identical — only a managed-compose tenant whose generated .env carries
+    /// the vars gets a smaller cache.
+    #[test]
+    fn prevalence_cache_cells_default_to_the_historical_literals() {
+        let ddl = "LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS {prevalence_cache_cells_ip}));\n\
+                   LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS {prevalence_cache_cells}));";
+        let out = ClickHouseMigrator::substitute_prevalence_cache_cells_with(ddl, "5000000", "1000000");
+        assert_eq!(
+            out,
+            "LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 5000000));\n\
+             LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 1000000));"
+        );
+        assert!(!out.contains('{'), "no placeholder may survive: {out}");
+    }
+
+    /// The ip placeholder must not be clipped by the shorter name — a naive
+    /// shortest-first replace would leave a dangling `_ip}` in the DDL and CH
+    /// would reject the LAYOUT clause.
+    #[test]
+    fn prevalence_cache_cells_ip_placeholder_is_not_clipped() {
+        let ddl = "SIZE_IN_CELLS {prevalence_cache_cells_ip}";
+        let out = ClickHouseMigrator::substitute_prevalence_cache_cells_with(ddl, "262144", "262144");
+        assert_eq!(out, "SIZE_IN_CELLS 262144");
+        assert!(!out.contains("_ip"), "the _ip suffix must be consumed: {out}");
+    }
+
+    /// Both dict classes are independently sizable — the ip trie is the expensive
+    /// one (2^23 cells ≈ 320 MiB) and may warrant a different budget than the two
+    /// small HASHED caches.
+    #[test]
+    fn prevalence_cache_cells_sizes_ip_independently() {
+        let ddl = "ip={prevalence_cache_cells_ip} other={prevalence_cache_cells}";
+        assert_eq!(
+            ClickHouseMigrator::substitute_prevalence_cache_cells_with(ddl, "262144", "65536"),
+            "ip=262144 other=65536"
+        );
+    }
+
+    /// Values are spliced naked into the DDL, so a non-numeric or zero value must
+    /// fail loudly at migrator startup rather than as a confusing ClickHouse parse
+    /// error (or a dict that can cache nothing) far from the misconfiguration.
+    #[test]
+    #[should_panic(expected = "NANO_PREVALENCE_CACHE_CELLS")]
+    fn prevalence_cache_cells_rejects_non_numeric() {
+        ClickHouseMigrator::substitute_prevalence_cache_cells_with("x", "5000000", "not-a-number");
+    }
+
+    #[test]
+    #[should_panic(expected = "greater than 0")]
+    fn prevalence_cache_cells_rejects_zero() {
+        ClickHouseMigrator::substitute_prevalence_cache_cells_with("x", "5000000", "0");
+    }
+
     // ── NAN-1728 C2/P0: dict-refresh MV repoint to _distributed wrapper ──
 
     /// `repoint_from_table` swaps the bare local base for its `_distributed`

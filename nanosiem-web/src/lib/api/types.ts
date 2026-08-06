@@ -674,6 +674,13 @@ export interface FieldValueInfo {
 export interface FieldValuesResponse {
   field: string;
   values: FieldValueInfo[];
+  /** Number of ranked values returned in `values`. */
+  returned_value_count: number;
+  /** Occurrences covered by the returned top values, not all matching events. */
+  covered_event_count: number;
+  /** Conservative signal that additional distinct values may exist. */
+  may_have_more_values: boolean;
+  /** Legacy alias of `covered_event_count`; not a matching-event population. */
   total_count: number;
 }
 

@@ -184,6 +184,68 @@ fn extract_context_before(input: &str, position: usize) -> Option<String> {
     }
 }
 
+/// Rewrite one unambiguous SPL-style double-quoted literal into nPL's
+/// equivalent single-quoted spelling.
+///
+/// This is deliberately a parse-error recovery, not the primary string grammar.
+/// The primary grammar must continue accepting a trailing-backslash Windows
+/// path such as `"C:\Windows\"`, where SPL and historic nPL assign conflicting
+/// meanings to the final `\"`. A query that already parses never reaches this
+/// helper. When parsing dies immediately after an apparent `\"` escape, however,
+/// we can follow SPL's odd-backslash rule to the real closing quote and express
+/// the same literal using nPL's other delimiter.
+///
+/// Returns `(whole_rewritten_query, replacement_literal)`. A single quote inside
+/// the literal has no lossless spelling in nPL's no-escape single-quoted grammar,
+/// so that uncommon case stays an error with the existing explicit guidance.
+pub(crate) fn rewrite_spl_escaped_double_quote(
+    input: &str,
+    position: usize,
+) -> Option<(String, String)> {
+    let consumed = input.get(..position)?.trim_end();
+    if !consumed.ends_with("\\\"") {
+        return None;
+    }
+
+    let escape_at = consumed.rfind("\\\"")?;
+    let open = consumed.get(..escape_at)?.rfind('"')?;
+
+    // Under SPL string rules a quote preceded by an odd run of backslashes is
+    // escaped; an even run closes the string. Scan bytes because both relevant
+    // characters are ASCII, while every returned quote index remains a valid
+    // UTF-8 boundary.
+    let bytes = input.as_bytes();
+    let mut slash_run = 0usize;
+    let mut close = None;
+    for (index, byte) in bytes.iter().enumerate().skip(open + 1) {
+        match *byte {
+            b'\\' => slash_run += 1,
+            b'"' if slash_run % 2 == 0 => {
+                close = Some(index);
+                break;
+            }
+            _ => slash_run = 0,
+        }
+    }
+    let close = close?;
+    if close <= escape_at + 1 {
+        return None;
+    }
+
+    let raw_inner = input.get(open + 1..close)?;
+    if !raw_inner.contains("\\\"") || raw_inner.contains('\'') {
+        return None;
+    }
+    let inner = raw_inner.replace("\\\"", "\"");
+    let replacement = format!("'{inner}'");
+
+    let mut rewritten = String::with_capacity(input.len());
+    rewritten.push_str(input.get(..open)?);
+    rewritten.push_str(&replacement);
+    rewritten.push_str(input.get(close + 1..)?);
+    Some((rewritten, replacement))
+}
+
 /// NAN-2241: detect the `\"`-inside-a-double-quoted-string trap and explain it.
 ///
 /// `values::double_quoted_string` is `take_while(|c| c != '"')` — the FIRST `"`
@@ -217,23 +279,11 @@ fn escaped_double_quote_diagnostic(
 
     let mut suggestions = Vec::new();
 
-    // Reconstruct what the author meant: the span from the `"` that opened the
-    // literal to the last `"` in the query, with `\"` unescaped and the whole
-    // thing re-quoted with `'`.
-    let escape_at = consumed.rfind("\\\"");
-    if let (Some(escape_at), Some(close)) = (escape_at, input.rfind('"')) {
-        if let Some(open) = consumed.get(..escape_at).and_then(|s| s.rfind('"')) {
-            if close > open + 1 {
-                let inner = input[open + 1..close].replace("\\\"", "\"");
-                if !inner.contains('\'') {
-                    suggestions.push(ErrorSuggestion {
-                        description: "single-quote the pattern so its double quotes stay literal"
-                            .to_string(),
-                        replacement: format!("'{}'", inner),
-                    });
-                }
-            }
-        }
+    if let Some((_, replacement)) = rewrite_spl_escaped_double_quote(input, position) {
+        suggestions.push(ErrorSuggestion {
+            description: "single-quote the pattern so its double quotes stay literal".to_string(),
+            replacement,
+        });
     }
 
     if suggestions.is_empty() {

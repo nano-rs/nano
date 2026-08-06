@@ -331,13 +331,13 @@ impl ClickHouseExecutor {
     ) -> Result<Vec<serde_json::Value>, SearchError> {
         let escaped_sql = escape_question_marks_in_strings(sql);
         debug!(
-            "Executing ClickHouse query with query_id {} and settings (timeout={}s, mem={}B, threads={}, priority={}): {}",
+            "Executing ClickHouse query with query_id {} and settings (timeout={}s, mem={:?}B, threads={}, priority={}): {}",
             query_id, settings.max_execution_time, settings.max_memory_usage_bytes,
             settings.max_threads, settings.priority,
             &escaped_sql[..escaped_sql.len().min(200)]
         );
 
-        let mut cursor = self
+        let mut query = self
             .client
             .query(&escaped_sql)
             .with_option("query_id", query_id)
@@ -345,13 +345,16 @@ impl ClickHouseExecutor {
                 "max_execution_time",
                 &settings.max_execution_time.to_string(),
             )
-            .with_option(
-                "max_memory_usage",
-                &settings.max_memory_usage_bytes.to_string(),
-            )
             .with_option("max_threads", &settings.max_threads.to_string())
             .with_option("priority", &settings.priority.to_string())
-            .with_option("queue_max_wait_ms", &settings.queue_max_wait_ms.to_string())
+            .with_option("queue_max_wait_ms", &settings.queue_max_wait_ms.to_string());
+        if let Some(max_memory_usage_bytes) = settings.max_memory_usage_bytes {
+            query = query.with_option(
+                "max_memory_usage",
+                &max_memory_usage_bytes.to_string(),
+            );
+        }
+        let mut cursor = query
             .fetch_bytes("JSONEachRow")
             .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
 
@@ -440,13 +443,15 @@ impl ClickHouseExecutor {
                     "max_execution_time",
                     &settings.max_execution_time.to_string(),
                 )
-                .with_option(
-                    "max_memory_usage",
-                    &settings.max_memory_usage_bytes.to_string(),
-                )
                 .with_option("max_threads", &settings.max_threads.to_string())
                 .with_option("priority", &settings.priority.to_string())
                 .with_option("queue_max_wait_ms", &settings.queue_max_wait_ms.to_string());
+            if let Some(max_memory_usage_bytes) = settings.max_memory_usage_bytes {
+                query = query.with_option(
+                    "max_memory_usage",
+                    &max_memory_usage_bytes.to_string(),
+                );
+            }
         }
 
         let mut cursor = query

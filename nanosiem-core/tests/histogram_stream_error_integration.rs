@@ -88,7 +88,7 @@ async fn histogram_stream_error_returns_err_not_zero_filled_ok() {
     // `while let Ok(Some(chunk))` loop silently swallowed into Ok(empty).
     let lethal_settings = ClickHouseQuerySettings {
         max_execution_time: 1,
-        max_memory_usage_bytes: 1,
+        max_memory_usage_bytes: Some(1),
         max_threads: 1,
         priority: 1,
         queue_max_wait_ms: 5_000,
@@ -121,7 +121,7 @@ async fn histogram_stream_error_returns_err_not_zero_filled_ok() {
     // Err above came from the forced settings, not a broken happy path.
     let sane_settings = ClickHouseQuerySettings {
         max_execution_time: 60,
-        max_memory_usage_bytes: 2 * 1024 * 1024 * 1024,
+        max_memory_usage_bytes: Some(2 * 1024 * 1024 * 1024),
         max_threads: 2,
         priority: 1,
         queue_max_wait_ms: 5_000,

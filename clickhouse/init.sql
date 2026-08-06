@@ -674,7 +674,7 @@ SOURCE(CLICKHOUSE(
            GROUP BY file_hash'
 ))
 LIFETIME(MIN 900 MAX 1800)
-LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 1000000));
+LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS {prevalence_cache_cells}));
 
 CREATE OR REPLACE DICTIONARY nanosiem.domain_prevalence_dict
 (
@@ -700,7 +700,7 @@ SOURCE(CLICKHOUSE(
            GROUP BY domain'
 ))
 LIFETIME(MIN 900 MAX 1800)
-LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 1000000));
+LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS {prevalence_cache_cells}));
 
 -- NAN-706: 5M cells (vs 1M for hash/domain) — saturn ip_prevalence_dict
 -- saturated the 1M cap at 89.85% hit rate; bumping gives ~400 MiB
@@ -731,7 +731,7 @@ SOURCE(CLICKHOUSE(
            GROUP BY ip'
 ))
 LIFETIME(MIN 900 MAX 1800)
-LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 5000000));
+LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS {prevalence_cache_cells_ip}));
 
 -- Identity enrichment (user_registry) payload table — ClickHouse-sourced as of
 -- NAN-1117 (was a PG table feeding a PG-sourced dict; moved to CH for the same

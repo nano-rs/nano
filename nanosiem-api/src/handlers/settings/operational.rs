@@ -16,7 +16,7 @@ use utoipa::ToSchema;
 
 use crate::error::{ApiError, ErrorResponse};
 use crate::handlers::AuditExt;
-use crate::middleware::{ensure_permission, AuthContext};
+use crate::middleware::{check_any_permission, ensure_permission, AuthContext};
 use crate::state::AppState;
 
 // ============================================================================
@@ -151,6 +151,19 @@ pub struct UpdateDeveloperSettingsRequest {
 // Organizational Context Handlers
 // ============================================================================
 
+fn ensure_organizational_context_read(auth: &AuthContext) -> Result<(), ApiError> {
+    // settings:ai was the legacy umbrella for both reading and changing this
+    // object. Preserve it for existing custom roles while admitting the
+    // dedicated read-only settings:view capability for investigators.
+    check_any_permission(
+        auth,
+        &[permissions::SETTINGS_VIEW, permissions::SETTINGS_AI],
+    )
+    .map_err(|_| {
+        ApiError::Forbidden("Missing permission: settings:view or settings:ai".to_string())
+    })
+}
+
 /// Get organizational context configuration
 ///
 /// GET /api/settings/organizational-context
@@ -171,7 +184,7 @@ pub async fn get_organizational_context(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<OrganizationalContextResponse>, ApiError> {
-    ensure_permission(&auth, permissions::SETTINGS_AI)?;
+    ensure_organizational_context_read(&auth)?;
 
     let service = OrganizationalContextService::new(state.pool.clone());
     let context = service.get_context().await?;
@@ -239,6 +252,54 @@ pub async fn update_organizational_context(
     );
 
     Ok(Json(OrganizationalContextResponse::from(context)))
+}
+
+#[cfg(test)]
+mod organizational_context_authorization_tests {
+    use super::*;
+    use nanosiem_core::auth::{api_key::ApiKeyInfo, types::TokenClaims};
+
+    fn session(permissions: &[&str]) -> AuthContext {
+        AuthContext::from_jwt(TokenClaims {
+            iss: "test".to_string(),
+            aud: "test".to_string(),
+            sub: uuid::Uuid::nil(),
+            roles: Vec::new(),
+            permissions: permissions.iter().map(ToString::to_string).collect(),
+            exp: i64::MAX,
+            iat: 0,
+            jti: uuid::Uuid::nil(),
+            purpose: "access".to_string(),
+        })
+    }
+
+    fn api_key(permissions: &[&str]) -> AuthContext {
+        AuthContext::from_api_key(&ApiKeyInfo {
+            id: uuid::Uuid::nil(),
+            name: "hunt-sweep".to_string(),
+            permissions: permissions.iter().map(ToString::to_string).collect(),
+            user_id: Some(uuid::Uuid::nil()),
+        })
+    }
+
+    #[test]
+    fn org_context_read_accepts_read_only_settings_for_sessions_and_keys() {
+        for auth in [
+            session(&[permissions::SETTINGS_VIEW]),
+            api_key(&[permissions::SETTINGS_VIEW]),
+        ] {
+            assert!(ensure_organizational_context_read(&auth).is_ok());
+            assert!(ensure_permission(&auth, permissions::SETTINGS_AI).is_err());
+        }
+    }
+
+    #[test]
+    fn org_context_read_preserves_the_legacy_ai_scope_but_rejects_no_scope() {
+        assert!(ensure_organizational_context_read(&session(&[permissions::SETTINGS_AI])).is_ok());
+        assert!(ensure_organizational_context_read(&api_key(&[permissions::SETTINGS_AI])).is_ok());
+        assert!(ensure_organizational_context_read(&session(&[])).is_err());
+        assert!(ensure_organizational_context_read(&api_key(&[])).is_err());
+    }
 }
 
 // ============================================================================

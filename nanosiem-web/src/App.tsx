@@ -338,13 +338,21 @@ function SsoEditRedirect() {
 // NAN-1111: the legacy /enrichments/:id deep-link used to render
 // pre-marketplace per-provider Settings UIs. ThreatFox + Tor moved to
 // the marketplace; IPinfo Lite stays native (binary-volume + non-IOC
-// schema — see project_ipinfo_lite_stays_native memory). Map the legacy
-// IDs to marketplace slugs and redirect; pass the IPinfo path through
-// to the still-active EnrichmentDetail component.
+// schema — see project_ipinfo_lite_stays_native memory).
+//
+// NAN-2343: IPinfo redirects too now. Its pass-through was the last route
+// still rendering a pre-marketplace provider UI, and it survived largely
+// because it was the one surface showing `download_url` in cleartext — the
+// marketplace drawer masked it. Migration 285 makes the field readable in the
+// drawer, so the second page no longer earns its keep: two config surfaces
+// writing the same column through different endpoints, only one of which
+// validated, is how a malformed URL got persisted and then blamed on the SSRF
+// check. IPinfo Lite remains native on the backend; only its legacy UI is gone.
 const LEGACY_ENRICHMENT_TO_MARKETPLACE: Record<string, string> = {
   threatfox: 'threatfox',
   tor: 'tor-exit-nodes',
   tor_exit_nodes: 'tor-exit-nodes',
+  ipinfo_lite: 'ipinfo_lite',
 };
 
 function LegacyEnrichmentRoute() {
@@ -361,10 +369,9 @@ function LegacyEnrichmentRoute() {
       />
     );
   }
-  // IPinfo Lite and any other still-native source render the legacy
-  // Settings detail page, gated by enrichments:view. EnrichmentDetail
-  // itself shows a "not available" fallback for unknown source types so
-  // unknown IDs don't 500.
+  // Any other still-native source renders the legacy Settings detail page,
+  // gated by enrichments:view. EnrichmentDetail itself shows a "not
+  // available" fallback for unknown source types so unknown IDs don't 500.
   return (
     <PermissionRoute
       permission="enrichments:view"
@@ -791,14 +798,13 @@ function ProtectedAppRoutes() {
           } />
           {/* Legacy /enrichments → /marketplace. Deep-link routes
               (/enrichments/:id, /enrichments/agent/:id, /enrichments/custom/*)
-              preserved below; the :id and /agent/:id routes now redirect
-              sunset providers to the marketplace drawer and only IPinfo
-              Lite continues to render the legacy Settings UI (NAN-1111). */}
+              preserved below as redirects so old bookmarks still land
+              somewhere useful (NAN-1111). Every pre-marketplace provider UI is
+              now retired, IPinfo Lite included (NAN-2343). */}
           <Route path="/enrichments" element={<Navigate to="/marketplace" replace />} />
-          {/* LegacyEnrichmentRoute handles the permission check itself:
-              the IPinfo pass-through path is gated by enrichments:view,
-              but the redirect branch deliberately is not (see comment
-              in the wrapper). */}
+          {/* LegacyEnrichmentRoute handles the permission check itself: the
+              fallback branch is gated by enrichments:view, but the redirect
+              branch deliberately is not (see comment in the wrapper). */}
           <Route path="/enrichments/:id" element={<LegacyEnrichmentRoute key={resetKey} />} />
 
           {/* Agent Enrichments — VirusTotal redirects to marketplace (NAN-1111).

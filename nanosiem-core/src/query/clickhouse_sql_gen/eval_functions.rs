@@ -20,6 +20,8 @@ use super::{escape_regex_pattern, ClickHouseSqlGenerator};
 use crate::query::ast::*;
 use crate::query::sql_gen::SqlGenError;
 
+type EvalFieldOverride<'a> = dyn Fn(&str, bool) -> Option<String> + 'a;
+
 /// Convert strftime format codes to ClickHouse formatDateTime codes
 /// https://clickhouse.com/docs/en/sql-reference/functions/date-time-functions#formatdatetime
 fn convert_strftime_to_clickhouse(format: &str) -> String {
@@ -98,16 +100,146 @@ pub(crate) fn eval_expression_to_sql(
     gen: &ClickHouseSqlGenerator,
     expr: &EvalExpression,
 ) -> Result<String, SqlGenError> {
-    eval_expression_to_sql_inner(gen, expr, false)
+    eval_expression_to_sql_inner(gen, expr, false, None)
+}
+
+fn scalar_min_max_to_sql(name: &str, arg_sqls: &[String]) -> Result<String, SqlGenError> {
+    match (name.to_ascii_lowercase().as_str(), arg_sqls) {
+        ("min", []) => Err(SqlGenError::InvalidQuery(
+            "min() requires at least 1 argument".into(),
+        )),
+        ("max", []) => Err(SqlGenError::InvalidQuery(
+            "max() requires at least 1 argument".into(),
+        )),
+        ("min" | "max", [arg]) => Ok(arg.clone()),
+        ("min", args) => Ok(format!("least({})", args.join(", "))),
+        ("max", args) => Ok(format!("greatest({})", args.join(", "))),
+        _ => unreachable!("caller only passes min/max"),
+    }
+}
+
+/// Convert a pipeline expression to SQL while preserving upstream-computed
+/// types. Raw event fields retain the regular String -> Float64 safety casts,
+/// while a downstream `where` after `stats` operates directly on typed aliases
+/// so both numeric and ClickHouse DateTime subtraction keep their semantics.
+pub(crate) fn typed_eval_expression_to_sql(
+    gen: &ClickHouseSqlGenerator,
+    expr: &EvalExpression,
+) -> Result<String, SqlGenError> {
+    typed_eval_expression_to_sql_inner(gen, expr, false, None)
+}
+
+/// Lower a typed eval expression while allowing one caller-owned namespace to
+/// override field references. Ordinary fields and every function still flow
+/// through the canonical, profile-aware eval generator.
+pub(crate) fn typed_eval_expression_to_sql_with_field_override(
+    gen: &ClickHouseSqlGenerator,
+    expr: &EvalExpression,
+    field_override: &EvalFieldOverride<'_>,
+) -> Result<String, SqlGenError> {
+    typed_eval_expression_to_sql_inner(gen, expr, false, Some(field_override))
+}
+
+fn typed_eval_expression_to_sql_inner(
+    gen: &ClickHouseSqlGenerator,
+    expr: &EvalExpression,
+    numeric_context: bool,
+    field_override: Option<&EvalFieldOverride<'_>>,
+) -> Result<String, SqlGenError> {
+    match expr {
+        EvalExpression::Field(name) => {
+            if let Some(sql) = field_override.and_then(|resolve| resolve(name, numeric_context)) {
+                return Ok(sql);
+            }
+            if gen.is_upstream_computed_field(name) {
+                Ok(field_to_sql_expr(name, gen).0)
+            } else {
+                eval_expression_to_sql_inner(gen, expr, numeric_context, field_override)
+            }
+        }
+        EvalExpression::Literal(_) => {
+            eval_expression_to_sql_inner(gen, expr, numeric_context, field_override)
+        }
+        EvalExpression::FunctionCall { name, args }
+            if matches!(name.to_ascii_lowercase().as_str(), "min" | "max") =>
+        {
+            let arg_sqls = args
+                .iter()
+                .map(|arg| {
+                    typed_eval_expression_to_sql_inner(gen, arg, numeric_context, field_override)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            scalar_min_max_to_sql(name, &arg_sqls)
+        }
+        EvalExpression::FunctionCall { .. } => {
+            eval_expression_to_sql_inner(gen, expr, false, field_override)
+        }
+        EvalExpression::BinaryOp { left, op, right } => {
+            let child_numeric_context = matches!(
+                op,
+                BinaryOperator::Add
+                    | BinaryOperator::Sub
+                    | BinaryOperator::Mul
+                    | BinaryOperator::Div
+                    | BinaryOperator::Mod
+                    | BinaryOperator::Gt
+                    | BinaryOperator::Lt
+                    | BinaryOperator::Gte
+                    | BinaryOperator::Lte
+            );
+            let left_sql = typed_eval_expression_to_sql_inner(
+                gen,
+                left,
+                child_numeric_context,
+                field_override,
+            )?;
+            let right_sql = typed_eval_expression_to_sql_inner(
+                gen,
+                right,
+                child_numeric_context,
+                field_override,
+            )?;
+            match op {
+                BinaryOperator::Contains => {
+                    Ok(format!("(position({}, {}) > 0)", left_sql, right_sql))
+                }
+                BinaryOperator::Like => Ok(format!("({} LIKE {})", left_sql, right_sql)),
+                _ => {
+                    let op_sql = match op {
+                        BinaryOperator::Add => "+",
+                        BinaryOperator::Sub => "-",
+                        BinaryOperator::Mul => "*",
+                        BinaryOperator::Div => "/",
+                        BinaryOperator::Mod => "%",
+                        BinaryOperator::Concat => "||",
+                        BinaryOperator::Eq => "=",
+                        BinaryOperator::Ne => "!=",
+                        BinaryOperator::Gt => ">",
+                        BinaryOperator::Lt => "<",
+                        BinaryOperator::Gte => ">=",
+                        BinaryOperator::Lte => "<=",
+                        BinaryOperator::And => "AND",
+                        BinaryOperator::Or => "OR",
+                        BinaryOperator::Contains | BinaryOperator::Like => unreachable!(),
+                    };
+                    Ok(format!("({} {} {})", left_sql, op_sql, right_sql))
+                }
+            }
+        }
+    }
 }
 /// Convert eval expression to SQL, optionally casting for numeric context
 fn eval_expression_to_sql_inner(
     gen: &ClickHouseSqlGenerator,
     expr: &EvalExpression,
     numeric_context: bool,
+    field_override: Option<&EvalFieldOverride<'_>>,
 ) -> Result<String, SqlGenError> {
     match expr {
         EvalExpression::Field(name) => {
+            if let Some(sql) = field_override.and_then(|resolve| resolve(name, numeric_context)) {
+                return Ok(sql);
+            }
             let (sql_expr, _needs_alias) = field_to_sql_expr(name, gen);
             if numeric_context {
                 // In numeric context (comparisons, arithmetic), cast field to Float64
@@ -158,8 +290,9 @@ fn eval_expression_to_sql_inner(
                     | BinaryOperator::Lte
             );
 
-            let left_sql = eval_expression_to_sql_inner(gen, left, is_numeric_op)?;
-            let right_sql = eval_expression_to_sql_inner(gen, right, is_numeric_op)?;
+            let left_sql = eval_expression_to_sql_inner(gen, left, is_numeric_op, field_override)?;
+            let right_sql =
+                eval_expression_to_sql_inner(gen, right, is_numeric_op, field_override)?;
 
             let op_sql = match op {
                 BinaryOperator::Add => "+",
@@ -188,7 +321,9 @@ fn eval_expression_to_sql_inner(
                 _ => Ok(format!("({} {} {})", left_sql, op_sql, right_sql)),
             }
         }
-        EvalExpression::FunctionCall { name, args } => eval_function_to_sql(gen, name, args),
+        EvalExpression::FunctionCall { name, args } => {
+            eval_function_to_sql(gen, name, args, field_override)
+        }
     }
 }
 
@@ -198,10 +333,11 @@ fn eval_function_to_sql(
     gen: &ClickHouseSqlGenerator,
     name: &str,
     args: &[EvalExpression],
+    field_override: Option<&EvalFieldOverride<'_>>,
 ) -> Result<String, SqlGenError> {
     let arg_sqls: Result<Vec<String>, SqlGenError> = args
         .iter()
-        .map(|arg| eval_expression_to_sql_inner(gen, arg, false))
+        .map(|arg| eval_expression_to_sql_inner(gen, arg, false, field_override))
         .collect();
     let arg_sqls = arg_sqls?;
 
@@ -1036,6 +1172,10 @@ fn eval_function_to_sql(
         // ============================================================
         // Math Functions
         // ============================================================
+        // Splunk's eval-context min()/max() are scalar functions, distinct
+        // from stats aggregations. One argument is an identity operation;
+        // multiple arguments map to ClickHouse least()/greatest().
+        "min" | "max" => scalar_min_max_to_sql(name, &arg_sqls),
         "abs" => {
             let arg = arg_sqls
                 .first()
@@ -1553,5 +1693,65 @@ mod tests {
         ] {
             assert_eq!(date_trunc(unit).unwrap(), format!("{}({})", func, ts));
         }
+    }
+
+    #[test]
+    fn field_override_keeps_ordinary_fields_on_profile_aware_lowering() {
+        let expression = EvalExpression::BinaryOp {
+            left: Box::new(EvalExpression::Field("source_port".into())),
+            op: BinaryOperator::Sub,
+            right: Box::new(EvalExpression::Field("destination_port".into())),
+        };
+        let no_override = |_: &str, _: bool| None;
+
+        let udm = typed_eval_expression_to_sql_with_field_override(
+            &ClickHouseSqlGenerator::new(),
+            &expression,
+            &no_override,
+        )
+        .unwrap();
+        assert!(udm.contains("src_port"), "{udm}");
+        assert!(udm.contains("dest_port"), "{udm}");
+        assert!(!udm.contains("source_port"), "{udm}");
+        assert!(!udm.contains("destination_port"), "{udm}");
+
+        let ocsf = ClickHouseSqlGenerator::new()
+            .with_profile(std::sync::Arc::new(crate::schema::OcsfProfile::new()));
+        let ocsf_sql =
+            typed_eval_expression_to_sql_with_field_override(&ocsf, &expression, &no_override)
+                .unwrap();
+        assert!(ocsf_sql.contains("src_endpoint.port"), "{ocsf_sql}");
+        assert!(ocsf_sql.contains("dst_endpoint.port"), "{ocsf_sql}");
+        assert!(!ocsf_sql.contains("source_port"), "{ocsf_sql}");
+        assert!(!ocsf_sql.contains("destination_port"), "{ocsf_sql}");
+    }
+
+    #[test]
+    fn field_override_applies_inside_functions_without_bypassing_allowlist() {
+        let pseudo = EvalExpression::FunctionCall {
+            name: "to_epoch".into(),
+            args: vec![EvalExpression::Field("first_seen".into())],
+        };
+        let override_first_seen = |field: &str, _: bool| {
+            (field == "first_seen").then(|| "PREVALENCE_FIRST_SEEN_CASE".to_string())
+        };
+        let sql = typed_eval_expression_to_sql_with_field_override(
+            &ClickHouseSqlGenerator::new(),
+            &pseudo,
+            &override_first_seen,
+        )
+        .unwrap();
+        assert_eq!(sql, "toUnixTimestamp(PREVALENCE_FIRST_SEEN_CASE)");
+
+        let forbidden = EvalExpression::FunctionCall {
+            name: "sleepEachRow".into(),
+            args: vec![EvalExpression::Field("first_seen".into())],
+        };
+        assert!(typed_eval_expression_to_sql_with_field_override(
+            &ClickHouseSqlGenerator::new(),
+            &forbidden,
+            &override_first_seen,
+        )
+        .is_err());
     }
 }

@@ -944,10 +944,12 @@ impl SearchService {
                 for assignment in assignments {
                     let field_name = assignment.field.clone();
                     // Pass true for in_prevalence_context to resolve ambiguous fields
-                    let expr_sql = self.eval_expression_to_clickhouse_sql_with_context(
-                        &assignment.expression,
-                        true,
-                    )?;
+                    let expr_sql = self
+                        .eval_expression_to_clickhouse_sql_with_context_and_eval_fields(
+                            &assignment.expression,
+                            true,
+                            &eval_field_names,
+                        )?;
                     eval_expressions.push((field_name.clone(), expr_sql));
                     eval_field_names.insert(field_name);
                 }
@@ -1672,6 +1674,27 @@ ORDER BY l.timestamp DESC"#,
                 let escaped = escape_sql_string(kw).to_lowercase();
                 Ok(format!("lower(toString(l.message)) iLike '%{}%'", escaped))
             }
+            // NAN-2336: arithmetic `where` predicates (NAN-2331) used to fall
+            // into the catch-all below and fail the query at RUNTIME with
+            // "Unsupported expression type", which is how the shape the
+            // feature most obviously exists for —
+            // `| prevalence enrich=true | where (last_seen - first_seen) >= 300`
+            // — never worked.
+            //
+            // `in_prevalence_context = true` is the load-bearing argument: it
+            // rewrites `first_seen`/`last_seen` into the rarest-wins CASE
+            // expressions over the dict-derived `_dp_*`/`_ip_*`/`_hp_*`
+            // aliases. They are logical prevalence fields, not columns of the
+            // scanned table, so without the rewrite the emitted SQL names
+            // something that does not resolve. Validated against live
+            // ClickHouse: the rewritten predicate parses and selects the
+            // rarest artifact's timestamps.
+            SearchExpr::EvalPredicate(expression) => self
+                .eval_expression_to_clickhouse_sql_with_context_and_eval_fields(
+                    expression,
+                    true,
+                    eval_field_names,
+                ),
             _ => Err(SearchError::SqlGenError(format!(
                 "Unsupported expression type: {:?}",
                 condition
@@ -1702,181 +1725,44 @@ ORDER BY l.timestamp DESC"#,
         &self,
         expr: &crate::query::EvalExpression,
     ) -> Result<String, SearchError> {
-        self.eval_expression_to_clickhouse_sql_with_context(expr, false)
+        self.eval_expression_to_clickhouse_sql_with_context_and_eval_fields(
+            expr,
+            false,
+            &std::collections::HashSet::new(),
+        )
     }
 
-    /// Convert eval expression to ClickHouse SQL, with optional prevalence context
-    /// When in_prevalence_context is true, ambiguous field names are replaced with
-    /// their properly qualified CASE expressions to avoid ClickHouse identifier errors.
-    fn eval_expression_to_clickhouse_sql_with_context(
+    /// Route prevalence evals through the same typed, profile-aware lowering as
+    /// ordinary nPL. Only names created by an earlier eval and the logical
+    /// prevalence timestamp fields override normal schema resolution.
+    fn eval_expression_to_clickhouse_sql_with_context_and_eval_fields(
         &self,
         expr: &crate::query::EvalExpression,
         in_prevalence_context: bool,
+        eval_field_names: &std::collections::HashSet<String>,
     ) -> Result<String, SearchError> {
-        use crate::query::EvalExpression;
+        const FIRST_SEEN: &str = "(CASE WHEN _dp_host_count < 9999 AND _dp_host_count <= _ip_host_count AND _dp_host_count <= _hp_host_count THEN _dp_first_seen WHEN _ip_host_count < 9999 AND _ip_host_count <= _hp_host_count THEN _ip_first_seen WHEN _hp_host_count < 9999 THEN _hp_first_seen ELSE NULL END)";
+        const LAST_SEEN: &str = "(CASE WHEN _dp_host_count < 9999 AND _dp_host_count <= _ip_host_count AND _dp_host_count <= _hp_host_count THEN _dp_last_seen WHEN _ip_host_count < 9999 AND _ip_host_count <= _hp_host_count THEN _ip_last_seen WHEN _hp_host_count < 9999 THEN _hp_last_seen ELSE NULL END)";
 
-        match expr {
-            EvalExpression::Field(field) => {
-                // When in prevalence context, certain field names are ambiguous because
-                // they exist in multiple JOINed CTEs (domain_prev, ip_prev, hash_prev)
-                // Replace them with the properly qualified CASE expression
-                if in_prevalence_context {
-                    match field.as_str() {
-                        // NAN-366: report the timestamps of the SAME artifact the SELECT/WHERE
-                        // side chose — the RAREST entity (lowest host_count), domain→ip→hash
-                        // only as a tie-break. The prior dict-PRESENCE priority (domain first
-                        // whenever present) disagreed with the rarest-wins selection, so an
-                        // eval like `eval age = now() - first_seen` reported the domain's
-                        // first_seen even when a rarer IP/hash won the row's host_count.
-                        "first_seen" => Ok("(CASE WHEN _dp_host_count < 9999 AND _dp_host_count <= _ip_host_count AND _dp_host_count <= _hp_host_count THEN _dp_first_seen WHEN _ip_host_count < 9999 AND _ip_host_count <= _hp_host_count THEN _ip_first_seen WHEN _hp_host_count < 9999 THEN _hp_first_seen ELSE NULL END)".to_string()),
-                        "last_seen" => Ok("(CASE WHEN _dp_host_count < 9999 AND _dp_host_count <= _ip_host_count AND _dp_host_count <= _hp_host_count THEN _dp_last_seen WHEN _ip_host_count < 9999 AND _ip_host_count <= _hp_host_count THEN _ip_last_seen WHEN _hp_host_count < 9999 THEN _hp_last_seen ELSE NULL END)".to_string()),
-                        // host_count and total_occurrences are also defined in the SELECT,
-                        // but reference them from the already-selected alias would cause ordering issues
-                        // Use the CASE expression for consistency
-                        _ => Ok(field.clone()),
-                    }
-                } else {
-                    Ok(field.clone())
-                }
+        let override_field = |field: &str, _numeric_context: bool| {
+            if eval_field_names.contains(field) {
+                return Some(crate::query::clickhouse_sql_gen::escape_identifier(field));
             }
-            EvalExpression::Literal(value) => {
-                match value {
-                    crate::query::Value::String(s) => Ok(format!("'{}'", escape_sql_string(s))),
-                    crate::query::Value::Number(n) => Ok(n.to_string()),
-                    crate::query::Value::Bool(b) => Ok(if *b { "1" } else { "0" }.to_string()),
-                    crate::query::Value::Interval(duration, unit) => {
-                        // Convert interval to ClickHouse INTERVAL syntax
-                        // The duration stores the total seconds, we need to convert back to the original unit
-                        let secs = duration.as_secs();
-                        let (value, unit_str) = match unit {
-                            crate::query::IntervalUnit::Microsecond => {
-                                (secs * 1_000_000, "MICROSECOND")
-                            }
-                            crate::query::IntervalUnit::Millisecond => {
-                                (secs * 1_000, "MILLISECOND")
-                            }
-                            crate::query::IntervalUnit::Second => (secs, "SECOND"),
-                            crate::query::IntervalUnit::Minute => (secs / 60, "MINUTE"),
-                            crate::query::IntervalUnit::Hour => (secs / 3600, "HOUR"),
-                            crate::query::IntervalUnit::Day => (secs / 86400, "DAY"),
-                            crate::query::IntervalUnit::Week => (secs / 604800, "WEEK"),
-                            crate::query::IntervalUnit::Month => (secs / 2592000, "MONTH"),
-                            crate::query::IntervalUnit::Year => (secs / 31536000, "YEAR"),
-                        };
-                        Ok(format!("INTERVAL {} {}", value, unit_str))
-                    }
-                    _ => Err(SearchError::SqlGenError(
-                        "Unsupported literal type in function".to_string(),
-                    )),
-                }
+            if !in_prevalence_context {
+                return None;
             }
-            EvalExpression::FunctionCall { name, args } => {
-                let arg_sqls: Result<Vec<String>, _> = args
-                    .iter()
-                    .map(|arg| {
-                        self.eval_expression_to_clickhouse_sql_with_context(
-                            arg,
-                            in_prevalence_context,
-                        )
-                    })
-                    .collect();
-                let arg_sqls = arg_sqls?;
-
-                // Map function names to ClickHouse equivalents
-                let clickhouse_func = match name.as_str() {
-                    // Date/time functions
-                    "now" => "now64(6)",
-                    "year" => "toYear",
-                    "month" => "toMonth",
-                    "day" => "toDayOfMonth",
-                    "hour" => "toHour",
-                    "minute" => "toMinute",
-                    "second" => "toSecond",
-                    "dayofweek" => "toDayOfWeek",
-                    "dayofyear" => "toDayOfYear",
-                    "weekofyear" => "toWeek",
-                    "date_add" => "addInterval",
-                    "date_sub" => "subtractInterval",
-                    "date_format" => "formatDateTime",
-                    "date_trunc" => "date_trunc",
-                    "unix_timestamp" => "toUnixTimestamp",
-                    "from_unixtime" => "fromUnixTimestamp",
-
-                    // String functions
-                    "upper" => "upper",
-                    "lower" => "lower",
-                    "length" => "length",
-                    "substr" => "substring",
-                    "substring" => "substring",
-                    "concat" => "concat",
-                    "replace" => "replaceAll",
-                    "trim" => "trim",
-                    "ltrim" => "trimLeft",
-                    "rtrim" => "trimRight",
-
-                    // Math functions
-                    "abs" => "abs",
-                    "ceil" => "ceil",
-                    "floor" => "floor",
-                    "round" => "round",
-                    "sqrt" => "sqrt",
-                    "pow" => "pow",
-
-                    // Conditional functions
-                    "if" => "if",
-                    "case" => "multiIf",
-                    "coalesce" => "coalesce",
-                    "nullif" => "nullIf",
-
-                    // Type conversion
-                    "tostring" => "toString",
-                    "tonumber" => "toFloat64OrNull",
-                    "toint" => "toInt64OrNull",
-
-                    // Pass through unknown functions (might be ClickHouse-specific)
-                    other => other,
-                };
-
-                if arg_sqls.is_empty() && clickhouse_func == "now64(6)" {
-                    Ok(clickhouse_func.to_string())
-                } else {
-                    Ok(format!("{}({})", clickhouse_func, arg_sqls.join(", ")))
-                }
+            match field {
+                "first_seen" | "prevalence_first_seen" => Some(FIRST_SEEN.to_string()),
+                "last_seen" | "prevalence_last_seen" => Some(LAST_SEEN.to_string()),
+                _ => None,
             }
-            EvalExpression::BinaryOp { left, op, right } => {
-                let left_sql = self
-                    .eval_expression_to_clickhouse_sql_with_context(left, in_prevalence_context)?;
-                let right_sql = self
-                    .eval_expression_to_clickhouse_sql_with_context(right, in_prevalence_context)?;
-                let op_sql = match op {
-                    crate::query::BinaryOperator::Add => "+",
-                    crate::query::BinaryOperator::Sub => "-",
-                    crate::query::BinaryOperator::Mul => "*",
-                    crate::query::BinaryOperator::Div => "/",
-                    crate::query::BinaryOperator::Mod => "%",
-                    crate::query::BinaryOperator::Concat => "||",
-                    crate::query::BinaryOperator::Eq => "=",
-                    crate::query::BinaryOperator::Ne => "!=",
-                    crate::query::BinaryOperator::Lt => "<",
-                    crate::query::BinaryOperator::Lte => "<=",
-                    crate::query::BinaryOperator::Gt => ">",
-                    crate::query::BinaryOperator::Gte => ">=",
-                    crate::query::BinaryOperator::And => "AND",
-                    crate::query::BinaryOperator::Or => "OR",
-                    crate::query::BinaryOperator::Contains | crate::query::BinaryOperator::Like => {
-                        ""
-                    }
-                };
-                match op {
-                    crate::query::BinaryOperator::Contains => {
-                        Ok(format!("(position({}, {}) > 0)", left_sql, right_sql))
-                    }
-                    crate::query::BinaryOperator::Like => {
-                        Ok(format!("({} LIKE {})", left_sql, right_sql))
-                    }
-                    _ => Ok(format!("({} {} {})", left_sql, op_sql, right_sql)),
-                }
-            }
-        }
+        };
+
+        crate::query::clickhouse_sql_gen::typed_eval_expression_to_sql_with_field_override(
+            &self.ch_sql_generator,
+            expr,
+            &override_field,
+        )
+        .map_err(|error| SearchError::SqlGenError(error.to_string()))
     }
 }

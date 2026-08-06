@@ -9,7 +9,9 @@ use std::time::Instant;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::playbooks::{parse_playbook, split_frontmatter, PlaybookFrontmatter, PlaybookKind};
+use crate::playbooks::{
+    parse_playbook, split_frontmatter, PlaybookCategory, PlaybookFrontmatter, PlaybookKind,
+};
 use crate::rule_repository::GitHubClient;
 
 use super::super::error::PlaybookRepositoryError;
@@ -67,13 +69,32 @@ impl PlaybookRepositoryService {
 
             match result {
                 Ok(sync_result) => {
+                    // NAN-2332: a run that could not write every file is not a
+                    // success, and saying otherwise is the bug this change
+                    // exists to fix. Persisting "success" here would leave the
+                    // repository screen green — it only surfaces
+                    // last_sync_error when the status is "failed" — so the
+                    // detail threaded into that column would never be read.
+                    //
+                    // Withholding the commit is the other half. The next sync
+                    // takes an early-return fast path when the stored commit
+                    // already matches upstream, so recording it after a partial
+                    // failure would both clear last_sync_error and skip the
+                    // retry, stranding the unwritten file until someone pushed
+                    // an unrelated change. Leaving the previous commit in place
+                    // makes the next sync try again; files that did land are
+                    // skipped cheaply by their own blob SHA.
+                    let (status, commit) = match sync_result.error.as_deref() {
+                        Some(_) => ("failed", None),
+                        None => ("success", sync_result.commit.as_deref()),
+                    };
                     let _ = repo_repository
                         .update_sync_status(
                             id,
-                            "success",
-                            sync_result.commit.as_deref(),
+                            status,
+                            commit,
                             Some(sync_result.playbooks_total),
-                            None,
+                            sync_result.error.as_deref(),
                         )
                         .await;
                     info!(
@@ -142,10 +163,22 @@ impl PlaybookRepositoryService {
                     .repo_repository
                     .update_sync_status(
                         id,
-                        "success",
-                        sync_result.commit.as_deref(),
+                        // NAN-2332: same reasoning as the background path —
+                        // a partial failure persists as "failed" (so the UI
+                        // surfaces the reason) and withholds the commit (so
+                        // the next sync retries rather than fast-pathing).
+                        if sync_result.error.is_some() {
+                            "failed"
+                        } else {
+                            "success"
+                        },
+                        if sync_result.error.is_some() {
+                            None
+                        } else {
+                            sync_result.commit.as_deref()
+                        },
                         Some(sync_result.playbooks_total),
-                        None,
+                        sync_result.error.as_deref(),
                     )
                     .await;
             }
@@ -232,6 +265,7 @@ impl PlaybookRepositoryService {
         let mut updated = 0i32;
         let mut synced_paths = Vec::new();
         let mut kind_refused = 0i32;
+        let mut write_failed = 0i32;
 
         for entry in &files {
             // Presence in `synced_paths` is what protects a cached row from
@@ -317,7 +351,10 @@ impl PlaybookRepositoryService {
 
             let _ = body; // currently unused; the full raw_content is stored
 
-            let _ = playbooks_repository
+            let (category, parse_status, parse_error) =
+                resolve_category(category, parse_status, parse_error);
+
+            let upserted = playbooks_repository
                 .upsert(
                     id,
                     &entry.path,
@@ -339,6 +376,19 @@ impl PlaybookRepositoryService {
                     step_count,
                 )
                 .await;
+
+            // NAN-2332: never count a write that did not happen. This used to
+            // be `let _ = upsert(...)` followed by an unconditional increment,
+            // so a failed write was reported to the operator as an added or
+            // updated playbook — success reported for a row that never landed.
+            if let Err(e) = upserted {
+                warn!("Failed to catalog playbook {}: {}", entry.path, e);
+                write_failed += 1;
+                // The path stays in `synced_paths` deliberately: a transient
+                // write error must not delete the existing catalog row and
+                // cascade away its import provenance (see the note above).
+                continue;
+            }
 
             if existing.is_some() {
                 updated += 1;
@@ -366,16 +416,46 @@ impl PlaybookRepositoryService {
             );
         }
 
+        // NAN-2332: surface write failures to the OPERATOR, not just to the
+        // server log. A warning in the log is invisible to whoever is looking
+        // at the repository in the product, and "the sync said success" is the
+        // whole bug this change exists to fix — reporting it only somewhere
+        // they will not look reproduces it one layer up.
+        let error = if write_failed > 0 {
+            warn!(
+                "Playbook repo {}: {} file(s) failed to write to the catalog and were not \
+                 counted as added or updated; see the per-file warnings above",
+                repo.name, write_failed
+            );
+            Some(format!(
+                "{write_failed} playbook(s) could not be written to the catalog and are \
+                 missing or stale; see the server log for the affected files"
+            ))
+        } else {
+            None
+        };
+
         Ok(PlaybookSyncResult {
             repository_id: id,
-            status: PlaybookSyncStatus::Success,
+            // Mirrors what gets persisted: a run with unwritten files reports
+            // Failed, so an API caller reading this struct and an operator
+            // reading the repository row are told the same thing.
+            status: if error.is_some() {
+                PlaybookSyncStatus::Failed
+            } else {
+                PlaybookSyncStatus::Success
+            },
             commit: Some(commit),
             playbooks_added: added,
             playbooks_updated: updated,
             playbooks_removed: removed,
-            playbooks_total: total,
+            // Failed writes stay in `synced_paths` on purpose (it is what keeps
+            // `delete_not_in_paths` from dropping the existing row), but they
+            // are NOT in the catalog, so they must not inflate the count that
+            // is persisted as the repository's playbook_count.
+            playbooks_total: total - write_failed,
             duration_ms: start.elapsed().as_millis() as u64,
-            error: None,
+            error,
         })
     }
 }
@@ -442,6 +522,53 @@ pub(crate) fn repo_accepts_kind(repo: &PlaybookRepository, kind: &str) -> bool {
 /// decides whether importing it creates a document or a scheduled process.
 pub(crate) fn catalog_kind(fm: Option<&PlaybookFrontmatter>) -> PlaybookKind {
     fm.map(|f| f.kind).unwrap_or(PlaybookKind::Response)
+}
+
+/// Resolve the catalog `category` column and the row's parse verdict together.
+///
+/// NAN-2332. `category` is free-form in frontmatter (`Option<String>`) but the
+/// catalog column is CHECK-constrained to the six documented values, so an
+/// unrecognised category fails the INSERT outright. Nulling the column and
+/// downgrading the row keeps the playbook in the catalog — browsable, and
+/// visibly broken with a reason — instead of letting the write fail.
+///
+/// Letting it fail is strictly worse than it first appears. The statement is
+/// `ON CONFLICT … DO UPDATE`, so a failed write leaves the previous row intact:
+/// editing an ALREADY-SYNCED playbook into a bad category would silently keep
+/// serving its old content, which is harder to diagnose than an absent one.
+///
+/// An existing parse failure is never masked. `fm` is `None` whenever the
+/// frontmatter split failed, so `category` is `None` on that path and the
+/// incoming status and error pass through untouched.
+pub(crate) fn resolve_category<'a>(
+    category: Option<String>,
+    parse_status: &'a str,
+    parse_error: Option<String>,
+) -> (Option<String>, &'a str, Option<String>) {
+    match category {
+        // Canonicalize to the enum's own lowercase spelling. `parse` folds
+        // case, but the CHECK constraint does NOT — it is a literal
+        // `IN ('identity', …)`. Writing the author's original casing back
+        // would let `category: Identity` parse as valid here and still fail
+        // the constraint, which is precisely the silent failure this function
+        // exists to prevent.
+        Some(ref value) => match PlaybookCategory::parse(value) {
+            Some(known) => (
+                Some(known.as_str().to_string()),
+                parse_status,
+                parse_error,
+            ),
+            None => (
+                None,
+                "failed",
+                Some(format!(
+                    "unknown category `{value}` — expected one of: \
+                     identity, endpoint, cloud, data, network, email"
+                )),
+            ),
+        },
+        None => (None, parse_status, parse_error),
+    }
 }
 
 #[cfg(test)]

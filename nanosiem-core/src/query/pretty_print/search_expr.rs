@@ -53,6 +53,11 @@ impl PrettyPrint for SearchExpr {
                 format!("{}{}{}", function.pretty_print(), op.as_str(), value)
             }
             SearchExpr::BooleanFunction(function) => function.pretty_print(),
+            // Preserve this as a single search-expression leaf when the
+            // source-scope gate pretty-prints and re-parses the query.
+            SearchExpr::EvalPredicate(expression) => {
+                format!("({})", expression.pretty_print())
+            }
             SearchExpr::FieldFunctionFilter {
                 field,
                 op,

@@ -46,6 +46,28 @@ impl PlaybookRepositoryService {
         let repo = self.get_repository(repo_id).await?;
         let repo_playbook = self.get_repository_playbook(repo_id, path).await?;
 
+        // NAN-2332: refuse to import a row the sync marked broken.
+        //
+        // This guard is load-bearing BECAUSE of the rest of this change.
+        // Previously an unrecognised category failed its INSERT, so the row
+        // never existed and could not be imported. Now it lands deliberately
+        // — catalogued with category NULL and parse_status 'failed' — and
+        // `build_create_request` resolves a NULL category to Identity. Without
+        // this check, landing the row would have converted a silent sync
+        // failure into a silent MIS-FILING, which is worse: the playbook shows
+        // up, in the wrong category, with nothing to indicate either.
+        //
+        // Bulk import already skips non-success rows; this is the single-
+        // playbook path, which did not check.
+        if repo_playbook.parse_status != "success" {
+            return Err(PlaybookRepositoryError::Parse(
+                repo_playbook
+                    .parse_error
+                    .clone()
+                    .unwrap_or_else(|| format!("playbook `{path}` failed to parse at sync")),
+            ));
+        }
+
         // Re-read the kind from the file's own content rather than trusting
         // `repository_playbooks.kind`, which is a browse cache written at sync
         // time. The write path decides from the source of truth: a cache row
@@ -273,7 +295,7 @@ impl PlaybookRepositoryService {
         user_id: Option<Uuid>,
     ) -> Result<super::super::models::PlaybookBundleImportResult, PlaybookRepositoryError> {
         use super::super::models::PlaybookBundleImportResult;
-        use super::sync::{catalog_kind, is_syncable_playbook_file};
+        use super::sync::{catalog_kind, is_syncable_playbook_file, resolve_category};
 
         let repo = self.find_or_create_airgap_playbook_repository(user_id).await?;
 
@@ -315,6 +337,12 @@ impl PlaybookRepositoryService {
             let review_cadence = fm.as_ref().and_then(|f| f.review_cadence.clone());
             let scope = fm.as_ref().and_then(|f| f.scope.clone());
             let kind = catalog_kind(fm.as_ref());
+
+            // NAN-2332: same treatment as the GitHub sync — an unrecognised
+            // category would fail the CHECK and drop the bundle's playbook
+            // entirely. Land it with the reason recorded instead.
+            let (category, parse_status, parse_error) =
+                resolve_category(category, parse_status, parse_error);
 
             if let Err(e) = self
                 .playbooks_repository

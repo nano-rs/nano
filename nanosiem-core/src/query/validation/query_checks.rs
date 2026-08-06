@@ -210,6 +210,7 @@ fn risk_in_search_expr(expr: &SearchExpr) -> bool {
         | SearchExpr::FieldFunctionFilter { .. }
         | SearchExpr::InList { .. }
         | SearchExpr::BooleanFunction(_)
+        | SearchExpr::EvalPredicate(_)
         | SearchExpr::LiteralComparison { .. }
         | SearchExpr::IocMatch { .. } => false,
     }

@@ -123,10 +123,15 @@ pub(crate) fn with_query_options(
     if let Some(s) = settings {
         query = query
             .with_option("max_execution_time", &s.max_execution_time.to_string())
-            .with_option("max_memory_usage", &s.max_memory_usage_bytes.to_string())
             .with_option("max_threads", &s.max_threads.to_string())
             .with_option("priority", &s.priority.to_string())
             .with_option("queue_max_wait_ms", &s.queue_max_wait_ms.to_string());
+        if let Some(max_memory_usage_bytes) = s.max_memory_usage_bytes {
+            query = query.with_option(
+                "max_memory_usage",
+                &max_memory_usage_bytes.to_string(),
+            );
+        }
     }
     query
 }

@@ -25,8 +25,8 @@ mod values;
 #[cfg(test)]
 mod tests;
 
-use error::convert_error;
 pub use error::ParseError;
+use error::{convert_error, rewrite_spl_escaped_double_quote};
 
 use nom::{
     bytes::complete::tag_no_case,
@@ -323,31 +323,72 @@ pub fn parse_query(input: &str) -> Result<Query, ParseError> {
         normalized
     };
 
-    let result = all_consuming(query).parse(normalized).finish();
-    match result {
-        Ok((_, parsed_query)) => {
-            // Enforce pipe depth limit to prevent DoS via CTE explosion
-            let pipe_count = count_pipe_commands(&parsed_query);
-            if pipe_count > MAX_PIPE_COMMANDS {
-                return Err(ParseError {
-                    message: format!(
-                        "Query too complex: maximum {} pipe commands allowed (found {})",
-                        MAX_PIPE_COMMANDS, pipe_count
-                    ),
-                    position: 0,
-                    line: 1,
-                    column: 1,
-                    token: None,
-                    context_before: None,
-                    expected: vec![],
-                    suggestions: vec![],
-                    full_query: Some(input.to_string()),
-                });
+    let parsed = match all_consuming(query).parse(normalized).finish() {
+        Ok((_, parsed_query)) => validate_pipe_depth(parsed_query, input),
+        Err(error) => {
+            // SPL compatibility without regressing NAN-1157: valid historic nPL
+            // (especially `file_path="C:\Windows\"`) already returned above.
+            // Only a failed parse at the familiar `\"` trap gets bounded
+            // retries after rewriting each affected literal to nPL's equivalent
+            // delimiter. One retry was not enough for a normal SPL pipeline
+            // containing two `rex` stages: the first pattern was repaired, the
+            // second failed, and the whole original query was rejected.
+            let original_error = error;
+            let mut recovery_input = normalized.to_string();
+            let mut position = normalized.len().saturating_sub(original_error.input.len());
+            for _ in 0..MAX_PIPE_COMMANDS {
+                let Some((rewritten, _)) =
+                    rewrite_spl_escaped_double_quote(&recovery_input, position)
+                else {
+                    break;
+                };
+                if rewritten == recovery_input {
+                    break;
+                }
+                NESTING_DEPTH.with(|depth| depth.set(0));
+                let attempt = {
+                    let mut recovery_parser = all_consuming(query);
+                    recovery_parser.parse(rewritten.as_str()).finish()
+                };
+                match attempt {
+                    Ok((_, parsed_query)) => return validate_pipe_depth(parsed_query, input),
+                    Err(next_error) => {
+                        position = rewritten.len().saturating_sub(next_error.input.len());
+                        drop(next_error);
+                        recovery_input = rewritten;
+                    }
+                }
             }
-            Ok(parsed_query)
+            // Recovery is invisible unless the complete query succeeds. If an
+            // unrelated syntax problem remains, keep the original query and
+            // its original SPL-quote guidance in the diagnostic.
+            Err(convert_error(normalized, original_error))
         }
-        Err(e) => Err(convert_error(normalized, e)),
+    };
+    parsed
+}
+
+/// Enforce the CTE-depth bound identically for the primary parse and the one
+/// SPL-compatibility retry.
+fn validate_pipe_depth(parsed_query: Query, input: &str) -> Result<Query, ParseError> {
+    let pipe_count = count_pipe_commands(&parsed_query);
+    if pipe_count > MAX_PIPE_COMMANDS {
+        return Err(ParseError {
+            message: format!(
+                "Query too complex: maximum {} pipe commands allowed (found {})",
+                MAX_PIPE_COMMANDS, pipe_count
+            ),
+            position: 0,
+            line: 1,
+            column: 1,
+            token: None,
+            context_before: None,
+            expected: vec![],
+            suggestions: vec![],
+            full_query: Some(input.to_string()),
+        });
     }
+    Ok(parsed_query)
 }
 
 // ============================================================================

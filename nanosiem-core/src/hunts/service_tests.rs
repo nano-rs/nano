@@ -23,6 +23,8 @@ struct FakeResolver {
     events: BTreeMap<String, (String, Vec<(String, String)>)>,
     prevalence: Option<f64>,
     prior_history: bool,
+    scoring_probe_error: bool,
+    scoring_probe_delay: Option<std::time::Duration>,
 }
 
 impl FakeResolver {
@@ -31,6 +33,8 @@ impl FakeResolver {
             events: BTreeMap::new(),
             prevalence: None,
             prior_history: true,
+            scoring_probe_error: false,
+            scoring_probe_delay: None,
         }
     }
 
@@ -89,6 +93,12 @@ impl EvidenceResolver for FakeResolver {
         _window_start: DateTime<Utc>,
         _scope: &ScopeSet,
     ) -> Result<bool, HuntError> {
+        if let Some(delay) = self.scoring_probe_delay {
+            tokio::time::sleep(delay).await;
+        }
+        if self.scoring_probe_error {
+            return Err(HuntError::LogStore("scripted history failure".to_string()));
+        }
         Ok(self.prior_history)
     }
 
@@ -100,6 +110,14 @@ impl EvidenceResolver for FakeResolver {
         _window_end: DateTime<Utc>,
         _scope: &ScopeSet,
     ) -> Result<Option<f64>, HuntError> {
+        if let Some(delay) = self.scoring_probe_delay {
+            tokio::time::sleep(delay).await;
+        }
+        if self.scoring_probe_error {
+            return Err(HuntError::LogStore(
+                "scripted prevalence failure".to_string(),
+            ));
+        }
         Ok(self.prevalence)
     }
 
@@ -281,6 +299,32 @@ async fn measurements_come_from_the_resolver_not_the_report() {
         prepared.first_seen_in_window,
         "no prior history must read as first-seen"
     );
+}
+
+#[tokio::test]
+async fn unavailable_optional_measurements_withhold_bonuses_without_losing_the_lead() {
+    for delayed in [false, true] {
+        let mut resolver = FakeResolver::new().with_event("e1", "sysmon", &[("host", "srv-web06")]);
+        resolver.prevalence = Some(0.001);
+        resolver.prior_history = false;
+        resolver.scoring_probe_error = !delayed;
+        resolver.scoring_probe_delay = delayed.then_some(std::time::Duration::from_millis(100));
+        let svc = service(resolver);
+
+        let prepared = prepare(
+            &svc,
+            &candidate("host", "srv-web06", &["e1"], &["T1021"]),
+            &known(&["t1021"]),
+        )
+        .await
+        .expect("corroborated evidence must survive an optional scoring outage");
+
+        assert_eq!(prepared.prevalence, None);
+        assert!(
+            !prepared.first_seen_in_window,
+            "an unanswered history probe must never manufacture novelty"
+        );
+    }
 }
 
 #[tokio::test]

@@ -920,11 +920,22 @@ fn absurd_counters_saturate_rather_than_wrapping_negative() {
 }
 
 #[test]
-fn a_lease_request_cannot_outlast_failover() {
-    // Reclaim only reassigns a sweep whose lease has EXPIRED, so an unbounded
-    // lease is an unbounded outage for that hunt.
+fn a_lease_request_cannot_hide_an_abandoned_attempt_forever() {
+    // The scheduler can only expose an abandoned attempt after its lease has
+    // expired, so an unbounded lease is an unbounded invisible failure.
     assert!(MAX_LEASE_SECONDS <= 3600);
     assert!(DEFAULT_LEASE_SECONDS <= MAX_LEASE_SECONDS);
+}
+
+#[test]
+fn runner_claims_never_reexecute_expired_sweeps() {
+    // A report timeout is ambiguous: the server may still be committing after
+    // the client stops waiting. Re-claiming the row used to run the full agent
+    // again every 30-minute lease. Only the scheduler may close expired work.
+    let claim = function_body(REPOSITORY_SOURCE, "pub async fn claim_next_sweep(");
+    assert!(claim.contains("WHERE status = 'queued'"));
+    assert!(!claim.contains("lease_expires_at <= NOW()"));
+    assert!(!claim.contains("status IN ('leased', 'running')"));
 }
 
 #[test]

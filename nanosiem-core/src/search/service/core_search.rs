@@ -25,6 +25,109 @@ fn asset_view_total_count(results: &[serde_json::Value]) -> Option<u64> {
 /// the filter into SQL and never hits this.
 const IN_MEMORY_PREVALENCE_FETCH_CAP: usize = 50_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SqlLimitPlan {
+    generator_limit: Option<usize>,
+    execution_limit: usize,
+    execution_offset: usize,
+    page_after_post_processing: bool,
+}
+
+/// Separate an SQL query's input/result-shape limit from its returned-page
+/// limit. Raw rows and SQL aggregations are paginated by the executor; other
+/// paths keep their internal fetch cap in generated SQL.
+fn sql_limit_plan(
+    is_raw_event_query: bool,
+    sql_has_aggregation: bool,
+    sql_aggregation_has_rust_suffix: bool,
+    aggregation_deferred_to_rust: bool,
+    internal_limit: usize,
+    page_limit: usize,
+    request_offset: usize,
+) -> SqlLimitPlan {
+    if sql_has_aggregation && sql_aggregation_has_rust_suffix {
+        SqlLimitPlan {
+            generator_limit: Some(AGGREGATE_OUTPUT_CAP),
+            execution_limit: AGGREGATE_OUTPUT_CAP,
+            execution_offset: 0,
+            page_after_post_processing: true,
+        }
+    } else if sql_has_aggregation {
+        SqlLimitPlan {
+            generator_limit: Some(AGGREGATE_OUTPUT_CAP),
+            execution_limit: page_limit,
+            execution_offset: request_offset,
+            page_after_post_processing: false,
+        }
+    } else if is_raw_event_query {
+        SqlLimitPlan {
+            generator_limit: None,
+            execution_limit: internal_limit,
+            execution_offset: request_offset,
+            page_after_post_processing: false,
+        }
+    } else if aggregation_deferred_to_rust {
+        SqlLimitPlan {
+            generator_limit: Some(internal_limit),
+            execution_limit: internal_limit,
+            execution_offset: 0,
+            page_after_post_processing: true,
+        }
+    } else {
+        SqlLimitPlan {
+            generator_limit: Some(internal_limit),
+            execution_limit: internal_limit,
+            execution_offset: request_offset,
+            page_after_post_processing: false,
+        }
+    }
+}
+
+/// Whether one of the Rust-only pipeline stages occurs after an aggregation.
+/// Stripping that suffix leaves a real SQL aggregation whose complete bounded
+/// output must reach Rust before request pagination is applied.
+fn has_rust_only_suffix_after_aggregation(query: &Query) -> bool {
+    match query {
+        Query::Search(_) => false,
+        Query::Piped { source, command } => {
+            let is_rust_only = matches!(
+                command,
+                Command::Prevalence { .. }
+                    | Command::InputLookup { .. }
+                    | Command::Lateral { .. }
+                    | Command::Ai { .. }
+            );
+            (is_rust_only && query_has_aggregation(source))
+                || has_rust_only_suffix_after_aggregation(source)
+        }
+    }
+}
+
+/// Apply request pagination after a Rust-side aggregation/transform has seen
+/// its complete fetched input. The returned count describes the full
+/// post-processed result, before this page is sliced.
+fn paginate_post_processed_results(
+    mut results: Vec<serde_json::Value>,
+    offset: usize,
+    limit: usize,
+    preserve_display_metadata: bool,
+) -> (Vec<serde_json::Value>, u64) {
+    let metadata = preserve_display_metadata
+        .then(|| {
+            results
+                .iter()
+                .position(|row| row.get("_display_type").is_some())
+                .map(|index| results.remove(index))
+        })
+        .flatten();
+    let total_count = u64::try_from(results.len()).unwrap_or(u64::MAX);
+    let mut page: Vec<_> = results.into_iter().skip(offset).take(limit).collect();
+    if let Some(metadata) = metadata {
+        page.insert(0, metadata);
+    }
+    (page, total_count)
+}
+
 impl SearchService {
     /// Kill an evaluator-owned set of exact ClickHouse query IDs in one
     /// cluster-aware round trip. Autonomous replay owns every ID up front, so
@@ -210,7 +313,7 @@ impl SearchService {
 
         let mut service = self.clone();
         // Set per-query ClickHouse settings based on priority
-        service.active_ch_settings = Some(priority.to_ch_settings());
+        service.active_ch_settings = Some(service.ch_settings_for_priority(priority));
         let job_id_clone = job_id.clone();
         let scope = scope.clone();
 
@@ -314,7 +417,7 @@ impl SearchService {
             .map_err(|e| SearchError::AdmissionDenied(e.to_string()))?;
 
         let mut service = self.clone();
-        service.active_ch_settings = Some(priority.to_ch_settings());
+        service.active_ch_settings = Some(service.ch_settings_for_priority(priority));
         // _permit drops at end of scope, freeing the slot.
         service.search(request, scope).await
     }
@@ -786,6 +889,10 @@ impl SearchService {
         // - Asset: needs events for identity resolution and activity aggregation (cap at 100k)
         // - Stats/Timechart/Top/Rare: needs all events for accurate counts
         // - Prevalence: needs all events to properly filter by prevalence scores
+        let page_limit = request
+            .limit
+            .unwrap_or(self.config.default_limit)
+            .min(self.config.max_limit);
         let limit = if is_tree_query {
             // Tree visualizations cap at 10k events - more than this makes the tree unusable anyway
             // and causes performance issues with tree building algorithm
@@ -795,7 +902,10 @@ impl SearchService {
             // build_*_view re-queries ClickHouse for the actual data.
             10
         } else if is_aggregation_query {
-            1_000_000 // Stats need all events for correct results
+            // This is an input-fetch cap only when aggregation is deferred to
+            // Rust post-processing. SQL aggregations replace it with
+            // `page_limit` below, after `query_for_sql` is known.
+            1_000_000
         } else if has_prevalence_filtering && !use_prevalence_join {
             // NAN-1691: residual in-memory prevalence filter (aggregation-before,
             // first_seen conditions, or non-ClickHouse backend). Filtering happens in
@@ -808,15 +918,9 @@ impl SearchService {
             // returns only the already-rare set and the executor paginates it. Use the
             // normal page limit, honoring the user's `| head N` / request.limit, instead
             // of materializing 1M rows.
-            request
-                .limit
-                .unwrap_or(self.config.default_limit)
-                .min(self.config.max_limit)
+            page_limit
         } else {
-            request
-                .limit
-                .unwrap_or(self.config.default_limit)
-                .min(self.config.max_limit)
+            page_limit
         };
         let offset = request.offset.unwrap_or(0);
 
@@ -976,6 +1080,23 @@ impl SearchService {
         // out of the SQL, ClickHouse really does return raw events, and those must
         // keep their pruning or a 1M-row fetch arrives with every empty UDM column.
         let grouped_output = query_produces_grouped_rows(&query_for_sql);
+        // NAN-2344: a caller limit on a SQL aggregation pages the rows/groups
+        // the aggregation PRODUCES; it must never become a LIMIT on the SQL
+        // feeding that aggregation. Aggregations stripped for Rust-side
+        // processing retain the large input fetch above.
+        let sql_has_aggregation = query_has_aggregation(&query_for_sql);
+        let sql_aggregation_has_rust_suffix =
+            sql_has_aggregation && has_rust_only_suffix_after_aggregation(&query);
+        let aggregation_deferred_to_rust = is_aggregation_query && !sql_has_aggregation;
+        let sql_limit_plan = sql_limit_plan(
+            is_raw_event_query,
+            sql_has_aggregation,
+            sql_aggregation_has_rust_suffix,
+            aggregation_deferred_to_rust,
+            limit,
+            page_limit,
+            offset,
+        );
 
         // The dataset this request targets (NAN-1534). Shared by the SQL-gen
         // block, the histogram spawn, and the field-stats gate below.
@@ -1007,9 +1128,12 @@ impl SearchService {
                 // injects LIMIT/OFFSET itself. Baking the page-size limit into
                 // the SQL here made that injection a silent no-op (page N
                 // re-served page 1's rows) and capped the count companion's
-                // total_count at the page size (NAN-1410). Aggregation /
-                // tree / asset / prevalence queries keep their explicit caps.
-                limit: if is_raw_event_query { None } else { Some(limit) },
+                // total_count at the page size (NAN-1410). SQL aggregation
+                // pagination is likewise executor-owned: its outer wrapper
+                // applies request.limit only after GROUP BY/window processing.
+                // Tree/asset/prevalence and Rust-side transformations retain
+                // their explicit input caps.
+                limit: sql_limit_plan.generator_limit,
                 unordered: false,
             };
             // Apply current query safety limits to the SQL generator.
@@ -1236,8 +1360,8 @@ impl SearchService {
                     let (data_result, field_stats_result) = tokio::join!(
                         self.execute_clickhouse_sql_with_query_id(
                             &sql,
-                            limit,
-                            offset,
+                            sql_limit_plan.execution_limit,
+                            sql_limit_plan.execution_offset,
                             Some(&query_id),
                             None,
                             bounded_count,
@@ -1273,8 +1397,8 @@ impl SearchService {
                     let (results, total_count) = self
                         .execute_clickhouse_sql_with_query_id(
                             &sql,
-                            limit,
-                            offset,
+                            sql_limit_plan.execution_limit,
+                            sql_limit_plan.execution_offset,
                             Some(&query_id),
                             None,
                             bounded_count,
@@ -1565,6 +1689,20 @@ impl SearchService {
             }
         }
 
+        // NAN-2344: when an aggregation was stripped from SQL (prevalence,
+        // inputlookup, lateral, or AI post-processing), the SQL fetch started
+        // at offset 0 and supplied the capped input set to Rust. Page only now,
+        // after every Rust command (including explicit sort/head) has run, and
+        // report the number of completed groups before request pagination.
+        let total_count = if sql_limit_plan.page_after_post_processing {
+            let (paged_results, grouped_total_count) =
+                paginate_post_processed_results(results, offset, page_limit, is_lateral_query);
+            results = paged_results;
+            grouped_total_count
+        } else {
+            total_count
+        };
+
         // Calculate field statistics (after enrichment so lookup fields are included)
         // Skip for tree/asset/cloud queries (visualization is the data) or if explicitly requested
         // Prefer server-side stats (computed across ALL matching events) over client-side stats (from sampled results)
@@ -1808,6 +1946,132 @@ fn collect_ext_prefixed_predicate_fields(query: &Query) -> std::collections::BTr
 mod ext_remap_note_tests {
     use super::*;
     use crate::query::parse_query;
+
+    /// NAN-2344: a stats request with `limit=60` keeps the independent 1M
+    /// aggregate-output guard and pages only its completed output.
+    #[test]
+    fn aggregation_limit_plan_pages_output_not_input() {
+        let plan = sql_limit_plan(false, true, false, false, 1_000_000, 60, 120);
+        assert_eq!(
+            plan,
+            SqlLimitPlan {
+                generator_limit: Some(AGGREGATE_OUTPUT_CAP),
+                execution_limit: 60,
+                execution_offset: 120,
+                page_after_post_processing: false,
+            }
+        );
+
+        // Raw pagination remains executor-owned.
+        assert_eq!(
+            sql_limit_plan(true, false, false, false, 60, 60, 120),
+            SqlLimitPlan {
+                generator_limit: None,
+                execution_limit: 60,
+                execution_offset: 120,
+                page_after_post_processing: false,
+            }
+        );
+    }
+
+    /// An aggregation stripped from SQL must fetch raw input from offset zero,
+    /// retain its internal safety cap, and defer request pagination until Rust
+    /// has completed grouping/sorting/head semantics.
+    #[test]
+    fn deferred_aggregation_limit_plan_pages_after_rust_processing() {
+        assert_eq!(
+            sql_limit_plan(false, false, false, true, 1_000_000, 60, 120),
+            SqlLimitPlan {
+                generator_limit: Some(1_000_000),
+                execution_limit: 1_000_000,
+                execution_offset: 0,
+                page_after_post_processing: true,
+            }
+        );
+    }
+
+    #[test]
+    fn sql_aggregation_before_rust_suffix_fetches_cap_then_pages_in_rust() {
+        assert_eq!(
+            sql_limit_plan(false, true, true, false, 10, 60, 120),
+            SqlLimitPlan {
+                generator_limit: Some(AGGREGATE_OUTPUT_CAP),
+                execution_limit: AGGREGATE_OUTPUT_CAP,
+                execution_offset: 0,
+                page_after_post_processing: true,
+            }
+        );
+
+        for query in [
+            "* | stats count by dest_ip | prevalence enrich=true",
+            r#"* | stats count by dest_ip | inputlookup url="https://example.com/{dest_ip}" key=dest_ip"#,
+            "* | stats count by src_host | lateral entity=src_host",
+            r#"* | stats count by dest_ip | ai prompt="classify""#,
+        ] {
+            let parsed = parse_query(query)
+                .unwrap_or_else(|error| panic!("test query must parse ({query}): {error}"));
+            assert!(
+                has_rust_only_suffix_after_aggregation(&parsed),
+                "missed Rust-only suffix after SQL aggregation: {query}"
+            );
+        }
+
+        let suffix_before_aggregation =
+            parse_query("* | prevalence enrich=true | stats count by dest_ip").unwrap();
+        assert!(
+            !has_rust_only_suffix_after_aggregation(&suffix_before_aggregation),
+            "a Rust stage before aggregation must use deferred-aggregation planning"
+        );
+    }
+
+    #[test]
+    fn post_processed_pagination_reports_pre_page_group_count() {
+        let rows: Vec<serde_json::Value> = (0..100)
+            .map(|i| serde_json::json!({ "group": i }))
+            .collect();
+        let (page, total_count) = paginate_post_processed_results(rows, 60, 25, false);
+
+        assert_eq!(total_count, 100);
+        assert_eq!(page.len(), 25);
+        assert_eq!(page.first().unwrap().get("group").unwrap(), 60);
+        assert_eq!(page.last().unwrap().get("group").unwrap(), 84);
+
+        let rows: Vec<serde_json::Value> =
+            (0..3).map(|i| serde_json::json!({ "group": i })).collect();
+        let (page, total_count) = paginate_post_processed_results(rows, 10, 60, false);
+        assert!(page.is_empty());
+        assert_eq!(total_count, 3);
+    }
+
+    #[test]
+    fn lateral_metadata_is_outside_data_pagination() {
+        let rows = vec![
+            serde_json::json!({ "_display_type": "lateral" }),
+            serde_json::json!({ "edge": 0 }),
+            serde_json::json!({ "edge": 1 }),
+            serde_json::json!({ "edge": 2 }),
+        ];
+        let (page, total_count) = paginate_post_processed_results(rows, 1, 1, true);
+
+        assert_eq!(total_count, 3, "metadata is not a data row");
+        assert_eq!(page.len(), 2, "metadata does not consume request.limit");
+        assert_eq!(
+            page[0].get("_display_type").and_then(|v| v.as_str()),
+            Some("lateral")
+        );
+        assert_eq!(page[1].get("edge").and_then(|v| v.as_i64()), Some(1));
+
+        let rows = vec![
+            serde_json::json!({ "_display_type": "lateral" }),
+            serde_json::json!({ "edge": 0 }),
+        ];
+        let (page, total_count) = paginate_post_processed_results(rows, 10, 10, true);
+        assert_eq!(total_count, 1);
+        assert_eq!(
+            page,
+            vec![serde_json::json!({ "_display_type": "lateral" })]
+        );
+    }
 
     /// NAN-1388: the OCSF empty-result note collects `ext.*` predicate fields
     /// from base search terms and `| where` stages — and nothing else.

@@ -166,6 +166,10 @@ fn reject_unsupported_for_realtime(expr: &SearchExpr) -> Result<(), Materialized
         SearchExpr::IocMatch { .. } => Err(MaterializedViewError::InvalidRule(
             "Real-time rules cannot use the ioc retro-hunt term".to_string(),
         )),
+        SearchExpr::EvalPredicate(_) => Err(MaterializedViewError::InvalidRule(
+            "Real-time rules cannot use arithmetic where predicates; use scheduled mode"
+                .to_string(),
+        )),
         SearchExpr::And(left, right) | SearchExpr::Or(left, right) => {
             reject_unsupported_for_realtime(left)?;
             reject_unsupported_for_realtime(right)
@@ -948,6 +952,7 @@ mod tests {
         // not a simple-column MV predicate.
         assert!(!is_realtime_eligible("malware"));
         assert!(!is_realtime_eligible("ioc"));
+        assert!(!is_realtime_eligible("(bytes_out - bytes_in) > 1000"));
     }
 
     #[test]
@@ -964,7 +969,11 @@ mod tests {
                 "shape gate said eligible but DDL failed for {query:?}"
             );
         }
-        for query in ["malware", "src_ip=\"10.0.0.1\" | stats count by user"] {
+        for query in [
+            "malware",
+            "src_ip=\"10.0.0.1\" | stats count by user",
+            "(bytes_out - bytes_in) > 1000",
+        ] {
             assert!(!is_realtime_eligible(query));
             let mut rule = create_test_rule();
             rule.query = query.to_string();

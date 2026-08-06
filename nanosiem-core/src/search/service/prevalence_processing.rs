@@ -33,6 +33,9 @@ impl SearchService {
             SearchExpr::BooleanFunction(function) => {
                 self.eval_expr_references_prevalence_nested(function)
             }
+            SearchExpr::EvalPredicate(expression) => {
+                self.eval_expr_references_prevalence_nested(expression)
+            }
             SearchExpr::Keyword(_) => false,
             SearchExpr::LiteralComparison { .. } => false,
             SearchExpr::InSubsearch { .. } => false,
@@ -1520,7 +1523,45 @@ pub(crate) fn decorated_filter_rescue_threshold(
     post_prevalence_commands: &[crate::query::Command],
     rarity_threshold: u64,
 ) -> Option<u64> {
-    use crate::query::{Command, Comparator, SearchExpr, Value};
+    use crate::query::{Command, Comparator, EvalExpression, SearchExpr, Value};
+    use std::collections::HashSet;
+
+    fn decorated_field(field: &str) -> bool {
+        matches!(
+            field,
+            "host_count"
+                | "is_rare"
+                | "prevalence_score"
+                | "first_seen"
+                | "last_seen"
+                | "prevalence_first_seen"
+                | "prevalence_last_seen"
+                | "total_occurrences"
+                | "prevalence_type"
+                | "prevalence_artifact"
+        )
+    }
+
+    fn eval_depends_on_decoration(
+        expression: &EvalExpression,
+        dependent_aliases: &HashSet<String>,
+    ) -> bool {
+        match expression {
+            EvalExpression::Field(field) => {
+                decorated_field(field) || dependent_aliases.contains(field)
+            }
+            EvalExpression::Literal(_) => false,
+            EvalExpression::FunctionCall { args, .. } => args
+                .iter()
+                .any(|arg| eval_depends_on_decoration(arg, dependent_aliases)),
+            EvalExpression::BinaryOp { left, right, .. } => {
+                eval_depends_on_decoration(left, dependent_aliases)
+                    || eval_depends_on_decoration(right, dependent_aliases)
+            }
+        }
+    }
+
+    let conservative_threshold = PREVALENCE_DICT_HOST_COUNT_CUTOFF.saturating_sub(1);
 
     // Walk a WHERE expression, collecting rescue thresholds from rare-direction
     // filters on decorated prevalence columns. AND/OR/Group are transparent —
@@ -1533,7 +1574,13 @@ pub(crate) fn decorated_filter_rescue_threshold(
     // contrived rare-via-`Not` forms (`NOT(is_rare = false)`,
     // `NOT(host_count >= N)`) simply aren't rescued — write the un-negated form
     // (`is_rare`, `host_count < N`), which is fully covered.
-    fn collect(expr: &SearchExpr, rarity_threshold: u64, out: &mut Vec<u64>) {
+    fn collect(
+        expr: &SearchExpr,
+        rarity_threshold: u64,
+        conservative_threshold: u64,
+        dependent_aliases: &HashSet<String>,
+        out: &mut Vec<u64>,
+    ) {
         match expr {
             SearchExpr::FieldFilter { field, op, value } => {
                 match field.as_str() {
@@ -1564,14 +1611,64 @@ pub(crate) fn decorated_filter_rescue_threshold(
                             out.push(rarity_threshold.saturating_sub(1).max(1));
                         }
                     }
+                    // Timestamp/occurrence decorations become NULL/zero while
+                    // a dict-negative artifact is masked. A direct predicate or
+                    // an eval alias derived from any decoration therefore gets
+                    // the conservative rarity-index superset; the outer WHERE
+                    // still performs the exact arithmetic/comparison.
+                    "first_seen"
+                    | "last_seen"
+                    | "prevalence_first_seen"
+                    | "prevalence_last_seen"
+                    | "total_occurrences" => out.push(conservative_threshold),
+                    _ if dependent_aliases.contains(field) => out.push(conservative_threshold),
                     _ => {}
                 }
             }
             SearchExpr::And(a, b) | SearchExpr::Or(a, b) => {
-                collect(a, rarity_threshold, out);
-                collect(b, rarity_threshold, out);
+                collect(
+                    a,
+                    rarity_threshold,
+                    conservative_threshold,
+                    dependent_aliases,
+                    out,
+                );
+                collect(
+                    b,
+                    rarity_threshold,
+                    conservative_threshold,
+                    dependent_aliases,
+                    out,
+                );
             }
-            SearchExpr::Group(inner) => collect(inner, rarity_threshold, out),
+            SearchExpr::Group(inner) => collect(
+                inner,
+                rarity_threshold,
+                conservative_threshold,
+                dependent_aliases,
+                out,
+            ),
+            SearchExpr::EvalPredicate(expression)
+            | SearchExpr::BooleanFunction(expression)
+            | SearchExpr::FunctionFilter {
+                function: expression,
+                ..
+            } if eval_depends_on_decoration(expression, dependent_aliases) => {
+                out.push(conservative_threshold)
+            }
+            SearchExpr::FieldFunctionFilter {
+                field, function, ..
+            } if decorated_field(field)
+                || dependent_aliases.contains(field)
+                || eval_depends_on_decoration(function, dependent_aliases) =>
+            {
+                out.push(conservative_threshold)
+            }
+            SearchExpr::InList { field, .. }
+                if decorated_field(field) || dependent_aliases.contains(field) =>
+            {
+                out.push(conservative_threshold)
+            }
             // `Not` is opaque — see the direction-inversion note above.
             SearchExpr::Not(_) => {}
             _ => {}
@@ -1579,9 +1676,28 @@ pub(crate) fn decorated_filter_rescue_threshold(
     }
 
     let mut thresholds: Vec<u64> = Vec::new();
+    let mut dependent_aliases = HashSet::new();
     for cmd in post_prevalence_commands {
-        if let Command::Where { condition } = cmd {
-            collect(condition, rarity_threshold, &mut thresholds);
+        match cmd {
+            Command::Eval { assignments } => {
+                for assignment in assignments {
+                    if eval_depends_on_decoration(&assignment.expression, &dependent_aliases) {
+                        dependent_aliases.insert(assignment.field.clone());
+                    } else {
+                        // Reassignment shadows the earlier value and must not
+                        // retain stale prevalence dependency.
+                        dependent_aliases.remove(&assignment.field);
+                    }
+                }
+            }
+            Command::Where { condition } => collect(
+                condition,
+                rarity_threshold,
+                conservative_threshold,
+                &dependent_aliases,
+                &mut thresholds,
+            ),
+            _ => {}
         }
     }
     // Rescue the SUPERSET covering the loosest filter (the in-SQL WHERE narrows

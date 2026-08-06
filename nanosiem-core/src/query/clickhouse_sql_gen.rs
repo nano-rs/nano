@@ -38,6 +38,7 @@ pub mod otel;
 pub(crate) mod search_expr;
 
 // Re-export helpers so submodules and external code can access them
+pub(crate) use eval_functions::typed_eval_expression_to_sql_with_field_override;
 pub(crate) use helpers::*;
 
 use super::ast::*;
@@ -705,6 +706,9 @@ fn extract_fields_from_search_expr(expr: &SearchExpr) -> Vec<String> {
         }
         // These don't have specific fields we want to capture
         // NAN-1580: IocMatch is an observable-anywhere term — no single field.
+        SearchExpr::EvalPredicate(expression) => {
+            extract_fields_from_eval_expression(expression, &mut fields);
+        }
         SearchExpr::Keyword(_)
         | SearchExpr::FunctionFilter { .. }
         | SearchExpr::BooleanFunction(_)
@@ -718,6 +722,22 @@ fn extract_fields_from_search_expr(expr: &SearchExpr) -> Vec<String> {
     fields.sort();
     fields.dedup();
     fields
+}
+
+fn extract_fields_from_eval_expression(expr: &EvalExpression, fields: &mut Vec<String>) {
+    match expr {
+        EvalExpression::Field(field) => fields.push(field.clone()),
+        EvalExpression::Literal(_) => {}
+        EvalExpression::FunctionCall { args, .. } => {
+            for arg in args {
+                extract_fields_from_eval_expression(arg, fields);
+            }
+        }
+        EvalExpression::BinaryOp { left, right, .. } => {
+            extract_fields_from_eval_expression(left, fields);
+            extract_fields_from_eval_expression(right, fields);
+        }
+    }
 }
 
 /// Options for SQL query generation

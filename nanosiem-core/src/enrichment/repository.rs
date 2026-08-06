@@ -222,7 +222,33 @@ impl EnrichmentRepository {
         Ok(())
     }
 
-    /// Update source download URL
+    /// Update source download URL, discarding any sync error left by the
+    /// previous URL and re-queueing the source for an immediate sync.
+    ///
+    /// The single writer for this column — the marketplace credential path
+    /// routes here too, so the re-queue semantics below cannot drift between
+    /// the two configure surfaces (NAN-2343).
+    ///
+    /// `last_sync_error` is otherwise cleared only by a sync attempt, so after
+    /// correcting a bad URL the operator kept seeing the *old* failure
+    /// verbatim — with `auto_sync_enabled` on, the scheduler re-ran and rewrote
+    /// the identical message, making it look permanently stuck and giving no
+    /// signal that the new value had been accepted. `pending` is the
+    /// scheduler's immediate-sync request (bypasses interval/auto-sync checks),
+    /// so a corrected URL is exercised promptly rather than at the next tick.
+    ///
+    /// Both of those only fire when the URL actually **changed**. In an UPDATE,
+    /// the right-hand side sees the pre-update row, so `download_url IS
+    /// DISTINCT FROM $2` compares old against new:
+    ///
+    /// - Re-saving an identical URL is inert. Otherwise every save queued a
+    ///   fresh multi-million-row download, and re-pasting the same value to be
+    ///   sure is exactly what an operator does when a feed looks wrong.
+    /// - An in-flight sync is never overwritten. Stamping `pending` over
+    ///   `in_progress` would both lose the request (the running sync writes its
+    ///   own terminal status last) and invite a second, overlapping download.
+    ///   The new URL still lands; the running sync finishes and the scheduler's
+    ///   normal cadence picks it up.
     #[instrument(skip(self))]
     pub async fn update_source_url(
         &self,
@@ -230,7 +256,18 @@ impl EnrichmentRepository {
         url: &str,
     ) -> Result<(), EnrichmentRepositoryError> {
         let result = sqlx::query(
-            "UPDATE enrichment_sources SET download_url = $2, updated_at = NOW() WHERE id = $1",
+            "UPDATE enrichment_sources \
+             SET download_url = $2, \
+                 last_sync_error = CASE \
+                     WHEN download_url IS DISTINCT FROM $2 THEN NULL \
+                     ELSE last_sync_error END, \
+                 last_sync_status = CASE \
+                     WHEN download_url IS DISTINCT FROM $2 \
+                          AND last_sync_status IS DISTINCT FROM 'in_progress' \
+                     THEN 'pending' \
+                     ELSE last_sync_status END, \
+                 updated_at = NOW() \
+             WHERE id = $1",
         )
         .bind(source_id)
         .bind(url)

@@ -1310,7 +1310,109 @@
         }
     }
 
-    /// NAN-1381 (root cause of NAN-1247): non-Eq string operators on a UDM alias
+
+/// NAN-2344: Splunk's `ip_field=CIDR` shorthand means network membership,
+/// not literal string equality. Equality, inequality, and an outer NOT have
+/// intentionally distinct missing-field semantics.
+#[test]
+fn ip_field_cidr_equality_and_negation_lower_to_membership() {
+    let gen = ClickHouseSqlGenerator::new();
+
+    let eq = gen
+        .generate(&parse_query("dest_ip=10.0.0.0/8").unwrap(), &time_range())
+        .unwrap();
+    let eq_where = where_slice(&eq);
+    assert!(
+        eq_where.contains("(length(dest_ip) > 0 AND isIPAddressInRange(dest_ip, '10.0.0.0/8'))"),
+        "CIDR equality must use network membership, got:\n{eq_where}"
+    );
+    assert!(
+        !eq_where.contains("dest_ip = '10.0.0.0/8'"),
+        "CIDR equality must never remain literal equality, got:\n{eq_where}"
+    );
+
+    let ne = gen
+        .generate(&parse_query("dest_ip!=10.0.0.0/8").unwrap(), &time_range())
+        .unwrap();
+    let ne_where = where_slice(&ne);
+    assert!(
+        ne_where
+            .contains("(length(dest_ip) > 0 AND NOT isIPAddressInRange(dest_ip, '10.0.0.0/8'))"),
+        "CIDR != must require a present field and negate membership, got:\n{ne_where}"
+    );
+
+    let outer_not = gen
+        .generate(
+            &parse_query("NOT dest_ip=10.0.0.0/8").unwrap(),
+            &time_range(),
+        )
+        .unwrap();
+    let outer_not_where = where_slice(&outer_not);
+    assert!(
+        outer_not_where
+            .contains("NOT ((length(dest_ip) > 0 AND isIPAddressInRange(dest_ip, '10.0.0.0/8')))"),
+        "outer NOT must negate the whole guarded equality, got:\n{outer_not_where}"
+    );
+}
+
+/// CIDR lowering follows schema resolution, so UDM aliases on OCSF target
+/// the promoted IP column rather than a nonexistent UDM token.
+#[test]
+fn ocsf_ip_alias_cidr_resolves_to_promoted_column() {
+    use crate::schema::OcsfProfile;
+    use std::sync::Arc;
+
+    let gen = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
+    let sql = gen
+        .generate(&parse_query("src_ip=2001:db8::/32").unwrap(), &time_range())
+        .unwrap();
+    let where_clause = where_slice(&sql);
+    assert!(
+        where_clause.contains("isIPAddressInRange(\"src_endpoint.ip\", '2001:db8::/32')"),
+        "OCSF CIDR must target the promoted IP column, got:\n{where_clause}"
+    );
+    assert!(
+        !where_clause.contains("isIPAddressInRange(src_ip,"),
+        "OCSF CIDR must not emit the UDM alias as a physical column, got:\n{where_clause}"
+    );
+}
+
+/// Reject malformed networks before ClickHouse execution. Slash-bearing
+/// strings on non-IP fields retain ordinary string equality semantics.
+#[test]
+fn ip_field_cidr_validation_is_strict_and_non_ip_slashes_are_unchanged() {
+    let gen = ClickHouseSqlGenerator::new();
+    for cidr in [
+        "10.0.0.0/33",
+        "2001:db8::/129",
+        "10.0.0.0/not-a-prefix",
+        "10.0.0.0/8/extra",
+        "not-an-ip/8",
+    ] {
+        let query = parse_query(&format!("src_ip=\"{cidr}\"")).unwrap();
+        let error = gen
+            .generate(&query, &time_range())
+            .expect_err("malformed CIDR must fail SQL generation");
+        assert!(
+            error.to_string().contains("CIDR"),
+            "malformed CIDR {cidr:?} returned an unrelated error: {error}"
+        );
+    }
+
+    let ordinary = gen
+        .generate(
+            &parse_query("message=\"folder/name\"").unwrap(),
+            &time_range(),
+        )
+        .unwrap();
+    assert!(
+        where_slice(&ordinary).contains("'folder/name'"),
+        "slash-bearing non-IP strings must retain equality semantics: {ordinary}"
+    );
+}
+
+
+/// NAN-1381 (root cause of NAN-1247): non-Eq string operators on a UDM alias
     /// that resolves to a plain non-null String column must reference `lower(col)`,
     /// never `toString(col)` — ClickHouse matches a text/bloom skip index by
     /// EXPRESSION, so the toString wrapper orphans every `lower(col)` index and
@@ -4323,6 +4425,73 @@ mod nan2244_rex_pattern_fidelity {
         assert!(
             sql.contains("it''s"),
             "single quote not escaped for the SQL literal: {sql}"
+        );
+    }
+}
+
+/// NAN-2331: the live parse-error corpus collapsed to arithmetic predicates
+/// over typed stats aliases. They must compile without changing the ordinary
+/// field-filter path or string-casting DateTime aliases to NULL.
+mod nan2331_where_arithmetic {
+    use super::*;
+
+    fn sql_for(npl: &str) -> String {
+        ClickHouseSqlGenerator::new()
+            .generate(&parse_query(npl).unwrap(), &time_range())
+            .unwrap()
+    }
+
+    #[test]
+    fn stats_alias_subtraction_preserves_typed_operands() {
+        let sql = sql_for(
+            "* | stats min(timestamp) as first_seen, max(timestamp) as last_seen, \
+             count() as event_count, dc(src_ip) as unique_ips by user | \
+             where event_count > 5 AND unique_ips >= 2 AND \
+             (last_seen - first_seen) >= 300",
+        );
+        assert!(
+            sql.contains("last_seen - first_seen"),
+            "typed alias subtraction missing: {sql}"
+        );
+        assert!(
+            !sql.contains("toFloat64OrNull(toString(last_seen))")
+                && !sql.contains("toFloat64OrNull(toString(first_seen))"),
+            "DateTime aliases must not be string-cast to nullable floats: {sql}"
+        );
+    }
+
+    #[test]
+    fn eval_context_min_max_are_scalar_not_second_stage_aggregates() {
+        let sql = sql_for(
+            "* | stats min(timestamp) as first_seen, max(timestamp) as last_seen by user | \
+             where (max(last_seen) - min(first_seen)) < 900",
+        );
+        assert!(
+            sql.contains("last_seen - first_seen"),
+            "single-argument eval min/max must collapse to their typed operand: {sql}"
+        );
+        assert!(
+            !sql.contains("max(last_seen)") && !sql.contains("min(first_seen)"),
+            "where must not introduce a second aggregation stage: {sql}"
+        );
+    }
+
+    #[test]
+    fn ordinary_where_generation_remains_on_the_existing_path() {
+        let sql = sql_for("* | where source_type=windows_sysmon");
+        assert!(
+            sql.contains("source_type = 'windows_sysmon'"),
+            "ordinary filter SQL changed: {sql}"
+        );
+    }
+
+    #[test]
+    fn raw_string_backed_fields_keep_numeric_safety_casts() {
+        let sql = sql_for("* | where (ext.left_value - ext.right_value) > 10");
+        assert!(
+            sql.contains("toFloat64OrNull(toString(\"ext.left_value\"))")
+                && sql.contains("toFloat64OrNull(toString(\"ext.right_value\"))"),
+            "raw extension fields must retain numeric safety casts: {sql}"
         );
     }
 }

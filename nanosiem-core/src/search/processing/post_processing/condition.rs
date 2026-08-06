@@ -313,6 +313,9 @@ pub fn evaluate_condition_on_json(condition: &SearchExpr, row: &serde_json::Valu
             // Would need full eval engine for post-processing evaluation
             false
         }
+        SearchExpr::EvalPredicate(expression) => evaluate_expression_on_json(expression, row)
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
         SearchExpr::LiteralComparison { left, op, right } => {
             // Compare two literal strings - used for parameter expansion checks
             let right_str = match right {
@@ -368,7 +371,28 @@ pub fn evaluate_expression_on_json(
             }
         }
         EvalExpression::FunctionCall { name, args } => {
-            match name.as_str() {
+            let normalized_name = name.to_ascii_lowercase();
+            match normalized_name.as_str() {
+                "min" | "max" => {
+                    let mut values = args.iter().map(|arg| evaluate_expression_on_json(arg, row));
+                    let first = values.next()??;
+                    values.try_fold(first, |best, candidate| {
+                        let candidate = candidate?;
+                        let ordering = match (best.as_f64(), candidate.as_f64()) {
+                            (Some(left), Some(right)) => left.partial_cmp(&right),
+                            _ => match (best.as_str(), candidate.as_str()) {
+                                (Some(left), Some(right)) => Some(left.cmp(right)),
+                                _ => None,
+                            },
+                        }?;
+                        let take_candidate = if normalized_name == "min" {
+                            ordering.is_gt()
+                        } else {
+                            ordering.is_lt()
+                        };
+                        Some(if take_candidate { candidate } else { best })
+                    })
+                }
                 "now" => {
                     // Return current time as ISO string
                     let now = chrono::Utc::now();
@@ -397,6 +421,21 @@ pub fn evaluate_expression_on_json(
 
             match op {
                 BinaryOperator::Sub => {
+                    // SPL timestamps are numeric epoch values. Preserve those
+                    // semantics when aggregate aliases arrive as ISO strings.
+                    if let (Some(left_str), Some(right_str)) =
+                        (left_val.as_str(), right_val.as_str())
+                    {
+                        if let (Some(left_dt), Some(right_dt)) = (
+                            parse_datetime_flexible(left_str),
+                            parse_datetime_flexible(right_str),
+                        ) {
+                            return Some(serde_json::json!(
+                                left_dt.signed_duration_since(right_dt).num_milliseconds() as f64
+                                    / 1000.0
+                            ));
+                        }
+                    }
                     // Handle datetime - interval
                     if let Some(left_str) = left_val.as_str() {
                         if let Some(dt) = parse_datetime_flexible(left_str) {
@@ -442,8 +481,88 @@ pub fn evaluate_expression_on_json(
                     }
                     None
                 }
-                _ => None,
+                BinaryOperator::Eq => Some(serde_json::Value::Bool(left_val == right_val)),
+                BinaryOperator::Ne => Some(serde_json::Value::Bool(left_val != right_val)),
+                BinaryOperator::Gt
+                | BinaryOperator::Lt
+                | BinaryOperator::Gte
+                | BinaryOperator::Lte => {
+                    let ordering = match (left_val.as_f64(), right_val.as_f64()) {
+                        (Some(left), Some(right)) => left.partial_cmp(&right),
+                        _ => match (left_val.as_str(), right_val.as_str()) {
+                            (Some(left), Some(right)) => Some(left.cmp(right)),
+                            _ => None,
+                        },
+                    }?;
+                    Some(serde_json::Value::Bool(match op {
+                        BinaryOperator::Gt => ordering.is_gt(),
+                        BinaryOperator::Lt => ordering.is_lt(),
+                        BinaryOperator::Gte => ordering.is_ge(),
+                        BinaryOperator::Lte => ordering.is_le(),
+                        _ => unreachable!(),
+                    }))
+                }
+                BinaryOperator::Mod => {
+                    let left = left_val.as_f64()?;
+                    let right = right_val.as_f64()?;
+                    (right != 0.0).then(|| serde_json::json!(left % right))
+                }
+                BinaryOperator::And
+                | BinaryOperator::Or
+                | BinaryOperator::Concat
+                | BinaryOperator::Contains
+                | BinaryOperator::Like => None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod nan2331_where_arithmetic_tests {
+    use super::*;
+    use crate::query::{parse_query, Command, Query};
+
+    fn where_condition(npl: &str) -> SearchExpr {
+        match parse_query(npl).unwrap() {
+            Query::Piped {
+                command: Command::Where { condition },
+                ..
+            } => condition,
+            other => panic!("expected piped where query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluates_numeric_stats_alias_arithmetic() {
+        let condition =
+            where_condition("* | where event_count > 5 AND (last_seen - first_seen) >= 300");
+
+        assert!(evaluate_condition_on_json(
+            &condition,
+            &serde_json::json!({
+                "event_count": 6,
+                "first_seen": 100,
+                "last_seen": 450
+            })
+        ));
+        assert!(!evaluate_condition_on_json(
+            &condition,
+            &serde_json::json!({
+                "event_count": 6,
+                "first_seen": 300,
+                "last_seen": 450
+            })
+        ));
+    }
+
+    #[test]
+    fn evaluates_datetime_alias_subtraction_and_case_insensitive_min_max() {
+        let condition = where_condition("* | where (MAX(last_seen) - MIN(first_seen)) >= 300");
+        let row = serde_json::json!({
+            "first_seen": "2026-08-05T10:00:00Z",
+            "last_seen": "2026-08-05T10:10:00Z"
+        });
+
+        assert!(evaluate_condition_on_json(&condition, &row));
     }
 }

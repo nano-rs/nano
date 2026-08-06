@@ -16,6 +16,7 @@ use super::error::MarketplaceError;
 use super::repository::MarketplaceRepository;
 use super::types::*;
 use crate::crypto::EncryptionService;
+use crate::inputlookup::SsrfValidator;
 
 /// Service for installing/uninstalling enrichments from the marketplace
 pub struct MarketplaceInstallService {
@@ -78,6 +79,13 @@ impl MarketplaceInstallService {
             return Err(MarketplaceError::CredentialRequired);
         }
 
+        // NAN-2343: same validation the update path runs, before anything is
+        // written. An install that stores a malformed download URL is exactly
+        // as broken as an update that does.
+        if let Some(ref creds) = request.credentials {
+            validate_credential_values(&entry, creds)?;
+        }
+
         // Encrypt credentials if provided
         let (ciphertext, nonce) = if let Some(ref creds) = request.credentials {
             let (ct, n) = self.encrypt_credentials(creds)?;
@@ -110,6 +118,16 @@ impl MarketplaceInstallService {
             .repository
             .set_installed(slug, true, ciphertext.as_deref(), nonce.as_deref())
             .await?;
+
+        // NAN-2343: propagate install-time credentials into the backend's own
+        // table. Without this a `download_url` typed into the install dialog
+        // lived only as catalog ciphertext, leaving `enrichment_sources` with a
+        // NULL URL while the UI reported the enrichment as configured.
+        // Runs against `updated` so `installed`/`native_source_id` reflect the
+        // row we just wrote.
+        if let Some(ref creds) = request.credentials {
+            self.push_native_credentials(&updated, creds).await?;
+        }
 
         info!(slug = %slug, backend = %backend, "Installed enrichment from marketplace");
         Ok(updated)
@@ -335,6 +353,21 @@ impl MarketplaceInstallService {
         slug: &str,
         credentials: &serde_json::Value,
     ) -> Result<(), MarketplaceError> {
+        let entry = self.repository.get_catalog_entry(slug).await?;
+
+        // NAN-2343: validate BEFORE anything is persisted, so a bad value never
+        // reaches the catalog ciphertext or the operational column. Previously
+        // the only feedback was a sync failure minutes-to-hours later, reported
+        // as an SSRF rejection.
+        //
+        // Ordered ahead of the masked/empty shortcut deliberately: a payload of
+        // `{"download_url": ""}` is "empty" by that guard's reckoning and would
+        // return success having written nothing, so clearing the field and
+        // saving reported "Credentials saved" while the broken URL stayed put.
+        // The validator passes masked sentinels through untouched so the
+        // NAN-1107 skip below still owns that case.
+        validate_credential_values(&entry, credentials)?;
+
         if credentials_payload_is_masked_or_empty(credentials) {
             // Promoted from info! — under correct frontend operation the
             // handler skips calling us when no credentials field is in the
@@ -349,49 +382,13 @@ impl MarketplaceInstallService {
             return Ok(());
         }
 
-        let entry = self.repository.get_catalog_entry(slug).await?;
-
         // Encrypt and store on marketplace_catalog
         let (ciphertext, nonce) = self.encrypt_credentials(credentials)?;
         self.repository
             .update_catalog_config(slug, None, None, Some(&ciphertext), Some(&nonce))
             .await?;
 
-        // For native enrichments, also push relevant fields to the underlying tables
-        if entry.execution_backend == "native" {
-            if let Some(ref source_id) = entry.native_source_id {
-                // IPinfo uses download_url on enrichment_sources
-                if let Some(url) = credentials.get("download_url").and_then(|v| v.as_str()) {
-                    sqlx::query("UPDATE enrichment_sources SET download_url = $2, updated_at = NOW() WHERE id = $1")
-                        .bind(source_id)
-                        .bind(url)
-                        .execute(&self.pool)
-                        .await?;
-                }
-                // Agent providers use api_key on agent_enrichment_providers
-                // The column stores JSON-encoded {"ciphertext": "...", "nonce": "..."} bytes
-                if let Some(api_key) = credentials.get("API_KEY").and_then(|v| v.as_str()) {
-                    let encrypted = self.encryption.encrypt(api_key.as_bytes()).map_err(|e| {
-                        MarketplaceError::Internal(format!("Failed to encrypt API key: {}", e))
-                    })?;
-                    let json = serde_json::json!({
-                        "ciphertext": encrypted.ciphertext,
-                        "nonce": encrypted.nonce,
-                    });
-                    let encrypted_bytes = serde_json::to_vec(&json).map_err(|e| {
-                        MarketplaceError::Internal(format!(
-                            "Failed to serialize encrypted key: {}",
-                            e
-                        ))
-                    })?;
-                    sqlx::query("UPDATE agent_enrichment_providers SET api_key_encrypted = $2, updated_at = NOW() WHERE id = $1")
-                        .bind(source_id)
-                        .bind(encrypted_bytes)
-                        .execute(&self.pool)
-                        .await?;
-                }
-            }
-        }
+        self.push_native_credentials(&entry, credentials).await?;
 
         // For identity providers, push credentials to identity_providers table
         if entry.execution_backend == "identity" {
@@ -415,6 +412,64 @@ impl MarketplaceInstallService {
     // =========================================================================
     // Private helpers
     // =========================================================================
+
+    /// Push credential fields that a native backend reads from its own table
+    /// rather than from `marketplace_catalog.credentials_encrypted`.
+    ///
+    /// NAN-2343: shared by `install` and `update_credentials`. Previously only
+    /// the update path did this, so a `download_url` supplied in the install
+    /// dialog was encrypted into the catalog and never reached
+    /// `enrichment_sources` — the source stayed unconfigured while the UI
+    /// showed a `CONFIGURED` badge (which only proves catalog ciphertext
+    /// exists). Callers must have run [`validate_credential_values`] first.
+    async fn push_native_credentials(
+        &self,
+        entry: &MarketplaceCatalogEntry,
+        credentials: &serde_json::Value,
+    ) -> Result<(), MarketplaceError> {
+        if entry.execution_backend != "native" {
+            return Ok(());
+        }
+        let Some(ref source_id) = entry.native_source_id else {
+            return Ok(());
+        };
+
+        // IPinfo uses download_url on enrichment_sources. Delegated to the
+        // enrichment repository rather than re-issuing the UPDATE here, so the
+        // clear-error / re-queue-on-change semantics have exactly one
+        // definition and cannot drift between the two configure surfaces that
+        // write this column (NAN-2343).
+        if let Some(url) = credentials.get("download_url").and_then(|v| v.as_str()) {
+            crate::enrichment::EnrichmentRepository::new(self.pool.clone())
+                .update_source_url(source_id, url)
+                .await
+                .map_err(|e| {
+                    MarketplaceError::Internal(format!("Failed to update download URL: {e}"))
+                })?;
+        }
+
+        // Agent providers use api_key on agent_enrichment_providers
+        // The column stores JSON-encoded {"ciphertext": "...", "nonce": "..."} bytes
+        if let Some(api_key) = credentials.get("API_KEY").and_then(|v| v.as_str()) {
+            let encrypted = self.encryption.encrypt(api_key.as_bytes()).map_err(|e| {
+                MarketplaceError::Internal(format!("Failed to encrypt API key: {}", e))
+            })?;
+            let json = serde_json::json!({
+                "ciphertext": encrypted.ciphertext,
+                "nonce": encrypted.nonce,
+            });
+            let encrypted_bytes = serde_json::to_vec(&json).map_err(|e| {
+                MarketplaceError::Internal(format!("Failed to serialize encrypted key: {}", e))
+            })?;
+            sqlx::query("UPDATE agent_enrichment_providers SET api_key_encrypted = $2, updated_at = NOW() WHERE id = $1")
+                .bind(source_id)
+                .bind(encrypted_bytes)
+                .execute(&self.pool)
+                .await?;
+        }
+
+        Ok(())
+    }
 
     /// Encrypt credentials JSON and return (ciphertext_bytes, nonce_string)
     fn encrypt_credentials(
@@ -615,119 +670,75 @@ fn credentials_payload_is_masked_or_empty(credentials: &serde_json::Value) -> bo
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn empty_object_is_masked_or_empty() {
-        assert!(credentials_payload_is_masked_or_empty(&json!({})));
+/// Validate credential values that a backend will later hand to a fetcher, so
+/// a malformed one is rejected at save time (NAN-2343).
+///
+/// Scoped to `native` entries. `download_url` is the one credential name whose
+/// shape this crate actually knows — it is copied into an operational column a
+/// background job dereferences — but the name is not reserved, so imposing
+/// IPinfo's http/https + SSRF contract on a third-party Deno or collector
+/// manifest that happens to use it would reject values that are perfectly
+/// valid for that backend.
+///
+/// Deliberately uses the **synchronous** [`SsrfValidator::validate_url`] rather
+/// than `validate_with_dns`. That covers the entire reported failure class —
+/// parse failures, bad schemes, literal loopback/metadata targets — without
+/// making a credential save depend on live DNS, which would fail on a
+/// transient resolver blip or in an air-gapped deployment. The full DNS-aware
+/// check plus address pinning still runs at fetch time, where it has to run
+/// regardless: DNS can change between save and fetch, so a save-time
+/// resolution proves nothing about the eventual connection.
+fn validate_credential_values(
+    entry: &MarketplaceCatalogEntry,
+    credentials: &serde_json::Value,
+) -> Result<(), MarketplaceError> {
+    if entry.execution_backend != "native" {
+        return Ok(());
     }
 
-    #[test]
-    fn all_empty_strings_is_masked_or_empty() {
-        assert!(credentials_payload_is_masked_or_empty(
-            &json!({"API_KEY": "", "OTHER": ""})
-        ));
+    let Some(value) = credentials.get("download_url") else {
+        // Absent means "not being changed" — the stored value stands.
+        return Ok(());
+    };
+
+    // Explicit JSON null reads as absent too, matching how
+    // `credentials_payload_is_masked_or_empty` classifies it. A client that
+    // sends nulls for untouched fields must keep getting the silent no-op
+    // rather than a 422.
+    if value.is_null() {
+        return Ok(());
     }
 
-    #[test]
-    fn masked_sentinel_strings_count_as_empty() {
-        assert!(credentials_payload_is_masked_or_empty(
-            &json!({"API_KEY": "••••••••"})
-        ));
-        assert!(credentials_payload_is_masked_or_empty(
-            &json!({"API_KEY": "***", "TOKEN": "••••••••"})
-        ));
+    let invalid = |reason: &str| MarketplaceError::InvalidCredential {
+        field: "download_url".to_string(),
+        reason: reason.to_string(),
+    };
+
+    let Some(url) = value.as_str() else {
+        // A number/bool/object/null would otherwise be dropped silently by the
+        // `as_str()` on the write path: accepted, never stored, reported saved.
+        return Err(invalid("must be a string"));
+    };
+
+    // Present-but-blank is a real submission (the operator cleared the field),
+    // not an absent one. Storing it would persist an empty string, which parses
+    // as `RelativeUrlWithoutBase` and reads back as an SSRF rejection.
+    if url.trim().is_empty() {
+        return Err(invalid("must not be empty"));
     }
 
-    #[test]
-    fn masked_sentinel_is_length_agnostic() {
-        // P2 follow-up: the original enumerated-list approach would have
-        // missed length variants. A 9-bullet, 13-bullet, or 32-star sentinel
-        // (the kind a "mask each typed char" UI might produce) must also
-        // route through the skip.
-        for n in 1..=64 {
-            let bullets: String = "•".repeat(n);
-            let stars: String = "*".repeat(n);
-            assert!(
-                credentials_payload_is_masked_or_empty(&json!({"API_KEY": bullets})),
-                "{} bullets should count as masked",
-                n
-            );
-            assert!(
-                credentials_payload_is_masked_or_empty(&json!({"API_KEY": stars})),
-                "{} stars should count as masked",
-                n
-            );
-        }
+    // A masked sentinel is a frontend round-tripping its own placeholder, which
+    // `credentials_payload_is_masked_or_empty` skips by design (NAN-1107).
+    // Rejecting it here would turn that silent, intentional no-op into a 422.
+    if is_masked_sentinel(url) {
+        return Ok(());
     }
 
-    #[test]
-    fn mixed_mask_characters_count_as_masked() {
-        // Don't care which mask char a future UI picks; we'd rather skip
-        // than overwrite.
-        assert!(credentials_payload_is_masked_or_empty(
-            &json!({"API_KEY": "•*●•*"})
-        ));
-    }
-
-    #[test]
-    fn real_credential_starting_with_mask_char_is_not_skipped() {
-        // Avoid the false-positive where someone's real key happens to lead
-        // with `*` — the trailing alphanumeric breaks the all-mask check.
-        assert!(!credentials_payload_is_masked_or_empty(&json!({
-            "API_KEY": "***real-value***"
-        })));
-    }
-
-    #[test]
-    fn null_values_count_as_empty() {
-        assert!(credentials_payload_is_masked_or_empty(
-            &json!({"API_KEY": null})
-        ));
-    }
-
-    #[test]
-    fn whitespace_only_strings_count_as_empty() {
-        assert!(credentials_payload_is_masked_or_empty(
-            &json!({"API_KEY": "   "})
-        ));
-    }
-
-    #[test]
-    fn real_credential_is_not_masked_or_empty() {
-        // A 48-char abuse.ch-style key.
-        assert!(!credentials_payload_is_masked_or_empty(&json!({
-            "API_KEY": "e6c7e5ed3c360c53e8fc66228751af99a21c45788fea66ad"
-        })));
-    }
-
-    #[test]
-    fn mixed_real_and_masked_is_treated_as_real() {
-        // A POST that re-sends some masked fields but also includes a real
-        // new value should still write — the user provided real material.
-        assert!(!credentials_payload_is_masked_or_empty(&json!({
-            "API_KEY": "real-value",
-            "REGION": "••••••••"
-        })));
-    }
-
-    #[test]
-    fn non_string_value_counts_as_real() {
-        // Numeric/bool credential configs (rare, but allowed) must not be
-        // silently dropped by the guard.
-        assert!(!credentials_payload_is_masked_or_empty(
-            &json!({"TIMEOUT_SECS": 30})
-        ));
-    }
-
-    #[test]
-    fn non_object_payload_does_not_skip() {
-        // Defensive: a non-object body falls through to the existing
-        // encrypt path rather than being silently swallowed.
-        assert!(!credentials_payload_is_masked_or_empty(&json!("string-body")));
-        assert!(!credentials_payload_is_masked_or_empty(&json!([1, 2, 3])));
-    }
+    SsrfValidator::http_allowed_validator()
+        .validate_url(url)
+        .map(|_| ())
+        .map_err(|e| invalid(&e.to_string()))
 }
+
+#[cfg(test)]
+mod tests;
