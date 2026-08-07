@@ -90,7 +90,7 @@ export type {
   CustomCollectorPreviewRequest, CustomCollectorPreviewEvent, CustomCollectorPreviewResponse,
   GenerateCustomCollectorCodeRequest, GenerateCustomCollectorCodeResponse,
 } from './integrations';
-export { collectorManifest } from './integrations';
+export { collectorManifest, streamNeedsAttention } from './integrations';
 
 /**
  * Cache transparency (NAN-1595). Parsed from the `x-nano-cache` / `x-nano-cache-age`

@@ -57,6 +57,13 @@ pub enum ParserRepositoryError {
     #[error("Missing permission: {0}")]
     Forbidden(String),
 
+    /// Importing would create a log source past the tenant's data-source tier
+    /// cap (NAN-2202). Distinct from `Forbidden`: the caller holds every
+    /// capability the operation needs, and the remedy is a plan change rather
+    /// than a grant. Maps to 403, matching `From<TierError> for ApiError`.
+    #[error("Tier limit exceeded: {0}")]
+    TierLimitExceeded(String),
+
     /// Caller passed a syntactically valid but semantically unacceptable
     /// request (e.g. a dispatch_source_config_id whose config_type doesn't
     /// match the parser's ingestion_method). Maps to 400.
@@ -65,6 +72,22 @@ pub enum ParserRepositoryError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+}
+
+/// NAN-2202: only an actual cap hit becomes `TierLimitExceeded`. A database
+/// fault while *reading* the tier settings or counting sources is still a
+/// database fault — reporting it as "tier limit exceeded" would send an
+/// operator to the billing page over a dropped connection. Either way the
+/// create is refused, so the guard stays fail-closed.
+impl From<crate::settings::tier::TierError> for ParserRepositoryError {
+    fn from(err: crate::settings::tier::TierError) -> Self {
+        use crate::settings::tier::TierError;
+        match err {
+            TierError::LimitExceeded(msg) => ParserRepositoryError::TierLimitExceeded(msg),
+            TierError::Database(e) => ParserRepositoryError::Database(e),
+            other => ParserRepositoryError::Internal(other.to_string()),
+        }
+    }
 }
 
 impl ParserRepositoryError {
@@ -96,6 +119,7 @@ impl ParserRepositoryError {
             ParserRepositoryError::SyncInProgress(_) => 409,
             ParserRepositoryError::RepositoryDisabled => 403,
             ParserRepositoryError::Forbidden(_) => 403,
+            ParserRepositoryError::TierLimitExceeded(_) => 403,
             _ => 500,
         }
     }

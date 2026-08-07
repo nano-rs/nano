@@ -37,23 +37,58 @@ export interface StreamStatus {
 /**
  * What happened when an enabled stream was given a log source (NAN-2192).
  *
- * Only present on create/update responses. Anything other than `linked` means
- * that stream is collecting into nothing the operator can see — which is the
- * whole reason this is surfaced rather than logged.
+ * Only present on create/update responses. Anything `streamNeedsAttention`
+ * flags means that stream is collecting into nothing the operator can see —
+ * which is the whole reason this is surfaced rather than logged.
  */
 export type StreamProvisionReport = {
   stream_id: string;
   source_type: string;
 } & (
-  | { status: 'linked'; log_source_id: string; created: boolean }
+  | {
+      status: 'linked';
+      log_source_id: string;
+      created: boolean;
+      /**
+       * Whether the log source is actually DEPLOYED to Vector (NAN-2202).
+       *
+       * `false` means the stream collects into nothing: the collector runs,
+       * authenticates, fetches events and POSTs them successfully, and they hit
+       * no route, because Vector never learned to handle this `source_type`.
+       * Zero data AND zero errors on every surface.
+       *
+       * Optional on the wire: a response from a pre-NAN-2202 API omits it, and
+       * `streamNeedsAttention` treats absent as not-deployed. That direction is
+       * deliberate — it surfaces the ambiguity rather than rendering an unknown
+       * state as healthy, which is the bug this field exists to end.
+       */
+      deployed?: boolean;
+    }
   // `declared_parser` is present when the collector manifest named the parser
   // it needs (NAN-2248) and no synced repository provides it. The remedy is to
   // sync that repository — not to look for a parser claiming `source_type`,
   // which by design nothing may claim.
   | { status: 'no_parser'; source_type: string; declared_parser?: string }
   | { status: 'not_permitted'; missing: string }
+  // NAN-2202: creating this stream's log source would exceed the data-source
+  // tier cap. Not a malfunction — the operator's next step is a plan change.
+  | { status: 'limit_exceeded'; message: string }
   | { status: 'failed'; error: string }
 );
+
+/**
+ * Whether a provisioning outcome is worth putting in front of an operator.
+ *
+ * The TypeScript half of `StreamProvisionReport::needs_attention()` in
+ * `nanosiem-enterprise/src/integrations/provisioning.rs` — keep the two in step.
+ *
+ * NAN-2202: `linked` alone is NOT success. A linked-but-undeployed stream looks
+ * healthy on every surface and collects into nothing, so it has to count here;
+ * treating any `linked` as fine is precisely how a dead feed stayed invisible.
+ */
+export function streamNeedsAttention(report: StreamProvisionReport): boolean {
+  return report.status !== 'linked' || report.deployed !== true;
+}
 
 export interface IntegrationInstance {
   id: string;

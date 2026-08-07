@@ -1859,6 +1859,7 @@ export interface ProviderCredentials {
 }
 
 export interface UpdateProviderCredentialsRequest {
+  /** Omit to keep the stored key; empty string removes it (NAN-2355). */
   api_key?: string;
   config?: Record<string, unknown>;
   enabled?: boolean;

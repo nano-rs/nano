@@ -37,7 +37,7 @@ import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
-import { api, collectorManifest } from '@/lib/api';
+import { api, collectorManifest, streamNeedsAttention } from '@/lib/api';
 import type {
   IntegrationInstance, MarketplaceCatalogEntry, StreamProvisionReport, StreamStatus,
 } from '@/lib/api';
@@ -440,14 +440,19 @@ function InstanceDialog({
  * failure this whole section exists to make impossible.
  */
 function ProvisioningNotice({ reports }: { reports: StreamProvisionReport[] }) {
-  const problems = reports.filter((r) => r.status !== 'linked');
+  const problems = reports.filter(streamNeedsAttention);
   if (problems.length === 0) return null;
 
   return (
     <div className="mx-3 mb-2 rounded border border-amber-500/40 bg-amber-500/5 px-3 py-2">
       <div className="flex items-center gap-1.5 font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-amber-600 dark:text-amber-400">
         <AlertTriangle className="h-[11px] w-[11px]" />
-        {problems.length} {problems.length === 1 ? 'stream has' : 'streams have'} no log source
+        {/* NAN-2202: not "no log source" any more. A linked-but-undeployed
+            stream HAS one — it just isn't routing — and a no_parser stream
+            collects unparsed rather than not at all. The per-stream lines below
+            carry the distinction; the heading only has to be true of all of
+            them. */}
+        {problems.length} {problems.length === 1 ? 'stream needs' : 'streams need'} attention
       </div>
       <ul className="mt-1.5 space-y-1">
         {problems.map((p) => (
@@ -480,6 +485,23 @@ function ProvisioningNotice({ reports }: { reports: StreamProvisionReport[] }) {
                 . Ask an administrator to provision this stream’s Log Source.
               </>
             )}
+            {/* NAN-2202: the stream IS linked and the log source exists — it
+                just never reached Vector, so the collector is POSTing events
+                into a route that does not exist. Deploying the log source is
+                the whole remedy, so link straight at it. */}
+            {p.status === 'linked' && (
+              <>
+                {' — log source created but not deployed, so Vector is not routing it. '}
+                {'Events are being collected and discarded. '}
+                <Link
+                  to={`/ingestion/log-sources/${p.log_source_id}`}
+                  className="text-primary hover:underline"
+                >
+                  Deploy it
+                </Link>
+              </>
+            )}
+            {p.status === 'limit_exceeded' && <> — {p.message}</>}
             {p.status === 'failed' && <> — {p.error}</>}
           </li>
         ))}
@@ -718,7 +740,11 @@ export function ConnectionsTab({ entry }: ConnectionsTabProps) {
               });
               return;
             }
-            const problems = reports.filter((report) => report.status !== 'linked');
+            // NAN-2202: an undeployed source counts as a problem, so a
+            // connection whose streams are linked-but-not-routing no longer
+            // hands the operator straight to a Log Source page that looks fine.
+            // They stay here, where `ProvisioningNotice` says what is wrong.
+            const problems = reports.filter(streamNeedsAttention);
             const logSourceIds = [
               ...new Set(
                 reports

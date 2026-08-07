@@ -75,6 +75,14 @@ impl LogSourceService {
         Ok(self.repository().find_by_name(name).await?)
     }
 
+    /// Enforce the data-source tier cap. See
+    /// [`crate::log_sources::enforce_data_source_limit`] — this is the
+    /// convenience form for callers that already hold a service and have no
+    /// transaction to serialize the check against.
+    pub async fn enforce_data_source_limit(&self) -> Result<(), crate::TierError> {
+        crate::log_sources::enforce_data_source_limit(&self.pool).await
+    }
+
     /// Create a new log source
     /// NAN-2311: reject a name whose GENERATED Vector identifier is already
     /// taken by another log source.

@@ -88,7 +88,8 @@ pub struct ProviderCredentialsResponse {
 /// Request to update provider credentials
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateProviderCredentialsRequest {
-    /// API key for the provider
+    /// API key for the provider. Omit (or null) to keep the stored key;
+    /// send an empty string to remove the stored key (NAN-2355).
     pub api_key: Option<String>,
     /// Provider-specific configuration (region, endpoint, etc.)
     pub config: Option<serde_json::Value>,
@@ -394,29 +395,41 @@ pub async fn update_ai_provider(
     // operators opt private endpoints in via NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS.
     validate_config_base_url(request.config.as_ref()).await?;
 
+    // NAN-2355: api_key is tri-state — absent keeps the stored key, a blank
+    // string removes it, anything else replaces it. Removal also resets the
+    // validation stamp, which described the key that no longer exists. Without
+    // an explicit remove path, a key saved for a direct endpoint (the
+    // Test-connection gate requires one) could never be evicted, and a stale
+    // key poisons credential-less providers like workers-ai on the managed path.
+    let clear_credentials = matches!(request.api_key.as_deref(), Some(k) if k.trim().is_empty());
+
     // Encrypt the API key if provided using AES-256-GCM
-    let encrypted_creds: Option<Vec<u8>> = if let Some(ref api_key) = request.api_key {
-        let encryption = EncryptionService::from_env();
-        let creds = serde_json::json!({ "api_key": api_key });
-        let encrypted = encryption
-            .encrypt_json(&creds)
-            .map_err(|e| ApiError::InternalError(format!("Encryption failed: {}", e)))?;
-        // Store as JSON: {"ciphertext": "...", "nonce": "..."}
-        Some(
-            serde_json::to_vec(&serde_json::json!({
-                "ciphertext": encrypted.ciphertext,
-                "nonce": encrypted.nonce
-            }))
-            .unwrap_or_default(),
-        )
-    } else {
-        None
+    let encrypted_creds: Option<Vec<u8>> = match request.api_key.as_deref() {
+        Some(api_key) if !api_key.trim().is_empty() => {
+            let encryption = EncryptionService::from_env();
+            let creds = serde_json::json!({ "api_key": api_key });
+            let encrypted = encryption
+                .encrypt_json(&creds)
+                .map_err(|e| ApiError::InternalError(format!("Encryption failed: {}", e)))?;
+            // Store as JSON: {"ciphertext": "...", "nonce": "..."}
+            Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "ciphertext": encrypted.ciphertext,
+                    "nonce": encrypted.nonce
+                }))
+                .unwrap_or_default(),
+            )
+        }
+        _ => None,
     };
 
     sqlx::query(
         r#"
         UPDATE provider_credentials
-        SET credentials_encrypted = COALESCE($2, credentials_encrypted),
+        SET credentials_encrypted = CASE WHEN $5 THEN NULL
+                                         ELSE COALESCE($2, credentials_encrypted) END,
+            last_validated_at = CASE WHEN $5 THEN NULL ELSE last_validated_at END,
+            validation_error = CASE WHEN $5 THEN NULL ELSE validation_error END,
             config = COALESCE($3, config),
             enabled = COALESCE($4, enabled),
             updated_at = NOW()
@@ -427,6 +440,7 @@ pub async fn update_ai_provider(
     .bind(&encrypted_creds)
     .bind(&request.config)
     .bind(&request.enabled)
+    .bind(clear_credentials)
     .execute(&state.pool)
     .await
     .map_err(|e| ApiError::InternalError(e.to_string()))?;
@@ -434,9 +448,10 @@ pub async fn update_ai_provider(
     tracing::info!(provider = %provider, "AI provider credentials updated");
 
     // When enabling a provider (with credentials), auto-enable the meloD master toggle
-    // and reload the AI service so it's immediately available.
+    // and reload the AI service so it's immediately available. A credential
+    // removal (blank api_key) is not an enable, even though api_key is present.
     let provider_being_enabled =
-        request.enabled == Some(true) || (request.api_key.is_some() && request.enabled.is_none());
+        request.enabled == Some(true) || (encrypted_creds.is_some() && request.enabled.is_none());
 
     if provider_being_enabled {
         // Check if the master toggle is off and auto-enable it

@@ -223,6 +223,14 @@ impl ParserRepositoryService {
             )));
         }
 
+        // NAN-2202: read the tier cap BEFORE opening the transaction. Reading it
+        // borrows a second pooled connection, and doing that while holding an
+        // open transaction deadlocks a small pool — the transaction will not
+        // give its connection back until it commits, and the commit is waiting
+        // on a connection that never frees. The count itself runs on `tx`
+        // further down, where it belongs.
+        let cap = crate::log_sources::data_source_cap(&self.pg_pool).await?;
+
         let mut tx = self
             .pg_pool
             .begin()
@@ -277,6 +285,13 @@ impl ParserRepositoryService {
         grants
             .ensure(TargetEffect::LogSourceCreate)
             .map_err(|effect| ParserRepositoryError::Forbidden(effect.permission().to_string()))?;
+
+        // NAN-2202: same placement, same reason — reuse consumes no tier slot,
+        // so the cap is checked only once we know we are inserting. Counted on
+        // `tx`, inside the per-source-type advisory lock taken above, so two
+        // concurrent provisions of this stream cannot both read "one slot left"
+        // and both insert.
+        cap.enforce(&mut *tx).await?;
 
         let id = Uuid::new_v4();
         let base_name = format!(
@@ -895,6 +910,18 @@ impl ParserRepositoryService {
         grants
             .ensure(TargetEffect::LogSourceCreate)
             .map_err(|effect| ParserRepositoryError::Forbidden(effect.permission().to_string()))?;
+
+        // NAN-2202: and the OTHER thing that route gates — the data-source tier
+        // cap. Without this, importing a repository parser (by hand, or via
+        // collector stream provisioning) creates an active source past the
+        // limit, because this path INSERTs `lifecycle_status = 'active'`
+        // directly and never passes through the handler that checks.
+        //
+        // Checked before the insert transaction opens rather than inside it: the
+        // `AlreadyImported` short-circuit above has already established that a
+        // row will be created, and there is no lock here to serialize against,
+        // so this carries the same best-effort semantics as the HTTP handler.
+        crate::log_sources::enforce_data_source_limit(&self.pg_pool).await?;
 
         // NAN-1149: an enrichment parser (kind = "enrichment") deploys as a
         // `kind='enrichment'` log_sources row carrying the per-source normalize

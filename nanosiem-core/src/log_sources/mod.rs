@@ -7,10 +7,12 @@
 
 mod repository;
 mod service;
+mod tier_guard;
 mod types;
 mod version_repository;
 
 pub use repository::{LogSourceRepository, LogSourceRepositoryError};
 pub use service::{LogSourceService, LogSourceServiceError};
+pub use tier_guard::{data_source_cap, enforce_data_source_limit, DataSourceCap};
 pub use types::*;
 pub use version_repository::{LogSourceVersionError, LogSourceVersionRepository};

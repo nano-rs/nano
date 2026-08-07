@@ -22,7 +22,7 @@ use nanosiem_core::audit::{
     AuditEvent, AuditSource, ClientContext, CUSTOM_INTEGRATION_CREATED, CUSTOM_INTEGRATION_DELETED,
     CUSTOM_INTEGRATION_PREVIEWED, CUSTOM_INTEGRATION_UPDATED, INTEGRATION_INSTANCE_CREATED,
     INTEGRATION_INSTANCE_DELETED, INTEGRATION_INSTANCE_UPDATED, INTEGRATION_RUN_TRIGGERED,
-    LOG_SOURCE_CREATED,
+    LOG_SOURCE_CREATED, LOG_SOURCE_DEPLOYED,
 };
 use nanosiem_core::auth::permissions;
 use nanosiem_core::crypto::EncryptionService;
@@ -796,10 +796,15 @@ async fn build_response(
     })
 }
 
-/// Audit each first-class Log Source actually created as a side effect of
-/// collector provisioning. The integration-instance event cannot substitute
-/// for the target resource's own audit trail.
-fn audit_created_log_sources(
+/// Audit each first-class Log Source created, and each one deployed, as a side
+/// effect of collector provisioning. The integration-instance event cannot
+/// substitute for the target resource's own audit trail.
+///
+/// Two distinct events from one pass over the reports, because they are two
+/// distinct facts about a resource that outlives this request: creation, and a
+/// Vector config regeneration plus reload. A stream can produce either, both, or
+/// neither.
+fn audit_provisioned_log_sources(
     state: &AppState,
     auth: &AuthContext,
     client: &ClientContext,
@@ -809,30 +814,71 @@ fn audit_created_log_sources(
     for report in reports {
         let StreamProvisionOutcome::Linked {
             log_source_id,
-            created: true,
+            created,
+            newly_deployed,
+            ..
         } = &report.outcome
         else {
             continue;
         };
 
-        state.emit_audit(
-            AuditEvent::builder(AuditSource::LogSource, LOG_SOURCE_CREATED)
-                .actor(Some(auth.user_id()), None)
-                .api_key(auth.api_key_id, auth.api_key_name.clone())
-                .resource(
-                    "log_source",
-                    Some(*log_source_id),
-                    Some(report.source_type.clone()),
-                )
-                .client_context(client)
-                .details(serde_json::json!({
-                    "source": "collector_stream_provisioning",
-                    "integration_instance_id": instance_id.to_string(),
-                    "stream_id": report.stream_id.clone(),
-                    "source_type": report.source_type.clone(),
-                }))
-                .build(),
-        );
+        // Shared by both events: which collector stream caused this, so an
+        // auditor reading the log source's history can trace it back without
+        // correlating timestamps against the instance event.
+        let provenance = serde_json::json!({
+            "source": "collector_stream_provisioning",
+            "integration_instance_id": instance_id.to_string(),
+            "stream_id": report.stream_id.clone(),
+            "source_type": report.source_type.clone(),
+        });
+
+        // `deployed` is deliberately not consulted here (NAN-2202): this audits
+        // the CREATION of a log source, which happened either way. Whether it
+        // also reached Vector is the separate event below.
+        if *created {
+            state.emit_audit(
+                AuditEvent::builder(AuditSource::LogSource, LOG_SOURCE_CREATED)
+                    .actor(Some(auth.user_id()), None)
+                    .api_key(auth.api_key_id, auth.api_key_name.clone())
+                    .resource(
+                        "log_source",
+                        Some(*log_source_id),
+                        Some(report.source_type.clone()),
+                    )
+                    .client_context(client)
+                    .details(provenance.clone())
+                    .build(),
+            );
+        }
+
+        // NAN-2202: `newly_deployed`, not `deployed`. An automatic deploy
+        // regenerates Vector config from every enabled source and reloads the
+        // pipeline — a security-relevant change to how the platform ingests, and
+        // until now it happened with no audit record at all. Gated on the call
+        // having actually done it, so re-saving an already-healthy collector
+        // does not write a config-change event for a no-op.
+        if *newly_deployed {
+            state.emit_audit(
+                AuditEvent::builder(AuditSource::LogSource, LOG_SOURCE_DEPLOYED)
+                    .actor(Some(auth.user_id()), None)
+                    .api_key(auth.api_key_id, auth.api_key_name.clone())
+                    .resource(
+                        "log_source",
+                        Some(*log_source_id),
+                        Some(report.source_type.clone()),
+                    )
+                    .client_context(client)
+                    .details(serde_json::json!({
+                        "success": true,
+                        "source": "collector_stream_provisioning",
+                        "integration_instance_id": instance_id.to_string(),
+                        "stream_id": report.stream_id.clone(),
+                        "source_type": report.source_type.clone(),
+                        "created_by_same_request": *created,
+                    }))
+                    .build(),
+            );
+        }
     }
 }
 
@@ -1437,7 +1483,7 @@ pub async fn create_instance(
     // still gets their instance saved; the report says which streams have no
     // log source and why.
     let parsers = ParserRepositoryService::new(state.pool.clone());
-    let provisioner = StreamProvisioner::new(&repo, &parsers);
+    let provisioner = StreamProvisioner::new(&repo, &parsers, &state.log_source_service);
     let provisioning = provisioner
         .reconcile(
             instance.id,
@@ -1445,6 +1491,10 @@ pub async fn create_instance(
             &instance.enabled_streams,
             Some(auth.user_id()),
             &held_target_grants(&auth),
+            // NAN-2202: the CALLER's deploy permission, resolved here rather than
+            // assumed by the provisioner. Without it the stream is reported as
+            // linked-but-undeployed instead of silently escalating.
+            auth.has_permission(permissions::LOG_SOURCES_DEPLOY),
         )
         .await
         .unwrap_or_else(|e| {
@@ -1455,7 +1505,7 @@ pub async fn create_instance(
             Vec::new()
         });
 
-    audit_created_log_sources(&state, &auth, &client, instance.id, &provisioning);
+    audit_provisioned_log_sources(&state, &auth, &client, instance.id, &provisioning);
 
     state.emit_audit(
         AuditEvent::builder(AuditSource::LogSource, INTEGRATION_INSTANCE_CREATED)
@@ -1563,7 +1613,7 @@ pub async fn update_instance(
     // still gets their instance saved; the report says which streams have no
     // log source and why.
     let parsers = ParserRepositoryService::new(state.pool.clone());
-    let provisioner = StreamProvisioner::new(&repo, &parsers);
+    let provisioner = StreamProvisioner::new(&repo, &parsers, &state.log_source_service);
     let provisioning = provisioner
         .reconcile(
             instance.id,
@@ -1571,6 +1621,10 @@ pub async fn update_instance(
             &instance.enabled_streams,
             Some(auth.user_id()),
             &held_target_grants(&auth),
+            // NAN-2202: the CALLER's deploy permission, resolved here rather than
+            // assumed by the provisioner. Without it the stream is reported as
+            // linked-but-undeployed instead of silently escalating.
+            auth.has_permission(permissions::LOG_SOURCES_DEPLOY),
         )
         .await
         .unwrap_or_else(|e| {
@@ -1581,7 +1635,7 @@ pub async fn update_instance(
             Vec::new()
         });
 
-    audit_created_log_sources(&state, &auth, &client, instance.id, &provisioning);
+    audit_provisioned_log_sources(&state, &auth, &client, instance.id, &provisioning);
 
     state.emit_audit(
         AuditEvent::builder(AuditSource::LogSource, INTEGRATION_INSTANCE_UPDATED)
