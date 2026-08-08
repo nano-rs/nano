@@ -58,8 +58,9 @@ import {
   NavGear,
   NavCollapse,
 } from '@/components/layout/nav-icons';
-import { PivtIcon } from '@/enterprise/icons/PivtIcon';
+import { PivtIcon } from '@/components/icons/PivtIcon';
 import { cn } from '@/lib/utils';
+import { isPlaceholderDimensionDetail } from '@/lib/siem-health-placeholders';
 import { useAuth } from '@/contexts/AuthContext';
 import { useOnboardingProgress, useSiemHealthLatest, useIngestionHistory } from '@/hooks/use-api';
 import { VersionBadge } from '@/components/VersionBadge';
@@ -251,7 +252,10 @@ const secondaryMainNavigation: NavItem[] = [
   { name: 'Notebooks', href: '/notebooks', icon: NavList, permissions: 'notebooks:view', capability: 'notebooks' },
   { name: 'Prevalence', href: '/prevalence', icon: NavChart, permissions: 'prevalence:view' },
   { name: 'Risk', href: '/risk', icon: NavBars, permissions: 'risk:view', capability: 'risk' },
-  { name: 'Health', href: '/platform/health', icon: NavInfo, permissions: 'settings:view', capability: 'siemHealth' },
+  // NAN-2357: every /api/siem-health handler requires SETTINGS_SYSTEM, so the
+  // nav must too — otherwise settings:view holders get a menu item that leads
+  // to an empty page (the 403 renders as "No health reports yet").
+  { name: 'Health', href: '/platform/health', icon: NavInfo, permissions: 'settings:system', capability: 'siemHealth' },
 ];
 
 /**
@@ -446,7 +450,7 @@ function StatusBar() {
   // back to "N% ingest" from the score if the string isn't populated. Filter
   // out the AI-unavailable placeholder so open builds drop down to score.
   const rawIngestDetail = siemHealth?.dimension_details?.ingestion?.trim();
-  const ingestDetail = rawIngestDetail === 'AI analysis unavailable' ? undefined : rawIngestDetail;
+  const ingestDetail = isPlaceholderDimensionDetail(rawIngestDetail) ? undefined : rawIngestDetail;
   // The narrative is markdown; strip inline formatting for the single-line
   // footer cell so `**foo**` etc. don't render as literal asterisks (F-2).
   const ingestDetailDisplay = ingestDetail ? stripInlineMarkdown(ingestDetail) : undefined;

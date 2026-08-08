@@ -26,7 +26,7 @@ export function QuickActions() {
             size="sm"
             className={`${action.color} rounded-xl h-9 px-3 text-xs font-medium`}
           >
-            <action.icon className="w-3.5 h-3.5 mr-1.5" />
+            <action.icon className="w-3.5 h-3.5" />
             {action.label}
           </Button>
         </Link>

@@ -39,7 +39,7 @@ export function SearchHistory({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogTrigger asChild>
         <Button variant="outline" className="bg-card border-border text-foreground hover:bg-accent rounded-xl transition-all">
-          <History className="w-4 h-4 mr-2" />
+          <History className="w-4 h-4" />
           History
         </Button>
       </DialogTrigger>
@@ -117,7 +117,7 @@ export function SearchHistory({
               onClick={() => setShowClearConfirm(true)}
               className="bg-transparent border-red-500/30 text-red-400 hover:bg-red-500/10 rounded-lg"
             >
-              <Trash2 className="w-4 h-4 mr-2" />
+              <Trash2 className="w-4 h-4" />
               Clear All History
             </Button>
           </DialogFooter>

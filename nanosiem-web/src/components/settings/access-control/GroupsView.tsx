@@ -132,7 +132,7 @@ function GroupDetailView({ group, members, membersLoading, onEdit, onDelete }: G
           <div className="flex items-center gap-2 shrink-0">
             {canEdit && !group.is_system && (
               <Button size="sm" variant="outline" className="h-7 text-[11.5px] px-2.5" onClick={onEdit}>
-                <PencilLine className="w-[11px] h-[11px] mr-1" />
+                <PencilLine className="w-[11px] h-[11px]" />
                 Edit
               </Button>
             )}

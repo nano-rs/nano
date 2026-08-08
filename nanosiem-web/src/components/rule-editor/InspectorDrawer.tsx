@@ -20,8 +20,9 @@ import {
   Shield,
   History,
 } from 'lucide-react';
-import { PivtIcon } from '@/enterprise/icons/PivtIcon';
+import { PivtIcon } from '@/components/icons/PivtIcon';
 import { cn } from '@/lib/utils';
+import { useCapabilities } from '@/hooks/use-capabilities';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import type { AiTriageHints, CaseVisibility, TestDetectionResult } from '@/lib/api/types';
 import { AiTriageHintsEditor } from '@/enterprise/components/detection/editor/AiTriageHintsEditor';
@@ -111,7 +112,25 @@ function TabButton({
 
 export function InspectorDrawer(props: InspectorDrawerProps) {
   const { collapsed, onToggle, disabled, pendingVersionFocusId } = props;
-  const [tab, setTab] = useState<TabId>('ai');
+
+  // NAN-2356: the pivt and Cases tabs render enterprise components that resolve
+  // to `return null` stubs in open builds. Without these gates the tab buttons
+  // still appeared and opened a blank panel.
+  const { capabilities } = useCapabilities();
+  const showAiTab = capabilities.melod;
+  const showCasesTab = capabilities.cases;
+
+  const [tab, setTab] = useState<TabId>(showAiTab ? 'ai' : 'versions');
+
+  // Capabilities arrive from an async fetch and start at the enterprise-everywhere
+  // fallback, so a tab chosen on the first render can become hidden a moment
+  // later. Fall back to Versions (always core) rather than stranding the drawer
+  // on an invisible tab.
+  useEffect(() => {
+    if ((tab === 'ai' && !showAiTab) || (tab === 'cases' && !showCasesTab)) {
+      setTab('versions');
+    }
+  }, [tab, showAiTab, showCasesTab]);
 
   // When a parent surface requests a version focus, switch to the versions
   // tab so the inner tab can pick it up. The id itself stays in parent
@@ -133,32 +152,36 @@ export function InspectorDrawer(props: InspectorDrawerProps) {
           <PanelRight className="w-4 h-4" strokeWidth={1.75} />
         </button>
         <div className="h-px w-6 bg-border my-1" />
-        <button
-          type="button"
-          onClick={() => {
-            if (disabled) return;
-            setTab('ai');
-            onToggle();
-          }}
-          disabled={disabled}
-          title="pivt triage guidance"
-          className="h-8 w-8 rounded hover:bg-[color-mix(in_srgb,var(--foreground)_5%,transparent)] text-[var(--primary)] inline-flex items-center justify-center disabled:opacity-40"
-        >
-          <PivtIcon className="w-4 h-4" />
-        </button>
-        <button
-          type="button"
-          onClick={() => {
-            if (disabled) return;
-            setTab('cases');
-            onToggle();
-          }}
-          disabled={disabled}
-          title="Case permissions"
-          className="h-8 w-8 rounded hover:bg-[color-mix(in_srgb,var(--foreground)_5%,transparent)] text-muted-foreground hover:text-foreground inline-flex items-center justify-center disabled:opacity-40"
-        >
-          <Shield className="w-4 h-4" strokeWidth={1.75} />
-        </button>
+        {showAiTab && (
+          <button
+            type="button"
+            onClick={() => {
+              if (disabled) return;
+              setTab('ai');
+              onToggle();
+            }}
+            disabled={disabled}
+            title="pivt triage guidance"
+            className="h-8 w-8 rounded hover:bg-[color-mix(in_srgb,var(--foreground)_5%,transparent)] text-[var(--primary)] inline-flex items-center justify-center disabled:opacity-40"
+          >
+            <PivtIcon className="w-4 h-4" />
+          </button>
+        )}
+        {showCasesTab && (
+          <button
+            type="button"
+            onClick={() => {
+              if (disabled) return;
+              setTab('cases');
+              onToggle();
+            }}
+            disabled={disabled}
+            title="Case permissions"
+            className="h-8 w-8 rounded hover:bg-[color-mix(in_srgb,var(--foreground)_5%,transparent)] text-muted-foreground hover:text-foreground inline-flex items-center justify-center disabled:opacity-40"
+          >
+            <Shield className="w-4 h-4" strokeWidth={1.75} />
+          </button>
+        )}
         <button
           type="button"
           onClick={() => {
@@ -180,8 +203,12 @@ export function InspectorDrawer(props: InspectorDrawerProps) {
     <aside className="w-[360px] bg-[var(--panel)] border-l border-border flex flex-col shrink-0 min-h-0">
       <div className="h-10 border-b border-border flex items-center px-2 shrink-0">
         <div className="flex-1 flex items-center gap-0">
-          <TabButton active={tab === 'ai'} onClick={() => setTab('ai')} icon={<PivtIcon className="w-3 h-3" />} label="pivt" />
-          <TabButton active={tab === 'cases'} onClick={() => setTab('cases')} icon={<Shield className="w-3 h-3" strokeWidth={1.75} />} label="Cases" />
+          {showAiTab && (
+            <TabButton active={tab === 'ai'} onClick={() => setTab('ai')} icon={<PivtIcon className="w-3 h-3" />} label="pivt" />
+          )}
+          {showCasesTab && (
+            <TabButton active={tab === 'cases'} onClick={() => setTab('cases')} icon={<Shield className="w-3 h-3" strokeWidth={1.75} />} label="Cases" />
+          )}
           <TabButton active={tab === 'versions'} onClick={() => setTab('versions')} icon={<History className="w-3 h-3" strokeWidth={1.75} />} label="Versions" />
         </div>
         <button
@@ -194,8 +221,8 @@ export function InspectorDrawer(props: InspectorDrawerProps) {
         </button>
       </div>
 
-      {tab === 'ai' && <AiTab {...props} />}
-      {tab === 'cases' && (
+      {tab === 'ai' && showAiTab && <AiTab {...props} />}
+      {tab === 'cases' && showCasesTab && (
         <InspectorCasesTab
           visibility={props.caseVisibility}
           groupIds={props.caseGroupIds}
@@ -232,6 +259,9 @@ function AiTab({
   ruleId,
   readOnly,
 }: InspectorDrawerProps) {
+  const { capabilities } = useCapabilities();
+  const showPlaybooks = capabilities.playbooks;
+
   return (
     <ScrollArea className="flex-1 min-h-0">
       <div className="p-3 space-y-4">
@@ -250,6 +280,10 @@ function AiTab({
           />
         </div>
 
+        {/* NAN-2356: playbooks are a SEPARATE capability from meloD. The tab is
+            shown on `melod`, so without this the section would render its header
+            and two null components the day the two are licensed independently. */}
+        {showPlaybooks && (
         <div className="pt-4 border-t border-border">
           <div className="text-[10px] font-mono uppercase tracking-[0.12em] font-semibold text-muted-foreground mb-2">
             Playbook assignment
@@ -268,6 +302,7 @@ function AiTab({
             <LinkedPlaybooksPreview ruleId={ruleId} />
           </div>
         </div>
+        )}
       </div>
     </ScrollArea>
   );

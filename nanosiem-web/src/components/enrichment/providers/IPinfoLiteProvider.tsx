@@ -425,7 +425,7 @@ export function IPinfoLiteProvider({ source, onRefresh }: IPinfoLiteProviderProp
                       <Loader2 className="w-4 h-4 animate-spin" />
                     ) : (
                       <>
-                        <Save className="w-4 h-4 mr-2" />
+                        <Save className="w-4 h-4" />
                         Save
                       </>
                     )}
@@ -468,12 +468,12 @@ export function IPinfoLiteProvider({ source, onRefresh }: IPinfoLiteProviderProp
                 >
                   {syncing || source.last_sync_status === 'in_progress' ? (
                     <>
-                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                      <Loader2 className="w-4 h-4 animate-spin" />
                       Syncing...
                     </>
                   ) : (
                     <>
-                      <RefreshCw className="w-4 h-4 mr-2" />
+                      <RefreshCw className="w-4 h-4" />
                       Sync Now
                     </>
                   )}

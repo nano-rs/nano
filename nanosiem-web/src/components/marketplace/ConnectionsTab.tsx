@@ -419,7 +419,7 @@ function InstanceDialog({
             }
             onClick={() => save.mutate()}
           >
-            {save.isPending && <Loader2 className="mr-1.5 h-3 w-3 animate-spin" />}
+            {save.isPending && <Loader2 className=" h-3 w-3 animate-spin" />}
             {isEdit ? 'Save' : 'Connect'}
           </Button>
         </DialogFooter>
@@ -602,7 +602,7 @@ export function ConnectionsTab({ entry }: ConnectionsTabProps) {
               setDialogOpen(true);
             }}
           >
-            <Plus className="mr-1.5 h-3.5 w-3.5" />
+            <Plus className=" h-3.5 w-3.5" />
             Connect tenant
           </Button>
         )}

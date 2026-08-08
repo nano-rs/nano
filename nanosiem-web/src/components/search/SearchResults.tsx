@@ -30,7 +30,7 @@ import {
   ExternalLink,
   Group as GroupIcon,
 } from 'lucide-react';
-import { PivtIcon } from '@/enterprise/icons/PivtIcon';
+import { PivtIcon } from '@/components/icons/PivtIcon';
 import { cn } from '@/lib/utils';
 import { EventInspectorPanel } from './EventInspectorPanel';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';

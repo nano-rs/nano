@@ -2,7 +2,7 @@
 
 import { useRef, useCallback, useEffect, useState, useMemo } from 'react';
 import { Clock, Pin, Search, X, Settings2, Trash2, Info } from 'lucide-react';
-import { PivtIcon } from '@/enterprise/icons/PivtIcon';
+import { PivtIcon } from '@/components/icons/PivtIcon';
 import type { SearchHistoryEntry } from '@/hooks/useSearchHistory';
 import { formatRelativeCompact } from '@/lib/date-utils';
 import { SearchQueryEditor, type SearchQueryEditorRef } from '@/components/editor';

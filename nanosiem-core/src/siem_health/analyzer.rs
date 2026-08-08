@@ -24,6 +24,22 @@ pub struct SuppressedFinding {
     pub reason: String,
 }
 
+/// Heading for the deterministic (non-AI) summary.
+///
+/// Enterprise says why the richer narrative is missing; open has no AI to miss,
+/// so it just names what this is (NAN-2357).
+#[cfg(feature = "enterprise")]
+const HEURISTIC_SUMMARY_HEADING: &str = "**Automated health check** (AI unavailable)";
+#[cfg(not(feature = "enterprise"))]
+const HEURISTIC_SUMMARY_HEADING: &str = "**Automated health check**";
+
+/// Per-dimension prose when no AI narrative was produced. Scores and findings
+/// for the dimension are unaffected — only the paragraph is missing.
+#[cfg(feature = "enterprise")]
+const HEURISTIC_DIMENSION_DETAIL: &str = "AI analysis unavailable";
+#[cfg(not(feature = "enterprise"))]
+const HEURISTIC_DIMENSION_DETAIL: &str = "Scored from live metrics";
+
 /// Produce a fallback report when AI is unavailable or fails.
 ///
 /// First classifies the deployment (Fresh / Stalled / Live) and short-circuits
@@ -71,12 +87,19 @@ pub fn fallback_report(metrics: &CollectedMetrics) -> AnalysisResult {
         detection_score,
         alerting_score,
         summary: format!(
-            "**Automated health check** (AI unavailable)\n\n\
+            // NAN-2357: "(AI unavailable)" is a useful warning in an ENTERPRISE
+            // build — it means a configured AI provider failed and the operator
+            // is getting less than they paid for. In an OPEN build there is no
+            // AI to be unavailable, so the same words turn a complete, correct
+            // report into something that reads broken. Same content, honest
+            // framing for the edition actually running.
+            "{}\n\n\
              - **Ingestion**: {} source types active, {} events in last 24h, {} silent sources\n\
              - **Parsing**: {} source types analyzed, {} with high ext usage\n\
              - **Enrichment**: GeoIP {:.0}% · ASN {:.0}% · IOC {:.0}% · identity {:.0}%\n\
              - **Detection**: {} enabled rules, {} stale, {} noisy\n\
              - **Alerting**: {} alerts in 24h, {} active webhooks, {} routing rules",
+            HEURISTIC_SUMMARY_HEADING,
             metrics.ingestion.source_volumes.len(),
             metrics.ingestion.total_events_24h,
             metrics.ingestion.silent_sources.len(),
@@ -104,12 +127,16 @@ pub fn fallback_report(metrics: &CollectedMetrics) -> AnalysisResult {
             recs.extend(lowercase_invariant_recommendations(&metrics.parsing));
             recs
         },
+        // NAN-2357: same framing problem as the summary heading. The scores and
+        // findings for every dimension are real; only the prose narrative is
+        // absent. The open-edition page hides this block entirely rather than
+        // showing a placeholder, but API/desktop consumers still read the field.
         dimension_details: DimensionDetails {
-            ingestion: "AI analysis unavailable".to_string(),
-            parsing: "AI analysis unavailable".to_string(),
-            enrichment: "AI analysis unavailable".to_string(),
-            detection: "AI analysis unavailable".to_string(),
-            alerting: "AI analysis unavailable".to_string(),
+            ingestion: HEURISTIC_DIMENSION_DETAIL.to_string(),
+            parsing: HEURISTIC_DIMENSION_DETAIL.to_string(),
+            enrichment: HEURISTIC_DIMENSION_DETAIL.to_string(),
+            detection: HEURISTIC_DIMENSION_DETAIL.to_string(),
+            alerting: HEURISTIC_DIMENSION_DETAIL.to_string(),
         },
     }
 }
@@ -378,13 +405,19 @@ fn insert_integrity_recommendations(ii: &InsertIntegrityMetrics) -> Vec<Recommen
         });
     }
     if ii.cache_dictionary_update_fails > 0 {
+        // NAN-2360: the count is cumulative for the life of the server, so say so
+        // rather than implying every one of them just happened. The collector has
+        // already excluded the boot window; what survives is a post-startup
+        // failure, which is what makes this actionable.
         recs.push(Recommendation {
             title: "Cache dictionary updates are failing".to_string(),
             description: format!(
-                "system.errors shows {} CACHE_DICTIONARY_UPDATE_FAIL occurrences with activity \
-                 in the last 24h — a cache-layout dictionary (e.g. hash_prevalence_dict) cannot \
-                 refresh from its source. Inspect system.dictionaries.last_exception for the \
-                 failing dictionary.",
+                "system.errors has {} CACHE_DICTIONARY_UPDATE_FAIL occurrences (a running total \
+                 since ClickHouse started), most recently within the last 24h and after startup \
+                 settled — a cache-layout dictionary (e.g. hash_prevalence_dict) cannot refresh \
+                 from its source. Inspect system.dictionaries.last_exception for the failing \
+                 dictionary. If system.dictionaries shows every dictionary LOADED with an empty \
+                 last_exception, the failures have already cleared and no action is needed.",
                 ii.cache_dictionary_update_fails
             ),
             priority: "high".to_string(),

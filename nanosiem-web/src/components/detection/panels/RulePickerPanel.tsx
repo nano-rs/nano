@@ -299,7 +299,7 @@ export function RulePickerPanel({ onLoadRule }: RulePickerPanelProps) {
                   className="h-7 px-2 text-xs opacity-0 group-hover:opacity-100 transition-opacity text-primary hover:text-primary hover:bg-primary/10"
                   onClick={() => handleUseRule(rule)}
                 >
-                  <ArrowDownToLine className="w-3.5 h-3.5 mr-1" />
+                  <ArrowDownToLine className="w-3.5 h-3.5" />
                   Use
                 </Button>
               </div>

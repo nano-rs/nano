@@ -47,9 +47,20 @@ pub struct Capabilities {
     pub playbooks: bool,
     /// Multi-case incidents.
     pub incidents: bool,
-    /// SIEM Health — basic stats live in core, but the AI narrative +
-    /// ranked recommendations that anchor the page are enterprise. Hidden
-    /// wholesale in open until a basic-only Health view ships.
+    /// SIEM Health. Available in BOTH editions (NAN-2357).
+    ///
+    /// This was `ENTERPRISE` on the reasoning that "the AI narrative + ranked
+    /// recommendations anchor the page". They don't — they enrich it. The
+    /// scheduler, the five dimension scores, the metrics, the findings and the
+    /// recommendations are all `nanosiem-core` with no `cfg` gate, and
+    /// `siem_health::analyzer` has a deterministic non-AI summary builder. A
+    /// fresh open tenant with zero AI credentials produces a complete report in
+    /// ~73ms, including real findings.
+    ///
+    /// Hiding it also never worked: the flag only suppressed the NAV ITEM, while
+    /// the route (permission-gated only) and the footer status link stayed
+    /// reachable — so open users found a page they were not supposed to have.
+    /// The meloD-authored narrative is gated inside the page on `melod`.
     pub siem_health: bool,
     /// SAML / OIDC SSO providers. Local credentials still work in open builds.
     pub sso: bool,
@@ -106,7 +117,8 @@ pub async fn get_capabilities() -> Json<CapabilitiesResponse> {
             ai_tuning: ENTERPRISE,
             playbooks: ENTERPRISE,
             incidents: ENTERPRISE,
-            siem_health: ENTERPRISE,
+            // Both editions — see the field doc. Deliberately not ENTERPRISE.
+            siem_health: true,
             sso: ENTERPRISE,
             observability_convergence: ENTERPRISE,
         },

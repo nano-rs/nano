@@ -354,7 +354,7 @@ export default function SourceConfigurations() {
                 className="h-8 text-[11.5px]"
                 onClick={() => deployTarget && deployMutation.mutate(deployTarget.id)}
               >
-                <Rocket className="h-3.5 w-3.5 mr-1.5" />
+                <Rocket className="h-3.5 w-3.5" />
                 Deploy
               </AlertDialogAction>
             </AlertDialogFooter>
@@ -378,7 +378,7 @@ export default function SourceConfigurations() {
                 className="h-8 text-[11.5px] bg-amber-600 hover:bg-amber-700 text-white"
                 onClick={() => undeployTarget && undeployMutation.mutate(undeployTarget.id)}
               >
-                <Power className="h-3.5 w-3.5 mr-1.5" />
+                <Power className="h-3.5 w-3.5" />
                 Undeploy
               </AlertDialogAction>
             </AlertDialogFooter>
@@ -952,7 +952,7 @@ function AddSourceSheet({
               disabled={submitting || !name.trim()}
               onClick={submit}
             >
-              {submitting && <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />}
+              {submitting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
               Create &amp; configure
             </Button>
           )}

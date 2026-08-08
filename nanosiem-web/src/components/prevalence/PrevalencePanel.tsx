@@ -415,7 +415,7 @@ export function PrevalencePanel({
                   onClick={loadScatterData}
                   className="ml-4 text-muted-foreground hover:text-primary"
                 >
-                  <RefreshCw className="w-3 h-3 mr-1" />
+                  <RefreshCw className="w-3 h-3" />
                   Retry
                 </Button>
               </div>

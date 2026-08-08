@@ -304,7 +304,7 @@ export function PrevalenceSettings() {
           onClick={handleReset}
           className="h-7 text-[11.5px] px-2.5"
         >
-          <RotateCcw className="w-3 h-3 mr-1" />
+          <RotateCcw className="w-3 h-3" />
           Reset to defaults
         </Button>
         <Button
@@ -313,7 +313,7 @@ export function PrevalenceSettings() {
           size="sm"
           className="h-7 text-[11.5px] px-2.5"
         >
-          {saving ? <Loader2 className="w-3 h-3 mr-1 animate-spin" /> : <Save className="w-3 h-3 mr-1" />}
+          {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
           Save changes
         </Button>
       </div>

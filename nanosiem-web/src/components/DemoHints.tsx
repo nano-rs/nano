@@ -9,7 +9,7 @@
 
 import { useState } from 'react';
 import { X, Search, Shield, Briefcase, BarChart3, ArrowRight, Play } from 'lucide-react';
-import { PivtIcon } from '@/enterprise/icons/PivtIcon';
+import { PivtIcon } from '@/components/icons/PivtIcon';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
 

@@ -1484,7 +1484,7 @@ function OverviewTab({
               onClick={save}
               disabled={!valid || updating}
             >
-              {updating && <Loader2 className="w-3 h-3 mr-1.5 animate-spin" />}
+              {updating && <Loader2 className="w-3 h-3 animate-spin" />}
               Save changes
             </Button>
           </div>
@@ -1749,7 +1749,7 @@ function DangerTab({
           disabled={!canDelete || !matches || deleting}
           onClick={onDelete}
         >
-          {deleting && <Loader2 className="w-3 h-3 mr-1.5 animate-spin" />}
+          {deleting && <Loader2 className="w-3 h-3 animate-spin" />}
           Delete permanently
         </Button>
       </div>

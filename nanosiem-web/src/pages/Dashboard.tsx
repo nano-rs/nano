@@ -31,7 +31,7 @@ import {
   BookOpen,
   ActivitySquare,
 } from 'lucide-react';
-import { PivtIcon } from '@/enterprise/icons/PivtIcon';
+import { PivtIcon } from '@/components/icons/PivtIcon';
 import { useAuth } from '@/contexts/AuthContext';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';

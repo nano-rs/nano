@@ -196,7 +196,7 @@ export function CreateApiKeyDialog({ open, permissions, onClose, onCreated }: Cr
             Cancel
           </Button>
           <Button size="sm" onClick={handleSubmit} disabled={!canSubmit} className="h-7 text-[11.5px]">
-            {saving && <Loader2 className="w-3 h-3 mr-1 animate-spin" />}
+            {saving && <Loader2 className="w-3 h-3 animate-spin" />}
             Create key
           </Button>
         </SheetFooter>

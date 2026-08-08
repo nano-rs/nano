@@ -51,7 +51,7 @@ import {
   Menu,
   Settings2,
 } from 'lucide-react';
-import { PivtIcon } from '@/enterprise/icons/PivtIcon';
+import { PivtIcon } from '@/components/icons/PivtIcon';
 import {
   useSearch,
   useSearchSql,
@@ -82,6 +82,7 @@ import { Sheet, SheetContent, SheetTitle } from '@/components/ui/sheet';
 import { useNotebookCapture } from '@/enterprise/contexts/NotebookContext';
 import { TimelineVisualization, FieldsPanel, FIELD_STATS_PINNED_COLUMNS, SearchResults, SearchQueryInput, SavedQueriesPalette, SearchJobsModal, PrevalenceSlider, DatasetSelector, type FieldStat } from '@/components/search';
 import { AnalyzeView } from '@/enterprise/components/search/AnalyzeView';
+import { useCapabilities } from '@/hooks/use-capabilities';
 import { ScheduleReportDialog, type ScheduleReportPreset } from '@/components/reports/ScheduleReportDialog';
 import { useHereCardOverride } from '@/contexts/PageContext';
 import type { SearchJobSummary } from '@/lib/api';
@@ -467,17 +468,33 @@ export function Search() {
   // (a full-page LLM analysis of the current result set). Back button in
   // AnalyzeView flips this back to false and the user lands on their
   // existing results with query + time range intact.
+  const { capabilities } = useCapabilities();
   const [analyzeActive, setAnalyzeActive] = useState(false);
+
+  // ONE predicate, used with its exact inverse below. These two guards were
+  // never complementary: AnalyzeView also required `hasSearched` and a non-empty
+  // result set, while the results area was hidden on `analyzeActive` alone — so
+  // `analyzeActive` with no results rendered NEITHER and the page went blank.
+  // `pivt:summarize` sets `analyzeActive` unconditionally, so it could reach
+  // exactly that state. Deriving both from one value makes the blank case
+  // unrepresentable (NAN-2356).
+  const showAnalyze =
+    analyzeActive && capabilities.melod && hasSearched && searchResults.length > 0;
 
   // PIVT bridge — `@summarize` from anywhere in the app fires
   // `pivt:summarize`. Route to the Analyze view the same way the
   // toolbar button does. (Router navigates to /search first if the
   // user isn't here yet, so the listener is always mounted in time.)
+  // NAN-2356: only wired when meloD is available. AnalyzeView is enterprise and
+  // stubs to `return null` in open builds, while `analyzeActive` ALSO hides the
+  // fields + results area below — so firing this in an open build would blank
+  // the whole search page.
   useEffect(() => {
+    if (!capabilities.melod) return;
     const handler = () => setAnalyzeActive(true);
     window.addEventListener('pivt:summarize', handler);
     return () => window.removeEventListener('pivt:summarize', handler);
-  }, []);
+  }, [capabilities.melod]);
 
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1);
@@ -4293,7 +4310,7 @@ export function Search() {
 
         {/* Analyze mode — replaces the normal fields + results area with
             a full-page LLM analysis view when active. */}
-        {analyzeActive && hasSearched && searchResults.length > 0 && (
+        {showAnalyze && (
           <div className="flex-1 flex flex-col min-h-0 min-w-0">
             <AnalyzeView
               query={query}
@@ -4313,7 +4330,7 @@ export function Search() {
         )}
 
         {/* Fields panel + Results area - Fields panel hidden for full-width visualizations */}
-        {!analyzeActive && (() => {
+        {!showAnalyze && (() => {
           const showFieldsPanel = fieldsPanelVisible && !isTreeView &&
             displayType !== 'timechart' && displayType !== 'ranked_bar' && displayType !== 'flow' && displayType !== 'asset' && displayType !== 'cloud' && displayType !== 'lateral' && displayType !== 'services' && displayType !== 'service' && displayType !== 'trace' && displayType !== 'metric' && displayType !== 'baseline';
           return (

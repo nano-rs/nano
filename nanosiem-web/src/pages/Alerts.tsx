@@ -479,7 +479,7 @@ export function Alerts() {
             disabled={isLoading || actionBusy}
             className="h-8 border-border text-[11.5px]"
           >
-            <RefreshCw className={cn('mr-1.5 h-3 w-3', isLoading && 'animate-spin')} />
+            <RefreshCw className={cn(' h-3 w-3', isLoading && 'animate-spin')} />
             Refresh
           </Button>
         </div>
@@ -607,7 +607,7 @@ export function Alerts() {
               onClick={acknowledgeBulk}
               className="h-7 border-border text-[11px]"
             >
-              <Check className="mr-1.5 h-3 w-3" />
+              <Check className=" h-3 w-3" />
               Acknowledge
             </Button>
           )}
@@ -619,7 +619,7 @@ export function Alerts() {
               onClick={() => setCloseDialog({ id: null })}
               className="h-7 border-border text-[11px]"
             >
-              <CircleCheck className="mr-1.5 h-3 w-3" />
+              <CircleCheck className=" h-3 w-3" />
               Close…
             </Button>
           )}
@@ -630,7 +630,7 @@ export function Alerts() {
             onClick={() => setSelected(new Set())}
             className="h-7 text-[11px] text-muted-foreground hover:text-foreground"
           >
-            <X className="mr-1.5 h-3 w-3" />
+            <X className=" h-3 w-3" />
             Clear
           </Button>
         </div>

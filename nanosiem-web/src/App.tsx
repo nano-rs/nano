@@ -659,9 +659,11 @@ function ProtectedAppRoutes() {
             } />
           } />
 
-          {/* SIEM Health */}
+          {/* SIEM Health — settings:system matches every /api/siem-health
+              handler; settings:view would land the user on an empty page
+              standing in for a 403 (NAN-2357). */}
           <Route path="/platform/health" element={
-            <PermissionRoute permission="settings:view" element={
+            <PermissionRoute permission="settings:system" element={
               <Suspense fallback={<ListPageLoadingFallback />}>
                 <SiemHealth key={resetKey} />
               </Suspense>

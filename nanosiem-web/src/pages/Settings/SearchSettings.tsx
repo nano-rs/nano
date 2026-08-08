@@ -370,7 +370,7 @@ export function SearchSettings() {
           size="sm"
           className="h-7 text-[11.5px] px-2.5"
         >
-          {saving ? <Loader2 className="w-3 h-3 mr-1 animate-spin" /> : <Save className="w-3 h-3 mr-1" />}
+          {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
           Save admission settings
         </Button>
       </div>
@@ -481,7 +481,7 @@ export function SearchSettings() {
             size="sm"
             className="h-7 text-[11.5px] px-2.5"
           >
-            {savingLimits ? <Loader2 className="w-3 h-3 mr-1 animate-spin" /> : <Save className="w-3 h-3 mr-1" />}
+            {savingLimits ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
             Save query limits
           </Button>
         </div>

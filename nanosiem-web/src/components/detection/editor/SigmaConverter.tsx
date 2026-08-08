@@ -789,18 +789,18 @@ level: medium`}
                 disabled={!conversionResult?.success}
                 className="bg-blue-600 hover:bg-blue-700 rounded-xl"
               >
-                <ArrowRight className="w-4 h-4 mr-2" />
+                <ArrowRight className="w-4 h-4" />
                 View Converted Rule
               </Button>
             ) : (
               <>
                 <Button variant="outline" onClick={handleCopy} className="rounded-xl">
-                  <Copy className="w-4 h-4 mr-2" />
+                  <Copy className="w-4 h-4" />
                   Copy
                 </Button>
                 {onApply && (
                   <Button onClick={handleApply} className="bg-blue-600 hover:bg-blue-700 rounded-xl">
-                    <ArrowRight className="w-4 h-4 mr-2" />
+                    <ArrowRight className="w-4 h-4" />
                     Apply to Editor
                   </Button>
                 )}

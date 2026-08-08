@@ -159,6 +159,74 @@ fn probe_source(cluster: Option<&str>, table: &str) -> String {
     }
 }
 
+/// How long after ClickHouse starts we refuse to attribute `system.errors`
+/// counters to a live problem.
+///
+/// A cold `CACHE` dictionary legitimately raises code 510
+/// (`CACHE_DICTIONARY_UPDATE_FAIL`) when something queries it before its first
+/// scheduled update — "Could not update cache dictionary now, because nearest
+/// update is scheduled at …; try again later". Migrations racing table creation
+/// raise `UNKNOWN_TABLE`; services racing readiness raise `AUTHENTICATION_FAILED`.
+/// All of it is normal startup churn, and all of it is permanent in the counter.
+///
+/// Five minutes clears the observed install window with room to spare (on the
+/// NAN-2360 tenant the last dictionary failure was 7s after boot and the last
+/// migration error 2m18s) while still admitting a genuine post-boot error — a
+/// real `UNKNOWN_IDENTIFIER` at boot+5m22s on that same tenant is still counted.
+const ERROR_COUNTER_BOOT_GRACE: &str = "INTERVAL 5 MINUTE";
+
+/// `system.errors` counters for the two insert-integrity tells.
+///
+/// The counters are cumulative for the life of the server and never reset, so
+/// recency has to come from `last_error_time`.
+///
+/// NAN-1728 (M-3): sum per-name across all nodes so an error spiking on any one
+/// shard surfaces (`system.errors` is per-node); single-node emits the original
+/// ungrouped SQL.
+///
+/// NAN-2360: a 24h window alone is not enough. On a server up for LESS than 24h
+/// every startup transient is trivially "within 24h", so a freshly installed
+/// tenant reported 32 `CACHE_DICTIONARY_UPDATE_FAIL`s — every one of them from a
+/// 14-second window during install, against a dictionary instance that had since
+/// been dropped and recreated — as a live, high-priority incident. Meanwhile
+/// `failed_logs_dictionaries`, the accurate signal, was correctly empty. The
+/// second predicate excludes the boot settling window: `now() - uptime()` is the
+/// server's start time.
+///
+/// On a cluster `uptime()` is per-node; if ClickHouse folds it on the initiator
+/// instead of each replica, a node that restarted much more recently than the
+/// initiator could still contribute boot noise. Nodes in a tenant start
+/// together, so that window is small and strictly better than counting all of it.
+fn build_error_counters_sql(cluster: Option<&str>) -> String {
+    // The grace applies to the DICTIONARY counter only. `MEMORY_LIMIT_EXCEEDED`
+    // is not startup churn — an OOM four minutes after boot is a real ingestion
+    // failure, and on a too-small memory limit it is the FIRST symptom (the
+    // NAN-2251 wedge). Applying the grace to both would have suppressed that for
+    // the entire life of the server unless a second OOM happened later, trading
+    // one false positive for a false negative on silent data loss.
+    let recency = format!(
+        "last_error_time >= now() - INTERVAL 24 HOUR \
+           AND ( \
+             name != 'CACHE_DICTIONARY_UPDATE_FAIL' \
+             OR last_error_time >= now() - uptime() + {ERROR_COUNTER_BOOT_GRACE} \
+           )"
+    );
+    match cluster {
+        Some(cl) => format!(
+            "SELECT name, sum(value) AS value FROM {} \
+             WHERE name IN ('MEMORY_LIMIT_EXCEEDED', 'CACHE_DICTIONARY_UPDATE_FAIL') \
+               AND {recency} \
+             GROUP BY name",
+            probe_source(Some(cl), "errors")
+        ),
+        None => format!(
+            "SELECT name, value FROM system.errors \
+               WHERE name IN ('MEMORY_LIMIT_EXCEEDED', 'CACHE_DICTIONARY_UPDATE_FAIL') \
+                 AND {recency}"
+        ),
+    }
+}
+
 /// Collect insert-path integrity signals (NAN-1405) — the storage-layer tells
 /// of the NAN-1404 silent-loss class. Every probe is best-effort: on a
 /// pre-NAN-1405 deployment the app user lacks the system-table grants and the
@@ -307,24 +375,8 @@ async fn collect_insert_integrity(
         }
     }
 
-    // 2) Error-counter tells from system.errors. The counters never reset, so
-    // gate on last_error_time recency to keep them actionable. NAN-1728 (M-3):
-    // sum per-name across all nodes so an error spiking on any one shard surfaces
-    // (`system.errors` is per-node); single-node emits the original ungrouped SQL.
-    let sql = if let Some(cl) = cluster_ref {
-        format!(
-            "SELECT name, sum(value) AS value FROM {} \
-             WHERE name IN ('MEMORY_LIMIT_EXCEEDED', 'CACHE_DICTIONARY_UPDATE_FAIL') \
-               AND last_error_time >= now() - INTERVAL 24 HOUR \
-             GROUP BY name",
-            probe_source(Some(cl), "errors")
-        )
-    } else {
-        "SELECT name, value FROM system.errors \
-               WHERE name IN ('MEMORY_LIMIT_EXCEEDED', 'CACHE_DICTIONARY_UPDATE_FAIL') \
-                 AND last_error_time >= now() - INTERVAL 24 HOUR"
-            .to_string()
-    };
+    // 2) Error-counter tells from system.errors.
+    let sql = build_error_counters_sql(cluster_ref);
     match ch.query(&sql).fetch_all::<(String, u64)>().await {
         Ok(rows) => {
             m.probes_available = true;
@@ -1530,6 +1582,91 @@ mod tests {
                 .map(|source_type| source_type.to_string())
                 .collect(),
         )
+    }
+
+    /// NAN-2360. A fresh tenant reported 32 `CACHE_DICTIONARY_UPDATE_FAIL`s as a
+    /// live high-priority incident. Every one happened inside a 14-second window
+    /// during install, against a dictionary that had since been dropped and
+    /// recreated; `system.dictionaries` showed all seven LOADED with no
+    /// exception. The counters are cumulative for the life of the server, so the
+    /// pre-existing 24h recency gate filters nothing at all while the server has
+    /// been up for less than 24h — precisely when the noise is worst.
+    ///
+    /// Both shapes must carry the boot-window exclusion; a cluster tenant is not
+    /// less deserving of a truthful health report than a single-node one.
+    #[test]
+    fn error_counter_sql_excludes_the_boot_window_in_both_shapes() {
+        for (name, sql) in [
+            ("single-node", build_error_counters_sql(None)),
+            ("cluster", build_error_counters_sql(Some("nanosiem_cluster"))),
+        ] {
+            assert!(
+                sql.contains("last_error_time >= now() - INTERVAL 24 HOUR"),
+                "{name}: lost the 24h recency gate: {sql}"
+            );
+            assert!(
+                sql.contains("last_error_time >= now() - uptime() + INTERVAL 5 MINUTE"),
+                "{name}: missing the boot-window exclusion — a server up <24h reports \
+                 every startup transient as a live incident: {sql}"
+            );
+        }
+    }
+
+    /// The grace must apply to the DICTIONARY counter only.
+    ///
+    /// Applying it to both names would suppress a genuine `MEMORY_LIMIT_EXCEEDED`
+    /// at boot+4m for the whole life of the server — trading NAN-2360's false
+    /// positive for a false negative on silent ingestion loss, which is the
+    /// strictly worse bug. A cache-dictionary throttle during startup is noise;
+    /// an OOM during startup is a too-small memory limit (NAN-2251).
+    #[test]
+    fn boot_grace_covers_only_the_dictionary_counter() {
+        for (shape, sql) in [
+            ("single-node", build_error_counters_sql(None)),
+            ("cluster", build_error_counters_sql(Some("nanosiem_cluster"))),
+        ] {
+            // The uptime predicate must sit inside a disjunction that exempts
+            // every OTHER error name, not as a bare top-level AND.
+            assert!(
+                sql.contains("name != 'CACHE_DICTIONARY_UPDATE_FAIL'"),
+                "{shape}: boot grace is unscoped — it will also swallow \
+                 MEMORY_LIMIT_EXCEEDED, a silent-data-loss signal: {sql}"
+            );
+
+            let uptime_at = sql.find("uptime()").expect("uptime predicate present");
+            let escape_at = sql
+                .find("name != 'CACHE_DICTIONARY_UPDATE_FAIL'")
+                .expect("escape hatch present");
+            let or_between = sql[escape_at..uptime_at].contains("OR");
+            assert!(
+                or_between,
+                "{shape}: the name exemption must be OR'd with the uptime bound, \
+                 otherwise it does not actually exempt anything: {sql}"
+            );
+        }
+    }
+
+    /// The cluster shape must still aggregate per name across replicas (NAN-1728
+    /// M-3) — the boot-window fix must not quietly drop the `sum`/`GROUP BY`.
+    #[test]
+    fn error_counter_sql_keeps_cluster_aggregation() {
+        let sql = build_error_counters_sql(Some("nanosiem_cluster"));
+        assert!(sql.contains("sum(value)"), "cluster shape lost sum(): {sql}");
+        assert!(sql.contains("GROUP BY name"), "cluster shape lost GROUP BY: {sql}");
+        assert!(
+            sql.contains("clusterAllReplicas"),
+            "cluster shape must read every replica: {sql}"
+        );
+
+        let single = build_error_counters_sql(None);
+        assert!(
+            !single.contains("GROUP BY"),
+            "single-node shape should stay ungrouped: {single}"
+        );
+        assert!(
+            single.contains("FROM system.errors"),
+            "single-node shape should read the local table: {single}"
+        );
     }
 
     #[test]

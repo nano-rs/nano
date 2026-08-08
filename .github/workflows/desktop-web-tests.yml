@@ -83,7 +83,8 @@ jobs:
     if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.changes.result != 'success' || needs.changes.outputs.web == 'true') }}
     # Self-hosted only (repo rule — never ubuntu-latest).
     runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 15
+    # Raised from 15 for the open-edition build step added at the end (NAN-2356).
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -132,6 +133,22 @@ jobs:
             echo "FAILED:$failed"
             exit 1
           fi
+
+      # NAN-2356: CI only ever built the ENTERPRISE bundle, so anything that
+      # breaks the open edition landed green on main and surfaced 40 minutes
+      # into a `push_open_core=true` publish — or, worse, shipped. NAN-1190 was
+      # a missing stub caught that way; NAN-2356 was an inert "+ New Dashboard"
+      # that no build could have caught, which is why the stub-gating suite
+      # above runs too.
+      #
+      # `VITE_EDITION=open` swaps `@/enterprise` to `src/enterprise-stubs`
+      # (vite.config.ts resolveEdition), so this is the only step that proves
+      # every stub the open bundle needs actually exists and type-checks.
+      - name: Open-edition build
+        working-directory: nanosiem-web
+        env:
+          VITE_EDITION: open
+        run: npm run build
 
   desktop-web:
     # The `web` job above runs in `nanosiem-web`. `nano-desktop` is a SECOND

@@ -376,7 +376,7 @@ export function MfaSetup() {
                 onClick={() => setStep('scan')}
                 className="h-9 text-[12.5px]"
               >
-                <ArrowLeft className="w-3.5 h-3.5 mr-1.5" />
+                <ArrowLeft className="w-3.5 h-3.5" />
                 Back
               </Button>
               <Button
@@ -386,9 +386,9 @@ export function MfaSetup() {
                 className="h-9 text-[12.5px] font-semibold flex-1"
               >
                 {loading ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin mr-2" />
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
                 ) : (
-                  <ShieldCheck className="w-3.5 h-3.5 mr-2" />
+                  <ShieldCheck className="w-3.5 h-3.5" />
                 )}
                 Verify
               </Button>
@@ -429,7 +429,7 @@ export function MfaSetup() {
                   onClick={copyBackupCodes}
                   className="h-8 text-[11.5px] flex-1"
                 >
-                  <Copy className="w-3 h-3 mr-1.5" />
+                  <Copy className="w-3 h-3" />
                   Copy
                 </Button>
                 <Button
@@ -438,7 +438,7 @@ export function MfaSetup() {
                   onClick={downloadBackupCodes}
                   className="h-8 text-[11.5px] flex-1"
                 >
-                  <Download className="w-3 h-3 mr-1.5" />
+                  <Download className="w-3 h-3" />
                   Download
                 </Button>
               </div>
@@ -462,7 +462,7 @@ export function MfaSetup() {
               size="sm"
               className="w-full h-9 text-[12.5px] font-semibold"
             >
-              <CheckCircle2 className="w-3.5 h-3.5 mr-2" />
+              <CheckCircle2 className="w-3.5 h-3.5" />
               Done
             </Button>
           </div>

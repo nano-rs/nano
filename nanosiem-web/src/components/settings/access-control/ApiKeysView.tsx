@@ -188,13 +188,13 @@ function ApiKeyDetail({ apiKey, permissions, onEdit, onRotate, onRevoke, onEnabl
           <div className="flex items-center gap-2 shrink-0">
             {canEdit && (
               <Button size="sm" variant="outline" className="h-7 text-[11.5px] px-2.5" onClick={onEdit}>
-                <Pencil className="w-[11px] h-[11px] mr-1" />
+                <Pencil className="w-[11px] h-[11px]" />
                 Edit
               </Button>
             )}
             {canEdit && apiKey.enabled && (
               <Button size="sm" variant="outline" className="h-7 text-[11.5px] px-2.5" onClick={onRotate}>
-                <RefreshCw className="w-[11px] h-[11px] mr-1" />
+                <RefreshCw className="w-[11px] h-[11px]" />
                 Rotate
               </Button>
             )}
@@ -205,7 +205,7 @@ function ApiKeyDetail({ apiKey, permissions, onEdit, onRotate, onRevoke, onEnabl
                 className="h-7 text-[11.5px] px-2.5 text-yellow-500 hover:text-yellow-500/90"
                 onClick={onRevoke}
               >
-                <ShieldOff className="w-[11px] h-[11px] mr-1" />
+                <ShieldOff className="w-[11px] h-[11px]" />
                 Revoke
               </Button>
             ) : (
@@ -613,7 +613,7 @@ export function ApiKeysView() {
           <AlertDialogFooter className="border-t border-border px-5 py-3 flex flex-row items-center gap-2 sm:justify-end space-x-0">
             <AlertDialogCancel className="h-7 text-[11.5px] mt-0">Cancel</AlertDialogCancel>
             <AlertDialogAction onClick={handleRotate} disabled={actionLoading} className="h-7 text-[11.5px]">
-              {actionLoading && <Loader2 className="w-3 h-3 mr-1 animate-spin" />}
+              {actionLoading && <Loader2 className="w-3 h-3 animate-spin" />}
               Rotate
             </AlertDialogAction>
           </AlertDialogFooter>

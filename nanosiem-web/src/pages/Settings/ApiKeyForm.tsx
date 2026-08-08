@@ -271,7 +271,7 @@ export function ApiKeyForm() {
         onClick={() => navigate('/settings/access-control?tab=api-keys')}
         className="rounded-xl"
       >
-        <ArrowLeft className="w-4 h-4 mr-2" />
+        <ArrowLeft className="w-4 h-4" />
         Back to API Keys
       </Button>
 
@@ -299,7 +299,7 @@ export function ApiKeyForm() {
               onClick={() => setResetDialogOpen(true)}
               className="rounded-xl border-border"
             >
-              <RefreshCw className="w-4 h-4 mr-2" />
+              <RefreshCw className="w-4 h-4" />
               Reset Key
             </Button>
           )}
@@ -308,7 +308,7 @@ export function ApiKeyForm() {
             disabled={saving}
             className="bg-primary hover:bg-primary/90 rounded-xl"
           >
-            {saving && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
+            {saving && <Loader2 className="w-4 h-4 animate-spin" />}
             {isEditing ? 'Save Changes' : 'Create API Key'}
           </Button>
         </div>

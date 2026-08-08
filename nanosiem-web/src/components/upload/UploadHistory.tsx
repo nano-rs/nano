@@ -112,7 +112,7 @@ export function UploadHistory({ filter: initialFilter, showFilters = true, limit
         <div className="flex items-center justify-between">
           <CardTitle className="text-lg text-foreground">Upload History</CardTitle>
           <Button variant="outline" size="sm" onClick={() => refetch()} className="rounded-xl border-border">
-            <RefreshCw className="w-4 h-4 mr-2" />
+            <RefreshCw className="w-4 h-4" />
             Refresh
           </Button>
         </div>

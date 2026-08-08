@@ -216,7 +216,7 @@ function HunkView({
                   className={`h-7 px-2 ${hunk.accepted === false ? 'bg-amber-500/20' : ''}`}
                   onClick={onReject}
                 >
-                  <XCircle className="w-4 h-4 mr-1 text-amber-600" />
+                  <XCircle className="w-4 h-4 text-amber-600" />
                   Keep Mine
                 </Button>
               </TooltipTrigger>
@@ -230,7 +230,7 @@ function HunkView({
                   className={`h-7 px-2 ${hunk.accepted === true ? 'bg-green-500/20' : ''}`}
                   onClick={onAccept}
                 >
-                  <CircleCheck className="w-4 h-4 mr-1 text-green-600" />
+                  <CircleCheck className="w-4 h-4 text-green-600" />
                   Accept
                 </Button>
               </TooltipTrigger>
@@ -427,15 +427,15 @@ export function UpstreamMergeModal({
               </div>
               <div className="flex items-center gap-2">
                 <Button variant="outline" size="sm" onClick={acceptAll}>
-                  <CircleCheck className="w-4 h-4 mr-1 text-green-600" />
+                  <CircleCheck className="w-4 h-4 text-green-600" />
                   Accept All
                 </Button>
                 <Button variant="outline" size="sm" onClick={rejectAll}>
-                  <XCircle className="w-4 h-4 mr-1 text-amber-600" />
+                  <XCircle className="w-4 h-4 text-amber-600" />
                   Keep All Mine
                 </Button>
                 <Button variant="ghost" size="sm" onClick={resetAll}>
-                  <RotateCcw className="w-4 h-4 mr-1" />
+                  <RotateCcw className="w-4 h-4" />
                   Reset
                 </Button>
               </div>
@@ -470,7 +470,7 @@ export function UpstreamMergeModal({
             onClick={handleApply}
             disabled={!diff || queriesMatch}
           >
-            <Check className="w-4 h-4 mr-2" />
+            <Check className="w-4 h-4" />
             Apply Merged Changes
           </Button>
         </DialogFooter>

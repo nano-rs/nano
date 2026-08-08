@@ -10,7 +10,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { ArrowLeft, Save, Loader2, Play, FileCode, WandSparkles, Eye, Archive, ArchiveRestore, Trash2, MoreHorizontal, Undo2, Import, Power } from 'lucide-react';
-import { PivtIcon } from '@/enterprise/icons/PivtIcon';
+import { PivtIcon } from '@/components/icons/PivtIcon';
 import { Link } from 'react-router-dom';
 
 interface DetectionEditorHeaderProps {
@@ -111,7 +111,7 @@ export function DetectionEditorHeader({
         {ruleId && (
           <Link to={`/rules/${ruleId}/matches`}>
             <Button variant="outline" size="sm" className="bg-accent/50 border-border text-foreground hover:bg-accent h-8 hidden md:inline-flex">
-              <Eye className="w-4 h-4 mr-1" />
+              <Eye className="w-4 h-4" />
               View Matches
             </Button>
           </Link>
@@ -124,7 +124,7 @@ export function DetectionEditorHeader({
           onClick={onValidate}
           disabled={validating || disableValidate}
         >
-          {validating ? <Loader2 className="w-4 h-4 md:mr-1 animate-spin" /> : <Play className="w-4 h-4 md:mr-1" />}
+          {validating ? <Loader2 className="w-4 h-4 md: animate-spin" /> : <Play className="w-4 h-4 md:" />}
           <span className="hidden md:inline">Validate</span>
         </Button>
 
@@ -186,7 +186,7 @@ export function DetectionEditorHeader({
           disabled={saving || disableSave || archived}
           className="bg-primary hover:bg-primary/90 text-foreground h-8"
         >
-          {saving ? <Loader2 className="w-4 h-4 md:mr-1 animate-spin" /> : <Save className="w-4 h-4 md:mr-1" />}
+          {saving ? <Loader2 className="w-4 h-4 md: animate-spin" /> : <Save className="w-4 h-4 md:" />}
           <span className="hidden md:inline">{saveLabel}</span>
         </Button>
       </div>

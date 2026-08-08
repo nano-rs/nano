@@ -496,7 +496,7 @@ function NotificationSettings() {
               className="h-7 text-[11.5px] font-mono flex-1"
             />
             <Button onClick={saveBaseUrl} disabled={savingBaseUrl} size="sm" className="h-7 text-[11px] px-2.5">
-              {savingBaseUrl && <Loader2 className="w-3 h-3 mr-1 animate-spin" />}
+              {savingBaseUrl && <Loader2 className="w-3 h-3 animate-spin" />}
               Save
             </Button>
             <Button variant="ghost" size="sm" onClick={() => setEditingBaseUrl(false)} className="h-7 text-[11px] px-2.5">
@@ -733,7 +733,7 @@ function NotificationSettings() {
                     Custom headers <span className="text-muted-foreground/70 font-normal ml-1">(optional)</span>
                   </label>
                   <Button variant="ghost" size="sm" onClick={addHeaderRow} className="h-6 text-[10.5px] px-2">
-                    <Plus className="w-[11px] h-[11px] mr-0.5" />
+                    <Plus className="w-[11px] h-[11px]" />
                     Add
                   </Button>
                 </div>
@@ -892,7 +892,7 @@ function NotificationSettings() {
           <SheetFooter className="border-t border-border px-5 py-3 flex sm:justify-end gap-2">
             <Button variant="ghost" size="sm" onClick={() => setDialogOpen(false)} className="h-7 text-[11.5px] px-2.5">Cancel</Button>
             <Button onClick={handleSave} disabled={saving} size="sm" className="h-7 text-[11.5px] px-2.5">
-              {saving && <Loader2 className="w-3 h-3 mr-1 animate-spin" />}
+              {saving && <Loader2 className="w-3 h-3 animate-spin" />}
               {editing ? 'Save changes' : 'Create channel'}
             </Button>
           </SheetFooter>

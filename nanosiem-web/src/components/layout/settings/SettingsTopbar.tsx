@@ -17,6 +17,7 @@ import { Separator } from '@/components/ui/separator';
 import { cn } from '@/lib/utils';
 import { useTheme } from 'next-themes';
 import { PivtSummon } from '@/enterprise/components/pivt/PivtSummon';
+import { useCapabilities } from '@/hooks/use-capabilities';
 import type { PivtState } from '@/enterprise/hooks/use-pivt-state';
 import { NotificationBell } from '@/components/NotificationBell';
 import { GROUP_LABEL, SECTION_BY_ID, resolveActiveSection } from './sections';
@@ -30,6 +31,7 @@ interface SettingsTopbarProps {
 
 export function SettingsTopbar({ onOpenAudit, auditOpen, pivt }: SettingsTopbarProps) {
   const location = useLocation();
+  const { capabilities } = useCapabilities();
   const { resolvedTheme, setTheme } = useTheme();
   const theme = resolvedTheme === 'light' ? 'light' : 'dark';
 
@@ -92,9 +94,15 @@ export function SettingsTopbar({ onOpenAudit, auditOpen, pivt }: SettingsTopbarP
 
       <Separator orientation="vertical" className="h-5 mx-1" />
 
-      <PivtSummon state={pivt} />
-
-      <Separator orientation="vertical" className="h-5 mx-0.5" />
+      {/* NAN-2356: pivt is enterprise; AppLayout gates the same mount. The
+          trailing separator goes with it — otherwise open builds render two
+          adjacent dividers where the control used to be. */}
+      {capabilities.melod && (
+        <>
+          <PivtSummon state={pivt} />
+          <Separator orientation="vertical" className="h-5 mx-0.5" />
+        </>
+      )}
 
       <NotificationBell />
 

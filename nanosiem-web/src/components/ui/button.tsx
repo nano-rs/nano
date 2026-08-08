@@ -6,8 +6,25 @@ import { cva, type VariantProps } from 'class-variance-authority';
 
 import { cn } from '@/lib/utils';
 
+// `gap-1.5` belongs in the BASE (NAN-2362). Upstream shadcn carries `gap-2`
+// here; our copy lost it, so `<Button><Icon/>Label</Button>` rendered flush —
+// "⟳Refresh", "✏Edit dashboard".
+//
+// Of 354 icon+label call sites at the time of the fix: 83 were genuinely flush,
+// 86 set their own `gap-*`, and 185 spaced the icon with `mr-*` instead. That
+// last group is why this change could not be a one-liner — tailwind-merge
+// resolves a `gap` against a `gap`, but nothing cancels a CHILD's margin, so
+// adding the base alone would have double-spaced 185 buttons to fix 83. The
+// redundant `mr-*` were removed in the same commit; `gap-1.5` (not shadcn's
+// looser `gap-2`) matches what the 86 hand-gapped sites had already converged on
+// for this density.
+//
+// Safe by construction: text-only and `size="icon"` buttons have a single child
+// so a gap is a no-op, and `cn()` is tailwind-merge — a `className` gap at a
+// call site still overrides this. Icon-only buttons keep their margins (there
+// the margin is positioning, not label spacing).
 const buttonVariants = cva(
-  'inline-flex items-center justify-center whitespace-nowrap rounded-md text-[12px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50',
+  'inline-flex items-center justify-center gap-1.5 whitespace-nowrap rounded-md text-[12px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50',
   {
     variants: {
       variant: {

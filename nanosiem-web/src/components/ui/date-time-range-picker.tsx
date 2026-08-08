@@ -245,7 +245,7 @@ export function DateTimeRangePicker({ value, onChange, className, variant = 'def
             className
           )}
         >
-          <Clock className={cn('mr-2', variant === 'search' ? 'w-[13px] h-[13px]' : 'w-4 h-4', aiMode ? 'text-ai' : 'text-muted-foreground')} />
+          <Clock className={cn('', variant === 'search' ? 'w-[13px] h-[13px]' : 'w-4 h-4', aiMode ? 'text-ai' : 'text-muted-foreground')} />
           {labelPrefix && (
             <span className="mr-1.5 font-mono text-[10.5px] uppercase tracking-[0.08em] text-muted-foreground">
               {labelPrefix}

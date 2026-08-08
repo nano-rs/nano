@@ -1307,7 +1307,7 @@ export function TimelineVisualization({
                 {error ? (
                   <div className="flex items-center justify-center py-8 text-red-400 text-sm">
                     <AlertTriangle className="w-4 h-4 mr-2" />{error}
-                    <Button variant="ghost" size="sm" onClick={() => loadScatterData()} className="ml-4 text-muted-foreground hover:text-primary"><RefreshCw className="w-3 h-3 mr-1" />Retry query</Button>
+                    <Button variant="ghost" size="sm" onClick={() => loadScatterData()} className="ml-4 text-muted-foreground hover:text-primary"><RefreshCw className="w-3 h-3" />Retry query</Button>
                   </div>
                 ) : rarityGatedByWindow ? (
                   // NAN-1701: large window — don't auto-score; require an explicit
@@ -1321,7 +1321,7 @@ export function TimelineVisualization({
                     {/* Only flip the opt-in flag — the prefetch effect (which depends
                         on rarityGatedByWindow) fires the single load, so we don't
                         double-fetch by also calling loadScatterData() here. */}
-                    <Button variant="outline" size="sm" onClick={() => setRarityManualLoad(true)} className="mt-1"><Fingerprint className="w-3 h-3 mr-1.5" />Load rarity anyway</Button>
+                    <Button variant="outline" size="sm" onClick={() => setRarityManualLoad(true)} className="mt-1"><Fingerprint className="w-3 h-3" />Load rarity anyway</Button>
                   </div>
                 ) : (scatterData ?? pendingScatterData) ? (
                   // NAN-1700: render immediately with pending points (event-time

@@ -272,9 +272,9 @@ export function GdprAnonymizationPage() {
               className="h-7 text-[11.5px] px-2.5"
             >
               {submitting ? (
-                <Loader2 className="w-3 h-3 mr-1 animate-spin" />
+                <Loader2 className="w-3 h-3 animate-spin" />
               ) : (
-                <Send className="w-3 h-3 mr-1" />
+                <Send className="w-3 h-3" />
               )}
               Submit request
             </Button>
@@ -344,7 +344,7 @@ export function GdprAnonymizationPage() {
                           setExecuteOpen(true);
                         }}
                       >
-                        <Play className="w-3 h-3 mr-1" />
+                        <Play className="w-3 h-3" />
                         Execute
                       </Button>
                     )}
@@ -500,7 +500,7 @@ export function GdprAnonymizationPage() {
               className="h-7 text-[11.5px] px-2.5 bg-red-600 hover:bg-red-700"
               disabled={executing}
             >
-              {executing && <Loader2 className="w-3 h-3 mr-1 animate-spin" />}
+              {executing && <Loader2 className="w-3 h-3 animate-spin" />}
               Execute
             </AlertDialogAction>
           </AlertDialogFooter>

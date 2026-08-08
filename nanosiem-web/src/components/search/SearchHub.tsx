@@ -1215,11 +1215,11 @@ function LibraryQueryCard({
         </div>
         <div className="flex items-center gap-1">
           <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" onClick={(e) => { e.stopPropagation(); onCopy(query.query, query.id); }}>
-            {copiedId === query.id ? <Check className="h-3 w-3 mr-1" /> : <Copy className="h-3 w-3 mr-1" />}
+            {copiedId === query.id ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
             {copiedId === query.id ? 'Copied' : 'Copy'}
           </Button>
           <Button size="sm" className="h-6 px-2 text-xs bg-primary hover:bg-primary/90" onClick={(e) => { e.stopPropagation(); onRun(query.query); }}>
-            <Play className="h-3 w-3 mr-1" />
+            <Play className="h-3 w-3" />
             Run
           </Button>
         </div>

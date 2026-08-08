@@ -90,6 +90,7 @@ import {
   type ViewMode,
 } from '@/components/rule-editor';
 import { NewRuleAiPanel } from '@/enterprise/components/rule-editor/NewRuleAiPanel';
+import { useCapabilities } from '@/hooks/use-capabilities';
 import { UpstreamMergeModal } from '@/components/repositories/UpstreamMergeModal';
 import { ruleDiffAccess } from '@/components/repositories/repository-action-policy';
 import type { AiTriageHints, CaseVisibility, GeneratedDetection, TestDetectionResult } from '@/lib/api/types';
@@ -171,7 +172,11 @@ export function RuleEditorRedesign() {
   const [validationDetailsOpen, setValidationDetailsOpen] = useState(false);
   // New-rule AI panel — shown by default in new-rule mode so the narrative /
   // batch-generation entry point is visible next to a blank template. Closable.
-  const [aiPanelOpen, setAiPanelOpen] = useState(isNewMode);
+  // NAN-2356: NewRuleAiPanel is enterprise and renders nothing in open builds.
+  // It used to default OPEN for a new rule, so an open-core operator started the
+  // create flow with an invisible panel held open and no way to close it.
+  const { capabilities } = useCapabilities();
+  const [aiPanelOpen, setAiPanelOpen] = useState(isNewMode && capabilities.melod);
   // `?merge=upstream` entry point — Rule Repositories page sends analysts
   // here when they click "Merge upstream" on a forked rule. Open the modal
   // once; after they apply or close, we leave the URL param alone (clearing
@@ -1178,7 +1183,7 @@ export function RuleEditorRedesign() {
         onPendingVersionConsumed={() => setPendingVersionFocusId(null)}
       />
 
-      {isNewMode && aiPanelOpen && (
+      {isNewMode && aiPanelOpen && capabilities.melod && (
         <NewRuleAiPanel
           initialNarrative={initialNarrative}
           disabled={!canEdit}

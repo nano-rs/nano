@@ -119,7 +119,7 @@ export function InstallDialog({ entry, open, onOpenChange, onInstall }: InstallD
             Cancel
           </Button>
           <Button className="rounded-lg" onClick={handleInstall} disabled={installing || !canInstall()}>
-            {installing && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
+            {installing && <Loader2 className="w-4 h-4 animate-spin" />}
             Install
           </Button>
         </SheetFooter>

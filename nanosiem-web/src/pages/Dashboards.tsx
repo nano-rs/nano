@@ -27,7 +27,7 @@ import {
 
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { PivtIcon } from '@/enterprise/icons/PivtIcon';
+import { PivtIcon } from '@/components/icons/PivtIcon';
 import {
   Dialog,
   DialogContent,
@@ -63,6 +63,8 @@ import type {
 } from '@/lib/api';
 
 import { DashboardGenerationWizard } from '@/enterprise/components/dashboard/DashboardGenerationWizard';
+import { CreateDashboardDialog } from '@/components/dashboard/CreateDashboardDialog';
+import { useCapabilities } from '@/hooks/use-capabilities';
 import { WireframePreview, synthesizePreview } from '@/components/dashboard/WireframePreview';
 
 type Density = 'gallery' | 'list';
@@ -263,7 +265,16 @@ function DashCardList({ d, onDelete, canDelete }: DashCardProps) {
   );
 }
 
-function NewDashboardCard({ density, onClick }: { density: Density; onClick: () => void }) {
+function NewDashboardCard({
+  density,
+  onClick,
+  canGenerate,
+}: {
+  density: Density;
+  onClick: () => void;
+  /** False in open builds — the card can only open the blank dialog (NAN-2356). */
+  canGenerate: boolean;
+}) {
   if (density === 'list') {
     return (
       <button
@@ -276,7 +287,7 @@ function NewDashboardCard({ density, onClick }: { density: Density; onClick: () 
         </div>
         <span className="text-[13px] font-semibold">New dashboard</span>
         <span className="text-[11px] text-muted-foreground font-normal">
-          Create a blank or pivt-generated board
+          {canGenerate ? 'Create a blank or pivt-generated board' : 'Create a blank board'}
         </span>
       </button>
     );
@@ -292,11 +303,20 @@ function NewDashboardCard({ density, onClick }: { density: Density; onClick: () 
       </div>
       <div className="flex flex-col gap-0.5">
         <div className="text-[13px] font-semibold text-foreground">New Dashboard</div>
-        <div className="text-[11px] text-muted-foreground">Blank board or pivt-generate</div>
+        <div className="text-[11px] text-muted-foreground">{canGenerate ? 'Blank board or pivt-generate' : 'Blank board'}</div>
       </div>
+      {/* The meta line advertises what this card can actually do. Open builds
+          only get the blank path, so naming pivt there promises a mode that
+          isn't reachable (NAN-2356). */}
       <div className="mt-1 text-[9.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground/70 flex items-center gap-1.5">
-        <PivtIcon className="w-[11px] h-[11px] text-primary" />
-        <span><span className="lowercase">pivt</span> · BLANK</span>
+        {canGenerate ? (
+          <>
+            <PivtIcon className="w-[11px] h-[11px] text-primary" />
+            <span><span className="lowercase">pivt</span> · BLANK</span>
+          </>
+        ) : (
+          <span>BLANK</span>
+        )}
       </div>
     </button>
   );
@@ -383,6 +403,12 @@ export function Dashboards() {
   const { recentDashboardIds, removeRecentDashboard } = useRecentlyViewedDashboards();
 
   const canCreate = hasPermission('dashboards:create');
+  // NAN-2356: the meloD generation wizard is enterprise-only and resolves to a
+  // `return null` stub in open builds. Creating a BLANK dashboard is core, so
+  // the two paths are split: `canGenerate` gates only the AI affordances, and
+  // the blank path always renders a real dialog.
+  const { capabilities } = useCapabilities();
+  const canGenerate = canCreate && capabilities.melod;
   const canDelete = hasPermission('dashboards:delete');
 
   const [searchQuery, setSearchQuery] = useState('');
@@ -399,15 +425,19 @@ export function Dashboards() {
   const [dashboardToDelete, setDashboardToDelete] = useState<DashboardSummary | null>(null);
   const [builderInitialMode, setBuilderInitialMode] = useState<'blank' | 'generate'>('blank');
 
-  // PIVT bridge — `@dashboard <prompt>` opens the builder pre-seeded to generate mode.
+  // PIVT bridge — `@dashboard <prompt>` opens the builder pre-seeded to generate
+  // mode. Only wired when generation is actually available: in open builds the
+  // wizard is a null stub, so opening it would flip state and render nothing
+  // (NAN-2356).
   useEffect(() => {
+    if (!canGenerate) return;
     const handler = () => {
       setBuilderInitialMode('generate');
       setCreateDialogOpen(true);
     };
     window.addEventListener('pivt:open-dashboard-wizard', handler);
     return () => window.removeEventListener('pivt:open-dashboard-wizard', handler);
-  }, []);
+  }, [canGenerate]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -766,12 +796,13 @@ export function Dashboards() {
           canCreate={canCreate}
           onNew={() => openBuilder('blank')}
           onAi={() => openBuilder('generate')}
+          showAi={canGenerate}
         />
       ) : density === 'gallery' ? (
         <div className="flex flex-col gap-2">
           <SectionHeader label="All dashboards" count={filteredDashboards.length} />
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
-            {canCreate && <NewDashboardCard density="gallery" onClick={() => openBuilder('blank')} />}
+            {canCreate && <NewDashboardCard density="gallery" canGenerate={canGenerate} onClick={() => openBuilder('blank')} />}
             {filteredDashboards.map(d => (
               <DashCardGallery
                 key={d.id}
@@ -787,7 +818,7 @@ export function Dashboards() {
         <div className="flex flex-col gap-2">
           <SectionHeader label="All dashboards" count={filteredDashboards.length} />
           <div className="bg-card border border-border rounded-lg overflow-hidden">
-            {canCreate && <NewDashboardCard density="list" onClick={() => openBuilder('blank')} />}
+            {canCreate && <NewDashboardCard density="list" canGenerate={canGenerate} onClick={() => openBuilder('blank')} />}
             {filteredDashboards.map(d => (
               <DashCardList
                 key={d.id}
@@ -821,14 +852,25 @@ export function Dashboards() {
         </DialogContent>
       </Dialog>
 
-      <DashboardGenerationWizard
-        open={createDialogOpen}
-        onOpenChange={setCreateDialogOpen}
-        onComplete={handleGeneratedDashboardComplete}
-        onCreateBlank={handleCreateDashboard}
-        creatingBlank={creating}
-        initialMode={builderInitialMode}
-      />
+      {/* NAN-2356: the wizard covers blank + generate, but it's enterprise-only.
+          Open builds get the core blank dialog so creating a dashboard works. */}
+      {canGenerate ? (
+        <DashboardGenerationWizard
+          open={createDialogOpen}
+          onOpenChange={setCreateDialogOpen}
+          onComplete={handleGeneratedDashboardComplete}
+          onCreateBlank={handleCreateDashboard}
+          creatingBlank={creating}
+          initialMode={builderInitialMode}
+        />
+      ) : (
+        <CreateDashboardDialog
+          open={createDialogOpen}
+          onOpenChange={setCreateDialogOpen}
+          onCreate={handleCreateDashboard}
+          creating={creating}
+        />
+      )}
     </div>
   );
 }
@@ -852,11 +894,14 @@ function EmptyState({
   canCreate,
   onNew,
   onAi,
+  showAi,
 }: {
   searching: boolean;
   canCreate: boolean;
   onNew: () => void;
   onAi: () => void;
+  /** False in open builds — the generation wizard is enterprise (NAN-2356). */
+  showAi: boolean;
 }) {
   if (searching) {
     return (
@@ -877,7 +922,12 @@ function EmptyState({
         </div>
       </div>
       {canCreate && (
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-w-[520px] w-full">
+        <div
+          className={cn(
+            'grid grid-cols-1 gap-3 w-full',
+            showAi ? 'sm:grid-cols-2 max-w-[520px]' : 'max-w-[260px]',
+          )}
+        >
           <button
             type="button"
             onClick={onNew}
@@ -891,19 +941,21 @@ function EmptyState({
               Start with an empty dashboard and add panels manually.
             </div>
           </button>
-          <button
-            type="button"
-            onClick={onAi}
-            className="bg-card border border-dashed border-primary/35 rounded-lg p-4 hover:border-primary hover:bg-primary/5 transition-colors flex flex-col items-center gap-2 group"
-          >
-            <div className="w-9 h-9 rounded-full bg-primary/10 text-primary flex items-center justify-center group-hover:bg-primary/20 transition-colors">
-              <PivtIcon className="w-[16px] h-[16px]" />
-            </div>
-            <div className="text-[13px] font-semibold text-foreground">Generate with pivt</div>
-            <div className="text-[11px] text-muted-foreground text-center">
-              Describe what you need; pivt builds the panels for you.
-            </div>
-          </button>
+          {showAi && (
+            <button
+              type="button"
+              onClick={onAi}
+              className="bg-card border border-dashed border-primary/35 rounded-lg p-4 hover:border-primary hover:bg-primary/5 transition-colors flex flex-col items-center gap-2 group"
+            >
+              <div className="w-9 h-9 rounded-full bg-primary/10 text-primary flex items-center justify-center group-hover:bg-primary/20 transition-colors">
+                <PivtIcon className="w-[16px] h-[16px]" />
+              </div>
+              <div className="text-[13px] font-semibold text-foreground">Generate with pivt</div>
+              <div className="text-[11px] text-muted-foreground text-center">
+                Describe what you need; pivt builds the panels for you.
+              </div>
+            </button>
+          )}
         </div>
       )}
     </div>

@@ -77,7 +77,7 @@ import { useMelodJob } from '@/enterprise/hooks/use-melod-job';
 import { useMelodStatus } from '@/hooks/use-api';
 import type { CollectorError, MelodEditParserResponse } from '@/lib/api';
 import { Send } from 'lucide-react';
-import { PivtIcon } from '@/enterprise/icons/PivtIcon';
+import { PivtIcon } from '@/components/icons/PivtIcon';
 
 import { api } from '@/lib/api';
 import type {
@@ -252,7 +252,7 @@ export function LogSourceDetail() {
         <Rss className="w-10 h-10 text-muted-foreground/50" />
         <div className="text-[13px] font-medium text-foreground">Log source not found</div>
         <Button variant="outline" size="sm" className="h-8" onClick={() => navigate('/ingestion/log-sources')}>
-          <ArrowLeft className="w-3.5 h-3.5 mr-1.5" />
+          <ArrowLeft className="w-3.5 h-3.5" />
           Back to log sources
         </Button>
       </div>
@@ -1054,7 +1054,7 @@ function DraftBanner({
           disabled={discarding}
           onClick={onDiscard}
         >
-          {discarding ? <Loader2 className="w-3 h-3 animate-spin mr-1" /> : <RotateCcw className="w-3 h-3 mr-1" />}
+          {discarding ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />}
           Discard draft
         </Button>
         <Button
@@ -1063,7 +1063,7 @@ function DraftBanner({
           disabled={publishing || !validated}
           onClick={onPublish}
         >
-          {publishing ? <Loader2 className="w-3 h-3 animate-spin mr-1" /> : <Rocket className="w-3 h-3 mr-1" />}
+          {publishing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Rocket className="w-3 h-3" />}
           Publish
         </Button>
       </div>

@@ -923,7 +923,7 @@ export function UserSettings() {
                         className="h-8 text-[11.5px]"
                         onClick={() => setShowRegen(true)}
                       >
-                        <KeyRound className="w-3 h-3 mr-1.5" />
+                        <KeyRound className="w-3 h-3" />
                         Regenerate backup codes
                       </Button>
                       <Button
@@ -932,7 +932,7 @@ export function UserSettings() {
                         className="h-8 text-[11.5px] text-destructive hover:text-destructive"
                         onClick={() => setShowDisableConfirm(true)}
                       >
-                        <ShieldOff className="w-3 h-3 mr-1.5" />
+                        <ShieldOff className="w-3 h-3" />
                         Disable MFA
                       </Button>
                     </>
@@ -976,7 +976,7 @@ export function UserSettings() {
                           }
                         }}
                       >
-                        {regenLoading && <Loader2 className="w-3 h-3 animate-spin mr-1.5" />}
+                        {regenLoading && <Loader2 className="w-3 h-3 animate-spin" />}
                         Generate new codes
                       </Button>
                       <Button
@@ -1024,7 +1024,7 @@ export function UserSettings() {
                         className="h-8 text-[11.5px]"
                         onClick={() => copyBackupCodes(regenCodes)}
                       >
-                        <Copy className="w-3 h-3 mr-1.5" />
+                        <Copy className="w-3 h-3" />
                         Copy
                       </Button>
                       <Button
@@ -1033,7 +1033,7 @@ export function UserSettings() {
                         className="h-8 text-[11.5px]"
                         onClick={() => downloadBackupCodes(regenCodes)}
                       >
-                        <Download className="w-3 h-3 mr-1.5" />
+                        <Download className="w-3 h-3" />
                         Download
                       </Button>
                       <Button
@@ -1088,7 +1088,7 @@ export function UserSettings() {
                           }
                         }}
                       >
-                        {disabling && <Loader2 className="w-3 h-3 animate-spin mr-1.5" />}
+                        {disabling && <Loader2 className="w-3 h-3 animate-spin" />}
                         Confirm disable
                       </Button>
                       <Button
@@ -1128,9 +1128,9 @@ export function UserSettings() {
                   disabled={mfaActionLoading}
                 >
                   {mfaActionLoading ? (
-                    <Loader2 className="w-3.5 h-3.5 animate-spin mr-1.5" />
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
                   ) : (
-                    <ShieldCheck className="w-3.5 h-3.5 mr-1.5" />
+                    <ShieldCheck className="w-3.5 h-3.5" />
                   )}
                   Enable two-factor authentication
                 </Button>
@@ -1246,7 +1246,7 @@ export function UserSettings() {
                     className="h-9 text-[12.5px]"
                     onClick={() => setMfaStep('scan')}
                   >
-                    <ArrowLeft className="w-3.5 h-3.5 mr-2" />
+                    <ArrowLeft className="w-3.5 h-3.5" />
                     Back
                   </Button>
                   <Button
@@ -1256,9 +1256,9 @@ export function UserSettings() {
                     disabled={mfaActionLoading || verifyCode.length < 6}
                   >
                     {mfaActionLoading ? (
-                      <Loader2 className="w-3.5 h-3.5 animate-spin mr-2" />
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
                     ) : (
-                      <ShieldCheck className="w-3.5 h-3.5 mr-2" />
+                      <ShieldCheck className="w-3.5 h-3.5" />
                     )}
                     Verify
                   </Button>
@@ -1298,7 +1298,7 @@ export function UserSettings() {
                     className="h-8 text-[11.5px]"
                     onClick={() => copyBackupCodes(backupCodes)}
                   >
-                    <Copy className="w-3 h-3 mr-1.5" />
+                    <Copy className="w-3 h-3" />
                     Copy
                   </Button>
                   <Button
@@ -1307,7 +1307,7 @@ export function UserSettings() {
                     className="h-8 text-[11.5px]"
                     onClick={() => downloadBackupCodes(backupCodes)}
                   >
-                    <Download className="w-3 h-3 mr-1.5" />
+                    <Download className="w-3 h-3" />
                     Download
                   </Button>
                 </div>
@@ -1328,7 +1328,7 @@ export function UserSettings() {
                   onClick={completeMfaSetup}
                   disabled={!savedConfirmed}
                 >
-                  <CheckCircle2 className="w-3.5 h-3.5 mr-2" />
+                  <CheckCircle2 className="w-3.5 h-3.5" />
                   Done
                 </Button>
               </div>

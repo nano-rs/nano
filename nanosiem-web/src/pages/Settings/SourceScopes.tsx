@@ -200,7 +200,7 @@ function GrantsDetail({
                 className="h-7 text-[11.5px] px-2.5"
                 onClick={onAddGrant}
               >
-                <Plus className="w-[11px] h-[11px] mr-1" />
+                <Plus className="w-[11px] h-[11px]" />
                 Grant group
               </Button>
             )}

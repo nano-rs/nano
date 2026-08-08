@@ -39,6 +39,7 @@ import {
   RefreshCw,
   RotateCcw,
   Shield,
+  ClipboardList,
   Sparkles,
   X,
 } from 'lucide-react';
@@ -54,6 +55,8 @@ import {
   PopoverTrigger,
 } from '@/components/ui/popover';
 import { useAuth } from '@/contexts/AuthContext';
+import { useCapabilities } from '@/hooks/use-capabilities';
+import { isPlaceholderDimensionDetail } from '@/lib/siem-health-placeholders';
 import { api } from '@/lib/api';
 import type {
   CollectedMetrics,
@@ -519,6 +522,20 @@ function PipelineSpine({
   );
 }
 
+/**
+ * Did meloD author the prose on this report?
+ *
+ * The health engine (scheduler, scores, metrics, findings, recommendations) is
+ * core and runs in every edition; only the narrative prose is meloD's. Open
+ * builds get the deterministic roll-up from `siem_health::analyzer`, which is
+ * real content — so the page labels it honestly instead of dressing it as AI
+ * output or showing empty "AI unavailable" scaffolding (NAN-2357).
+ */
+function useAiAuthored(): boolean {
+  const { capabilities } = useCapabilities();
+  return capabilities.melod;
+}
+
 /* ============================================================================
    NARRATIVE
    ============================================================================ */
@@ -534,13 +551,20 @@ function Narrative({
   loading: boolean;
   onRefresh: () => void;
 }) {
+  const aiAuthored = useAiAuthored();
   return (
     <div className="rounded-xl border border-border bg-card p-5">
       <div className="mb-3 flex items-center gap-2">
         <div className="flex h-6 w-6 items-center justify-center rounded-md border border-primary/40 bg-primary/15">
-          <Sparkles className="h-[12px] w-[12px] text-primary" />
+          {aiAuthored ? (
+            <Sparkles className="h-[12px] w-[12px] text-primary" />
+          ) : (
+            <ClipboardList className="h-[12px] w-[12px] text-primary" />
+          )}
         </div>
-        <Eyebrow2>Health narrative · auto-generated</Eyebrow2>
+        <Eyebrow2>
+          {aiAuthored ? 'Health narrative · auto-generated' : 'Health summary · every 12h'}
+        </Eyebrow2>
         {asOf && (
           <>
             <span className="font-mono text-[10px] text-muted-foreground/40">
@@ -564,7 +588,7 @@ function Narrative({
           <RefreshCw
             className={cn('h-[10px] w-[10px]', loading && 'animate-spin')}
           />
-          re-analyze
+          {aiAuthored ? 're-analyze' : 're-check'}
         </button>
       </div>
       {summary ? (
@@ -573,7 +597,9 @@ function Narrative({
         </div>
       ) : (
         <p className="text-[12.5px] text-muted-foreground">
-          No narrative available yet.
+          {aiAuthored
+            ? 'No narrative available yet.'
+            : 'No summary yet — the first check runs within 12h, or run one now.'}
         </p>
       )}
     </div>
@@ -743,6 +769,7 @@ function SuppressFindingButton({
 }) {
   const [open, setOpen] = useState(false);
   const [reason, setReason] = useState('');
+  const aiAuthored = useAiAuthored();
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -761,9 +788,9 @@ function SuppressFindingButton({
           Mark this as not an issue
         </div>
         <p className="mb-2 text-[10.5px] leading-[1.4] text-muted-foreground">
-          The AI will stop raising this class of finding. Your reason is fed
-          into the prompt so it can re-raise it later if the metric materially
-          regresses.
+          {aiAuthored
+            ? 'The AI will stop raising this class of finding. Your reason is fed into the prompt so it can re-raise it later if the metric materially regresses.'
+            : 'This finding is hidden from the list while the suppression is active. Your reason is kept with it so the decision stays reviewable.'}
         </p>
         <textarea
           value={reason}
@@ -872,8 +899,13 @@ function StageDetail({
         <AlertingDetail metrics={report.metrics?.alerting} />
       )}
 
-      {/* Per-dimension narrative */}
-      {detail && (
+      {/* Per-dimension narrative. Hidden when the field is a sentinel rather
+          than prose — an "Analysis" heading over "Scored from live metrics"
+          reads as a broken section instead of an absent one (NAN-2357).
+          Deliberately keyed on the VALUE, not on the meloD capability: Fresh and
+          Stalled reports fill these with real deterministic explanations ("No
+          events in the last 48h…") that open builds should still see. */}
+      {detail && !isPlaceholderDimensionDetail(detail) && (
         <div className="border-t border-border px-5 py-4">
           <Eyebrow2 className="mb-2">Analysis</Eyebrow2>
           <div className={PROSE_CLASSES}>
@@ -1629,6 +1661,7 @@ export function SiemHealth() {
   const { hasPermission } = useAuth();
   const { toast } = useToast();
   const isAdmin = hasPermission('settings:system');
+  const aiAuthored = useAiAuthored();
 
   const { data: report, isLoading } = useQuery({
     queryKey: ['siem-health', 'latest'],
@@ -1904,7 +1937,9 @@ export function SiemHealth() {
         health checks run every{' '}
         <span className="px-1 text-foreground">12h</span>
         <span className="mx-2 text-muted-foreground/40">·</span>
-        narrative regenerated when scores change materially
+        {aiAuthored
+          ? 'narrative regenerated when scores change materially'
+          : 'summary recomputed from live metrics on every run'}
         <span className="flex-1" />
         <span>click a stage to drill in</span>
       </div>

@@ -248,13 +248,13 @@ function RoleDetailView({
           <div className="flex items-center gap-2 shrink-0">
             {canEdit && !locked && (
               <Button size="sm" variant="outline" className="h-7 text-[11.5px] px-2.5" onClick={onEdit}>
-                <PencilLine className="w-[11px] h-[11px] mr-1" />
+                <PencilLine className="w-[11px] h-[11px]" />
                 Rename
               </Button>
             )}
             {canCreate && (
               <Button size="sm" variant="outline" className="h-7 text-[11.5px] px-2.5" onClick={onDuplicate}>
-                <Copy className="w-[11px] h-[11px] mr-1" />
+                <Copy className="w-[11px] h-[11px]" />
                 Duplicate
               </Button>
             )}

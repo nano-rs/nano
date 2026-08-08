@@ -45,12 +45,13 @@ import {
   Layers,
   Loader2,
 } from 'lucide-react';
-import { PivtIcon } from '@/enterprise/icons/PivtIcon';
+import { PivtIcon } from '@/components/icons/PivtIcon';
 import { Textarea } from '@/components/ui/textarea';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { api } from '@/lib/api';
 import type { MelodApiResponse } from '@/lib/api';
 import { useMelodJob } from '@/enterprise/hooks/use-melod-job';
+import { useCapabilities } from '@/hooks/use-capabilities';
 import { DateTimeRangePicker } from '@/components/ui/date-time-range-picker';
 import { QueryTestModal } from './QueryTestModal';
 import { type TimeRangeValue } from '@/hooks/use-api';
@@ -141,6 +142,12 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
   const queryJob = useMelodJob<MelodApiResponse>();
+
+  // NAN-2356: `useMelodJob` resolves to a no-op stub in open builds — its
+  // `start()` returns a rejected promise. Gate the affordance instead of
+  // letting the operator click a button that cannot work.
+  const { capabilities } = useCapabilities();
+  const canAskAi = capabilities.melod;
 
   const isValid = useMemo(() => title.trim().length > 0 && query.trim().length > 0, [title, query]);
 
@@ -338,18 +345,20 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
                     </button>
                   </div>
                 </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setShowAiInput(!showAiInput)}
-                  className="h-[26px] gap-1.5 border-primary/40 text-primary hover:bg-primary/5 hover:text-primary"
-                >
-                  <PivtIcon className="w-[12px] h-[12px]" />
-                  Ask AI
-                </Button>
+                {canAskAi && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setShowAiInput(!showAiInput)}
+                    className="h-[26px] gap-1.5 border-primary/40 text-primary hover:bg-primary/5 hover:text-primary"
+                  >
+                    <PivtIcon className="w-[12px] h-[12px]" />
+                    Ask AI
+                  </Button>
+                )}
               </div>
 
-              {showAiInput && (
+              {showAiInput && canAskAi && (
                 <div className="rounded-md border border-primary/30 bg-primary/[0.06] p-3 flex flex-col gap-2">
                   <div className="flex items-center gap-1.5">
                     <PivtIcon className="w-[12px] h-[12px] text-primary" />

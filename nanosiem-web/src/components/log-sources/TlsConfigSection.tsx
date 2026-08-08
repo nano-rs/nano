@@ -171,7 +171,7 @@ function CertificateInput({
               disabled={disabled}
               className="h-6 text-xs text-red-400 hover:text-red-300"
             >
-              <X className="w-3 h-3 mr-1" />
+              <X className="w-3 h-3" />
               Clear
             </Button>
           )}
@@ -183,7 +183,7 @@ function CertificateInput({
             disabled={disabled}
             className="h-6 text-xs"
           >
-            <Upload className="w-3 h-3 mr-1" />
+            <Upload className="w-3 h-3" />
             Upload
           </Button>
           <input

@@ -1,7 +1,7 @@
 {
   "name": "vite-react-typescript-starter",
   "private": true,
-  "version": "0.1.698",
+  "version": "0.1.699",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -23,6 +23,7 @@
     "test:oidc-provider-slug": "node --test src/enterprise/pages/Settings/oidc-provider-slug.test.ts",
     "test:login-auth-methods": "node --test src/pages/login-auth-methods.test.ts",
     "test:lazy-route-exports": "node tests/e2e/check-lazy-route-exports.mjs",
+    "test:enterprise-stub-gating": "node tests/e2e/check-enterprise-stub-gating.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.app.json",
     "test:deadlinks": "node tests/e2e/check-dead-links.mjs",
     "test:e2e:404": "node tests/e2e/crawl-404.mjs"

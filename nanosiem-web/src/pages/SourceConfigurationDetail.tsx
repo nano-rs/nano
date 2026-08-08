@@ -779,9 +779,9 @@ export default function SourceConfigurationDetail() {
                 onClick={() => deployMutation.mutate()}
               >
                 {deployMutation.isPending && (
-                  <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
                 )}
-                <Rocket className="h-3.5 w-3.5 mr-1.5" />
+                <Rocket className="h-3.5 w-3.5" />
                 Deploy
               </AlertDialogAction>
             </AlertDialogFooter>
@@ -805,7 +805,7 @@ export default function SourceConfigurationDetail() {
                 className="h-8 text-[11.5px] bg-amber-600 hover:bg-amber-700 text-white"
                 onClick={() => undeployMutation.mutate()}
               >
-                <Power className="h-3.5 w-3.5 mr-1.5" />
+                <Power className="h-3.5 w-3.5" />
                 Undeploy
               </AlertDialogAction>
             </AlertDialogFooter>
@@ -889,7 +889,7 @@ export default function SourceConfigurationDetail() {
                   deleteRuleTarget && deleteRuleMutation.mutate(deleteRuleTarget.id)
                 }
               >
-                <Trash2 className="h-3.5 w-3.5 mr-1.5" />
+                <Trash2 className="h-3.5 w-3.5" />
                 Delete rule
               </AlertDialogAction>
             </AlertDialogFooter>
@@ -1037,7 +1037,7 @@ function SourceConfigHeader({
           className="h-[28px] px-2.5 text-[11.5px]"
           onClick={onOpenConnection}
         >
-          <Plug className="h-3 w-3 mr-1" />
+          <Plug className="h-3 w-3" />
           Connection
         </Button>
         <Button
@@ -1055,7 +1055,7 @@ function SourceConfigHeader({
             className="h-[28px] px-2.5 text-[11.5px] border-amber-500/40 text-amber-500 hover:bg-amber-500/10"
             onClick={onUndeploy}
           >
-            <Power className="h-3 w-3 mr-1" />
+            <Power className="h-3 w-3" />
             Undeploy
           </Button>
         )}
@@ -1066,7 +1066,7 @@ function SourceConfigHeader({
             onClick={onDeploy}
             disabled={!hasPendingChanges && config.deployed}
           >
-            <Rocket className="h-3 w-3 mr-1" />
+            <Rocket className="h-3 w-3" />
             {config.deployed ? 'Deploy changes' : 'Deploy'}
           </Button>
         )}
@@ -1548,8 +1548,8 @@ function EditConnectionSheet({
             disabled={!isDirty || saving}
             onClick={onSave}
           >
-            {saving && <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />}
-            <Save className="h-3.5 w-3.5 mr-1.5" />
+            {saving && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            <Save className="h-3.5 w-3.5" />
             Save
           </Button>
         </SheetFooter>
@@ -1807,8 +1807,8 @@ function RuleEditor({
             onClick={onSave}
             disabled={saving}
           >
-            {saving && <Loader2 className="h-3 w-3 mr-1 animate-spin" />}
-            <Save className="h-3 w-3 mr-1" />
+            {saving && <Loader2 className="h-3 w-3 animate-spin" />}
+            <Save className="h-3 w-3" />
             Save changes
           </Button>
         )}
@@ -1819,7 +1819,7 @@ function RuleEditor({
             className="h-[26px] text-[11px] text-red-500 hover:bg-red-500/10"
             onClick={onDelete}
           >
-            <Trash2 className="h-3 w-3 mr-1" />
+            <Trash2 className="h-3 w-3" />
             Delete
           </Button>
         )}
@@ -2180,7 +2180,7 @@ function AddRuleSheet({
             disabled={submitting || !matchField || !targetSourceType}
             onClick={submit}
           >
-            {submitting && <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />}
+            {submitting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
             Add rule
           </Button>
         </SheetFooter>
@@ -2529,9 +2529,9 @@ function SingleSourceTypeMode({
             disabled={!canSave}
           >
             {(creating || updating) && (
-              <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+              <Loader2 className="h-3 w-3 animate-spin" />
             )}
-            <Save className="h-3 w-3 mr-1" />
+            <Save className="h-3 w-3" />
             {defaultRule ? 'Save' : 'Create rule'}
           </Button>
         </div>

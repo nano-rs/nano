@@ -306,9 +306,9 @@ export function ParserUpstreamDiffModal({
                   disabled={deploying || !deployAccess.allowed}
                 >
                   {deploying ? (
-                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    <Loader2 className="w-4 h-4 animate-spin" />
                   ) : (
-                    <Rocket className="w-4 h-4 mr-2" />
+                    <Rocket className="w-4 h-4" />
                   )}
                   Deploy Now
                 </Button>
@@ -330,9 +330,9 @@ export function ParserUpstreamDiffModal({
                   }
                 >
                   {dismissMutation.isPending ? (
-                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    <Loader2 className="w-4 h-4 animate-spin" />
                   ) : (
-                    <X className="w-4 h-4 mr-2" />
+                    <X className="w-4 h-4" />
                   )}
                   Dismiss
                 </Button>
@@ -348,9 +348,9 @@ export function ParserUpstreamDiffModal({
                   }
                 >
                   {applyMutation.isPending ? (
-                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    <Loader2 className="w-4 h-4 animate-spin" />
                   ) : (
-                    <ArrowUpCircle className="w-4 h-4 mr-2" />
+                    <ArrowUpCircle className="w-4 h-4" />
                   )}
                   Apply Update
                 </Button>

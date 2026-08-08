@@ -758,7 +758,7 @@ function ConfigTab(props: ConfigTabProps) {
             )}
           </div>
           <Button size="sm" className="h-7 rounded-md flex-shrink-0" onClick={handleUpdate} disabled={updating}>
-            {updating ? <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5 mr-1" />}
+            {updating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
             Update
           </Button>
         </div>
@@ -867,7 +867,7 @@ function ConfigTab(props: ConfigTabProps) {
           {credentialFields.find(f => f.name === 'collector_token') && (
             <div className="mt-2 flex items-center gap-2">
               <Button variant="outline" size="sm" className="h-7 rounded-md text-[11px]" onClick={generateToken}>
-                <KeyRound className="w-3 h-3 mr-1" /> Generate token
+                <KeyRound className="w-3 h-3" /> Generate token
               </Button>
               {credentials.collector_token && (
                 <Button
@@ -876,7 +876,7 @@ function ConfigTab(props: ConfigTabProps) {
                   className="h-7 rounded-md text-[11px]"
                   onClick={() => navigator.clipboard.writeText(credentials.collector_token)}
                 >
-                  <Copy className="w-3 h-3 mr-1" /> Copy
+                  <Copy className="w-3 h-3" /> Copy
                 </Button>
               )}
             </div>
@@ -888,7 +888,7 @@ function ConfigTab(props: ConfigTabProps) {
           )}
           {credsDirty && (
             <Button size="sm" className="mt-3 h-8 rounded-md" onClick={handleSaveCredentials} disabled={savingCreds}>
-              {savingCreds ? <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" /> : <Save className="w-3.5 h-3.5 mr-1" />}
+              {savingCreds ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
               Save credentials
             </Button>
           )}
@@ -961,7 +961,7 @@ function ConfigTab(props: ConfigTabProps) {
                 onClick={() => handleToggleEnabled(true)}
                 disabled={entry.requires_credential === 'required' && !entry.has_credentials}
               >
-                <Zap className="w-[12px] h-[12px] mr-1" />
+                <Zap className="w-[12px] h-[12px]" />
                 Activate
               </Button>
             )}
@@ -974,12 +974,12 @@ function ConfigTab(props: ConfigTabProps) {
                     className="h-8 rounded-md"
                     title="Live sync needs outbound internet. Import a signed data bundle instead."
                   >
-                    <FileDown className="w-3.5 h-3.5 mr-1" /> Import bundle
+                    <FileDown className="w-3.5 h-3.5" /> Import bundle
                   </Button>
                 </Link>
               ) : (
                 <Button variant="outline" size="sm" className="h-8 rounded-md" onClick={handleSync} disabled={syncing}>
-                  {syncing ? <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5 mr-1" />}
+                  {syncing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
                   Sync now
                 </Button>
               )
@@ -1001,8 +1001,8 @@ function ConfigTab(props: ConfigTabProps) {
             }
           >
             {checkingDelete
-              ? <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" />
-              : <Trash2 className="w-3.5 h-3.5 mr-1" />}
+              ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              : <Trash2 className="w-3.5 h-3.5" />}
             Delete integration
           </Button>
         ) : entry.installed && !isSystem ? (
@@ -1012,7 +1012,7 @@ function ConfigTab(props: ConfigTabProps) {
             className="h-8 rounded-md text-muted-foreground hover:text-red-500"
             onClick={handleUninstall}
           >
-            <Trash2 className="w-3.5 h-3.5 mr-1" /> Uninstall
+            <Trash2 className="w-3.5 h-3.5" /> Uninstall
           </Button>
         ) : null}
       </div>
@@ -1060,7 +1060,7 @@ function CodeTab({ entry, handleExport, exporting }: CodeTabProps) {
             onClick={handleExport}
             disabled={exporting}
           >
-            {exporting ? <Loader2 className="w-3 h-3 mr-1 animate-spin" /> : <Download className="w-3 h-3 mr-1" />}
+            {exporting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
             export
           </Button>
         )}

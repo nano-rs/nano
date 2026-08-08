@@ -405,7 +405,7 @@ export function Marketplace() {
           {airGap && (
             <Link to={AIRGAP_IMPORT_ROUTE}>
               <Button size="sm" className="h-8 rounded-md text-[12px]">
-                <FileDown className="w-3.5 h-3.5 mr-1" /> Import enrichment bundle
+                <FileDown className="w-3.5 h-3.5" /> Import enrichment bundle
               </Button>
             </Link>
           )}
@@ -417,7 +417,7 @@ export function Marketplace() {
                 variant={airGap ? 'outline' : 'default'}
                 className="h-8 rounded-md text-[12px]"
               >
-                <Plus className="w-3.5 h-3.5 mr-1" /> Create custom
+                <Plus className="w-3.5 h-3.5" /> Create custom
               </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-72">
@@ -501,7 +501,7 @@ export function Marketplace() {
           </div>
           <Link to={AIRGAP_IMPORT_ROUTE} className="shrink-0">
             <Button size="sm" className="h-7 rounded-md text-[11.5px]">
-              <FileDown className="w-3 h-3 mr-1" /> Import bundle
+              <FileDown className="w-3 h-3" /> Import bundle
             </Button>
           </Link>
         </div>

@@ -325,8 +325,8 @@ export function DetectionTesterPanel({
                 disabled={isSearching || !panelQuery.trim()}
               >
                 {isSearching
-                  ? <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" />
-                  : <Play className="w-3.5 h-3.5 mr-1" />
+                  ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  : <Play className="w-3.5 h-3.5" />
                 }
                 Run
               </Button>
@@ -342,7 +342,7 @@ export function DetectionTesterPanel({
                   }}
                   title="Sync query from rule editor"
                 >
-                  <RefreshCw className="w-3.5 h-3.5 mr-1" />
+                  <RefreshCw className="w-3.5 h-3.5" />
                   Sync from Rule
                 </Button>
 
@@ -357,7 +357,7 @@ export function DetectionTesterPanel({
                     }}
                     title="Apply this query back to the rule editor"
                   >
-                    <ArrowUpToLine className="w-3.5 h-3.5 mr-1" />
+                    <ArrowUpToLine className="w-3.5 h-3.5" />
                     Apply to Rule
                   </Button>
                 )}

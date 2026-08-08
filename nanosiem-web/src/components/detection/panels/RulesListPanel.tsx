@@ -559,7 +559,7 @@ export function RulesListPanel({
                 onClick={onCreateNew}
                 className="flex-1 justify-start text-muted-foreground hover:text-primary hover:bg-transparent h-8"
               >
-                <Plus className="w-4 h-4 mr-2" />
+                <Plus className="w-4 h-4" />
                 New Rule
               </Button>
               <Button

@@ -174,7 +174,7 @@ export function QueryLibrary({ onSelectQuery }: QueryLibraryProps) {
     <Sheet open={open} onOpenChange={setOpen}>
       <SheetTrigger asChild>
         <Button variant="ghost" size="sm" className="text-muted-foreground hover:text-primary hover:bg-accent/50 rounded-lg h-7 px-2 text-xs">
-          <BookOpen className="h-3.5 w-3.5 mr-1.5" />
+          <BookOpen className="h-3.5 w-3.5" />
           Query Library
         </Button>
       </SheetTrigger>

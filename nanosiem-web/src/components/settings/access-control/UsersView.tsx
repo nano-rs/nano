@@ -427,7 +427,7 @@ export function UsersView() {
               />
             )}
             <Button size="sm" variant="outline" className="h-7 text-[11.5px] px-2.5" onClick={exportCsv}>
-              <Download className="w-[12px] h-[12px] mr-1" />
+              <Download className="w-[12px] h-[12px]" />
               Export CSV
             </Button>
             {canCreate && (
@@ -436,7 +436,7 @@ export function UsersView() {
                 className="h-7 text-[11.5px] px-2.5"
                 onClick={() => setInviteOpen(true)}
               >
-                <Plus className="w-[12px] h-[12px] mr-1" />
+                <Plus className="w-[12px] h-[12px]" />
                 Invite user
               </Button>
             )}

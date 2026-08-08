@@ -154,7 +154,7 @@ export function PreviewModal({ slug, name, open, onOpenChange }: PreviewModalPro
             onClick={() => run()}
             disabled={running || !slug}
           >
-            {running ? <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5 mr-1" />}
+            {running ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
             Run
           </Button>
         </div>

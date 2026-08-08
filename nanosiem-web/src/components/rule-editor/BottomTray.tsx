@@ -21,6 +21,7 @@ import {
 import { Line, LineChart, ResponsiveContainer, Tooltip } from 'recharts';
 import { Separator } from '@/components/ui/separator';
 import { cn } from '@/lib/utils';
+import { useCapabilities } from '@/hooks/use-capabilities';
 import type { ValidationState } from '@/components/editor/detection-linter';
 import type { DailyStat } from '@/lib/api/types';
 import { AutoTuneSettingsPopover } from '@/enterprise/components/rule-editor/AutoTuneSettingsPopover';
@@ -69,6 +70,7 @@ export function BottomTray({
   onOpenVersion,
 }: BottomTrayProps) {
   const [open, setOpen] = useState(true);
+  const { capabilities } = useCapabilities();
 
   const valStatus: 'valid' | 'invalid' | 'unchecked' = validation
     ? validation.valid
@@ -156,7 +158,10 @@ export function BottomTray({
 
         <div className="flex-1" />
 
-        {ruleId && (
+        {/* NAN-2356: AutoTuneSettingsPopover is enterprise (aiTuning) and renders
+            null in open builds — without the capability check the separator was
+            left behind as a stray divider with nothing beside it. */}
+        {ruleId && capabilities.aiTuning && (
           <>
             <AutoTuneSettingsPopover ruleId={ruleId} disabled={readOnly} />
             <Separator orientation="vertical" className="h-4" />

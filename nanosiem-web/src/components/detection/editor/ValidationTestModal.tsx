@@ -141,7 +141,7 @@ export function ValidationTestModal({
               disabled={validating || !dateRange?.from || !dateRange?.to || isRangeTooLarge}
               className="w-full bg-primary hover:bg-primary/90 disabled:opacity-50"
             >
-              {validating ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Play className="w-4 h-4 mr-2" />}
+              {validating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
               Run Test
             </Button>
           </div>

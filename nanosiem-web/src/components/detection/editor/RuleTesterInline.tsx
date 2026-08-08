@@ -99,8 +99,8 @@ export function RuleTesterInline({
             disabled={isSearching || !state.panelQuery.trim()}
           >
             {isSearching
-              ? <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" />
-              : <Play className="w-3.5 h-3.5 mr-1" />
+              ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              : <Play className="w-3.5 h-3.5" />
             }
             Run
           </Button>
@@ -120,7 +120,7 @@ export function RuleTesterInline({
               }}
               title="Sync query from rule editor"
             >
-              <RefreshCw className="w-3.5 h-3.5 mr-1" />
+              <RefreshCw className="w-3.5 h-3.5" />
               Sync
             </Button>
 
@@ -135,7 +135,7 @@ export function RuleTesterInline({
                 }}
                 title="Apply this query back to the rule editor"
               >
-                <ArrowUpToLine className="w-3.5 h-3.5 mr-1" />
+                <ArrowUpToLine className="w-3.5 h-3.5" />
                 Apply
               </Button>
             )}

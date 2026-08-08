@@ -429,7 +429,7 @@ export function IdentitySettings() {
                             onClick={() => handleTestConnection(existing.id)}
                             disabled={testing === existing.id}
                           >
-                            {testing === existing.id ? <Loader2 className="w-3 h-3 mr-1 animate-spin" /> : <Plug className="w-3 h-3 mr-1" />}
+                            {testing === existing.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <Plug className="w-3 h-3" />}
                             Test
                           </Button>
                           <Button
@@ -439,7 +439,7 @@ export function IdentitySettings() {
                             onClick={() => handleSync(existing.id)}
                             disabled={syncing === existing.id}
                           >
-                            {syncing === existing.id ? <Loader2 className="w-3 h-3 mr-1 animate-spin" /> : <RefreshCw className="w-3 h-3 mr-1" />}
+                            {syncing === existing.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
                             Sync
                           </Button>
                         </>
@@ -452,7 +452,7 @@ export function IdentitySettings() {
                           asChild
                         >
                           <a href="/scripts/Sync-ADUsers.ps1" download>
-                            <Download className="w-3 h-3 mr-1" />
+                            <Download className="w-3 h-3" />
                             Collector Script
                           </a>
                         </Button>
@@ -463,7 +463,7 @@ export function IdentitySettings() {
                         className="h-7 text-xs text-destructive hover:text-destructive"
                         onClick={() => handleDelete(existing.id)}
                       >
-                        <Trash2 className="w-3 h-3 mr-1" />
+                        <Trash2 className="w-3 h-3" />
                         Delete
                       </Button>
                     </div>
@@ -621,7 +621,7 @@ export function IdentitySettings() {
                           setCredentials(prev => ({ ...prev, [field.key]: token }));
                         }}
                       >
-                        <Wand2 className="w-3.5 h-3.5 mr-1.5" />
+                        <Wand2 className="w-3.5 h-3.5" />
                         Generate
                       </Button>
                     </div>
@@ -647,7 +647,7 @@ export function IdentitySettings() {
           <SheetFooter className="mt-6">
             <Button variant="outline" onClick={() => setConfigDialog(null)}>Cancel</Button>
             <Button onClick={handleSave} disabled={saving}>
-              {saving ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : null}
+              {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
               {editingProvider ? 'Update' : 'Save'}
             </Button>
           </SheetFooter>
