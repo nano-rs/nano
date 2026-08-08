@@ -56,8 +56,13 @@ RUN test "$EDITION" = "enterprise" || test "$EDITION" = "open" \
 ARG AIRGAP_BUNDLE_PUBLIC_KEY_HEX=""
 ENV AIRGAP_BUNDLE_PUBLIC_KEY_HEX=${AIRGAP_BUNDLE_PUBLIC_KEY_HEX}
 
-# Cook dependencies (cached unless Cargo.toml/Cargo.lock change). Cook with
-# the same feature set as the build below so the cached deps aren't a miss.
+# Cook dependencies (cached unless Cargo.toml/Cargo.lock change).
+#
+# Deliberately workspace-wide, unlike the scoped build below (NAN-2363). Cook
+# only warms the dependency cache; cargo will not reuse a unit compiled with a
+# different feature set, so a wider cook cannot leak features into the shipped
+# binaries — it just warms some units the scoped build won't use. Scoping this
+# too would trade that small waste for a colder cache on the enterprise path.
 COPY --from=planner /app/recipe.json recipe.json
 RUN if [ "$EDITION" = "enterprise" ]; then \
         cargo chef cook --release --features enterprise --recipe-path recipe.json; \
@@ -77,16 +82,31 @@ RUN if [ "$EDITION" = "enterprise" ]; then \
 # temporarily prepend `ENV CARGO_PROFILE_RELEASE_LTO=false` to the RUN
 # commands below. CI has plenty of memory and uses the default (LTO on).
 COPY . .
+# NAN-2363: `-p` is load-bearing, do not drop it. Without an explicit package,
+# cargo selects EVERY workspace member and unifies features across the whole
+# selection. `nanosiem-enterprise` is a member and declares
+# `nanosiem-core = { features = ["enterprise"] }`, so an open build silently
+# compiled nanosiem-core WITH the enterprise feature — every
+# `#[cfg(feature = "enterprise")]` in core took the enterprise branch in
+# open-edition images.
+#
+# It hid well: nanosiem-api's OWN feature was correctly off, so
+# `/api/capabilities` reported `edition: "open"` while core was built as
+# enterprise underneath. Caught on a tenant when an edition-aware string in
+# siem_health rendered the enterprise variant (NAN-2357).
+#
+# nanosiem-jobs and clickhouse_migrator are [[bin]] targets of nanosiem-api
+# (nanosiem-api/Cargo.toml:13-23), hence `-p nanosiem-api` for all three.
 RUN if [ "$EDITION" = "enterprise" ]; then \
-        cargo build --release --features enterprise --bin nanosiem-api \
-        && cargo build --release --features enterprise --bin nanosiem-search \
-        && cargo build --release --features enterprise --bin nanosiem-jobs \
-        && cargo build --release --features enterprise --bin clickhouse_migrator; \
+        cargo build --release --features enterprise -p nanosiem-api --bin nanosiem-api \
+        && cargo build --release --features enterprise -p nanosiem-search --bin nanosiem-search \
+        && cargo build --release --features enterprise -p nanosiem-api --bin nanosiem-jobs \
+        && cargo build --release --features enterprise -p nanosiem-api --bin clickhouse_migrator; \
     else \
-        cargo build --release --bin nanosiem-api \
-        && cargo build --release --bin nanosiem-search \
-        && cargo build --release --bin nanosiem-jobs \
-        && cargo build --release --bin clickhouse_migrator; \
+        cargo build --release -p nanosiem-api --bin nanosiem-api \
+        && cargo build --release -p nanosiem-search --bin nanosiem-search \
+        && cargo build --release -p nanosiem-api --bin nanosiem-jobs \
+        && cargo build --release -p nanosiem-api --bin clickhouse_migrator; \
     fi
 
 # -----------------------------------------------------------------------------

@@ -13,6 +13,8 @@ on:
       - docker-compose.opensource.yml
       - images.lock
       - install.sh
+      - Dockerfile*
+      - scripts/check-cargo-package-scoping.sh
       - config/vector/**
       - scripts/check-opensource-pins.sh
       - .github/workflows/opensource-stack-gate.yml
@@ -39,6 +41,13 @@ jobs:
           else
             echo "shellcheck not installed on runner — skipping."
           fi
+
+      # NAN-2363: an unscoped `cargo build` in the Dockerfile selects the whole
+      # workspace and unifies features, so nanosiem-enterprise turned on
+      # nanosiem-core/enterprise for OPEN images too. Both editions still
+      # compile, so only a structural check catches it.
+      - name: Cargo package scoping (open-edition feature leak)
+        run: bash scripts/check-cargo-package-scoping.sh
 
       - name: Validate open-source stack definition
         run: bash scripts/check-opensource-pins.sh
