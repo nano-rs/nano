@@ -207,11 +207,68 @@ fn env_ai_credits_ceiling() -> Option<u32> {
         .and_then(|v| parse_ai_credits_ceiling(&v))
 }
 
+/// Env var carrying a per-deployment detection-rule ceiling (NAN-2366).
+pub const MAX_DETECTION_RULES_ENV: &str = "NANO_MAX_DETECTION_RULES";
+
+/// Parse a detection-rule ceiling override.
+///
+/// Tri-state, because `max_detection_rules: None` already means "unlimited"
+/// and so cannot double as "no override":
+///
+/// - `None` — absent or unusable; keep whatever the tier/DB resolved to
+/// - `Some(None)` — the explicit `unlimited` sentinel
+/// - `Some(Some(n))` — a concrete ceiling
+///
+/// Zero, negatives and garbage degrade to "no override" rather than to a zero
+/// ceiling: a platform typo must not leave a tenant unable to create a single
+/// detection rule. Parsed through `i32` because `tier_max_detection_rules` is
+/// a PostgreSQL INTEGER — `set_tier` binds it as `i32`, so a value past
+/// `i32::MAX` would wrap negative on the way to the column.
+fn parse_max_detection_rules(raw: &str) -> Option<Option<u32>> {
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("unlimited") || raw.eq_ignore_ascii_case("none") {
+        return Some(None);
+    }
+    raw.parse::<i32>()
+        .ok()
+        .filter(|v| *v > 0)
+        .map(|v| Some(v as u32))
+}
+
+/// Per-deployment detection-rule ceiling, set by the platform at provision
+/// time (FRO-704).
+///
+/// Lets one tenant carry a different rule ceiling without moving its tier —
+/// which on compose tenants would also rewrite the ClickHouse memory caps to
+/// match a box size it may not actually have.
+///
+/// **Test pollution warning**: reads process-wide env state — see the note on
+/// `env_ai_credits_ceiling`. Tests cover the pure pieces
+/// (`parse_max_detection_rules`, `with_rule_override`) instead of toggling
+/// the var.
+fn env_max_detection_rules() -> Option<Option<u32>> {
+    std::env::var(MAX_DETECTION_RULES_ENV)
+        .ok()
+        .and_then(|v| parse_max_detection_rules(&v))
+}
+
 impl TierLimits {
     /// Get the default limits for a given tier.
     /// These are the hardcoded defaults; DB values can override for Enterprise.
     pub fn for_tier(tier: OrganizationTier) -> Self {
         Self::for_tier_with_ceiling(tier, env_ai_credits_ceiling())
+            .with_rule_override(env_max_detection_rules())
+    }
+
+    /// Tier defaults with no env overrides applied.
+    ///
+    /// Use this wherever the result is *persisted* rather than merely resolved.
+    /// An env-derived override written into `tier_max_detection_rules` would
+    /// outlive the env var that produced it: clearing the override on the
+    /// platform would leave the stale cap sitting in the tenant's own row, and
+    /// the DB merge prefers that column over the tier default.
+    pub fn for_tier_unoverridden(tier: OrganizationTier) -> Self {
+        Self::for_tier_with_ceiling(tier, None)
     }
 
     /// `for_tier` with the env ceiling passed explicitly.
@@ -225,6 +282,26 @@ impl TierLimits {
             limits.ai_credits_per_month = ceiling;
         }
         limits
+    }
+
+    /// Apply the detection-rule override, replacing whatever was resolved.
+    ///
+    /// Unlike the AI credit ceiling this is an unconditional replace, not a
+    /// fill-if-none: the whole point is to raise a concrete tier default
+    /// (hobby's 15) without moving the tenant's tier.
+    ///
+    /// It must also be re-applied *after* the DB merge in `get_tier_limits`,
+    /// not just here. `tier_max_detection_rules` is a real column that
+    /// `set_tier` rewrites with the tier default on every boot, and the merge
+    /// prefers the column over the defaults — so an override left only in
+    /// `for_tier` would be shadowed the moment the tenant restarts. The AI
+    /// ceiling has no such column, which is why it gets away with one
+    /// application.
+    fn with_rule_override(mut self, max_rules: Option<Option<u32>>) -> Self {
+        if let Some(rules) = max_rules {
+            self.max_detection_rules = rules;
+        }
+        self
     }
 
     fn tier_defaults(tier: OrganizationTier) -> Self {
@@ -369,7 +446,13 @@ impl TierLimits {
 
     /// Check if any limit is enforced (i.e., not Unrestricted)
     pub fn is_enforced(&self) -> bool {
-        self.tier != OrganizationTier::Unrestricted
+        // Unrestricted normally means "no limits at all". An explicit
+        // detection-rule override is a cap the platform deliberately set,
+        // though, and skipping enforcement for it would have the API report a
+        // ceiling while letting rule creation sail past it. Every other limit
+        // on this tier is None, and `check_limit` treats None as unlimited, so
+        // enforcing here caps rules only (NAN-2366).
+        self.tier != OrganizationTier::Unrestricted || self.max_detection_rules.is_some()
     }
 }
 
@@ -497,15 +580,26 @@ impl TierSettings {
                     max_metric_monitors: defaults.max_metric_monitors,
                     max_synthetic_checks: defaults.max_synthetic_checks,
                     max_slos: defaults.max_slos,
-                })
+                }
+                // Re-applied after the merge, not just inside `for_tier`:
+                // `tier_max_detection_rules` is non-NULL for every metered
+                // tier once `set_tier` has run at boot, and the merge above
+                // prefers the column over the defaults. Without this the
+                // platform's override would work exactly once and then be
+                // shadowed by the tenant's own DB row (NAN-2366).
+                .with_rule_override(env_max_detection_rules()))
             }
+            // `for_tier` already applies the override on this path.
             None => Ok(TierLimits::for_tier(OrganizationTier::default())),
         }
     }
 
     /// Update the organization tier
     pub async fn set_tier(&self, tier: OrganizationTier) -> Result<TierLimits, TierError> {
-        let defaults = TierLimits::for_tier(tier);
+        // Persist pristine tier defaults, not the env-resolved ones: this runs
+        // on every boot, and writing an override into tier_max_detection_rules
+        // would make it survive the removal of the env var that set it.
+        let defaults = TierLimits::for_tier_unoverridden(tier);
 
         sqlx::query(
             r#"
@@ -538,7 +632,9 @@ impl TierSettings {
         .execute(&self.pool)
         .await?;
 
-        Ok(defaults)
+        // Return the *effective* limits, not the persisted ones — this is what
+        // boot logs, and it should show the ceiling the tenant will really get.
+        Ok(TierLimits::for_tier(tier))
     }
 
     /// Update specific tier limit overrides (for Enterprise customization)
@@ -1229,6 +1325,96 @@ mod tests {
         assert_eq!(limits.ai_credits_per_month, None);
     }
 
+    // NAN-2366: the per-deployment detection-rule override.
+
+    #[test]
+    fn test_rule_override_parse_is_tri_state() {
+        assert_eq!(parse_max_detection_rules("50"), Some(Some(50)));
+        assert_eq!(parse_max_detection_rules(" 50 "), Some(Some(50)));
+        // `None` means "no override", which is distinct from an explicit
+        // unlimited — the limit field already uses None for unlimited.
+        assert_eq!(parse_max_detection_rules("unlimited"), Some(None));
+        assert_eq!(parse_max_detection_rules("UNLIMITED"), Some(None));
+        assert_eq!(parse_max_detection_rules("none"), Some(None));
+        // Zero, negatives and garbage degrade to "no override" rather than to
+        // a zero ceiling that would block every rule create.
+        assert_eq!(parse_max_detection_rules("0"), None);
+        assert_eq!(parse_max_detection_rules("-1"), None);
+        assert_eq!(parse_max_detection_rules(""), None);
+        assert_eq!(parse_max_detection_rules("fifty"), None);
+        assert_eq!(parse_max_detection_rules("5e1"), None);
+        // tier_max_detection_rules is a PostgreSQL INTEGER.
+        assert_eq!(parse_max_detection_rules("2147483647"), Some(Some(2_147_483_647)));
+        assert_eq!(parse_max_detection_rules("2147483648"), None);
+    }
+
+    #[test]
+    fn test_rule_override_replaces_a_concrete_tier_default() {
+        // The case that motivated this: raise hobby's 15 without moving tier.
+        let hobby = TierLimits::for_tier_with_ceiling(OrganizationTier::Hobby, None)
+            .with_rule_override(Some(Some(50)));
+        assert_eq!(hobby.max_detection_rules, Some(50));
+        // Unlike the AI ceiling this is not fill-if-none, so it can lower too.
+        let growth = TierLimits::for_tier_with_ceiling(OrganizationTier::Growth, None)
+            .with_rule_override(Some(Some(5)));
+        assert_eq!(growth.max_detection_rules, Some(5));
+        // ...and can grant unlimited to a metered tier.
+        let unlimited = TierLimits::for_tier_with_ceiling(OrganizationTier::Hobby, None)
+            .with_rule_override(Some(None));
+        assert_eq!(unlimited.max_detection_rules, None);
+    }
+
+    #[test]
+    fn test_rule_override_absent_preserves_tier_default() {
+        let hobby = TierLimits::for_tier_with_ceiling(OrganizationTier::Hobby, None)
+            .with_rule_override(None);
+        assert_eq!(hobby.max_detection_rules, Some(15));
+        let team = TierLimits::for_tier_with_ceiling(OrganizationTier::Team, None)
+            .with_rule_override(None);
+        assert_eq!(team.max_detection_rules, None);
+    }
+
+    #[test]
+    fn test_rule_override_switches_enforcement_on_for_unrestricted() {
+        // Unrestricted skips every limit check, so an override there would be
+        // reported by the API and then never applied. A numeric override has to
+        // turn enforcement back on; an "unlimited" one must not.
+        let base = TierLimits::for_tier_unoverridden(OrganizationTier::Unrestricted);
+        assert!(!base.is_enforced());
+
+        let capped = TierLimits::for_tier_unoverridden(OrganizationTier::Unrestricted)
+            .with_rule_override(Some(Some(50)));
+        assert!(capped.is_enforced());
+        assert_eq!(capped.max_detection_rules, Some(50));
+        // Every other limit stays None, and check_limit treats None as
+        // unlimited — so flipping enforcement on caps rules and nothing else.
+        assert_eq!(capped.max_data_sources, None);
+        assert_eq!(capped.max_eps, None);
+        assert!(check_limit("data sources", 9_999, capped.max_data_sources, capped.tier, "").is_ok());
+        assert!(check_limit("detection rules", 50, capped.max_detection_rules, capped.tier, "").is_err());
+
+        let unlimited = TierLimits::for_tier_unoverridden(OrganizationTier::Unrestricted)
+            .with_rule_override(Some(None));
+        assert!(!unlimited.is_enforced());
+    }
+
+    #[test]
+    fn test_rule_override_touches_nothing_else() {
+        // The override exists so a tenant can gain rules without gaining the
+        // ingest allowance and AI spend a tier move would bring.
+        let base = TierLimits::for_tier_with_ceiling(OrganizationTier::Hobby, None);
+        let overridden = TierLimits::for_tier_with_ceiling(OrganizationTier::Hobby, None)
+            .with_rule_override(Some(Some(50)));
+        assert_eq!(overridden.tier, base.tier);
+        assert_eq!(overridden.max_daily_gb, base.max_daily_gb);
+        assert_eq!(overridden.max_eps, base.max_eps);
+        assert_eq!(overridden.max_data_sources, base.max_data_sources);
+        assert_eq!(overridden.ai_credits_per_month, base.ai_credits_per_month);
+        assert_eq!(overridden.ai_model_tier, base.ai_model_tier);
+        assert_eq!(overridden.sso_enabled, base.sso_enabled);
+        assert_eq!(overridden.ha_enabled, base.ha_enabled);
+    }
+
     #[test]
     fn test_unrestricted_has_no_limits() {
         // via for_tier_with_ceiling(None): a NANO_AI_CREDITS_PER_MONTH set in
@@ -1253,7 +1439,7 @@ mod tests {
 
     #[test]
     fn test_hobby_limits() {
-        let limits = TierLimits::for_tier(OrganizationTier::Hobby);
+        let limits = TierLimits::for_tier_unoverridden(OrganizationTier::Hobby);
         assert_eq!(limits.max_data_sources, Some(10));
         assert_eq!(limits.max_detection_rules, Some(15));
         assert_eq!(limits.max_team_members, Some(3));
@@ -1273,7 +1459,7 @@ mod tests {
 
     #[test]
     fn test_startup_limits() {
-        let limits = TierLimits::for_tier(OrganizationTier::Startup);
+        let limits = TierLimits::for_tier_unoverridden(OrganizationTier::Startup);
         assert_eq!(limits.max_data_sources, Some(20));
         assert_eq!(limits.max_detection_rules, Some(30));
         assert_eq!(limits.max_team_members, Some(8));
@@ -1288,7 +1474,7 @@ mod tests {
 
     #[test]
     fn test_growth_limits() {
-        let limits = TierLimits::for_tier(OrganizationTier::Growth);
+        let limits = TierLimits::for_tier_unoverridden(OrganizationTier::Growth);
         assert_eq!(limits.max_data_sources, Some(30));
         assert_eq!(limits.max_detection_rules, Some(50));
         assert_eq!(limits.max_team_members, Some(12));
@@ -1303,7 +1489,7 @@ mod tests {
 
     #[test]
     fn test_team_limits() {
-        let limits = TierLimits::for_tier(OrganizationTier::Team);
+        let limits = TierLimits::for_tier_unoverridden(OrganizationTier::Team);
         assert_eq!(limits.max_team_members, Some(15));
         assert_eq!(limits.max_daily_gb, Some(25.0));
         assert_eq!(limits.max_eps, Some(385));
@@ -1320,7 +1506,7 @@ mod tests {
 
     #[test]
     fn test_starter_limits() {
-        let limits = TierLimits::for_tier(OrganizationTier::Starter);
+        let limits = TierLimits::for_tier_unoverridden(OrganizationTier::Starter);
         assert_eq!(limits.max_data_sources, None);
         assert_eq!(limits.max_detection_rules, None);
         assert_eq!(limits.max_team_members, None);
@@ -1334,7 +1520,7 @@ mod tests {
 
     #[test]
     fn test_pro_limits() {
-        let limits = TierLimits::for_tier(OrganizationTier::Pro);
+        let limits = TierLimits::for_tier_unoverridden(OrganizationTier::Pro);
         assert_eq!(limits.max_team_members, None);
         assert_eq!(limits.max_daily_gb, Some(100.0));
         assert_eq!(limits.max_eps, Some(1_550));
@@ -1373,24 +1559,24 @@ mod tests {
     #[test]
     fn test_api_access() {
         // NAN-1472: API access is available on all tiers, including Hobby.
-        let hobby = TierLimits::for_tier(OrganizationTier::Hobby);
+        let hobby = TierLimits::for_tier_unoverridden(OrganizationTier::Hobby);
         assert!(check_api_write_access(&hobby).is_ok());
         assert!(check_api_access(&hobby).is_ok());
 
-        let growth = TierLimits::for_tier(OrganizationTier::Growth);
+        let growth = TierLimits::for_tier_unoverridden(OrganizationTier::Growth);
         assert!(check_api_write_access(&growth).is_ok());
         assert!(check_api_access(&growth).is_ok());
 
-        let starter = TierLimits::for_tier(OrganizationTier::Starter);
+        let starter = TierLimits::for_tier_unoverridden(OrganizationTier::Starter);
         assert!(check_api_write_access(&starter).is_ok());
     }
 
     #[test]
     fn test_sso_access() {
-        assert!(check_sso_access(&TierLimits::for_tier(OrganizationTier::Hobby)).is_err());
-        assert!(check_sso_access(&TierLimits::for_tier(OrganizationTier::Growth)).is_err());
-        assert!(check_sso_access(&TierLimits::for_tier(OrganizationTier::Starter)).is_ok());
-        assert!(check_sso_access(&TierLimits::for_tier(OrganizationTier::Pro)).is_ok());
+        assert!(check_sso_access(&TierLimits::for_tier_unoverridden(OrganizationTier::Hobby)).is_err());
+        assert!(check_sso_access(&TierLimits::for_tier_unoverridden(OrganizationTier::Growth)).is_err());
+        assert!(check_sso_access(&TierLimits::for_tier_unoverridden(OrganizationTier::Starter)).is_ok());
+        assert!(check_sso_access(&TierLimits::for_tier_unoverridden(OrganizationTier::Pro)).is_ok());
     }
 
     #[test]
