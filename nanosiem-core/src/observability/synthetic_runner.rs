@@ -242,8 +242,17 @@ impl SyntheticRunner {
         // Parameterized via the official client's `?` binding — injection-safe.
         // (`table` is not user input: a compile-time literal chosen by cluster
         // state, so splicing it into the query text carries no injection risk.)
-        let sql =
-            format!("SELECT toInt64(max(timestamp) * 1000) FROM {table} WHERE check_id = ?");
+        // `timestamp` is DateTime64(3, 'UTC') (clickhouse/142) and ClickHouse
+        // rejects arithmetic between a DateTime64 and an integer outright —
+        // Code 43 ILLEGAL_TYPE_OF_ARGUMENT. The original form scaled the max to
+        // milliseconds by multiplication and so failed on EVERY tick; because the
+        // caller logs-and-skips (NAN-1102), that silently meant no synthetic check
+        // ever ran (NAN-2381). `toUnixTimestamp64Milli` is the typed conversion;
+        // the empty set still yields 0 (the DateTime64 epoch) -> `last_ms == 0`
+        // -> due. Guarded by tests/synthetic_due_for_type_guard.rs.
+        let sql = format!(
+            "SELECT toUnixTimestamp64Milli(max(timestamp)) FROM {table} WHERE check_id = ?"
+        );
         let last_ms: i64 = self
             .ch_client
             .query(&sql)
