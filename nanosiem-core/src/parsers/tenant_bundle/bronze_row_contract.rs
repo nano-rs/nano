@@ -117,29 +117,19 @@ pub enum LaneInput {
     },
 }
 
-/// The log event Vector's `splunk_hec` source builds from one envelope
-/// (legacy namespace, `build_log_legacy` in the nano-rs/vector fork): a
-/// string `event` becomes `.message`; an object `event` is spread over the
-/// root (a scalar `line` becomes `.message`), so `.message` is unset; any
-/// other or empty `event` refuses the request. `sourcetype` / `source` land
-/// in `splunk_sourcetype` / `splunk_source`.
+/// The shipped HEC source uses `event.decoding.codec = "bytes"`:
+/// string payloads stay text and object payloads are serialized to JSON in
+/// `.message`. Envelope metadata remains separate from payload routing fields.
 pub fn splunk_hec_log(envelope: &serde_json::Value) -> Result<serde_json::Value, String> {
     use serde_json::Value;
     let mut log = serde_json::Map::new();
-    match envelope.get("event") {
-        Some(Value::String(text)) if !text.is_empty() => {
-            log.insert("message".into(), Value::String(text.clone()));
-        }
-        Some(Value::Object(object)) if !object.is_empty() => {
-            let mut object = object.clone();
-            if let Some(line) = object.remove("line") {
-                let key = if line.is_array() || line.is_object() { "line" } else { "message" };
-                log.insert(key.into(), line);
-            }
-            log.extend(object);
-        }
-        _ => return Err("splunk_hec refuses the envelope's event".into()),
-    }
+    let message = match envelope.get("event") {
+        Some(Value::String(text)) if !text.is_empty() => text.clone(),
+        Some(Value::Null) | None => return Err("splunk_hec refuses the envelope's event".into()),
+        Some(Value::String(_)) => return Err("splunk_hec refuses the envelope's event".into()),
+        Some(value) => value.to_string(),
+    };
+    log.insert("message".into(), Value::String(message));
     for (field, key) in [("sourcetype", "splunk_sourcetype"), ("source", "splunk_source")] {
         if let Some(value) = envelope.get(field).filter(|v| v.is_string()) {
             log.insert(key.into(), value.clone());
@@ -350,23 +340,18 @@ mod tests {
     use super::super::{archive, overlay, platform_audit_lane};
     use super::*;
 
-    /// Vector's splunk_hec decode: only a string `event` reaches `.message`
-    /// (NAN-3490).
     #[test]
-    fn splunk_hec_log_matches_vector_legacy_decode() {
+    fn splunk_hec_log_matches_vector_bytes_decode() {
         use serde_json::json;
-        let text = splunk_hec_log(&json!({"event": "{\"a\":1}", "sourcetype": "s", "source": "x"})).unwrap();
-        assert_eq!(
-            text,
-            json!({"message": "{\"a\":1}", "splunk_sourcetype": "s", "splunk_source": "x", "source_type": "splunk_hec"})
-        );
-        let object = splunk_hec_log(&json!({"event": {"a": 1, "message": "m"}})).unwrap();
-        assert_eq!(object, json!({"a": 1, "message": "m", "source_type": "splunk_hec"}));
-        let spread = splunk_hec_log(&json!({"event": {"a": 1}})).unwrap();
-        assert!(spread.get("message").is_none(), "an object event leaves .message unset");
-        let line = splunk_hec_log(&json!({"event": {"line": "l", "b": 2}})).unwrap();
-        assert_eq!(line["message"], "l");
-        for bad in [json!({}), json!({"event": ""}), json!({"event": {}}), json!({"event": 3})] {
+        for payload in [json!({"a": 1, "message": "m"}), json!({"line": "l", "b": 2}), json!({}), json!(3)] {
+            let log = splunk_hec_log(&json!({"event": payload, "sourcetype": "s"})).unwrap();
+            assert_eq!(serde_json::from_str::<serde_json::Value>(log["message"].as_str().unwrap()).unwrap(), payload);
+            assert_eq!(log["splunk_sourcetype"], "s");
+            assert!(log.get("a").is_none());
+        }
+        let text = splunk_hec_log(&json!({"event": "raw text"})).unwrap();
+        assert_eq!(text["message"], "raw text");
+        for bad in [json!({}), json!({"event": ""}), json!({"event": null})] {
             assert!(splunk_hec_log(&bad).is_err(), "{bad}");
         }
     }

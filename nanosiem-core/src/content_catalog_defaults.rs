@@ -11,12 +11,13 @@
 //! [`ensure_first_party_catalogs`] runs from the leader's repository sync
 //! schedulers on every start, so it covers both a first boot and an upgrade:
 //!
-//! * **Missing** catalog row: registered at the lake content branch
-//!   (`ocsf-1.9`) with auto-sync on and an hourly cadence, so the schedulers
-//!   sync it straight away and the full catalog is there at first login.
-//! * **Existing, enabled** row on `main` (OCSF 1.8 content) or an empty
-//!   branch: moved to `ocsf-1.9`. Auto-sync off: switched on, exactly like
-//!   the hosted `ensure_default_catalog` reconcile. Either change clears
+//! * **Missing** catalog row: registered at the content branch (`main`, which
+//!   carries the OCSF 1.9 content since NAN-3897) with auto-sync on and an
+//!   hourly cadence, so the schedulers sync it straight away and the full
+//!   catalog is there at first login.
+//! * **Existing, enabled** row on the retired `ocsf-1.9` default (NAN-3758)
+//!   or an empty branch: moved to `main`. Auto-sync off: switched on, exactly
+//!   like the hosted `ensure_default_catalog` reconcile. Either change clears
 //!   `last_synced_at` so the row is due on the next scheduler pass.
 //! * **Disabled** row: the operator's opt-out. Left alone.
 //! * Any other branch (an explicit pin or fork branch): kept.
@@ -123,7 +124,8 @@ pub fn plan(existing: Option<&ExistingCatalog>, target_branch: &str) -> CatalogP
         return CatalogPlan::Disabled(row.id);
     }
     let stored = row.branch.trim();
-    let branch = (target_branch != "main" && (stored.is_empty() || stored == "main")).then(|| target_branch.to_owned());
+    let retired = stored.is_empty() || stored == crate::schema::RETIRED_OCSF_CONTENT_BRANCH;
+    let branch = (retired && stored != target_branch).then(|| target_branch.to_owned());
     if branch.is_none() && row.auto_sync_enabled {
         return CatalogPlan::Current(row.id);
     }
@@ -271,35 +273,36 @@ mod tests {
     }
 
     #[test]
-    fn fresh_install_registers_the_lake_branch() {
-        assert_eq!(plan(None, "ocsf-1.9"), CatalogPlan::Create { branch: "ocsf-1.9".into() });
+    fn fresh_install_registers_main() {
+        assert_eq!(crate::schema::default_content_branch(FirstPartyCatalog::Rules.url(), None), "main");
+        assert_eq!(plan(None, "main"), CatalogPlan::Create { branch: "main".into() });
     }
 
+    /// NAN-3897: the retired `ocsf-1.9` default (or an unset branch) moves to `main`.
     #[test]
-    fn upgrade_moves_main_or_unset_and_enables_auto_sync() {
-        for stored in ["main", "", " main "] {
+    fn upgrade_moves_ocsf19_or_unset_to_main_and_enables_auto_sync() {
+        for stored in ["ocsf-1.9", "", " ocsf-1.9 "] {
             assert_eq!(
-                plan(Some(&row(stored, true, false)), "ocsf-1.9"),
-                CatalogPlan::Update { id: Uuid::nil(), branch: Some("ocsf-1.9".into()), enable_auto_sync: true }
+                plan(Some(&row(stored, true, false)), "main"),
+                CatalogPlan::Update { id: Uuid::nil(), branch: Some("main".into()), enable_auto_sync: true }
             );
         }
         assert_eq!(
-            plan(Some(&row("main", true, true)), "ocsf-1.9"),
-            CatalogPlan::Update { id: Uuid::nil(), branch: Some("ocsf-1.9".into()), enable_auto_sync: false }
+            plan(Some(&row("ocsf-1.9", true, true)), "main"),
+            CatalogPlan::Update { id: Uuid::nil(), branch: Some("main".into()), enable_auto_sync: false }
         );
         assert_eq!(
-            plan(Some(&row("ocsf-1.9", true, false)), "ocsf-1.9"),
+            plan(Some(&row("main", true, false)), "main"),
             CatalogPlan::Update { id: Uuid::nil(), branch: None, enable_auto_sync: true }
         );
     }
 
     #[test]
-    fn pins_current_rows_and_opt_outs_are_kept() {
-        assert_eq!(plan(Some(&row("ocsf-1.9", true, true)), "ocsf-1.9"), CatalogPlan::Current(Uuid::nil()));
-        assert_eq!(plan(Some(&row("my-fork", true, true)), "ocsf-1.9"), CatalogPlan::Current(Uuid::nil()));
-        assert_eq!(plan(Some(&row("main", false, false)), "ocsf-1.9"), CatalogPlan::Disabled(Uuid::nil()));
-        // An unresolvable profile resolves "main": never rewrite anything to it.
-        assert_eq!(plan(Some(&row("", true, true)), "main"), CatalogPlan::Current(Uuid::nil()));
+    fn main_pins_and_opt_outs_are_kept() {
+        assert_eq!(plan(Some(&row("main", true, true)), "main"), CatalogPlan::Current(Uuid::nil()));
+        assert_eq!(plan(Some(&row("my-fork", true, true)), "main"), CatalogPlan::Current(Uuid::nil()));
+        assert_eq!(plan(Some(&row("legacy/clickhouse", true, true)), "main"), CatalogPlan::Current(Uuid::nil()));
+        assert_eq!(plan(Some(&row("ocsf-1.9", false, false)), "main"), CatalogPlan::Disabled(Uuid::nil()));
     }
 
     #[test]

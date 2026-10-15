@@ -340,6 +340,27 @@ struct LiteRecord {
     asn: String,
 }
 
+/// Bundle feeds that are not exact-match IOC sections.
+const NON_IOC_FEEDS: [&str; 2] = ["ipinfo_lite", "synthient"];
+
+/// Human-readable name for a platform feed id, as the product names it.
+pub fn platform_feed_display_name(feed: &str) -> String {
+    match feed {
+        "threatfox" => "ThreatFox".to_string(),
+        "tor_exit_nodes" => "Tor exit nodes".to_string(),
+        "urlhaus" => "URLhaus".to_string(),
+        "malwarebazaar" => "MalwareBazaar".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// One granted platform IOC row with the grant that admits it.
+struct GrantedIoc<'a> {
+    row: IocSnapshotInput,
+    grant: &'a PlatformGrant,
+    source_until: Option<DateTime<Utc>>,
+}
+
 pub struct PlatformBundle {
     map: Arc<Mmap>,
     mmdb: Option<Reader<MappedSection>>,
@@ -662,6 +683,104 @@ impl PlatformBundle {
         Ok(out)
     }
 
+    /// Every live platform IOC row for one normalized value that this
+    /// tenant's policy grants at the revision the bundle carries. The single
+    /// grant/revision/expiry gate shared by ingest stamping ([`Self::stamp`])
+    /// and the on-demand lookup ([`Self::lookup_indicator`]), so the two can
+    /// never disagree about which baseline feeds a tenant has (NAN-3881).
+    fn granted_ioc_rows<'a>(
+        &self,
+        policy: &'a TenantPlatformPolicy,
+        value: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<GrantedIoc<'a>>> {
+        let mut out = Vec::new();
+        for row in self.lookup_ioc(value)? {
+            if row
+                .data
+                .get("effective_valid_until")
+                .and_then(Value::as_i64)
+                .is_some_and(|until| until <= now.timestamp())
+            {
+                continue;
+            }
+            if let Some(expiry) = row.data.get("indicator_expires_at").and_then(Value::as_str) {
+                let expiry =
+                    DateTime::parse_from_rfc3339(expiry).context("invalid platform IOC expiry")?;
+                if expiry <= now {
+                    continue;
+                }
+            }
+            let Some(grant) = self.grant(policy, &row.source_id, now) else {
+                continue;
+            };
+            if self.revisions.get(&row.source_id) != Some(&grant.feed_revision) {
+                continue;
+            }
+            let mut source_until = self.valid_until.get(&row.source_id).copied();
+            if let Some(record_until) = row
+                .data
+                .get("effective_valid_until")
+                .and_then(Value::as_i64)
+                .and_then(|s| DateTime::from_timestamp(s, 0))
+            {
+                source_until = Some(source_until.map_or(record_until, |v| v.min(record_until)));
+            }
+            out.push(GrantedIoc { row, grant, source_until });
+        }
+        Ok(out)
+    }
+
+    /// The exact-match IOC feeds in this bundle (every feed but the IPinfo
+    /// and Synthient sections) that `policy` grants now at the bundle's
+    /// revision: the platform IOC feeds ingest stamping matches for this
+    /// tenant. Sorted feed ids. Never another tenant's: the policy is the
+    /// process tenant's own projection (NAN-3881).
+    pub fn granted_ioc_feeds(
+        &self,
+        policy: &TenantPlatformPolicy,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<String>> {
+        ensure!(
+            policy.bundle_sha256 == self.digest,
+            "platform policy and bundle differ"
+        );
+        Ok(self
+            .revisions
+            .iter()
+            .filter(|(feed, _)| !NON_IOC_FEEDS.contains(&feed.as_str()))
+            .filter(|(feed, revision)| {
+                self.grant(policy, feed, now)
+                    .is_some_and(|grant| grant.feed_revision == **revision)
+            })
+            .map(|(feed, _)| feed.clone())
+            .collect())
+    }
+
+    /// On-demand point lookup of one value in the platform IOC feeds this
+    /// tenant is granted, through the same gate as ingest stamping. The value
+    /// is normalized as ingest normalizes artifact candidates.
+    pub fn lookup_indicator(
+        &self,
+        policy: &TenantPlatformPolicy,
+        value: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<IocSnapshotInput>> {
+        ensure!(
+            policy.bundle_sha256 == self.digest,
+            "platform policy and bundle differ"
+        );
+        let value = value.trim().to_ascii_lowercase();
+        if value.is_empty() || value.len() > 4096 || value.contains(['\n', '\t']) {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .granted_ioc_rows(policy, &value, now)?
+            .into_iter()
+            .map(|granted| granted.row)
+            .collect())
+    }
+
     pub fn stamp(
         &self,
         event: &mut Map<String, Value>,
@@ -808,37 +927,7 @@ impl PlatformBundle {
             }
         }
         for (field, value) in candidates {
-            for row in self.lookup_ioc(&value)? {
-                if row
-                    .data
-                    .get("effective_valid_until")
-                    .and_then(Value::as_i64)
-                    .is_some_and(|until| until <= now.timestamp())
-                {
-                    continue;
-                }
-                if let Some(expiry) = row.data.get("indicator_expires_at").and_then(Value::as_str) {
-                    let expiry = DateTime::parse_from_rfc3339(expiry)
-                        .context("invalid platform IOC expiry")?;
-                    if expiry <= now {
-                        continue;
-                    }
-                }
-                let Some(grant) = self.grant(policy, &row.source_id, now) else {
-                    continue;
-                };
-                if self.revisions.get(&row.source_id) != Some(&grant.feed_revision) {
-                    continue;
-                }
-                let mut source_until = self.valid_until.get(&row.source_id).copied();
-                if let Some(record_until) = row
-                    .data
-                    .get("effective_valid_until")
-                    .and_then(Value::as_i64)
-                    .and_then(|s| DateTime::from_timestamp(s, 0))
-                {
-                    source_until = Some(source_until.map_or(record_until, |v| v.min(record_until)));
-                }
+            for GrantedIoc { row, grant, source_until } in self.granted_ioc_rows(policy, &value, now)? {
                 stamps.push(stamp_record(&row.source_id, &field, &value, grant,
                     source_until, &self.digest, now, Vec::new(), "threat_intelligence", json!({
                     "matched_field": field, "ioc_type": row.ioc_type, "threat_type": row.threat_type,

@@ -1398,6 +1398,7 @@ impl QueryService {
             .route("/v1/entity/ranges", post(entity_ranges))
             .route("/v1/risk", post(risk_route))
             .route("/v1/ioc/lookup", post(ioc_lookup))
+            .route("/v1/ioc/indicator-sets", post(ioc_indicator_sets))
             .route("/v1/ioc/source-records", post(ioc_source_records))
             .route("/v1/identity/directory/users", post(identity_directory_list))
             .route("/v1/identity/directory/lookup", post(identity_directory_lookup))
@@ -2267,6 +2268,30 @@ async fn ioc_lookup(State(state): State<AppState>, Json(request): Json<crate::le
     let tenant = state.service.engine().settings().tenant_id.parse().map_err(|_|
         ApiError(StatusCode::SERVICE_UNAVAILABLE, "process tenant is invalid".into(), "not_ready", None))?;
     let result = crate::lean_ioc_query::lookup(store, &state.service.state_dir.join("enrichment"), tenant, request).await?;
+    Ok(Json(result))
+}
+
+/// NAN-3881: the Enrich flyout's point lookup over every IOC source the
+/// tenant has enabled — its own snapshot plus the platform baseline feeds its
+/// policy grants — through the same reads ingest matching uses. Unlike
+/// `/v1/ioc/lookup` (own snapshot only, used by search and retro), a tenant
+/// with no published snapshot or no IOC reader still searches its feeds.
+async fn ioc_indicator_sets(State(state): State<AppState>, Json(request): Json<crate::lean_ioc_query::LookupRequest>) -> ApiResult {
+    use crate::lean_ioc_query::PlatformIocs;
+    state.service.require_ready()?;
+    let _inflight = state.service.begin();
+    let tenant = state.service.engine().settings().tenant_id.parse().map_err(|_|
+        ApiError(StatusCode::SERVICE_UNAVAILABLE, "process tenant is invalid".into(), "not_ready", None))?;
+    let view = crate::enrichment_read::platform_ioc_view(tenant).map_err(|error| {
+        tracing::warn!(%error, tenant_id = %tenant, "platform IOC feeds unavailable for indicator lookup");
+    });
+    let platform = match &view {
+        Ok(Some((bundle, policy))) => PlatformIocs::Granted { bundle: bundle.as_ref(), policy },
+        Ok(None) => PlatformIocs::NotConfigured,
+        Err(()) => PlatformIocs::Unavailable,
+    };
+    let result = crate::lean_ioc_query::indicator_sets(state.service.ioc_store.as_deref(),
+        &state.service.state_dir.join("enrichment"), tenant, platform, request).await?;
     Ok(Json(result))
 }
 
@@ -3789,6 +3814,7 @@ mod future_size_tests {
             ("entity_ranges", r2(entity_ranges)),
             ("risk_route", r2(risk_route)),
             ("ioc_lookup", r2(ioc_lookup)),
+            ("ioc_indicator_sets", r2(ioc_indicator_sets)),
             ("ioc_source_records", r2(ioc_source_records)),
             ("detection_plan", r2(detection_plan)),
             ("detection_commit", r2(detection_commit)),

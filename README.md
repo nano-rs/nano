@@ -162,8 +162,8 @@ for ingest modes, upgrades, backups and release notes.
   findings logged back into the lake, prevalence-based noise reduction.
 - **Alerts** — lifecycle (new → triaged → resolved), grouping, dedup.
 - **Marketplace** — install + configure out-of-the-box enrichment
-  providers (threat intel, identity, asset inventory, geolocation).
-  Coverage indicator across UDM fields.
+  providers (identity and geolocation in open core).
+  Coverage indicator across OCSF fields.
 - **Web UI** — React SPA, lazy-loaded, runs in any modern browser.
 
 <p align="center">
@@ -187,7 +187,7 @@ for ingest modes, upgrades, backups and release notes.
 </p>
 
 <p align="center">
-  <em>Marketplace — out-of-the-box enrichment catalog (threat intel, identity, asset inventory, geolocation). Coverage indicator tracks which UDM fields have a provider behind them.</em>
+  <em>Marketplace — enrichment catalog (identity and geolocation in open core). Coverage indicator tracks which OCSF fields have a provider behind them.</em>
 </p>
 
 ## Develop from source
@@ -268,11 +268,11 @@ the content layer most teams want on day one:
   catalog backing pivt's AI features
 
 nano ships no parsers or rules of its own. On first start, an install
-registers `nano-rs/parsers` and `nano-rs/rules` on their `ocsf-1.9` branches
-and syncs them, so the full catalog is there at first login. After that it
-checks them every hour. An upgraded install with those repositories on `main`,
-or with auto-sync off, is moved to `ocsf-1.9` and starts following them with no
-action needed. Upstream updates refresh the catalog only: parsers and rules you
+registers `nano-rs/parsers` and `nano-rs/rules` on their `main` branches
+(OCSF 1.9 content) and syncs them, so the full catalog is there at first login.
+After that it checks them every hour. An upgraded install with those
+repositories on the retired `ocsf-1.9` branch, or with auto-sync off, is moved
+to `main` and starts following them with no action needed. Upstream updates refresh the catalog only: parsers and rules you
 already imported are flagged for review and never overwritten. To stop following
 a catalog, disable that repository (a deleted one is registered again on the
 next start). Offline installs keep booting and show the

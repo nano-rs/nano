@@ -636,7 +636,7 @@ export function RuleRepositories() {
                         name: 'nano rules',
                         url: 'https://github.com/nano-rs/rules',
                         description: 'Official nano detection rules in native nPL format',
-                        branch: 'ocsf-1.9',
+                        branch: 'main',
                         rules_path: '',
                         rule_format: 'nanosiem',
                         auto_sync_enabled: true,

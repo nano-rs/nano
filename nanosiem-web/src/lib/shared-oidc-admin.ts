@@ -33,6 +33,30 @@ function idempotencyKey(): string {
   return globalThis.crypto.randomUUID().toLowerCase();
 }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const TYPEID_ALPHABET = '0123456789abcdefghjkmnpqrstvwxyz';
+
+/**
+ * NAN-3905: the settings list (`/api/settings/oidc`, what the page draws)
+ * names a provider by its `oidc_<base32>` TypeID, while the step-up admin
+ * API (`/api/auth/shared/oidc/admin/providers/{provider_id}`) takes the raw
+ * UUID. Passing the TypeID through made enable / update / delete answer 404
+ * `route_not_available` on hosted tenants. Every admin call normalizes here.
+ */
+export function adminProviderId(id: string): string {
+  if (UUID_PATTERN.test(id)) return id.toLowerCase();
+  const match = /^oidc_([0-9a-z]{26})$/.exec(id);
+  if (!match || match[1][0] > '7') throw new Error('Unrecognized SSO provider id');
+  let n = 0n;
+  for (const char of match[1]) {
+    const value = TYPEID_ALPHABET.indexOf(char);
+    if (value < 0) throw new Error('Unrecognized SSO provider id');
+    n = (n << 5n) | BigInt(value);
+  }
+  const hex = n.toString(16).padStart(32, '0');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 /** Render a step-up admin provider in the dedicated summary shape the page draws. */
 export function sharedAdminProviderToSummary(p: SharedOidcAdminProvider, previous?: OidcProviderSummary): OidcProviderSummary {
   return {
@@ -43,6 +67,8 @@ export function sharedAdminProviderToSummary(p: SharedOidcAdminProvider, previou
     enabled: p.enabled,
     scopes: p.scopes,
     group_claim: p.groupClaim ?? undefined,
+    access_policy: p.accessPolicy,
+    google_service_account_configured: p.googleServiceAccountConfigured,
     created_at: previous?.created_at ?? new Date().toISOString(),
     updated_at: new Date().toISOString(),
   };
@@ -58,8 +84,14 @@ export async function sharedCreateOidcProvider(request: CreateOidcProviderReques
     client_secret: request.client_secret,
     scopes: request.scopes && request.scopes.length > 0 ? request.scopes : ['openid', 'email', 'profile'],
     group_claim: request.group_claim ?? null,
+    access_policy: request.access_policy,
+    google_service_account: request.google_service_account,
+    clear_google_service_account: request.clear_google_service_account,
   });
   let provider = created.provider;
+  if (request.enabled === true && !provider.enabled) {
+    provider = (await api.setSharedOidcAdminProviderEnabled(provider.id, idempotencyKey(), true)).provider;
+  }
   if (request.enabled === false && provider.enabled) {
     provider = (await api.setSharedOidcAdminProviderEnabled(provider.id, idempotencyKey(), false)).provider;
   }
@@ -74,32 +106,36 @@ export async function sharedUpdateOidcProvider(
   // The step-up API replaces the whole configuration; fill unchanged fields
   // from the current row. `client_id` is never returned by the settings
   // read, so the admin API's own view supplies it when the form left it blank.
+  const id = adminProviderId(current.id);
   const clientId = request.client_id
     ?? currentClientId
-    ?? (await api.listSharedOidcAdminProviders()).providers.find(p => p.id === current.id)?.clientId;
+    ?? (await api.listSharedOidcAdminProviders()).providers.find(p => p.id.toLowerCase() === id)?.clientId;
   if (!clientId) throw new Error('The provider could not be read from the SSO admin ledger.');
-  let provider = (await api.updateSharedOidcAdminProvider(current.id, {
+  let provider = (await api.updateSharedOidcAdminProvider(id, {
     idempotency_key: idempotencyKey(),
     name: request.name ?? current.name,
     issuer: request.issuer ?? current.issuer,
     client_id: clientId,
     scopes: request.scopes && request.scopes.length > 0 ? request.scopes : current.scopes,
     group_claim: request.group_claim ?? current.group_claim ?? null,
+    access_policy: request.access_policy,
+    google_service_account: request.google_service_account,
+    clear_google_service_account: request.clear_google_service_account,
   })).provider;
   if (request.client_secret) {
-    provider = (await api.rotateSharedOidcAdminProviderSecret(current.id, idempotencyKey(), request.client_secret)).provider;
+    provider = (await api.rotateSharedOidcAdminProviderSecret(id, idempotencyKey(), request.client_secret)).provider;
   }
   if (request.enabled !== undefined && request.enabled !== provider.enabled) {
-    provider = (await api.setSharedOidcAdminProviderEnabled(current.id, idempotencyKey(), request.enabled)).provider;
+    provider = (await api.setSharedOidcAdminProviderEnabled(id, idempotencyKey(), request.enabled)).provider;
   }
   return sharedAdminProviderToSummary(provider, current);
 }
 
 export async function sharedDeleteOidcProvider(id: string): Promise<void> {
-  await api.deleteSharedOidcAdminProvider(id, idempotencyKey());
+  await api.deleteSharedOidcAdminProvider(adminProviderId(id), idempotencyKey());
 }
 
 export async function sharedSetOidcProviderEnabled(current: OidcProviderSummary, enabled: boolean): Promise<OidcProviderSummary> {
-  const result = await api.setSharedOidcAdminProviderEnabled(current.id, idempotencyKey(), enabled);
+  const result = await api.setSharedOidcAdminProviderEnabled(adminProviderId(current.id), idempotencyKey(), enabled);
   return sharedAdminProviderToSummary(result.provider, current);
 }

@@ -40,6 +40,7 @@ import { useAuth, OidcProvider } from '@/contexts/AuthContext';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { cn } from '@/lib/utils';
 import { safeReturnPath } from '@/lib/tenant-auth-shell';
+import { authenticatedFetch } from '@/lib/authenticated-fetch';
 import {
   discoverEnterpriseSharedLoginMethods,
   startEnterpriseSharedOidcLogin,
@@ -326,7 +327,7 @@ export function Login({ tenantSlug }: { tenantSlug?: string } = {}) {
     // is on) from the one uniform tenant-local discovery call (NAN-2361 wave
     // 8); the dedicated page keeps its two endpoints.
     const providersRequest = tenantSlug === undefined
-      ? fetch(`${API_BASE_URL}/api/auth/oidc/providers`).then(async (res) => {
+      ? authenticatedFetch('/api/auth/oidc/providers', `${API_BASE_URL}/api/auth/oidc/providers`).then(async (res) => {
           if (!res.ok) throw new Error(`providers request failed: ${res.status}`);
           return { providers: (await res.json()) as OidcProvider[], localPasswordEnabled: null };
         })
@@ -366,7 +367,7 @@ export function Login({ tenantSlug }: { tenantSlug?: string } = {}) {
     // until it settles, so an SSO-only tenant never flashes the prompt).
     if (tenantSlug !== undefined) return;
     let cancelled = false;
-    fetch(`${API_BASE_URL}/api/auth/methods`)
+    authenticatedFetch('/api/auth/methods', `${API_BASE_URL}/api/auth/methods`)
       .then(async (res) => {
         if (!res.ok) throw new Error(`auth methods request failed: ${res.status}`);
         return (await res.json()) as { localPassword: boolean };

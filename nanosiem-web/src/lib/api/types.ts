@@ -3758,6 +3758,19 @@ export interface OidcProviderInfo {
   slug: string;
 }
 
+export interface SsoGroupMapping {
+  idp_group: string;
+  group_ids: string[];
+  role_ids: string[];
+}
+export interface SsoAccessPolicy {
+  mapped_groups_only: boolean;
+  mappings: SsoGroupMapping[];
+  entra_tenant_id?: string | null;
+  verified_domains: string[];
+  google_delegated_admin?: string | null;
+}
+
 // OIDC Provider Management Types
 export interface OidcProviderSummary {
   id: string;
@@ -3769,6 +3782,8 @@ export interface OidcProviderSummary {
   group_claim?: string;
   created_at: string;
   updated_at: string;
+  access_policy?: SsoAccessPolicy;
+  google_service_account_configured?: boolean;
 }
 
 export interface OidcProviderListResponse {
@@ -3797,6 +3812,11 @@ export interface CreateOidcProviderRequest {
   scopes?: string[];
   group_claim?: string;
   enabled?: boolean;
+  access_policy?: SsoAccessPolicy;
+  google_service_account?: string;
+  clear_google_service_account?: boolean;
+  mfa_code?: string;
+
 }
 
 export interface UpdateOidcProviderRequest {
@@ -3807,6 +3827,11 @@ export interface UpdateOidcProviderRequest {
   scopes?: string[];
   group_claim?: string;
   enabled?: boolean;
+  access_policy?: SsoAccessPolicy;
+  google_service_account?: string;
+  clear_google_service_account?: boolean;
+  mfa_code?: string;
+
 }
 
 export interface OidcGroupMapping {
@@ -3826,6 +3851,7 @@ export interface UpdateOidcGroupMappingsRequest {
     oidc_group: string;
     local_group_id: string;
   }>;
+  mfa_code?: string;
 }
 
 export interface OidcUserGroups {
@@ -4017,6 +4043,8 @@ export interface SharedOidcAdminProvider {
   revision: number;
   secretRevision: number;
   discoveryValidated: boolean;
+  accessPolicy?: SsoAccessPolicy;
+  googleServiceAccountConfigured?: boolean;
 }
 
 export interface SharedOidcAdminProviderList {
@@ -4037,6 +4065,10 @@ export interface SharedOidcAdminCreateRequest {
   client_secret: string;
   scopes: string[];
   group_claim?: string | null;
+  access_policy?: SsoAccessPolicy;
+  google_service_account?: string;
+  clear_google_service_account?: boolean;
+
 }
 
 export interface SharedOidcAdminUpdateRequest {
@@ -4046,6 +4078,10 @@ export interface SharedOidcAdminUpdateRequest {
   client_id: string;
   scopes: string[];
   group_claim?: string | null;
+  access_policy?: SsoAccessPolicy;
+  google_service_account?: string;
+  clear_google_service_account?: boolean;
+
 }
 
 /** Error body of the step-up admin API (`oidc_provider_admin_denied` = stale MFA / not fresh). */

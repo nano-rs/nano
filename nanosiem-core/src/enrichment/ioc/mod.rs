@@ -189,24 +189,36 @@ impl LakeIocClient {
     }
 
     pub async fn lookup(&self, value: &str) -> Result<Vec<IocLookupResult>, IocLookupError> {
-        self.lookup_with_sources(value).await.map(|lookup| lookup.results)
+        self.post_lookup(OWN_SNAPSHOT_LOOKUP_PATH, value)
+            .await?
+            .map(|lookup| lookup.results)
+            .ok_or_else(|| IocLookupError::Lake("worker returned HTTP 404".to_string()))
     }
 
-    /// NAN-3881: point lookup against the tenant's own indicator sets that
-    /// also reports which sources were searched. A tenant whose enrichment
-    /// coordinator has not published any snapshot yet has zero sources (an
-    /// answer, not a failure). `sources` is `None` when the worker predates
-    /// the field.
+    /// NAN-3881: point lookup over every IOC source the tenant has enabled —
+    /// its own published IOC lists/feeds plus the platform baseline feeds its
+    /// policy grants (ThreatFox, Tor exit nodes...) — reporting every source
+    /// searched. The worker reads the same snapshot and bundle/policy pair
+    /// ingest matching uses. A worker that predates `/v1/ioc/indicator-sets`
+    /// (404) falls back to the own-snapshot lookup, where a tenant with no
+    /// published snapshot has zero sources (an answer, not a failure).
     pub async fn lookup_indicator_sets(&self, value: &str) -> Result<IocSetLookup, IocLookupError> {
-        match self.lookup_with_sources(value).await {
+        if let Some(lookup) = self.post_lookup(INDICATOR_SETS_LOOKUP_PATH, value).await? {
+            return Ok(lookup);
+        }
+        match self.post_lookup(OWN_SNAPSHOT_LOOKUP_PATH, value).await {
+            Ok(Some(lookup)) => Ok(lookup),
+            Ok(None) => Err(IocLookupError::Lake("worker returned HTTP 404".to_string())),
             Err(IocLookupError::Lake(message)) if message.contains(IOC_POINTER_ABSENT) => {
-                Ok(IocSetLookup { results: Vec::new(), sources: Some(Vec::new()) })
+                Ok(IocSetLookup { sources: Some(Vec::new()), ..IocSetLookup::default() })
             }
-            other => other,
+            Err(error) => Err(error),
         }
     }
 
-    async fn lookup_with_sources(&self, value: &str) -> Result<IocSetLookup, IocLookupError> {
+    /// `Ok(None)` only for a 404 (a worker without the route).
+    async fn post_lookup(&self, path: &str, value: &str) -> Result<Option<IocSetLookup>, IocLookupError> {
+        let indicator_sets = path == INDICATOR_SETS_LOOKUP_PATH;
         let value = value.trim();
         if value.is_empty() || value.len() > 4_096 || value.chars().any(char::is_control) {
             return Err(IocLookupError::Lake(
@@ -216,7 +228,7 @@ impl LakeIocClient {
         let request_id = uuid::Uuid::now_v7().to_string();
         let response = self
             .http
-            .post(format!("{}/v1/ioc/lookup", self.base_url))
+            .post(format!("{}{path}", self.base_url))
             .bearer_auth(&self.bearer_token)
             .json(&LakeIocRequest {
                 request_id: &request_id,
@@ -228,6 +240,9 @@ impl LakeIocClient {
             .await
             .map_err(|error| IocLookupError::Lake(format!("request failed: {error}")))?;
         let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
         let body = response
             .bytes()
             .await
@@ -245,12 +260,13 @@ impl LakeIocClient {
         if envelope.request_id.as_deref() != Some(request_id.as_str())
             || envelope.tenant_id.as_deref() != Some(self.tenant_id.as_str())
             || envelope.snapshot_id.as_deref() != Some(self.snapshot_id.as_str())
-            || envelope.snapshot_version.as_deref().is_none_or(|version| {
-                version.len() != 64
-                    || !version
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            })
+            // The indicator-set answer carries no snapshot version when the
+            // tenant has not published one (its baseline feeds still count).
+            || (!indicator_sets && envelope.snapshot_version.is_none())
+            || envelope.snapshot_version.as_deref().is_some_and(valid_digest_not)
+            || (indicator_sets
+                && (envelope.sources.is_none()
+                    || !matches!(envelope.platform_status.as_deref(), Some("ok" | "not_configured" | "unavailable"))))
             || envelope
                 .value
                 .as_deref()
@@ -262,7 +278,11 @@ impl LakeIocClient {
                 "worker response did not match the pinned IOC request".to_string(),
             ));
         }
-        Ok(IocSetLookup { results: envelope.results, sources: envelope.sources })
+        Ok(Some(IocSetLookup {
+            results: envelope.results,
+            sources: envelope.sources,
+            platform_unavailable: envelope.platform_status.as_deref() == Some("unavailable"),
+        }))
     }
 
     /// Enumerate a bounded current feed selection from the same immutable
@@ -357,15 +377,23 @@ fn valid_digest_not(version: &str) -> bool {
 /// The worker's error text when the tenant has no published IOC snapshot
 /// (`lean_ioc_query::lookup`).
 const IOC_POINTER_ABSENT: &str = "tenant IOC pointer is absent";
+/// Own-snapshot point lookup (search, retro, prevalence discovery).
+const OWN_SNAPSHOT_LOOKUP_PATH: &str = "/v1/ioc/lookup";
+/// Every enabled source: own snapshot plus granted platform feeds (NAN-3881).
+const INDICATOR_SETS_LOOKUP_PATH: &str = "/v1/ioc/indicator-sets";
 
 /// One point lookup over the tenant's indicator sets (NAN-3881).
 #[derive(Debug, Clone, Default)]
 pub struct IocSetLookup {
     /// One verdict per matching (source, type, threat, malware, confidence).
     pub results: Vec<IocLookupResult>,
-    /// Display names of every indicator source in the tenant's current
-    /// snapshot; `None` when the worker does not report them.
+    /// Display names of every indicator source searched (the tenant's own
+    /// lists/feeds and its enabled platform baseline feeds); `None` when the
+    /// worker does not report them.
     pub sources: Option<Vec<String>>,
+    /// The tenant has platform feed mounts but its policy or bundle could
+    /// not be read for this lookup: the baseline feeds were not searched.
+    pub platform_unavailable: bool,
 }
 
 #[derive(Serialize)]
@@ -424,6 +452,8 @@ struct LakeIocResponse {
     results: Vec<IocLookupResult>,
     #[serde(default)]
     sources: Option<Vec<String>>,
+    #[serde(default)]
+    platform_status: Option<String>,
 }
 
 #[derive(SerdeDeserialize)]
@@ -625,6 +655,106 @@ mod lake_client_tests {
                 sources: serde_json::json!(["B private feed"]),
                 results: serde_json::json!([{ "found": true, "source_id": "B private feed", "ioc_type": "ip", "tags": [] }]),
             })
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let client = assignment_client(tenant_a, &server.uri(), dir.path());
+        let error = client.lookup_indicator_sets("198.51.100.7").await.unwrap_err();
+        assert!(error.to_string().contains("did not match the pinned IOC request"), "{error}");
+    }
+
+    /// The `/v1/ioc/indicator-sets` answer: tenant + pinned identity echoed,
+    /// no `snapshot_version` when the tenant has no own snapshot.
+    struct SetsEcho {
+        tenant: String,
+        sources: serde_json::Value,
+        results: serde_json::Value,
+        platform_status: &'static str,
+    }
+
+    impl wiremock::Respond for SetsEcho {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "request_id": body["request_id"], "tenant_id": self.tenant,
+                "snapshot_id": format!("ioc-{}-current", self.tenant), "snapshot_version": null,
+                "value": body["value"], "results": self.results, "sources": self.sources,
+                "platform_status": self.platform_status, "platform_feeds": ["threatfox", "tor_exit_nodes"],
+            }))
+        }
+    }
+
+    /// The flyout searches the tenant's enabled
+    /// platform baseline feeds too. A tenant with ThreatFox + Tor granted and
+    /// no own snapshot gets both as searched sources and the ThreatFox match;
+    /// `/v1/ioc/lookup` is never consulted when the new route answers.
+    #[tokio::test]
+    async fn indicator_set_lookup_includes_enabled_baseline_feeds() {
+        use wiremock::{matchers, Mock, MockServer};
+        let server = MockServer::start().await;
+        let tenant = uuid::Uuid::from_u128(0xa);
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/ioc/indicator-sets"))
+            .respond_with(SetsEcho {
+                tenant: tenant.to_string(),
+                sources: serde_json::json!(["ThreatFox", "Tor exit nodes", "easy_intel"]),
+                results: serde_json::json!([{ "found": true, "source_id": "ThreatFox", "ioc_type": "ip",
+                    "threat_type": "botnet_cc", "confidence_level": 75, "tags": [] }]),
+                platform_status: "ok",
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/ioc/lookup"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let client = assignment_client(tenant, &server.uri(), dir.path());
+        let hit = client.lookup_indicator_sets("198.51.100.7").await.unwrap();
+        assert_eq!(
+            hit.sources.as_deref(),
+            Some(&["ThreatFox".to_string(), "Tor exit nodes".to_string(), "easy_intel".to_string()][..])
+        );
+        assert_eq!(hit.results.len(), 1);
+        assert!(!hit.platform_unavailable);
+    }
+
+    /// An unreadable policy is reported, not hidden as "no baseline feeds".
+    #[tokio::test]
+    async fn indicator_set_lookup_reports_unavailable_baseline_feeds() {
+        use wiremock::{matchers, Mock, MockServer};
+        let server = MockServer::start().await;
+        let tenant = uuid::Uuid::from_u128(0xa);
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/ioc/indicator-sets"))
+            .respond_with(SetsEcho { tenant: tenant.to_string(), sources: serde_json::json!(["easy_intel"]),
+                results: serde_json::json!([]), platform_status: "unavailable" })
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let client = assignment_client(tenant, &server.uri(), dir.path());
+        let answer = client.lookup_indicator_sets("198.51.100.7").await.unwrap();
+        assert!(answer.platform_unavailable);
+        assert_eq!(answer.sources.as_deref().map(<[String]>::len), Some(1));
+    }
+
+    /// NAN-3881 zero cross-tenant sharing on the new route: tenant B's
+    /// answer (B's feeds and list) is refused for tenant A's reader.
+    #[tokio::test]
+    async fn indicator_sets_route_refuses_another_tenants_answer() {
+        use wiremock::{matchers, Mock, MockServer};
+        let server = MockServer::start().await;
+        let tenant_a = uuid::Uuid::from_u128(0xa);
+        let tenant_b = uuid::Uuid::from_u128(0xb);
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/ioc/indicator-sets"))
+            .respond_with(SetsEcho { tenant: tenant_b.to_string(),
+                sources: serde_json::json!(["B private feed", "ThreatFox"]),
+                results: serde_json::json!([{ "found": true, "source_id": "B private feed", "ioc_type": "ip", "tags": [] }]),
+                platform_status: "ok" })
             .mount(&server)
             .await;
         let dir = tempfile::tempdir().unwrap();

@@ -116,6 +116,7 @@ export function EnterpriseSharedOidcCallback() {
         await acceptSharedOidcSession(
           result.user as unknown as User,
           result.tenant.tenant.slug,
+          result.session,
         );
         return result;
       } catch (error) {

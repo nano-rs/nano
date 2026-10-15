@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { lazyWithRetry } from '@/lib/lazyWithRetry';
+import { authenticatedFetch } from '@/lib/authenticated-fetch';
 import { customInventoryRedirect } from '@/lib/api/marketplace-inventory';
 
 import { BrowserRouter, Routes, Route, useLocation, Navigate, useParams, useSearchParams, Link } from 'react-router-dom';
@@ -239,7 +240,7 @@ function SetupRedirect({ children }: { children: React.ReactNode }) {
 
     const checkSetupStatus = async () => {
       try {
-        const response = await fetch(`${API_BASE_URL}/api/setup/status`);
+        const response = await authenticatedFetch('/api/setup/status', `${API_BASE_URL}/api/setup/status`);
         if (response.ok) {
           const status: SetupStatus = await response.json();
           // Need setup if not initialized AND no users exist

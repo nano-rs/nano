@@ -450,6 +450,10 @@ pub struct OidcProvider {
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[sqlx(json)]
+    pub access_policy: super::SsoAccessPolicy,
+    #[serde(skip_serializing)]
+    pub google_service_account_encrypted: Option<Vec<u8>>,
 }
 
 /// Request to create an OIDC provider
@@ -462,6 +466,11 @@ pub struct CreateOidcProviderRequest {
     pub client_secret: String,
     pub scopes: Option<Vec<String>>,
     pub group_claim: Option<String>,
+    pub access_policy: Option<super::SsoAccessPolicy>,
+    pub google_service_account: Option<String>,
+    #[serde(default)]
+    pub clear_google_service_account: bool,
+    pub mfa_code: Option<String>,
 }
 
 /// Request to update an OIDC provider
@@ -474,6 +483,11 @@ pub struct UpdateOidcProviderRequest {
     pub scopes: Option<Vec<String>>,
     pub group_claim: Option<String>,
     pub enabled: Option<bool>,
+    pub access_policy: Option<super::SsoAccessPolicy>,
+    pub google_service_account: Option<String>,
+    #[serde(default)]
+    pub clear_google_service_account: bool,
+    pub mfa_code: Option<String>,
 }
 
 /// OIDC group mapping

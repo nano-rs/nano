@@ -1,56 +1,134 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//
-// NAN-2361: shared auth refuses two credentials (Bearer + cookie) with 401.
-// Every raw `fetch(` that sets an Authorization header must therefore decide
-// its cookie policy through `requestCredentials()`. The JSON transport in
-// lib/api/index.ts does; this guards the hand-rolled fetches (tuning, meloD
-// streams, uploads, lookup tables, search history, …) that black-boxed 401s
-// on the hosted-shared tenant on 2026-09-16.
-import { test } from 'node:test';
-import assert from 'node:assert/strict';
+
+/**
+ * Static guard: no raw tenant `/api` fetch bypasses the ApiClient credential
+ * rule. NAN-2361 first guarded raw fetches that sent a bearer; NAN-3905
+ * widens it to EVERY raw fetch (the header-less QueryLibrary reads and the
+ * cookie-only step-up slipped through the narrower check).
+ *
+ * On the pooled hosted origin every signed-in tenant owns an
+ * `access_token__<d>` cookie, and the shared-tenant extractor refuses a
+ * request that presents more than one credential ("Provide exactly one
+ * authentication credential"). The SPA therefore sends its in-memory bearer
+ * with `credentials: 'omit'`. A bare `fetch('/api/…')` uses the browser
+ * default (`same-origin`: every cookie) and breaks as soon as a second tenant
+ * is signed in — the bug behind NAN-3905 (step-up) and earlier useMitreData.
+ *
+ * Every global `fetch(` call in app code must either go through
+ * `authenticatedFetch` / the ApiClient, or pass
+ * `credentials: requestCredentials(...)`. The few calls that are not tenant
+ * API calls are listed below with the reason. Literal `credentials:
+ * 'include' | 'same-origin'` is confined to the cookie-carried auth-lifecycle
+ * adapters.
+ */
 import { readdirSync, readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import assert from 'node:assert/strict';
+import test from 'node:test';
 
-const ROOT = new URL('../', import.meta.url).pathname;
-const EXEMPT = new Set([
-  'lib/api/index.ts',            // the transport itself
-  'lib/request-credentials.ts',
-  'contexts/AuthContext.tsx',    // login/refresh own their cookie policy
-  'contexts/CapabilitiesProvider.tsx',
-  'pages/Setup.tsx',             // first-run initialize: no session exists yet
-]);
+const SRC = fileURLToPath(new URL('..', import.meta.url));
 
-function walk(dir: string, out: string[]): string[] {
+/** Global fetch calls that are not tenant API requests. file -> count. */
+const NON_API_FETCH: Record<string, { count: number; reason: string }> = {
+  'lib/build-update.ts': { count: 1, reason: 'static /index.html build probe, no API' },
+  'enterprise/pages/CustomIntegrationWizard.tsx': { count: 1, reason: 'vendor-API sample inside a generated script template' },
+  'components/search/cloud-overview/progressive.ts': { count: 2, reason: '`fetch` is an injected section loader parameter' },
+  'hooks/use-api.ts': { count: 1, reason: '`fetch` is a local callback name' },
+};
+
+/** `window.fetch` adapters for the dependency-injected auth-lifecycle flows;
+ * each caller sets `credentials` explicitly and is covered by its own tests. */
+const WINDOW_FETCH_ADAPTERS: Record<string, number> = {
+  'pages/EnterpriseSharedOidc.tsx': 1,
+  'pages/Login.tsx': 1,
+  'pages/EnterpriseSharedActivation.tsx': 1,
+  'pages/EnterpriseSharedMembershipAcceptance.tsx': 1,
+};
+
+/** Cookie-carried auth lifecycle (activation, SSO entry/start/callback/refresh,
+ * best-effort cleanup logout). Never a tenant API read or write. */
+const COOKIE_CREDENTIAL_LITERALS: Record<string, number> = {
+  'lib/enterprise-shared-activation.ts': 1,
+  'lib/enterprise-shared-oidc.ts': 5,
+  'pages/EnterpriseSharedOidc.tsx': 1,
+};
+
+function sourceFiles(dir: string): string[] {
+  const out: string[] = [];
   for (const name of readdirSync(dir)) {
-    const p = join(dir, name);
-    if (statSync(p).isDirectory()) walk(p, out);
-    else if (/\.(ts|tsx)$/.test(name) && !/\.test\.tsx?$/.test(name) && !/\.d\.ts$/.test(name)) out.push(p);
+    const path = join(dir, name);
+    if (statSync(path).isDirectory()) {
+      if (name === 'node_modules' || name === '__tests__' || name === 'test') continue;
+      out.push(...sourceFiles(path));
+    } else if (/\.(ts|tsx)$/.test(name) && !/\.(test|spec)\.(ts|tsx)$/.test(name) && !name.endsWith('.d.ts')) {
+      out.push(path);
+    }
   }
   return out;
 }
 
-test('every Bearer-bearing raw fetch decides its cookie policy via requestCredentials', () => {
-  const offenders: string[] = [];
-  for (const file of walk(ROOT, [])) {
-    const rel = file.slice(ROOT.length);
-    if (EXEMPT.has(rel) || rel.startsWith('lib/enterprise-shared-') || rel.startsWith('pages/EnterpriseShared')) continue;
-    const src = readFileSync(file, 'utf8');
-    let from = 0;
-    for (;;) {
-      const start = src.indexOf('fetch(', from);
-      if (start === -1) break;
-      if (start > 0 && /[\w.]/.test(src[start - 1])) { from = start + 6; continue; } // refetch(, this.fetch(
-      // balanced-paren extraction of the call's argument list
-      let depth = 0; let end = start + 5;
-      for (; end < src.length; end++) {
-        if (src[end] === '(') depth++;
-        else if (src[end] === ')' && --depth === 0) break;
-      }
-      const call = src.slice(start + 6, end);
-      const sendsBearer = /Authorization|getAuthHeaders\(\)|\bheaders\b/.test(call);
-      if (sendsBearer && !/credentials\s*:/.test(call)) offenders.push(`${rel}:${src.slice(0, start).split('\n').length}`);
-      from = end;
+/** Text of the call starting at `open` (index of its `(`), parens balanced. */
+function callText(source: string, open: number): string {
+  let depth = 0;
+  for (let i = open; i < source.length; i += 1) {
+    if (source[i] === '(') depth += 1;
+    else if (source[i] === ')') {
+      depth -= 1;
+      if (depth === 0) return source.slice(open, i + 1);
     }
   }
-  assert.deepEqual(offenders, [], `raw fetch() sends headers without a credentials policy:\n${offenders.join('\n')}`);
+  return source.slice(open);
+}
+
+const files = sourceFiles(SRC).map((path) => ({
+  rel: relative(SRC, path).split('\\').join('/'),
+  source: readFileSync(path, 'utf8'),
+}));
+
+test('every raw global fetch( uses requestCredentials or is a listed non-API call', () => {
+  const offenders: string[] = [];
+  const counts: Record<string, number> = {};
+  for (const { rel, source } of files) {
+    for (const match of source.matchAll(/(?<![\w$.])fetch\(/g)) {
+      const call = callText(source, match.index! + 'fetch'.length);
+      if (/credentials:\s*requestCredentials\(/.test(call)) continue;
+      counts[rel] = (counts[rel] ?? 0) + 1;
+      if (!NON_API_FETCH[rel]) {
+        const line = source.slice(0, match.index).split('\n').length;
+        offenders.push(`${rel}:${line} ${call.slice(0, 80).replace(/\s+/g, ' ')}`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, [], `route tenant API calls through authenticatedFetch/ApiClient or pass credentials: requestCredentials(...):\n${offenders.join('\n')}`);
+  for (const [rel, { count }] of Object.entries(NON_API_FETCH)) {
+    assert.equal(counts[rel] ?? 0, count, `${rel}: allowlist count is stale`);
+  }
+});
+
+test('window.fetch is used only by the listed auth-lifecycle adapters', () => {
+  const counts: Record<string, number> = {};
+  for (const { rel, source } of files) {
+    const n = source.match(/\b(?:window|globalThis|self)\.fetch\(/g)?.length ?? 0;
+    if (n) counts[rel] = n;
+  }
+  assert.deepEqual(counts, WINDOW_FETCH_ADAPTERS);
+});
+
+test("credentials: 'include' / 'same-origin' literals stay in the cookie-carried auth lifecycle", () => {
+  const counts: Record<string, number> = {};
+  for (const { rel, source } of files) {
+    const n = source.match(/credentials:\s*['"](?:include|same-origin)['"]/g)?.length ?? 0;
+    if (n) counts[rel] = n;
+  }
+  assert.deepEqual(counts, COOKIE_CREDENTIAL_LITERALS);
+});
+
+test('the guard actually detects a bare tenant fetch', () => {
+  const sample = "const r = await fetch(`${API}/api/rules`, { method: 'GET' });";
+  const match = /(?<![\w$.])fetch\(/.exec(sample)!;
+  const call = callText(sample, match.index + 'fetch'.length);
+  assert.equal(/credentials:\s*requestCredentials\(/.test(call), false);
+  const ok = "fetch(url, { headers, credentials: requestCredentials('/api/rules', headers) })";
+  assert.equal(/credentials:\s*requestCredentials\(/.test(callText(ok, 'fetch'.length)), true);
 });

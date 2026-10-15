@@ -20,8 +20,6 @@ use std::collections::HashMap;
 use thiserror::Error;
 use uuid::Uuid;
 
-use tracing::warn;
-
 use crate::auth::repository::{
     GroupRepository, OidcRepository, OidcRepositoryError, UserRepository, UserRepositoryError,
 };
@@ -29,6 +27,10 @@ use crate::auth::types::{OidcProvider, User};
 
 #[derive(Error, Debug)]
 pub enum OidcError {
+    #[error("Group membership could not be verified")]
+    GroupMembershipUnknown,
+    #[error("your account is not in a group allowed to access this tenant")]
+    GroupNotAllowed,
     #[error("OIDC provider not found: {0}")]
     ProviderNotFound(String),
     #[error("OIDC provider is disabled: {0}")]
@@ -144,6 +146,13 @@ pub struct IdTokenClaims {
     pub email: Option<String>,
     /// Email verified
     pub email_verified: Option<bool>,
+    /// Entra verified email-domain ownership signal; only trusted for an exact Entra issuer.
+    pub xms_edov: Option<bool>,
+    /// Entra directory tenant, bound to the validated issuer.
+    pub tid: Option<String>,
+    pub hasgroups: Option<bool>,
+    #[serde(default, rename = "_claim_names")]
+    pub claim_names: HashMap<String, String>,
     /// Name
     pub name: Option<String>,
     /// Given name
@@ -160,6 +169,129 @@ pub struct IdTokenClaims {
     pub roles: Vec<String>,
     /// Preferred username (UPN in Azure AD, fallback for email)
     pub preferred_username: Option<String>,
+}
+
+impl IdTokenClaims {
+    pub fn has_group_overage(&self) -> bool {
+        self.hasgroups == Some(true) || self.claim_names.contains_key("groups")
+    }
+
+    pub fn entra_tenant(&self) -> Option<&str> {
+        let tenant = self
+            .iss
+            .strip_prefix("https://login.microsoftonline.com/")?
+            .strip_suffix("/v2.0")?;
+        (Uuid::parse_str(tenant).is_ok() && self.tid.as_deref() == Some(tenant)).then_some(tenant)
+    }
+
+    /// This method is used only after signature, exact issuer, audience and
+    /// nonce validation. An arbitrary issuer cannot opt into Entra semantics.
+    pub fn verified_email(&self) -> bool {
+        if self.email_verified == Some(true) {
+            return true;
+        }
+        self.entra_tenant().is_some()
+            && self
+                .email
+                .as_ref()
+                .is_some_and(|email| !email.trim().is_empty())
+            && self.xms_edov == Some(true)
+    }
+}
+
+/// Resolve overage only through a fixed Microsoft Graph endpoint. Never use
+/// `_claim_sources`, which would disclose a bearer credential to an arbitrary URL.
+pub async fn resolve_entra_groups(
+    claims: &mut IdTokenClaims,
+    access_token: &str,
+) -> Result<(), OidcError> {
+    if !claims.has_group_overage() {
+        return Ok(());
+    }
+    if claims.entra_tenant().is_none() || access_token.is_empty() {
+        return Err(OidcError::GroupMembershipUnknown);
+    }
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| OidcError::GroupMembershipUnknown)?;
+    claims.groups = fetch_entra_groups(
+        &client,
+        "https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.group?$select=id&$count=true",
+        access_token,
+    )
+    .await?;
+    claims.hasgroups = None;
+    claims.claim_names.remove("groups");
+    Ok(())
+}
+
+async fn fetch_entra_groups(
+    client: &Client,
+    endpoint: &str,
+    token: &str,
+) -> Result<Vec<String>, OidcError> {
+    let denied = || OidcError::GroupMembershipUnknown;
+    let origin = url::Url::parse(endpoint).map_err(|_| denied())?;
+    let mut next = Some(origin.clone());
+    let mut groups = Vec::new();
+    for _ in 0..32 {
+        let Some(url) = next.take() else {
+            groups.sort();
+            groups.dedup();
+            return Ok(groups);
+        };
+        if url.origin() != origin.origin()
+            || url.path() != origin.path()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(denied());
+        }
+        let mut response = client
+            .get(url)
+            .header("ConsistencyLevel", "eventual")
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| denied())?;
+        if !response.status().is_success()
+            || response.content_length().is_some_and(|n| n > 1024 * 1024)
+        {
+            return Err(denied());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| denied())? {
+            if bytes.len() + chunk.len() > 1024 * 1024 {
+                return Err(denied());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        #[derive(Deserialize)]
+        struct Group {
+            id: String,
+        }
+        #[derive(Deserialize)]
+        struct Page {
+            value: Vec<Group>,
+            #[serde(rename = "@odata.nextLink")]
+            next_link: Option<String>,
+        }
+        let page: Page = serde_json::from_slice(&bytes).map_err(|_| denied())?;
+        for group in page.value {
+            if Uuid::parse_str(&group.id).is_err() || groups.len() >= 2048 {
+                return Err(denied());
+            }
+            groups.push(group.id);
+        }
+        next = page
+            .next_link
+            .map(|value| url::Url::parse(&value).map_err(|_| denied()))
+            .transpose()?;
+    }
+    Err(denied())
 }
 
 /// User info from OIDC authentication
@@ -232,7 +364,6 @@ const AUTH_TRANSACTION_TTL_SECONDS: i64 = 600;
 pub struct OidcService {
     oidc_repo: OidcRepository,
     user_repo: UserRepository,
-    group_repo: GroupRepository,
     /// Cache for discovery documents
     discovery_cache: std::sync::Arc<tokio::sync::RwLock<HashMap<String, OidcDiscovery>>>,
     /// Cache for JWKS
@@ -243,12 +374,11 @@ impl OidcService {
     pub fn new(
         oidc_repo: OidcRepository,
         user_repo: UserRepository,
-        group_repo: GroupRepository,
+        _group_repo: GroupRepository,
     ) -> Self {
         Self {
             oidc_repo,
             user_repo,
-            group_repo,
             // SSRF (NAN-1369 / NAN-2018): discovery & JWKS fetches build a
             // per-request client PINNED to the SSRF-validated IP (see
             // fetch_discovery / fetch_jwks), so no shared http_client is kept.
@@ -511,7 +641,7 @@ impl OidcService {
             .ok_or_else(|| OidcError::InvalidIdToken("No ID token in response".to_string()))?;
 
         // Validate ID token — using the *server-stored* nonce
-        let claims = self
+        let mut claims = self
             .validate_id_token(
                 &id_token,
                 &provider,
@@ -520,17 +650,30 @@ impl OidcService {
             )
             .await?;
 
+        resolve_entra_groups(&mut claims, &token_response.access_token).await?;
+
         // Extract user info
-        let oidc_user = self.extract_user_info(&claims, &provider)?;
+        let mut oidc_user = self.extract_user_info(&claims, &provider)?;
+        if provider.issuer == "https://accounts.google.com" {
+            oidc_user.groups.clear();
+            if provider.access_policy.google_delegated_admin.is_some() {
+                if let Some(key) = self.oidc_repo.google_service_account(provider.id).await? {
+                    oidc_user.groups = super::google_workspace_groups(
+                        &provider.access_policy,
+                        &key,
+                        &oidc_user.email,
+                    )
+                    .await?;
+                }
+            }
+        }
 
         // Provision or update user
         let (user, newly_created) = self
             .provision_user(&oidc_user, ip_address, user_agent)
             .await?;
 
-        // Sync groups
-        self.sync_groups(user.id, &oidc_user.groups, provider.id)
-            .await?;
+        // Provisioning and source-aware group reconciliation commit together.
 
         Ok((user, oidc_user, newly_created))
     }
@@ -703,7 +846,9 @@ impl OidcService {
             .unwrap_or_else(|| email.split('@').next().unwrap_or(&email).to_string());
 
         // Extract groups based on provider's group claim configuration
-        let groups = if let Some(ref group_claim) = provider.group_claim {
+        let groups = if claims.entra_tenant().is_some() {
+            claims.groups.clone()
+        } else if let Some(ref group_claim) = provider.group_claim {
             match group_claim.as_str() {
                 "groups" => claims.groups.clone(),
                 "roles" => claims.roles.clone(),
@@ -721,7 +866,7 @@ impl OidcService {
         Ok(OidcUser {
             subject: claims.sub.clone(),
             email,
-            email_verified: claims.email_verified.unwrap_or(false),
+            email_verified: provider.access_policy.verifies_email(claims),
             name,
             groups,
             provider_id: provider.id,
@@ -742,148 +887,162 @@ impl OidcService {
         _ip_address: Option<&str>,
         _user_agent: Option<&str>,
     ) -> Result<(User, bool), OidcError> {
-        // Try to find existing user by OIDC subject
-        let existing_user = sqlx::query_as::<_, User>(
-            "SELECT * FROM users WHERE oidc_provider_id = $1 AND oidc_subject = $2",
+        let failed = || OidcError::ProvisioningError("SSO provisioning unavailable".into());
+        let mut tx = self.user_repo.pool().begin().await.map_err(|_| failed())?;
+        let provider = sqlx::query_as::<_, OidcProvider>(
+            "SELECT * FROM oidc_providers WHERE id=$1 AND enabled FOR SHARE",
         )
         .bind(oidc_user.provider_id)
-        .bind(&oidc_user.subject)
-        .fetch_optional(self.user_repo.pool())
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| OidcError::ProvisioningError(e.to_string()))?;
-
-        let (user, newly_created) = if let Some(existing) = existing_user {
-            // Update existing user
-            let updated_user = sqlx::query_as::<_, User>(
-                r#"
-                UPDATE users SET
-                    email = $2,
-                    name = $3,
-                    last_login_at = NOW(),
-                    last_oidc_groups = $4,
-                    updated_at = NOW()
-                WHERE id = $1
-                RETURNING *
-                "#,
-            )
-            .bind(existing.id)
-            .bind(&oidc_user.email)
-            .bind(&oidc_user.name)
-            .bind(&oidc_user.groups)
-            .fetch_one(self.user_repo.pool())
-            .await
-            .map_err(|e| OidcError::ProvisioningError(e.to_string()))?;
-
-            (updated_user, false)
+        .map_err(|_| failed())?
+        .ok_or_else(failed)?;
+        let user = sqlx::query_as::<_, User>(
+            "SELECT * FROM users WHERE oidc_provider_id=$1 AND oidc_subject=$2 FOR UPDATE",
+        )
+        .bind(provider.id)
+        .bind(&oidc_user.subject)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| failed())?;
+        let linked = user.is_some();
+        let existing = if user.is_some() {
+            user
         } else {
-            // Check if user exists by email (might be a local user)
-            let existing_by_email = self
-                .user_repo
-                .get_user_by_email(&oidc_user.email)
-                .await
-                .ok();
-
-            if let Some(existing) = existing_by_email {
-                // SECURITY: Only link existing accounts if OIDC email is verified
-                // This prevents account takeover where an attacker creates an OIDC
-                // account with a victim's email (unverified) to hijack their local account
-                if !oidc_user.email_verified {
-                    warn!(
-                        email = %oidc_user.email,
-                        provider_id = %oidc_user.provider_id,
-                        "Rejected OIDC account linking: email not verified by provider"
-                    );
-                    return Err(OidcError::ProvisioningError(
-                        "Cannot link to existing account: email address must be verified by the identity provider".to_string()
-                    ));
-                }
-
-                // Link existing user to OIDC provider
-                let linked_user = sqlx::query_as::<_, User>(
-                    r#"
-                    UPDATE users SET
-                        oidc_provider_id = $2,
-                        oidc_subject = $3,
-                        last_login_at = NOW(),
-                        last_oidc_groups = $4,
-                        updated_at = NOW()
-                    WHERE id = $1
-                    RETURNING *
-                    "#,
-                )
-                .bind(existing.id)
-                .bind(oidc_user.provider_id)
-                .bind(&oidc_user.subject)
-                .bind(&oidc_user.groups)
-                .fetch_one(self.user_repo.pool())
-                .await
-                .map_err(|e| OidcError::ProvisioningError(e.to_string()))?;
-
-                (linked_user, false)
-            } else {
-                // Create new user (JIT provisioning)
-                let new_user = sqlx::query_as::<_, User>(
-                    r#"
-                    INSERT INTO users (email, name, status, oidc_provider_id, oidc_subject, last_login_at, last_oidc_groups)
-                    VALUES ($1, $2, 'active', $3, $4, NOW(), $5)
-                    RETURNING *
-                    "#
-                )
+            sqlx::query_as::<_, User>("SELECT * FROM users WHERE lower(email)=lower($1) FOR UPDATE")
                 .bind(&oidc_user.email)
-                .bind(&oidc_user.name)
-                .bind(oidc_user.provider_id)
-                .bind(&oidc_user.subject)
-                .bind(&oidc_user.groups)
-                .fetch_one(self.user_repo.pool())
+                .fetch_optional(&mut *tx)
                 .await
-                .map_err(|e| OidcError::ProvisioningError(e.to_string()))?;
-
-                (new_user, true)
-            }
+                .map_err(|_| failed())?
         };
-
+        if existing
+            .as_ref()
+            .is_some_and(|u| u.status != "active" || (!linked && u.oidc_provider_id.is_some()))
+        {
+            return Err(OidcError::ProvisioningError(
+                "SSO account is not active or cannot be linked".into(),
+            ));
+        }
+        let invited = if let Some(u) = &existing {
+            !sqlx::query_scalar::<_, bool>("SELECT sso_jit FROM users WHERE id=$1")
+                .bind(u.id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|_| failed())?
+        } else {
+            false
+        };
+        let lookup_known=provider.issuer!="https://accounts.google.com" || (
+            provider.access_policy.google_delegated_admin.is_some() &&
+            sqlx::query_scalar::<_,bool>("SELECT google_service_account_encrypted IS NOT NULL FROM oidc_providers WHERE id=$1")
+                .bind(provider.id).fetch_one(&mut *tx).await.map_err(|_| failed())?);
+        if !provider
+            .access_policy
+            .allows(&oidc_user.groups, invited, lookup_known)
+        {
+            if let Some(u) = existing {
+                self.reconcile_groups(&mut tx, u.id, &[], &provider).await?;
+            }
+            tx.commit().await.map_err(|_| failed())?;
+            return Err(OidcError::GroupNotAllowed);
+        }
+        if !linked && !oidc_user.email_verified {
+            return Err(OidcError::ProvisioningError(
+                "Email address must be verified by the identity provider".into(),
+            ));
+        }
+        let newly_created = existing.is_none();
+        let user = if let Some(existing) = existing {
+            let user=sqlx::query_as::<_,User>("UPDATE users SET oidc_provider_id=$2,oidc_subject=$3,last_login_at=NOW(),last_oidc_groups=$4,updated_at=NOW() WHERE id=$1 RETURNING *")
+                .bind(existing.id).bind(provider.id).bind(&oidc_user.subject).bind(&oidc_user.groups)
+                .fetch_one(&mut *tx).await.map_err(|_| failed())?;
+            user
+        } else {
+            sqlx::query_as::<_,User>("INSERT INTO users(email,name,status,oidc_provider_id,oidc_subject,last_login_at,last_oidc_groups,sso_jit) VALUES($1,$2,'active',$3,$4,NOW(),$5,TRUE) RETURNING *")
+                .bind(&oidc_user.email).bind(&oidc_user.name).bind(provider.id).bind(&oidc_user.subject).bind(&oidc_user.groups)
+                .fetch_one(&mut *tx).await.map_err(|_| failed())?
+        };
+        self.reconcile_groups(&mut tx, user.id, &oidc_user.groups, &provider)
+            .await?;
+        tx.commit().await.map_err(|_| failed())?;
         Ok((user, newly_created))
     }
 
-    /// Sync user groups from OIDC claims
-    /// Requirements: 3.4
+    async fn reconcile_groups(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        user_id: Uuid,
+        groups: &[String],
+        provider: &OidcProvider,
+    ) -> Result<(), OidcError> {
+        let failed = || OidcError::ProvisioningError("SSO group reconciliation unavailable".into());
+        let prefix = format!("sso_group:{}:", provider.id);
+        sqlx::query("DELETE FROM oidc_group_grant_sources WHERE user_id=$1 AND source LIKE $2")
+            .bind(user_id)
+            .bind(format!("{prefix}%"))
+            .execute(&mut **tx)
+            .await
+            .map_err(|_| failed())?;
+        for mapping in provider.access_policy.matching(groups) {
+            let source = format!("{prefix}{}", mapping.idp_group);
+            sqlx::query("SELECT set_config('nano.sso_grant_source',$1,TRUE)")
+                .bind(&source)
+                .execute(&mut **tx)
+                .await
+                .map_err(|_| failed())?;
+            for group in &mapping.group_ids {
+                sqlx::query("INSERT INTO user_groups(user_id,group_id) VALUES($1,$2) ON CONFLICT DO NOTHING")
+                    .bind(user_id).bind(group).execute(&mut **tx).await.map_err(|_| failed())?;
+            }
+        }
+        sqlx::query("SELECT set_config('nano.sso_grant_source','',TRUE)")
+            .execute(&mut **tx)
+            .await
+            .map_err(|_| failed())?;
+        let removed=sqlx::query("DELETE FROM user_groups g WHERE user_id=$1 AND NOT EXISTS(SELECT 1 FROM oidc_group_grant_sources s WHERE s.user_id=g.user_id AND s.group_id=g.group_id)")
+            .bind(user_id).execute(&mut **tx).await.map_err(|_| failed())?.rows_affected();
+        if removed > 0 {
+            sqlx::query("UPDATE users SET tokens_valid_from=clock_timestamp() WHERE id=$1")
+                .bind(user_id)
+                .execute(&mut **tx)
+                .await
+                .map_err(|_| failed())?;
+            sqlx::query("DELETE FROM sessions WHERE user_id=$1")
+                .bind(user_id)
+                .execute(&mut **tx)
+                .await
+                .map_err(|_| failed())?;
+        }
+        Ok(())
+    }
+
     pub async fn sync_groups(
         &self,
         user_id: Uuid,
-        oidc_groups: &[String],
+        groups: &[String],
         provider_id: Uuid,
     ) -> Result<(), OidcError> {
-        // Get local group IDs for the OIDC groups
-        let local_group_ids = self
-            .oidc_repo
-            .get_local_groups_for_oidc_groups(provider_id, oidc_groups)
-            .await?;
-
-        // Get current user groups
-        let current_groups = self
+        let mut tx = self
             .user_repo
-            .get_user_groups(user_id)
+            .pool()
+            .begin()
             .await
-            .map_err(|e| OidcError::ProvisioningError(e.to_string()))?;
-
-        let current_group_ids: Vec<Uuid> = current_groups.iter().map(|g| g.id).collect();
-
-        // Add user to mapped groups they're not already in
-        for group_id in &local_group_ids {
-            if !current_group_ids.contains(group_id) {
-                self.group_repo
-                    .add_user_to_group(user_id, *group_id)
-                    .await
-                    .map_err(|e| OidcError::ProvisioningError(e.to_string()))?;
-            }
-        }
-
-        // Note: We don't remove users from groups they were added to via OIDC
-        // This is intentional - group removal should be explicit
-        // If you want to sync groups exactly, you could remove users from
-        // groups that are mapped but not in their OIDC claims
-
-        Ok(())
+            .map_err(|_| OidcError::GroupNotAllowed)?;
+        let provider = sqlx::query_as::<_, OidcProvider>(
+            "SELECT * FROM oidc_providers WHERE id=$1 AND enabled FOR SHARE",
+        )
+        .bind(provider_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| OidcError::GroupNotAllowed)?;
+        sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| OidcError::GroupNotAllowed)?;
+        self.reconcile_groups(&mut tx, user_id, groups, &provider)
+            .await?;
+        tx.commit().await.map_err(|_| OidcError::GroupNotAllowed)
     }
 
     /// List enabled OIDC providers (for login page)
@@ -905,4 +1064,136 @@ impl OidcService {
 pub struct OidcProviderInfo {
     pub slug: String,
     pub name: String,
+}
+
+#[cfg(test)]
+mod verified_email_tests {
+    use super::IdTokenClaims;
+    use serde_json::{json, Value};
+
+    fn claims(patch: Value) -> IdTokenClaims {
+        let mut value = json!({
+            "iss": "https://login.microsoftonline.com/11111111-1111-4111-8111-111111111111/v2.0",
+            "tid": "11111111-1111-4111-8111-111111111111",
+            "sub": "test-subject", "aud": "test-client", "exp": 2000000000,
+            "iat": 1900000000, "email": "member@example.com"
+        });
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(patch.as_object().unwrap().clone());
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn entra_requires_verified_email_domain_signal() {
+        assert!(claims(json!({"xms_edov": true})).verified_email());
+        assert!(!claims(json!({})).verified_email());
+        assert!(!claims(json!({"xms_edov": false})).verified_email());
+        assert!(!claims(json!({"xms_edov": true, "email": null,
+            "preferred_username": "member@example.com"}))
+        .verified_email());
+    }
+
+    #[test]
+    fn entra_signal_is_bound_to_exact_issuer_and_tenant() {
+        for issuer in ["https://issuer.example", "https://login.microsoftonline.com.evil.example/11111111-1111-4111-8111-111111111111/v2.0",
+            "https://login.microsoftonline.com/common/v2.0", "https://login.microsoftonline.com/11111111-1111-4111-8111-111111111111/v2.0/"] {
+            assert!(!claims(json!({"iss": issuer, "xms_edov": true})).verified_email());
+        }
+        assert!(!claims(json!({"tid": null, "xms_edov": true})).verified_email());
+        assert!(
+            !claims(json!({"tid": "22222222-2222-4222-8222-222222222222", "xms_edov": true}))
+                .verified_email()
+        );
+    }
+
+    #[test]
+    fn other_providers_still_require_email_verified() {
+        assert!(
+            claims(json!({"iss": "https://accounts.google.com", "email_verified": true}))
+                .verified_email()
+        );
+        assert!(
+            !claims(json!({"iss": "https://accounts.google.com", "xms_edov": true}))
+                .verified_email()
+        );
+    }
+}
+
+#[cfg(test)]
+mod entra_group_tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    #[tokio::test]
+    async fn graph_membership_is_read_from_complete_response() {
+        let server = MockServer::start().await;
+        let group = "11111111-1111-4111-8111-111111111111";
+        Mock::given(method("GET"))
+            .and(path("/groups"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"value": [{"id": group}]})),
+            )
+            .mount(&server)
+            .await;
+        let result = fetch_entra_groups(
+            &Client::new(),
+            &format!("{}/groups", server.uri()),
+            "disposable-test-token",
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, vec![group]);
+    }
+
+    #[tokio::test]
+    async fn graph_failure_or_unknown_membership_is_denied() {
+        for (status, body) in [
+            (403, json!({"error": "consent required"})),
+            (200, json!({"value": [{"id": "invalid"}]})),
+            (200, json!({})),
+            (
+                200,
+                json!({"value": [], "@odata.nextLink": "https://evil.example/groups"}),
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .mount(&server)
+                .await;
+            assert!(fetch_entra_groups(
+                &Client::new(),
+                &format!("{}/groups", server.uri()),
+                "disposable-test-token"
+            )
+            .await
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn graph_pagination_must_complete_before_granting_any_group() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/groups"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"value": [{"id": "11111111-1111-4111-8111-111111111111"}],
+                "@odata.nextLink": format!("{}/failure", server.uri())}),
+            ))
+            .mount(&server)
+            .await;
+        assert!(fetch_entra_groups(
+            &Client::new(),
+            &format!("{}/groups", server.uri()),
+            "disposable-test-token"
+        )
+        .await
+        .is_err());
+    }
 }

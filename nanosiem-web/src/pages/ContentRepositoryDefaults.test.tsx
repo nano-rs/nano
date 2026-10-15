@@ -29,12 +29,12 @@ afterEach(() => { cleanup(); vi.clearAllMocks(); });
 it.each([
   ['parsers', ParserRepositories, requests.parsers, 'parsers/'],
   ['rules', RuleRepositories, requests.rules, ''],
-] as const)('one-click Add nano %s requests the 1.9 branch with auto-sync on', async (kind, Page, create, path) => {
+] as const)('one-click Add nano %s requests the main branch with auto-sync on', async (kind, Page, create, path) => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(<QueryClientProvider client={client}><MemoryRouter><Page /></MemoryRouter></QueryClientProvider>);
   fireEvent.click(await screen.findByRole('button', { name: `Add nano ${kind}` }));
   await waitFor(() => expect(create).toHaveBeenCalledWith(expect.objectContaining({
-    url: `https://github.com/nano-rs/${kind}`, branch: 'ocsf-1.9', auto_sync_enabled: true,
+    url: `https://github.com/nano-rs/${kind}`, branch: 'main', auto_sync_enabled: true,
     [kind === 'parsers' ? 'parsers_path' : 'rules_path']: path,
   })));
   client.clear();

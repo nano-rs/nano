@@ -246,7 +246,7 @@ RUN apt-get update && apt-get install -y ca-certificates curl \
          -o /tmp/libchdb.tar.gz \
     && echo "${CHDB_ARM64_ARCHIVE_SHA256}  /tmp/libchdb.tar.gz" | sha256sum -c - \
     && mkdir -p /opt/nano-chdb \
-    && tar -xzf /tmp/libchdb.tar.gz -C /opt/nano-chdb libchdb.so \
+    && tar --no-same-owner -xzf /tmp/libchdb.tar.gz -C /opt/nano-chdb libchdb.so \
     && sha256sum /opt/nano-chdb/libchdb.so | cut -d ' ' -f 1 \
          > /opt/nano-chdb/libchdb.sha256 \
     && chmod 0555 /opt/nano-chdb/libchdb.so \
@@ -254,6 +254,8 @@ RUN apt-get update && apt-get install -y ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* /tmp/libchdb.tar.gz
 
 FROM chdb-runtime-${TARGETARCH} AS chdb-runtime
+# Both architecture paths must satisfy the native loader's ownership policy.
+RUN test "$(stat -c '%u:%g' /opt/nano-chdb/libchdb.so)" = "0:0"
 
 # RustFS's official CLI is used only by the one-shot bucket initializer. Pin
 # both the version and architecture-specific checksum so an upstream release
@@ -503,7 +505,8 @@ COPY --from=open-lake-cell-builder /app/open-cell-bin/ /usr/local/bin/
 # trusted-local init records the stable worker entrypoint names
 # nanosiem-lake-ingest / nanosiem-lake-query; open-lake-cell-builder installs them.
 COPY --from=chdb-runtime /opt/nano-chdb/ /usr/local/lib/nano-chdb/
-RUN sha256sum /usr/local/bin/lake_query_compile | cut -d ' ' -f 1 \
+RUN test "$(stat -c '%u:%g' /usr/local/lib/nano-chdb/libchdb.so)" = "0:0" \
+    && sha256sum /usr/local/bin/lake_query_compile | cut -d ' ' -f 1 \
       > /usr/local/lib/nano-lake/lake_query_compile.sha256 \
     && chmod 0444 /usr/local/lib/nano-lake/lake_query_compile.sha256
 ENTRYPOINT ["/usr/local/bin/nanosiem-lake-cell"]

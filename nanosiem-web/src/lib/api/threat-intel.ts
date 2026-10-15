@@ -100,12 +100,25 @@ export interface IndicatorSourceMatches {
   matches: IndicatorMatch[];
 }
 
+/** NAN-3881: one source searched (own IOC list/feed or enabled baseline feed). */
+export interface IndicatorSearchedSource {
+  source: string;
+  matched: boolean;
+  match_count: number;
+}
+
 export interface IndicatorLookupResponse {
   artifact: string;
   artifact_type: ThreatIntelArtifactType | null;
-  /** Indicator sources searched; null when the tenant worker does not report them. */
+  /** Indicator sources searched (own lists + enabled baseline feeds; 0 = none
+      enabled); null when the tenant worker does not report them. */
   source_count: number | null;
   source_names: string[] | null;
+  /** Every source searched with match / no-match, matched first. Absent from
+      an API that predates it. */
+  searched?: IndicatorSearchedSource[];
+  /** The tenant's baseline feeds exist but could not be read for this lookup. */
+  baseline_feeds_unavailable?: boolean;
   /** Matches grouped by source, strongest first. */
   sources: IndicatorSourceMatches[];
 }

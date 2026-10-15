@@ -1324,13 +1324,14 @@ services:
     # `docker pull` enforces.
     image: tenzir/tenzir:v6.19.1@sha256:6e96f962bc0a957d94d5149f840f7603c47a7b11d995e0f1fc167c141db7c06f
     container_name: nano-tenzir
-    restart: unless-stopped
+    restart: on-failure
     logging: *default-logging
     security_opt:
       - no-new-privileges:true
     command: ["-f", "/pipeline.tql"]
     volumes:
       - ./.nano-tenzir/pipeline.tql:/pipeline.tql:ro
+      - ./.nano-tenzir/data:/data:ro
     depends_on:
       lean-object-init: {condition: service_completed_successfully, required: false}
     deploy:

@@ -8,6 +8,9 @@ struct CellPolicy {
     path: PathBuf,
     bundle: crate::lean_platform_bundle::PlatformBundleSource,
     current: std::sync::Mutex<crate::lean_platform_bundle::TenantPlatformPolicy>,
+    /// The verified bundle `current` names, kept so an on-demand IOC lookup
+    /// does not re-hash the bundle per request (NAN-3881).
+    opened: std::sync::Mutex<std::sync::Arc<crate::lean_platform_bundle::PlatformBundle>>,
     custom_root: Option<PathBuf>,
     custom_digest: std::sync::Mutex<Option<String>>,
 }
@@ -26,7 +29,7 @@ pub fn configure_cell(assignment: &nanosiem_lake_cell::contract::Assignment) -> 
     };
     ensure!(path.is_absolute(), "platform paths must be absolute");
     let policy = crate::lean_platform_bundle::TenantPlatformPolicy::read_for_query(path, tenant)?;
-    let _verified = bundle.open(&policy.bundle_sha256)?;
+    let verified = std::sync::Arc::new(bundle.open(&policy.bundle_sha256)?);
     let custom_digest = assignment.custom_context_root.as_ref().map(|root| -> anyhow::Result<String> {
         let (path, digest) = crate::ip_context::current_assignment_pointer(root, assignment.tenant.as_str())?
             .context("configured custom context has no current revision")?;
@@ -34,7 +37,8 @@ pub fn configure_cell(assignment: &nanosiem_lake_cell::contract::Assignment) -> 
         Ok(digest)
     }).transpose()?;
     let _ = CELL_POLICY.set(CellPolicy { tenant, path: path.clone(), bundle,
-        current: std::sync::Mutex::new(policy), custom_root: assignment.custom_context_root.clone(),
+        current: std::sync::Mutex::new(policy), opened: std::sync::Mutex::new(verified),
+        custom_root: assignment.custom_context_root.clone(),
         custom_digest: std::sync::Mutex::new(custom_digest) });
     Ok(())
 }
@@ -186,6 +190,39 @@ mod lean_policy_tests {
     }
 }
 
+/// Reread the cell's private policy (revocations land on the next dispatch),
+/// refuse a rollback, and verify + keep the bundle it names when it moved.
+fn refresh_cell_policy(
+    cell: &CellPolicy,
+    tenant: uuid::Uuid,
+) -> anyhow::Result<(crate::lean_platform_bundle::TenantPlatformPolicy, std::sync::Arc<crate::lean_platform_bundle::PlatformBundle>)> {
+    let policy = crate::lean_platform_bundle::TenantPlatformPolicy::read_for_query(&cell.path, tenant)?;
+    let mut current = cell.current.lock().map_err(|_| anyhow::anyhow!("cell policy lock poisoned"))?;
+    policy.validate_successor(&current)?;
+    let mut opened = cell.opened.lock().map_err(|_| anyhow::anyhow!("cell bundle lock poisoned"))?;
+    if policy.bundle_sha256 != opened.digest() {
+        let fresh = cell.bundle.open(&policy.bundle_sha256)?;
+        anyhow::ensure!(fresh.digest() == policy.bundle_sha256, "platform bundle digest differs");
+        *opened = std::sync::Arc::new(fresh);
+    }
+    *current = policy.clone();
+    Ok((policy, opened.clone()))
+}
+
+/// NAN-3881: the platform baseline IOC feeds (ThreatFox, Tor exit nodes...)
+/// this process's tenant is granted, exactly as ingest stamping reads them:
+/// the node bundle plus the tenant's own fresh policy. `None` when the
+/// process has no platform mounts (open core, a cell without a bundle).
+/// Another tenant id is refused: a process only ever answers for its own.
+pub fn platform_ioc_view(
+    tenant: uuid::Uuid,
+) -> anyhow::Result<Option<(std::sync::Arc<crate::lean_platform_bundle::PlatformBundle>, crate::lean_platform_bundle::TenantPlatformPolicy)>> {
+    let Some(cell) = CELL_POLICY.get() else { return Ok(None) };
+    anyhow::ensure!(!tenant.is_nil() && tenant == cell.tenant, "platform IOC view tenant differs from process tenant");
+    let (policy, bundle) = refresh_cell_policy(cell, tenant)?;
+    Ok(Some((bundle, policy)))
+}
+
 /// A separate execute-only, tenant-bound DB identity. Optional metadata
 /// failures never weaken the caller's existing event authorization.
 pub async fn resolve(tenant_id: &str) -> ReadAuthorization {
@@ -193,17 +230,8 @@ pub async fn resolve(tenant_id: &str) -> ReadAuthorization {
         let now = chrono::Utc::now();
         let tenant = tenant_id.parse().unwrap_or(uuid::Uuid::nil());
         if tenant != cell.tenant { return ReadAuthorization::unknown(tenant, now); }
-        return match crate::lean_platform_bundle::TenantPlatformPolicy::read_for_query(&cell.path, tenant).and_then(|policy| {
-            let mut current = cell.current.lock().map_err(|_| anyhow::anyhow!("cell policy lock poisoned"))?;
-            policy.validate_successor(&current)?;
-            if policy.bundle_sha256 != current.bundle_sha256 {
-                let opened = cell.bundle.open(&policy.bundle_sha256)?;
-                anyhow::ensure!(opened.digest() == policy.bundle_sha256, "platform bundle digest differs");
-            }
-            *current = policy.clone();
-            Ok(policy)
-        }) {
-            Ok(policy) => from_lean_policy(&policy, now),
+        return match refresh_cell_policy(cell, tenant) {
+            Ok((policy, _)) => from_lean_policy(&policy, now),
             Err(error) => {
                 tracing::warn!(%error, tenant = tenant_id, "cell policy unavailable; denying platform enrichment");
                 ReadAuthorization::unknown(tenant, now)

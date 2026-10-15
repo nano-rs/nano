@@ -3,6 +3,7 @@
 import {
   tenantShellPath,
   canonicalTenantSlug,
+  tenantContinuationBody,
   verifyServerAuthIdentity,
   type ServerAuthIdentity,
 } from './tenant-auth-shell.ts';
@@ -56,10 +57,32 @@ interface SharedOidcCallbackResponse {
   assignment_revision: number;
 }
 
+/** The tab's in-memory access bearer, never persisted (NAN-3905). */
+export interface SharedOidcTabSession {
+  accessToken: string;
+  expiresIn: number;
+}
+
 export interface SharedOidcBrowserResult {
   user: ServerAuthIdentity & Record<string, unknown>;
   tenant: TenantCapabilitySnapshot;
   destination: string;
+  /** Bearer that proved `/auth/me` + bootstrap; the auth context adopts it. */
+  session: SharedOidcTabSession;
+}
+
+function exactRefreshSession(value: unknown): SharedOidcTabSession {
+  if (
+    !isRecord(value)
+    || typeof value.access_token !== 'string'
+    || !/^\S{16,8192}$/.test(value.access_token)
+    || typeof value.expires_in !== 'number'
+    || !Number.isInteger(value.expires_in)
+    || value.expires_in <= 0
+  ) {
+    throw new SharedOidcBrowserError();
+  }
+  return { accessToken: value.access_token, expiresIn: value.expires_in };
 }
 
 export interface SharedOidcLoginProvider {
@@ -502,9 +525,27 @@ export async function completeEnterpriseSharedOidc(
       throw new SharedOidcBrowserError();
     }
 
+    dependencies.runtime.assertCurrent(capturedRuntime);
+
+    // NAN-3905: the callback answers cookies only. Turn this tenant's new
+    // refresh cookie (selected by tenant_slug, NAN-3548) into the tab's
+    // in-memory bearer, then prove `/auth/me` and the bootstrap with that
+    // bearer and `credentials: 'omit'`. A cookie-only proof presented every
+    // signed-in tenant's `access_token__<d>` cookie on the pooled host and
+    // was refused ("Provide exactly one authentication credential").
+    const session = exactRefreshSession(await uniformJson(await dependencies.fetch('/api/auth/refresh', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(tenantContinuationBody(pending.tenantSlug)),
+    })));
+    dependencies.runtime.assertCurrent(capturedRuntime);
+    const bearer = { Authorization: `Bearer ${session.accessToken}` };
+
     const currentUserValue = await uniformJson(await dependencies.fetch('/api/auth/me', {
       method: 'GET',
-      credentials: 'include',
+      credentials: 'omit',
+      headers: bearer,
     }));
     assertNoCredentialFields(currentUserValue);
     if (!isRecord(currentUserValue)) throw new SharedOidcBrowserError();
@@ -520,7 +561,7 @@ export async function completeEnterpriseSharedOidc(
 
     const bootstrapValue = await uniformJson(await dependencies.fetch(
       '/api/auth/tenant-bootstrap',
-      { method: 'GET', credentials: 'include' },
+      { method: 'GET', credentials: 'omit', headers: bearer },
     ));
     assertNoCredentialFields(bootstrapValue);
     const tenant = validateTenantCapabilitySnapshot(bootstrapValue, {
@@ -544,6 +585,7 @@ export async function completeEnterpriseSharedOidc(
       // The tenant's product root, reached by a full load (see the callback
       // page): the router that ran the callback has no tenant basename.
       destination: tenantShellPath(verified.activeTenant.slug),
+      session,
     };
   } catch {
     throw new SharedOidcBrowserError();

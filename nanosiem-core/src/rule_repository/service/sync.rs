@@ -134,8 +134,9 @@ impl RuleRepositoryService {
         // Get rule files - use git sparse-checkout for selected paths (avoids API rate limits entirely)
         // NAN-1266: under NANO_SCHEMA_PROFILE=ocsf the sync walks the sibling
         // `rules-ocsf/` tree so imported rules target OCSF; UDM is unchanged.
-        // NAN-2361: same content-branch remap as the parser sync. Scoped to the
-        // first-party rules repo: sigmahq/sigma has no `ocsf-1.9` branch.
+        // NAN-3897: same content-branch resolution as the parser sync (the
+        // retired `ocsf-1.9` default follows `main`). Scoped to the
+        // first-party repos: a third-party branch is never rewritten.
         let resolved_branch = if owner == "nano-rs" {
             crate::schema::active_content_branch(&repo.branch)
         } else {
@@ -146,7 +147,7 @@ impl RuleRepositoryService {
                 repo_id = %id,
                 stored = %repo.branch,
                 resolved = %resolved_branch,
-                "Lake profile: syncing the OCSF 1.9 content branch"
+                "Retired ocsf-1.9 content branch: syncing main"
             );
         }
 

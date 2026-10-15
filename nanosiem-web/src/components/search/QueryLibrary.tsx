@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useState, useMemo, useEffect, useCallback } from 'react';
+import { authenticatedFetch } from '@/lib/authenticated-fetch';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
@@ -102,7 +103,7 @@ export function QueryLibrary({ onSelectQuery }: QueryLibraryProps) {
       const params = new URLSearchParams();
       if (searchTerm) params.set('search', searchTerm);
       if (selectedCategory) params.set('category', selectedCategory);
-      const response = await fetch(`${API_BASE}/api/query-library?${params}`);
+      const response = await authenticatedFetch('/api/query-library', `${API_BASE}/api/query-library?${params}`);
       if (response.ok) {
         const data = await response.json();
         setQueries(data.queries || []);
@@ -117,7 +118,7 @@ export function QueryLibrary({ onSelectQuery }: QueryLibraryProps) {
   // Fetch categories
   const fetchCategories = useCallback(async () => {
     try {
-      const response = await fetch(`${API_BASE}/api/query-library/categories`);
+      const response = await authenticatedFetch('/api/query-library/categories', `${API_BASE}/api/query-library/categories`);
       if (response.ok) {
         const data = await response.json();
         setCategories(data.categories || []);

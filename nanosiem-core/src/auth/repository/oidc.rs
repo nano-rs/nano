@@ -112,6 +112,22 @@ impl OidcRepository {
             .map_err(|e| OidcRepositoryError::EncryptionError(e.to_string()))
     }
 
+    pub async fn google_service_account(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<String>, OidcRepositoryError> {
+        let value: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT google_service_account_encrypted FROM oidc_providers WHERE id=$1",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        value
+            .as_deref()
+            .map(|bytes| self.decrypt_secret(bytes))
+            .transpose()
+    }
+
     /// List all OIDC providers
     /// Requirements: 3.5
     pub async fn list_providers(&self) -> Result<Vec<OidcProvider>, OidcRepositoryError> {
@@ -192,8 +208,8 @@ impl OidcRepository {
 
         let provider = sqlx::query_as::<_, OidcProvider>(
             r#"
-            INSERT INTO oidc_providers (name, slug, issuer, client_id, client_secret_encrypted, scopes, group_claim, enabled)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
+            INSERT INTO oidc_providers (name, slug, issuer, client_id, client_secret_encrypted, scopes, group_claim, enabled, access_policy, google_service_account_encrypted)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, $8, $9)
             RETURNING *
             "#
         )
@@ -204,6 +220,8 @@ impl OidcRepository {
         .bind(&encrypted_secret)
         .bind(&scopes)
         .bind(&request.group_claim)
+        .bind(sqlx::types::Json(request.access_policy.clone().unwrap_or_default()))
+        .bind(request.google_service_account.as_deref().map(|k| self.encrypt_secret(k)).transpose()?)
         .fetch_one(&self.pool)
         .await?;
 
@@ -232,8 +250,8 @@ impl OidcRepository {
         let provider = sqlx::query_as::<_, OidcProvider>(
             r#"
             INSERT INTO oidc_providers
-                (name, slug, issuer, client_id, client_secret_encrypted, scopes, group_claim, enabled)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
+                (name, slug, issuer, client_id, client_secret_encrypted, scopes, group_claim, enabled, access_policy, google_service_account_encrypted)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, $8, $9)
             RETURNING *
             "#,
         )
@@ -244,6 +262,8 @@ impl OidcRepository {
         .bind(&encrypted_secret)
         .bind(&scopes)
         .bind(&request.group_claim)
+        .bind(sqlx::types::Json(request.access_policy.clone().unwrap_or_default()))
+        .bind(request.google_service_account.as_deref().map(|k| self.encrypt_secret(k)).transpose()?)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| {
@@ -291,6 +311,8 @@ impl OidcRepository {
                 scopes = $6,
                 group_claim = $7,
                 enabled = $8,
+                access_policy = COALESCE($9, access_policy),
+                google_service_account_encrypted = CASE WHEN $11 THEN NULL ELSE COALESCE($10,google_service_account_encrypted) END,
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -304,6 +326,9 @@ impl OidcRepository {
         .bind(scopes)
         .bind(&group_claim)
         .bind(enabled)
+        .bind(request.access_policy.as_ref().map(sqlx::types::Json))
+        .bind(request.google_service_account.as_deref().map(|k| self.encrypt_secret(k)).transpose()?)
+        .bind(request.clear_google_service_account)
         .fetch_one(&self.pool)
         .await?;
 
@@ -358,6 +383,15 @@ impl OidcRepository {
         .bind(scopes)
         .bind(&group_claim)
         .bind(enabled)
+        .bind(request.access_policy.as_ref().map(sqlx::types::Json))
+        .bind(
+            request
+                .google_service_account
+                .as_deref()
+                .map(|k| self.encrypt_secret(k))
+                .transpose()?,
+        )
+        .bind(request.clear_google_service_account)
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -515,6 +549,28 @@ impl OidcRepository {
             .execute(&mut *tx)
             .await?;
         }
+        let mut policy: sqlx::types::Json<crate::auth::SsoAccessPolicy> =
+            sqlx::query_scalar("SELECT access_policy FROM oidc_providers WHERE id=$1 FOR UPDATE")
+                .bind(provider_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        policy.mappings = mappings
+            .iter()
+            .map(|(idp, id)| crate::auth::SsoGroupMapping {
+                idp_group: idp.clone(),
+                group_ids: vec![*id],
+                role_ids: vec![],
+            })
+            .collect();
+        policy.mapped_groups_only = true;
+        policy.validate(false).map_err(|_| {
+            OidcRepositoryError::EncryptionError("Invalid SSO group mapping".into())
+        })?;
+        sqlx::query("UPDATE oidc_providers SET access_policy=$2,updated_at=NOW() WHERE id=$1")
+            .bind(provider_id)
+            .bind(policy)
+            .execute(&mut *tx)
+            .await?;
         let rows = sqlx::query_as::<_, OidcGroupMapping>(
             "SELECT * FROM oidc_group_mappings WHERE provider_id = $1 ORDER BY oidc_group ASC",
         )

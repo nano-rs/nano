@@ -2,11 +2,12 @@
 // The one on-demand enrichment surface. Mounted once in the app shell; any
 // "Enrich" action (search value menu, prevalence, case entities, pivt
 // `@enrich`) dispatches ENRICH_ARTIFACT_EVENT and this sheet:
-// - always searches the tenant's own indicator sets (installed IOC feeds and
-//   IOC lists) through POST /api/threat-intel/indicator-lookup (NAN-3881);
+// - always searches every IOC source the tenant has enabled (its own IOC
+//   lists/feeds plus its enabled baseline feeds such as ThreatFox and Tor
+//   exit nodes) through POST /api/threat-intel/indicator-lookup (NAN-3881);
 // - adds external provider results (POST /api/threat-intel/lookup) only when
-//   the tenant has the agent-enrichment add-on; with none installed that is
-//   a one-line hint, not an error.
+//   the tenant has the agent-enrichment add-on. "No external provider" shows
+//   only when the tenant has no indicator source enabled at all.
 // Renders nothing outside hosted-shared tenants.
 
 import { useEffect, useState, type ReactNode } from 'react';
@@ -63,7 +64,8 @@ function AboutTooltip({ sets, external }: { sets: boolean; external: boolean }) 
           </button>
         </TooltipTrigger>
         <TooltipContent side="bottom" align="end" sideOffset={6} collisionPadding={8} className="max-w-[300px] text-[11px]">
-          {sets && "Indicator sets are your tenant's own IOC feeds and lists, searched in place."}
+          {sets &&
+            "Indicator sets are your tenant's IOC lists plus the baseline feeds it has enabled (ThreatFox, Tor exit nodes…), searched in place: the same sources ingest matches against."}
           {external &&
             ' External results come from your tenant\'s configured providers and are cached per provider. Each external lookup is audited.'}
         </TooltipContent>
@@ -108,6 +110,9 @@ export function EnrichSheet({ target, onClose }: { target: EnrichArtifactDetail;
   const matchCount = iocs?.sources.reduce((n, s) => n + s.matches.length, 0) ?? 0;
   const busy = indicators.isFetching || lookup.isFetching || refresh.isPending;
   const externalError = (lookup.error ?? refresh.error)?.message;
+  // NAN-3881: "no provider" is only news when nothing else was searched,
+  // never while the tenant's IOC lists / baseline feeds are enabled.
+  const noIndicatorSources = !sets || (iocs != null && iocs.source_count === 0);
   return (
     <DetailSheet
       open
@@ -203,7 +208,7 @@ export function EnrichSheet({ target, onClose }: { target: EnrichArtifactDetail;
               <SectionLabel right={sets ? undefined : <AboutTooltip sets={false} external />}>External providers</SectionLabel>
               <ThreatIntelResults response={data} />
             </>
-          ) : data ? (
+          ) : data && (data.availability !== 'no_provider_configured' || noIndicatorSources) ? (
             <ThreatIntelResults response={data} />
           ) : null}
         </section>

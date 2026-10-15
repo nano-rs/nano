@@ -8,6 +8,7 @@
 
 import { useState, FormEvent, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { authenticatedFetch } from '@/lib/authenticated-fetch';
 import {
   PASSWORD_MAX_BYTES,
   PASSWORD_MIN_BYTES,
@@ -56,7 +57,7 @@ export function Setup() {
   useEffect(() => {
     const checkStatus = async () => {
       try {
-        const response = await fetch(`${API_BASE_URL}/api/setup/status`);
+        const response = await authenticatedFetch('/api/setup/status', `${API_BASE_URL}/api/setup/status`);
         if (response.ok) {
           const status: SetupStatus = await response.json();
           if (status.initialized || status.has_users) {
@@ -125,7 +126,7 @@ export function Setup() {
     setIsSubmitting(true);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/setup/initialize`, {
+      const response = await authenticatedFetch('/api/setup/initialize', `${API_BASE_URL}/api/setup/initialize`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

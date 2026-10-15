@@ -271,7 +271,11 @@ CREATE TRIGGER t BEFORE INSERT ON public.rule_repositories FOR EACH ROW EXECUTE 
 ALTER TABLE public.cloud_credentials ADD COLUMN y INT;";
     assert!(violations(created_here, &registered).is_empty());
 
-    for file in ["360_cloud_credentials_azure_event_hubs.sql", "361_first_party_ocsf_content_defaults.sql"] {
+    for file in [
+        "360_cloud_credentials_azure_event_hubs.sql",
+        "361_first_party_ocsf_content_defaults.sql",
+        "367_first_party_content_follows_main.sql",
+    ] {
         let sql = std::fs::read_to_string(migrations_dir("postgres").join(file)).unwrap();
         assert!(violations(&sql, &registered).is_empty(), "{file}");
     }

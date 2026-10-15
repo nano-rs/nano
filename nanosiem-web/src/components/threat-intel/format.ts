@@ -82,6 +82,6 @@ export function citationToResponse(content: Record<string, unknown>): ThreatInte
 /** NAN-3881: the no-match line for the tenant's own indicator sets. */
 export function indicatorMissText(sourceCount: number | null): string {
   if (sourceCount == null) return 'No matches in your indicator sources';
-  if (sourceCount === 0) return 'No indicator sources published yet';
+  if (sourceCount === 0) return 'No threat-intel sources are enabled for this tenant';
   return `No matches in ${sourceCount} indicator source${sourceCount === 1 ? '' : 's'}`;
 }

@@ -94,7 +94,7 @@ const SHARED_FAIL_CLOSED_CAPABILITIES: CapabilitiesContextValue = {
 };
 
 async function fetchCapabilities(): Promise<CapabilitiesContextValue> {
-  const response = await fetch(`${API_BASE_URL}/api/capabilities`);
+  const response = await authenticatedFetch('/api/capabilities', `${API_BASE_URL}/api/capabilities`);
   if (!response.ok) {
     throw new Error(`Failed to fetch capabilities: ${response.status}`);
   }

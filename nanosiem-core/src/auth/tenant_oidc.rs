@@ -4,8 +4,8 @@
 //!
 //! This is intentionally separate from the dedicated OIDC repository. Shared
 //! provider slugs are tenant-local selectors, browser state is only an opaque
-//! lookup key, and an IdP identity may link only to an already-active invited
-//! member of the transaction's server-bound tenant.
+//! lookup key. Identities link to active invited members or group-admitted JIT
+//! memberships through a tenant-scoped capability and provenance reconciliation.
 
 use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
@@ -15,12 +15,12 @@ use sqlx::{FromRow, PgPool};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(feature = "enterprise")]
+use super::{service::hash_token, TokenService};
 use super::{
     tenant::{ResolvedTenantMembership, TenantMembershipResolver, TrustedTenantContext},
     TokenPair,
 };
-#[cfg(feature = "enterprise")]
-use super::{service::hash_token, TokenService};
 use crate::tenant_entitlements::{
     TenantComponent, TenantEntitlementResolver, TenantEntitlementSnapshot,
 };
@@ -177,9 +177,14 @@ pub struct ConsumedTenantOidcAuthorization {
     intended_email: Option<String>,
     provider_revision: i64,
     secret_revision: i64,
+    access_policy: super::SsoAccessPolicy,
+    google_service_account_encrypted: Option<Vec<u8>>,
 }
 
 impl ConsumedTenantOidcAuthorization {
+    pub fn access_policy(&self) -> &super::SsoAccessPolicy {
+        &self.access_policy
+    }
     pub fn tenant(&self) -> &TrustedTenantContext {
         &self.tenant
     }
@@ -282,7 +287,7 @@ pub struct TenantOidcMemberIdentity {
     secret_revision: i64,
     /// Tenant-local roles selected by this provider's exact group mappings.
     /// Session issuance still re-resolves membership and its effective roles;
-    /// these IDs are input to a future provenance-aware role reconciler.
+    /// these IDs have been persisted by the source-aware reconciler.
     pub mapped_role_ids: Vec<Uuid>,
 }
 
@@ -320,6 +325,8 @@ pub enum TenantOidcError {
     InvalidEntryRegistration,
     #[error("tenant OIDC identity is not linked to an active invited member")]
     IdentityNotInvited,
+    #[error("your account is not in a group allowed to access this tenant")]
+    GroupNotAllowed,
     #[error("tenant OIDC lookup unavailable — failing closed")]
     Unavailable,
     #[error("tenant OIDC credential could not be decrypted")]
@@ -816,6 +823,7 @@ impl TenantOidcRepository {
                 provider.issuer,
                 provider.client_id,
                 provider.client_secret_encrypted,
+                provider.access_policy,provider.google_service_account_encrypted,
                 provider.group_claim,
                 consumed.nonce,
                 consumed.code_verifier,
@@ -853,6 +861,8 @@ impl TenantOidcRepository {
             issuer: row.issuer,
             client_id: row.client_id,
             client_secret_encrypted: row.client_secret_encrypted,
+            access_policy: row.access_policy,
+            google_service_account_encrypted: row.google_service_account_encrypted,
             group_claim: row.group_claim,
             nonce: row.nonce,
             code_verifier: row.code_verifier,
@@ -869,9 +879,12 @@ impl TenantOidcRepository {
         &self,
         authorization: &ConsumedTenantOidcAuthorization,
     ) -> Result<String, TenantOidcError> {
+        self.decrypt_provider_secret(&authorization.client_secret_encrypted)
+    }
+
+    fn decrypt_provider_secret(&self, value: &[u8]) -> Result<String, TenantOidcError> {
         let stored: serde_json::Value =
-            serde_json::from_slice(&authorization.client_secret_encrypted)
-                .map_err(|_| TenantOidcError::CredentialUnavailable)?;
+            serde_json::from_slice(value).map_err(|_| TenantOidcError::CredentialUnavailable)?;
         let encrypted = crate::crypto::EncryptedData {
             ciphertext: stored
                 .get("ciphertext")
@@ -889,6 +902,33 @@ impl TenantOidcRepository {
             .decrypt(&encrypted)
             .map_err(|_| TenantOidcError::CredentialUnavailable)?;
         String::from_utf8(plaintext).map_err(|_| TenantOidcError::CredentialUnavailable)
+    }
+
+    /// Google ID tokens never establish group membership. Missing delegated
+    /// credentials is invitation-only; configured but unavailable lookup denies.
+    pub async fn resolve_google_membership(
+        &self,
+        authorization: &ConsumedTenantOidcAuthorization,
+        identity: &mut ValidatedTenantOidcIdentity,
+    ) -> Result<(), TenantOidcError> {
+        if authorization.issuer != "https://accounts.google.com" {
+            return Ok(());
+        }
+        identity.groups.clear();
+        if let Some(encrypted) = &authorization.google_service_account_encrypted {
+            if authorization.access_policy.google_delegated_admin.is_none() {
+                return Ok(());
+            }
+            let credential = self.decrypt_provider_secret(encrypted)?;
+            identity.groups = super::google_workspace_groups(
+                &authorization.access_policy,
+                &credential,
+                &identity.email,
+            )
+            .await
+            .map_err(|_| TenantOidcError::Unavailable)?;
+        }
+        Ok(())
     }
 
     /// Link/update a validated IdP subject only inside the consumed
@@ -969,6 +1009,32 @@ impl TenantOidcRepository {
                 .await
                 .map_err(|_| TenantOidcError::Unavailable)?;
             return Err(TenantOidcError::InvalidTransaction);
+        }
+
+        let admitted: Option<Uuid> = sqlx::query_scalar(
+            "SELECT nano_shared.resolve_sso_member($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+        )
+        .bind(authorization.tenant.tenant_id)
+        .bind(authorization.provider_id)
+        .bind(authorization.provider_revision)
+        .bind(authorization.secret_revision)
+        .bind(authorization.expires_at)
+        .bind(&identity.subject)
+        .bind(&identity.email)
+        .bind(identity.email_verified)
+        .bind(&identity.display_name)
+        .bind(&identity.groups)
+        .bind(authorization.intended_user_id)
+        .bind(&authorization.intended_email)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| TenantOidcError::Unavailable)?;
+        if admitted.is_none() {
+            // Reconciliation of a departed JIT user's grants must survive denial.
+            tx.commit()
+                .await
+                .map_err(|_| TenantOidcError::Unavailable)?;
+            return Err(TenantOidcError::GroupNotAllowed);
         }
 
         let existing_user = sqlx::query_scalar::<_, Uuid>(
@@ -1118,34 +1184,14 @@ impl TenantOidcRepository {
         .await
         .map_err(|_| TenantOidcError::Unavailable)?;
 
-        let mapped_role_ids = if identity.groups.is_empty() {
-            Vec::new()
-        } else {
-            sqlx::query_scalar::<_, Uuid>(
-                r#"
-                SELECT DISTINCT mapping.role_id
-                FROM enterprise_shared_oidc_group_mappings mapping
-                JOIN enterprise_shared_oidc_providers provider
-                 ON provider.tenant_id = mapping.tenant_id
-                 AND provider.id = mapping.provider_id
-                 AND provider.enabled = TRUE
-                 AND provider.revision = $4
-                 AND provider.secret_revision = $5
-                WHERE mapping.tenant_id = $1
-                  AND mapping.provider_id = $2
-                  AND mapping.oidc_group = ANY($3)
-                ORDER BY mapping.role_id
-                "#,
-            )
-            .bind(authorization.tenant.tenant_id)
-            .bind(authorization.provider_id)
-            .bind(&identity.groups)
-            .bind(authorization.provider_revision)
-            .bind(authorization.secret_revision)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|_| TenantOidcError::Unavailable)?
-        };
+        let mut mapped_role_ids: Vec<Uuid> = authorization
+            .access_policy
+            .matching(&identity.groups)
+            .iter()
+            .flat_map(|m| m.role_ids.iter().copied())
+            .collect();
+        mapped_role_ids.sort();
+        mapped_role_ids.dedup();
         // Locks prevent authority mutation, but wall-clock expiry can advance
         // while claims and group mappings are evaluated. Recheck both bounded
         // windows immediately before the identity metadata becomes durable.
@@ -1256,8 +1302,12 @@ impl TenantOidcRepository {
         )
         .await
         .map_err(|error| match error {
-            crate::ip_allowlist::tenant::TenantIpPolicyError::Denied => TenantOidcError::AccessDenied,
-            crate::ip_allowlist::tenant::TenantIpPolicyError::Unavailable => TenantOidcError::Unavailable,
+            crate::ip_allowlist::tenant::TenantIpPolicyError::Denied => {
+                TenantOidcError::AccessDenied
+            }
+            crate::ip_allowlist::tenant::TenantIpPolicyError::Unavailable => {
+                TenantOidcError::Unavailable
+            }
         })?;
 
         // Establish the authentication fence from PostgreSQL, not the API
@@ -1475,6 +1525,9 @@ struct ConsumedAuthorizationRow {
     intended_email: Option<String>,
     provider_revision: i64,
     secret_revision: i64,
+    #[sqlx(json)]
+    access_policy: super::SsoAccessPolicy,
+    google_service_account_encrypted: Option<Vec<u8>>,
 }
 
 #[cfg(test)]

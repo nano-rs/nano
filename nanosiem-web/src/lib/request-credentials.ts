@@ -9,10 +9,13 @@ export class SessionExpiredError extends Error {
 }
 
 /** Only authentication/bootstrap routes may intentionally use cookies without
- * a bearer. Keep this explicit: /auth also contains protected tenant APIs. */
+ * a bearer. Keep this explicit: /auth also contains protected tenant APIs.
+ * The shared MFA step-up is NOT here (NAN-3905): it is a tenant-session
+ * call and must carry the bearer; cookie-only it presents every tenant's
+ * access-token cookie on the pooled host and is refused. */
 export function allowsAnonymousRequest(endpoint: string): boolean {
   const path = endpoint.split('?')[0];
-  return /^\/api\/auth\/(login|refresh|logout|password\/reset-request|password\/reset|mfa\/(verify|setup|verify-setup|challenge)|shared\/mfa\/step-up)$/.test(path)
+  return /^\/api\/auth\/(login|refresh|logout|methods|password\/reset-request|password\/reset|mfa\/(verify|setup|verify-setup|challenge))$/.test(path)
     || /^\/api\/auth\/(shared\/)?oidc\/(providers|[^/]+\/(authorize|callback))$/.test(path)
     || /^\/api\/(capabilities|setup(?:\/.*)?|demo\/session(?:\/[^/]+\/claim)?)$/.test(path)
     || /^\/api\/search\/shared\/[^/]+$/.test(path);

@@ -115,7 +115,11 @@ export interface AuthContextType extends AuthState {
     state: string,
   ) => Promise<string>;
   /** Activate a cookies-only hosted-shared OIDC session after exact bootstrap proof. */
-  acceptSharedOidcSession: (user: User, expectedTenantSlug: string) => Promise<void>;
+  acceptSharedOidcSession: (
+    user: User,
+    expectedTenantSlug: string,
+    session?: { accessToken: string; expiresIn: number },
+  ) => Promise<void>;
   /** Clear local authority after a callback changed cookies but later proof failed. */
   discardFailedSharedOidcSession: () => void;
   logout: () => Promise<void>;
@@ -134,8 +138,9 @@ export interface AuthContextType extends AuthState {
   /**
    * Hosted-shared step-up (NAN-2361 wave 5): re-prove TOTP on the current
    * tenant session so fresh-MFA admin surfaces (SSO provider administration)
-   * work without signing in again. Replaces this tab's bearer and the
-   * session cookies; the session itself (its authentication fence) is kept.
+   * work without signing in again. Sent with this tab's bearer only
+   * (NAN-3905); replaces the tab's bearer, the session itself (its
+   * authentication fence) is kept.
    */
   stepUpMfa: (code: string) => Promise<void>;
 }
@@ -690,9 +695,18 @@ export function AuthProvider({ children }: AuthProviderProps) {
     }
   }, [authenticatedState, challengeToken, pendingTenantSlug, scheduleTokenRefresh]);
 
-  // Hosted-shared MFA step-up on the current session (cookie-carried so the
-  // answer's Set-Cookie replaces the session cookies; no bearer on purpose).
+  // Hosted-shared MFA step-up on the current session. NAN-3905: the request
+  // carries this tab's in-memory bearer with `credentials: 'omit'` (the
+  // ApiClient rule). It used to be cookie-only, which sent every tenant's
+  // `access_token__<d>` cookie on the pooled host; the shared extractor then
+  // refused it with "Provide exactly one authentication credential" as soon
+  // as a second tenant was signed in. The answer's Set-Cookie is ignored
+  // under 'omit': the stepped-up access bearer is taken from the JSON, and
+  // the cookie session keeps its existing refresh pair.
   const stepUpMfa = useCallback(async (code: string): Promise<void> => {
+    // Waits for an in-flight refresh and refreshes a missing bearer, like
+    // every ApiClient call; throws SessionExpiredError when there is none.
+    const bearer = await sessionCredentials.credential();
     await withBrowserCookieMutationLock(async () => {
       const response = await apiRequest<{
         user: User;
@@ -700,7 +714,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       }>('/api/auth/shared/mfa/step-up', {
         method: 'POST',
         body: JSON.stringify({ code }),
-      });
+      }, bearer);
       setAccessToken(response.tokens.access_token, response.tokens.expires_in);
       const userInfo = await apiRequest<User>('/api/auth/me', {}, response.tokens.access_token);
       setState(prev => ({ ...prev, user: userInfo, error: null }));
@@ -1008,20 +1022,25 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const acceptSharedOidcSession = useCallback(async (
     _callbackUser: User,
     expectedTenantSlug: string,
+    session?: { accessToken: string; expiresIn: number },
   ): Promise<void> => {
     // The callback itself exposes no credential. While its cookie mutation
     // lock is still held, rotate the new HttpOnly refresh cookie once and keep
     // only the returned short-lived access bearer in this tab's memory. Search
     // is a separate service and intentionally accepts tenant-bound bearer auth,
-    // not generic cookie POSTs.
-    const response = await apiRequest<{
-      access_token: string;
-      refresh_token: string;
-      expires_in: number;
-    }>('/api/auth/refresh', {
-      method: 'POST',
-      body: JSON.stringify(tenantContinuationBody(expectedTenantSlug)),
-    });
+    // not generic cookie POSTs. NAN-3905: the callback proof already did that
+    // rotation (it needs the bearer to prove /auth/me with one credential);
+    // adopt its bearer instead of rotating twice.
+    const response = session
+      ? { access_token: session.accessToken, expires_in: session.expiresIn }
+      : await apiRequest<{
+        access_token: string;
+        refresh_token: string;
+        expires_in: number;
+      }>('/api/auth/refresh', {
+        method: 'POST',
+        body: JSON.stringify(tenantContinuationBody(expectedTenantSlug)),
+      });
     const user = await apiRequest<User>('/api/auth/me', {}, response.access_token);
     setAccessToken(response.access_token, response.expires_in);
     setPendingTenantSlug(null);

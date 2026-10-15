@@ -534,10 +534,9 @@ impl ParserRepositoryService {
         let parsers_path =
             crate::schema::active_repo_path(repo.parsers_path.as_deref().unwrap_or("parsers/"));
         let parsers_path = parsers_path.as_str();
-        // NAN-2361: a lake tenant needs the `ocsf-1.9` content branch; every
-        // default (PG column, create fallback, the one-click add button) says
-        // `main`, which is the OCSF 1.8 set. Only the first-party content repo
-        // is remapped — third-party sources have no such branch.
+        // NAN-3897: the first-party OCSF 1.9 content lives on `main`; a row
+        // still on the retired `ocsf-1.9` default syncs `main`. Only the
+        // first-party content repo is resolved — a third-party branch is kept.
         let resolved_branch = if owner == "nano-rs" {
             crate::schema::active_content_branch(&repo.branch)
         } else {
@@ -548,7 +547,7 @@ impl ParserRepositoryService {
                 repo_id = %id,
                 stored = %repo.branch,
                 resolved = %resolved_branch,
-                "Lake profile: syncing the OCSF 1.9 content branch"
+                "Retired ocsf-1.9 content branch: syncing main"
             );
         }
         let branch = resolved_branch.as_str();

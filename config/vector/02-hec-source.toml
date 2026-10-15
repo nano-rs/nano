@@ -22,6 +22,10 @@
 [sources.splunk_hec_ingest]
 type = "splunk_hec"
 address = "0.0.0.0:8088"
+# nano-rs/vector nano/v0.59: preserve string AND object payloads as .message.
+# The bytes codec serializes object event values to JSON instead of flattening
+# them onto the root, so parsers and the lake retain the complete raw_data.
+event.decoding.codec = "bytes"
 valid_tokens = ["${VECTOR_AUTH_TOKEN}"]
 valid_tokens_file.path = "/etc/vector/dynamic/ingest-tokens/tokens.json"
 valid_tokens_file.reload_interval_secs = 2

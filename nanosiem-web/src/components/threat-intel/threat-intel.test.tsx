@@ -4,7 +4,7 @@
     EnrichSheet host, case-notebook citations and the pivt `@enrich` command. */
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, renderHook, screen, waitFor, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router-dom';
 import { CapabilitiesContext, type CapabilitiesContextValue } from '@/hooks/use-capabilities';
@@ -207,7 +207,7 @@ describe('IndicatorResults', () => {
     render(<IndicatorResults response={iocHit()} />);
     const groups = screen.getByTestId('ioc-results').querySelectorAll('[data-source]');
     expect(Array.from(groups).map((g) => g.getAttribute('data-source'))).toEqual(['Tor exit nodes', 'Custom IOC list']);
-    expect(screen.getByText('Tor exit nodes').className).toContain('font-mono');
+    expect(within(screen.getByTestId('ioc-results')).getByText('Tor exit nodes').className).toContain('font-mono');
     expect(screen.getByText('conf 90').parentElement?.className).toContain('font-mono');
     expect(screen.getByText('tor · exit')).toBeTruthy();
     expect(screen.getByText('anonymizer')).toBeTruthy();
@@ -217,8 +217,102 @@ describe('IndicatorResults', () => {
     render(<IndicatorResults response={iocs()} />);
     expect(screen.getByTestId('ioc-no-match').textContent).toBe('No matches in 3 indicator sources');
     expect(indicatorMissText(1)).toBe('No matches in 1 indicator source');
-    expect(indicatorMissText(0)).toBe('No indicator sources published yet');
+    expect(indicatorMissText(0)).toBe('No threat-intel sources are enabled for this tenant');
     expect(indicatorMissText(null)).toBe('No matches in your indicator sources');
+  });
+});
+
+describe('IndicatorResults searched sources (NAN-3881)', () => {
+  const searchedHit = () =>
+    iocs({
+      source_count: 3,
+      source_names: ['easy_intel', 'ThreatFox', 'Tor exit nodes'],
+      searched: [
+        { source: 'ThreatFox', matched: true, match_count: 1 },
+        { source: 'easy_intel', matched: true, match_count: 1 },
+        { source: 'Tor exit nodes', matched: false, match_count: 0 },
+      ],
+      sources: [
+        {
+          source: 'ThreatFox',
+          matches: [
+            { ioc_type: 'ip', threat_type: 'botnet_cc', malware: 'win.cobalt_strike', confidence: 75, first_seen_at: null, last_seen_at: null, tags: [] },
+          ],
+        },
+        {
+          source: 'easy_intel',
+          matches: [{ ioc_type: 'ip', threat_type: null, malware: null, confidence: 80, first_seen_at: null, last_seen_at: null, tags: [] }],
+        },
+      ],
+    });
+  const searchedState = () =>
+    Array.from(screen.getByTestId('ioc-searched').querySelectorAll('[data-searched]')).map((n) => [
+      n.getAttribute('data-searched'),
+      n.getAttribute('data-matched'),
+    ]);
+
+  it('sources matched: lists every searched source with match state, names in mono', () => {
+    render(<IndicatorResults response={searchedHit()} />);
+    const line = screen.getByTestId('ioc-searched');
+    expect(line.className).toContain('font-mono');
+    expect(line.textContent).toBe('searched:ThreatFox (1) ·easy_intel (1) ·Tor exit nodes');
+    expect(searchedState()).toEqual([
+      ['ThreatFox', 'true'],
+      ['easy_intel', 'true'],
+      ['Tor exit nodes', 'false'],
+    ]);
+    expect(screen.getAllByTestId('ioc-match')).toHaveLength(2);
+  });
+
+  it('none matched: says how many sources and still names each one searched', () => {
+    render(
+      <IndicatorResults
+        response={iocs({
+          source_names: ['easy_intel', 'ThreatFox', 'Tor exit nodes'],
+          searched: [
+            { source: 'ThreatFox', matched: false, match_count: 0 },
+            { source: 'Tor exit nodes', matched: false, match_count: 0 },
+            { source: 'easy_intel', matched: false, match_count: 0 },
+          ],
+        })}
+      />,
+    );
+    expect(screen.getByTestId('ioc-no-match').textContent).toBe('No matches in 3 indicator sources');
+    expect(searchedState()).toEqual([
+      ['ThreatFox', 'false'],
+      ['Tor exit nodes', 'false'],
+      ['easy_intel', 'false'],
+    ]);
+    expect(screen.queryByTestId('ioc-results')).toBeNull();
+  });
+
+  it('zero enabled: one plain line, no searched list', () => {
+    render(<IndicatorResults response={iocs({ source_count: 0, source_names: [], searched: [] })} />);
+    expect(screen.getByTestId('ioc-no-match').textContent).toBe('No threat-intel sources are enabled for this tenant');
+    expect(screen.queryByTestId('ioc-searched')).toBeNull();
+  });
+
+  it('flags baseline feeds that could not be searched', () => {
+    render(
+      <IndicatorResults
+        response={iocs({
+          source_count: 1,
+          source_names: ['easy_intel'],
+          searched: [{ source: 'easy_intel', matched: false, match_count: 0 }],
+          baseline_feeds_unavailable: true,
+        })}
+      />,
+    );
+    expect(screen.getByTestId('ioc-baseline-unavailable').textContent).toContain('not searched');
+  });
+
+  it('derives the searched list from an older API without `searched`', () => {
+    render(<IndicatorResults response={iocHit()} />);
+    expect(searchedState()).toEqual([
+      ['Tor exit nodes', 'true'],
+      ['Custom IOC list', 'true'],
+      ['ThreatFox', 'false'],
+    ]);
   });
 });
 
@@ -272,13 +366,46 @@ describe('EnrichSheetHost', () => {
     render(<EnrichSheetHost />, { wrapper: wrapper(caps()) });
     act(() => openEnrich({ artifact: '185.220.101.1', artifactType: 'ip' }));
     await waitFor(() => expect(screen.getByTestId('ioc-results')).toBeTruthy());
-    await waitFor(() => expect(screen.getByTestId('ti-no-provider')).toBeTruthy());
+    await waitFor(() => expect(lookup).toHaveBeenCalled());
     expect(screen.getByTestId('ti-ioc-count').textContent).toBe('2 indicator matches');
+    // Sources are enabled, so "no provider" is not shown at all.
+    expect(screen.queryByTestId('ti-no-provider')).toBeNull();
     // The old error-state copy and the permanent explanatory paragraph are gone;
     // the explanation lives behind the info tooltip trigger.
     expect(screen.queryByText(/No threat-intel provider is configured/)).toBeNull();
     expect(screen.queryByText(/Each external lookup is audited/)).toBeNull();
     expect(screen.getByTestId('ti-about').getAttribute('aria-label')).toBe('About these results');
+  });
+
+  it('zero enabled sources: says so, and only then shows the no-provider hint', async () => {
+    lookup.mockResolvedValue(vt({ availability: 'no_provider_configured', results: [], verdict: null, score: null, artifact_type: 'ip' }));
+    lookupIndicators.mockResolvedValue(iocs({ source_count: 0, source_names: [], searched: [] }));
+    render(<EnrichSheetHost />, { wrapper: wrapper(caps()) });
+    act(() => openEnrich({ artifact: '185.220.101.1', artifactType: 'ip' }));
+    await waitFor(() =>
+      expect(screen.getByTestId('ioc-no-match').textContent).toBe('No threat-intel sources are enabled for this tenant'),
+    );
+    await waitFor(() => expect(screen.getByTestId('ti-no-provider')).toBeTruthy());
+  });
+
+  it('enabled sources but no match: no "no provider" hint, searched list shown', async () => {
+    lookup.mockResolvedValue(vt({ availability: 'no_provider_configured', results: [], verdict: null, score: null, artifact_type: 'ip' }));
+    lookupIndicators.mockResolvedValue(
+      iocs({
+        source_names: ['easy_intel', 'ThreatFox', 'Tor exit nodes'],
+        searched: [
+          { source: 'ThreatFox', matched: false, match_count: 0 },
+          { source: 'Tor exit nodes', matched: false, match_count: 0 },
+          { source: 'easy_intel', matched: false, match_count: 0 },
+        ],
+      }),
+    );
+    render(<EnrichSheetHost />, { wrapper: wrapper(caps()) });
+    act(() => openEnrich({ artifact: '192.0.2.1', artifactType: 'ip' }));
+    await waitFor(() => expect(screen.getByTestId('ioc-searched')).toBeTruthy());
+    await waitFor(() => expect(lookup).toHaveBeenCalled());
+    expect(screen.queryByTestId('ti-no-provider')).toBeNull();
+    expect(screen.queryByText(/Results come from your tenant/)).toBeNull();
   });
 
   it('reports a miss against the number of indicator sources searched', async () => {

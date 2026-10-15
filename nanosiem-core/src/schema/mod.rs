@@ -730,37 +730,30 @@ pub fn select_ocsf_root_layout(
     (kept, untranslated)
 }
 
-/// The log-source-repository subtree for the env-configured schema profile.
-/// Env-resolving wrapper over [`repo_path_for`]; on any resolution error the
-/// stored path is returned unchanged so a malformed env never breaks sync.
-/// NAN-1266.
-/// The content branch a repository sync should actually fetch.
+/// The branch the first-party content repositories are followed on.
 ///
-/// `nano-rs/parsers` and `nano-rs/rules` carry ONE BRANCH PER OCSF VERSION:
-/// `main` is OCSF 1.8 content for tenants running OCSF over ClickHouse, and
-/// `ocsf-1.9` is the versioned parser/rule set the Iceberg+chDB lake requires.
-/// New lake repositories explicitly default to `ocsf-1.9` (NAN-3758).
-/// This remap remains a safety net for stored `main` rows and older clients.
+/// `nano-rs/parsers` and `nano-rs/rules` carry the OCSF 1.9 content on `main`
+/// (NAN-3897). The pre-1.9 UDM / OCSF 1.8 content for the frozen ClickHouse
+/// edition lives on `legacy/clickhouse`, which this app never defaults to.
+pub const FIRST_PARTY_CONTENT_BRANCH: &str = "main";
+
+/// The retired OCSF 1.9 content branch. NAN-3758 defaulted the first-party
+/// repositories to it; NAN-3897 folded it into `main`. The upstream branch is
+/// kept for open-core v1.0.0 installs, but this app follows `main`.
+pub const RETIRED_OCSF_CONTENT_BRANCH: &str = "ocsf-1.9";
+
+/// The content branch a first-party repository sync should actually fetch.
 ///
-/// The remap is deliberately narrow, because getting it wrong breaks a
-/// different tenant class:
+/// A stored `ocsf-1.9` (the NAN-3758 default) resolves to `main`, so rows the
+/// NAN-3897 migration has not rewritten yet and open-core v1.0.0 installs
+/// follow `main`. Every other stored branch (`main`, a fork or an operator
+/// pin) is kept.
 ///
-/// * It keys on the (OCSF profile AND lake backend) PAIR, never the profile
-///   alone. OCSF-on-ClickHouse tenants run `NANO_SCHEMA_PROFILE=ocsf` without
-///   the lake, and their 1.8 rules are CORRECT for that target — switching them
-///   to 1.9 would break working deployments.
-/// * It only rewrites the literal untouched default `main`, so an operator who
-///   has explicitly pinned a branch keeps it.
-/// * Callers apply it only to the first-party content repositories; third-party
-///   sources such as `sigmahq/sigma` have no `ocsf-1.9` branch.
-///
-/// Pure (env-free) so it is unit-testable; [`active_content_branch`] is the
-/// env-resolving wrapper. NAN-2361.
-pub fn content_branch_for(id: SchemaId, lake_backend: bool, stored: &str) -> String {
-    const DEFAULT_BRANCH: &str = "main";
-    const LAKE_OCSF_BRANCH: &str = "ocsf-1.9";
-    if id == SchemaId::Ocsf && lake_backend && stored == DEFAULT_BRANCH {
-        LAKE_OCSF_BRANCH.to_string()
+/// Callers apply it only to the first-party content repositories; a
+/// third-party source's branch is never rewritten.
+pub fn content_branch_for(stored: &str) -> String {
+    if stored.trim() == RETIRED_OCSF_CONTENT_BRANCH {
+        FIRST_PARTY_CONTENT_BRANCH.to_string()
     } else {
         stored.to_string()
     }
@@ -786,38 +779,33 @@ pub fn is_first_party_content_url(raw: &str) -> bool {
 }
 
 /// Creation default, preserving explicit pins and third-party branches.
-pub fn default_content_branch_for(
-    id: SchemaId,
-    lake_backend: bool,
-    url: &str,
-    requested: Option<&str>,
-) -> String {
-    requested.map(str::to_owned).unwrap_or_else(|| {
-        if is_first_party_content_url(url) {
-            content_branch_for(id, lake_backend, "main")
-        } else {
-            "main".to_owned()
-        }
-    })
+///
+/// First-party repositories default to `main`; an explicit `ocsf-1.9` request
+/// (older clients) is stored as `main` so the row shows what is synced.
+pub fn default_content_branch_for(url: &str, requested: Option<&str>) -> String {
+    match requested {
+        Some(branch) if is_first_party_content_url(url) => content_branch_for(branch),
+        Some(branch) => branch.to_owned(),
+        None => FIRST_PARTY_CONTENT_BRANCH.to_owned(),
+    }
 }
 
-/// Resolve defaults without loading the lake manifest: repository creation and
-/// first-boot migrations precede manifest availability.
+/// Branch to store for a new repository row. Resolves without the lake
+/// manifest or the schema profile: repository creation and first-boot
+/// migrations precede manifest availability.
 pub fn default_content_branch(url: &str, requested: Option<&str>) -> String {
-    runtime_profile_from_env()
-        .map(|profile| default_content_branch_for(profile.schema, true, url, requested))
-        .unwrap_or_else(|_| requested.unwrap_or("main").to_owned())
+    default_content_branch_for(url, requested)
 }
 
-/// Env-resolving wrapper for [`content_branch_for`]. Falls back to the stored
-/// branch whenever the profile cannot be resolved, so a misconfigured
-/// environment never silently changes which content a tenant syncs.
+/// Branch a first-party repository sync fetches; see [`content_branch_for`].
 pub fn active_content_branch(stored: &str) -> String {
-    runtime_profile_from_env()
-        .map(|p| content_branch_for(p.schema, true, stored))
-        .unwrap_or_else(|_| stored.to_string())
+    content_branch_for(stored)
 }
 
+/// The log-source-repository subtree for the env-configured schema profile.
+/// Env-resolving wrapper over [`repo_path_for`]; on any resolution error the
+/// stored path is returned unchanged so a malformed env never breaks sync.
+/// NAN-1266.
 pub fn active_repo_path(stored: &str) -> String {
     // NAN-3758: the validated runtime lane, not the lake manifest: a sync
     // that runs before the manifest resolves must still walk the OCSF tree.
@@ -939,41 +927,33 @@ mod tests {
         assert_eq!(log_telemetry_profile_for(SchemaId::Ocsf), "ocsf");
     }
 
+    // NAN-3897: first-party content follows `main`; the retired `ocsf-1.9`
+    // default resolves to it and every other branch is kept.
+    #[test]
+    fn content_branch_follows_main_and_retires_ocsf19() {
+        assert_eq!(content_branch_for("ocsf-1.9"), "main");
+        assert_eq!(content_branch_for(" ocsf-1.9 "), "main");
+        assert_eq!(content_branch_for("main"), "main");
+        assert_eq!(content_branch_for("my-fork"), "my-fork");
+        assert_eq!(content_branch_for("legacy/clickhouse"), "legacy/clickhouse");
+        assert_eq!(active_content_branch("ocsf-1.9"), "main");
+    }
+
+    #[test]
+    fn content_branch_creation_defaults_to_main() {
+        for url in ["https://github.com/nano-rs/parsers", "github.com/nano-rs/rules.git"] {
+            assert_eq!(default_content_branch_for(url, None), "main");
+            assert_eq!(default_content_branch_for(url, Some("ocsf-1.9")), "main");
+            assert_eq!(default_content_branch_for(url, Some("my-fork")), "my-fork");
+        }
+        // A third-party repository's explicit branch is never rewritten.
+        assert_eq!(default_content_branch_for("https://github.com/acme/rules", Some("ocsf-1.9")), "ocsf-1.9");
+        assert_eq!(default_content_branch_for("https://github.com/SigmaHQ/sigma", None), "main");
+    }
+
     // NAN-1266: log-source-repository subtree dispatch. UDM returns the stored
     // path unchanged (byte-identical); OCSF walks the sibling `<base>-ocsf/`.
     #[test]
-    #[test]
-    fn content_branch_only_switches_for_an_ocsf_lake_on_the_default_branch() {
-        // The lake needs OCSF 1.9 content.
-        assert_eq!(
-            content_branch_for(SchemaId::Ocsf, true, "main"),
-            "ocsf-1.9"
-        );
-
-        // HARD CONSTRAINT: OCSF-over-ClickHouse tenants run the OCSF profile
-        // WITHOUT the lake backend. Their 1.8 rules are correct for that target,
-        // so the profile alone must never be enough to switch them.
-        assert_eq!(content_branch_for(SchemaId::Ocsf, false, "main"), "main");
-
-        // UDM is untouched on either backend.
-        assert_eq!(content_branch_for(SchemaId::Udm, true, "main"), "main");
-        assert_eq!(content_branch_for(SchemaId::Udm, false, "main"), "main");
-
-        // An operator's explicit pin always wins, including a deliberate pin
-        // back to a 1.8-era branch on a lake tenant.
-        assert_eq!(
-            content_branch_for(SchemaId::Ocsf, true, "my-fork"),
-            "my-fork"
-        );
-        assert_eq!(
-            content_branch_for(SchemaId::Ocsf, true, "ocsf-1.9"),
-            "ocsf-1.9"
-        );
-
-        // Non-event profiles pass through like UDM.
-        assert_eq!(content_branch_for(SchemaId::Spans, true, "main"), "main");
-    }
-
     fn repo_path_for_dispatches_by_profile() {
         // UDM: unchanged
         assert_eq!(repo_path_for(SchemaId::Udm, "parsers/"), "parsers/");

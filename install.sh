@@ -57,6 +57,8 @@
 # created, the next run creates it (keyed on GET /api/setup/status, not on
 # whether .env exists) with the same credentials.
 
+# Parse the complete script before any subprocess can consume curl's stdin.
+main() {
 set -euo pipefail
 
 # NAN-3402: containers bind-mount files from this checkout (Hydra, nginx,
@@ -225,7 +227,7 @@ memory_capacity_bytes() {
         return
     fi
 
-    bytes=$(docker info --format '{{.MemTotal}}' 2>/dev/null || true)
+    bytes=$(docker </dev/null info --format '{{.MemTotal}}' 2>/dev/null || true)
     if [[ "$bytes" =~ ^[0-9]+$ ]] && (( bytes > 0 )); then
         echo "$bytes"
         return
@@ -435,13 +437,13 @@ legacy_clickhouse_reason() {
     fi
     project=$(install_compose_project "$dir")
     [[ -n "$project" ]] || return 1
-    ids=$(docker ps -aq \
+    ids=$(docker </dev/null ps -aq \
         --filter "label=com.docker.compose.project=${project}" \
         --filter "label=com.docker.compose.service=clickhouse" 2>/dev/null || true)
     if [[ -n "$ids" ]]; then
         echo "Docker has a ClickHouse container for its compose project '${project}'"; return 0
     fi
-    if docker volume inspect "${project}_nano-clickhouse-data" >/dev/null 2>&1; then
+    if docker </dev/null volume inspect "${project}_nano-clickhouse-data" >/dev/null 2>&1; then
         echo "Docker has its ClickHouse data volume ${project}_nano-clickhouse-data"; return 0
     fi
     return 1
@@ -616,7 +618,7 @@ fetch_release_lock() {
 # network, no tag re-resolution.
 repo_digest_of() {
     local line
-    line=$(docker image inspect "$1" \
+    line=$(docker </dev/null image inspect "$1" \
         --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
         | grep -F "${2}@" | head -1)
     printf '%s' "${line##*@}"
@@ -688,7 +690,7 @@ verify_image_digests() {
     log "Verifying pulled image digests against images.lock"
     local ref expected basename repo_notag inspect_ref result active_images
     local mismatch=0 verified_fp=0 verified_tp=0
-    active_images=$(docker compose -f "$COMPOSE_FILE" config --images 2>/dev/null || true)
+    active_images=$(docker </dev/null compose -f "$COMPOSE_FILE" config --images 2>/dev/null || true)
 
     # First-party lines (no tag): inspect repo:NANO_VERSION, from fp_lockfile.
     if [[ -n "$fp_lockfile" ]]; then
@@ -816,12 +818,12 @@ start_and_wait_for_api() {
     fi
     # The compose profile also starts the dedicated pull-feed worker. Do not
     # report a successful upgrade while its boot/sandbox/database check fails.
-    if docker compose -f "$COMPOSE_FILE" config --services | grep -qx connector-runner; then
+    if docker </dev/null compose -f "$COMPOSE_FILE" config --services | grep -qx connector-runner; then
         local connector_id connector_status connector_start
         connector_start=$(date +%s)
         while :; do
-            connector_id=$(docker compose -f "$COMPOSE_FILE" ps -q connector-runner)
-            connector_status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$connector_id" 2>/dev/null || true)
+            connector_id=$(docker </dev/null compose -f "$COMPOSE_FILE" ps -q connector-runner)
+            connector_status=$(docker </dev/null inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$connector_id" 2>/dev/null || true)
             [[ "$connector_status" == healthy ]] && break
             if (( $(date +%s) - connector_start >= 180 )); then
                 fail "Connector runner did not become healthy. Check 'docker compose -f $COMPOSE_FILE logs connector-runner'."
@@ -861,15 +863,15 @@ compose_up() {
         COMPOSE_UP_LOG=$(mktemp "${TMPDIR:-/tmp}/nano-compose-up.XXXXXX" 2>/dev/null) || COMPOSE_UP_LOG=/dev/null
     fi
     if [[ "$mode" == "loud" ]]; then
-        docker compose -f "$COMPOSE_FILE" up -d 2>&1 | tee -a "$COMPOSE_UP_LOG"
+        docker </dev/null compose -f "$COMPOSE_FILE" up -d 2>&1 | tee -a "$COMPOSE_UP_LOG"
         rc=${PIPESTATUS[0]}
     else
-        docker compose -f "$COMPOSE_FILE" up -d >> "$COMPOSE_UP_LOG" 2>&1
+        docker </dev/null compose -f "$COMPOSE_FILE" up -d >> "$COMPOSE_UP_LOG" 2>&1
         rc=$?
     fi
     (( rc == 0 )) || return "$rc"
     # container_name is gone (one install per compose project): address nginx by service.
-    docker compose -f "$COMPOSE_FILE" exec -T nginx nginx -s reload >/dev/null 2>&1 || true
+    docker </dev/null compose -f "$COMPOSE_FILE" exec -T nginx nginx -s reload >/dev/null 2>&1 || true
 }
 
 # While waiting, COMPOSE_RETRY_WHILE_WAITING=1 re-runs the idempotent
@@ -901,7 +903,7 @@ wait_for_api_health() {
             next_up=$((now + retry_every))
         fi
         if (( now >= next_report )); then
-            pending=$(docker compose -f "$COMPOSE_FILE" ps --format '{{.Name}}={{.Health}}' 2>/dev/null \
+            pending=$(docker </dev/null compose -f "$COMPOSE_FILE" ps --format '{{.Name}}={{.Health}}' 2>/dev/null \
                 | grep -E '=(starting|unhealthy)$' | tr '\n' ' ' || true)
             log "Still waiting for the API ($(( (now - start) / 60 ))m of $(( timeout / 60 ))m)${pending:+ — not yet healthy: $pending}"
             next_report=$((now + 60))
@@ -1067,11 +1069,11 @@ require_cmd openssl  "Install openssl (most distros ship it by default)."
 require_cmd curl     "Install curl."
 require_cmd python3  "Install Python 3 for lean bootstrap validation."
 
-if ! docker compose version >/dev/null 2>&1; then
+if ! docker </dev/null compose version >/dev/null 2>&1; then
     fail "docker compose v2 is required. Update Docker or install the compose plugin."
 fi
 
-if ! docker info >/dev/null 2>&1; then
+if ! docker </dev/null info >/dev/null 2>&1; then
     fail "Docker daemon is not running or this user can't talk to it. Start Docker and retry."
 fi
 
@@ -1502,6 +1504,8 @@ if [[ "$USE_LEAN" == "1" ]]; then
         cp tenzir/lean/sysmon-bucket.tql .nano-tenzir/pipeline.tql
         chmod 644 .nano-tenzir/pipeline.tql
     fi
+    mkdir -p .nano-tenzir/data
+    chmod 755 .nano-tenzir/data
     mkdir -p .nano-lean
     chmod 700 .nano-lean
     if [[ "$FRESH_LEAN_CUTOVER" == "1" ]]; then
@@ -1555,7 +1559,7 @@ if [[ "${NANO_SKIP_IMAGE_PULL:-0}" == "1" ]]; then
     # NANO_SKIP_IMAGE_VERIFY=1 is set too.
     warn "NANO_SKIP_IMAGE_PULL=1 — using images already present locally."
 elif log "Pulling images from ghcr.io/nano-rs (this may take a minute on first run)" \
-    && ! docker compose -f "$COMPOSE_FILE" pull; then
+    && ! docker </dev/null compose -f "$COMPOSE_FILE" pull; then
     fail "docker compose pull failed. A '403 Forbidden' on ghcr.io/token (or '401 Unauthorized') means that GHCR package is not public yet — the error names the repository. Run 'docker login ghcr.io' if you have access, or wait for nano-rs to publish it."
 fi
 
@@ -1568,10 +1572,10 @@ if [[ "$USE_LEAN" == "1" ]]; then
         # gen1 legacy/tenzir services (ClickHouse, its migrator, Tenzir): they
         # are still defined, so not orphans, and would keep running beside
         # lean. Stop every profile; volumes are retained for rollback.
-        docker compose -f "$COMPOSE_FILE" --profile '*' down --remove-orphans
+        docker </dev/null compose -f "$COMPOSE_FILE" --profile '*' down --remove-orphans
     fi
     log "Initializing the trusted-local UUID tenant using the cell initializer"
-    docker compose -f "$COMPOSE_FILE" run --rm --no-deps -e NANO_LEAN_FRESH_TENANT="$FRESH_LEAN_CUTOVER" lean-init \
+    docker </dev/null compose -f "$COMPOSE_FILE" run --rm --no-deps -e NANO_LEAN_FRESH_TENANT="$FRESH_LEAN_CUTOVER" lean-init \
         || fail "Lean initializer failed. No services have started."
     # A retry after initializer completion reuses its UUID rather than rotating again.
     if [[ -f .nano-lean/cutover-pending ]]; then
@@ -1623,7 +1627,7 @@ PYJOBS
     log "Sized nano-jobs memory limit to $LEAN_JOBS_MEM_LIMIT"
     log "Probing cell isolation; missing Landlock warns on trusted-local only"
     LEAN_PROBE_LOG=$(mktemp "${TMPDIR:-/tmp}/nano-lean-probe.XXXXXX")
-    if ! docker compose -f "$COMPOSE_FILE" run --rm --no-deps --entrypoint nanosiem-lake-cell lake-cell \
+    if ! docker </dev/null compose -f "$COMPOSE_FILE" run --rm --no-deps --entrypoint nanosiem-lake-cell lake-cell \
         probe --write --config /etc/nano-cell/cell.json > "$LEAN_PROBE_LOG"; then
         rm -f "$LEAN_PROBE_LOG"
         fail "Cell isolation probe failed."
@@ -1668,7 +1672,7 @@ if [[ "${TENZIR_DIRECT:-0}" == "1" ]]; then
     # Switching an existing install to Tenzir-direct: Vector and the connector
     # runner are no longer in the stack, so `up -d` would leave their old
     # containers running. Remove them; their volumes stay for --add-vector.
-    docker compose -f "$COMPOSE_FILE" --profile '*' rm -sf vector connector-runner >/dev/null 2>&1 || true
+    docker </dev/null compose -f "$COMPOSE_FILE" --profile '*' rm -sf vector connector-runner >/dev/null 2>&1 || true
 fi
 start_and_wait_for_api
 
@@ -1690,6 +1694,9 @@ printf "  Schema:   %s\n" "$(printf '%s' "${SCHEMA_PROFILE:-ocsf}" | tr '[:lower
 if [[ "$NANO_NONINTERACTIVE" != "1" && "${GENERATED_PASSWORD:-0}" == "1" && "${ADMIN_CREATED:-0}" == "1" ]]; then
     printf "  Password: %b%s%b  ← autogenerated, save this now (also in %s/.env as INITIAL_ADMIN_PASSWORD)\n" "$c_yellow$c_bold" "$ADMIN_PASSWORD" "$c_reset" "$NANO_INSTALL_DIR"
 fi
+if [[ "${ADMIN_CREATED:-0}" == "1" ]]; then
+    printf "  Password saved in %s/.env as INITIAL_ADMIN_PASSWORD.\n" "$NANO_INSTALL_DIR"
+fi
 # NAN-835 / NAN-836: surface every ingest endpoint + one-line curl so users
 # can point external Vector / HEC forwarders / curl at the new instance
 # without spelunking through .env or docker-compose.
@@ -1703,6 +1710,7 @@ if [[ "${TENZIR_DIRECT:-0}" == "1" ]]; then
     printf "            Run Tenzir on this host's compose network (%s_default, endpoint lake-object-store:9000),\n" "${COMPOSE_PROJECT_NAME:-$(basename "$NANO_INSTALL_DIR")}"
     printf "            or use the bundled node: put the pipeline in %s/.nano-tenzir/pipeline.tql and run\n" "$NANO_INSTALL_DIR"
     printf "              docker compose -f %s/%s --profile tenzir up -d tenzir\n" "$NANO_INSTALL_DIR" "$COMPOSE_FILE"
+    printf "            Put sysmon.ndjson in %s/.nano-tenzir/data (mounted at /data, read-only).\n" "$NANO_INSTALL_DIR"
     printf "            Example pipeline: %s/tenzir/lean/sysmon-bucket.tql   Guide: %s/tenzir/AGENTS.md\n" "$NANO_INSTALL_DIR" "$NANO_INSTALL_DIR"
     printf "            Status: Ingestion → Credentials → Bucket drop sources.   Add Vector later: install.sh --add-vector\n"
 elif [[ "$NANO_NONINTERACTIVE" != "1" && -n "${VECTOR_AUTH_TOKEN:-}" ]]; then
@@ -1712,18 +1720,19 @@ elif [[ "$NANO_NONINTERACTIVE" != "1" && -n "${VECTOR_AUTH_TOKEN:-}" ]]; then
     INGEST_HOST="${INGEST_HOST%%/*}"
     INGEST_HOST="${INGEST_HOST%%:*}"
     echo
-    printf "  Token:    %b%s%b  ← bearer for all ingest endpoints below\n" "$c_yellow$c_bold" "$VECTOR_AUTH_TOKEN" "$c_reset"
+    printf "  Token:    %b%s%b  ← bound to the install source (OpenTelemetry Logs on a fresh install)\n" "$c_yellow$c_bold" "$VECTOR_AUTH_TOKEN" "$c_reset"
     echo
+    printf "  Per-source tokens: Ingestion → Credentials. Use a token bound to your intended source.\n"
     printf "  HTTP:     POST %s/ingest\n" "$BASE_URL"
     printf "              curl -X POST %s/ingest \\\\\n" "$BASE_URL"
     printf "                -H 'Authorization: Bearer %s' \\\\\n" "$VECTOR_AUTH_TOKEN"
-    printf "                -H 'X-Source-Type: my_source' \\\\\n"
     printf "                -d '{\"message\":\"hello nano\"}'\n"
     echo
     printf "  HEC:      POST http://%s:8088/services/collector/event\n" "$INGEST_HOST"
     printf "              curl -X POST http://%s:8088/services/collector/event \\\\\n" "$INGEST_HOST"
     printf "                -H 'Authorization: Splunk %s' \\\\\n" "$VECTOR_AUTH_TOKEN"
-    printf "                -d '{\"event\":\"hello nano\",\"sourcetype\":\"my_source\"}'\n"
+    printf "                -H 'X-Splunk-Request-Channel: 11111111-1111-4111-8111-111111111111' \\\n"
+    printf "                -d '{\"event\":\"hello nano\"}'\n"
     echo
     printf "  OTLP/HTTP: %s/otlp  (SDK/collector endpoint; /v1/logs, /v1/traces, /v1/metrics)\n" "$BASE_URL"
     printf "              header 'Authorization: Bearer %s'\n" "$VECTOR_AUTH_TOKEN"
@@ -1758,3 +1767,6 @@ echo "  Logs:     docker compose -f $NANO_INSTALL_DIR/$COMPOSE_FILE logs -f"
 echo "  Stop:     docker compose -f $NANO_INSTALL_DIR/$COMPOSE_FILE down"
 echo "  Reset:    docker compose -f $NANO_INSTALL_DIR/$COMPOSE_FILE down -v   (DELETES ALL DATA)"
 echo
+
+}
+main "$@"

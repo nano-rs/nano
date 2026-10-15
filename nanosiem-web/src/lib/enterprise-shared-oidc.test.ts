@@ -109,6 +109,12 @@ function callback(tenant = TENANT_A, assignmentRevision = 7) {
   };
 }
 
+const TAB_BEARER = 'tab-bearer-0123456789abcdef';
+
+function refreshed() {
+  return { access_token: TAB_BEARER, refresh_token: 'rotated-refresh-not-read', expires_in: 900 };
+}
+
 function entry(tenant = TENANT_A, authorityRevision = 4) {
   return {
     url: 'https://idp.example/authorize?state=opaque-server-state',
@@ -154,6 +160,7 @@ test('repeat login discovers minimal tenant labels and starts the same exact cal
     json({ providers: [{ slug: 'entra-workforce', name: 'Company SSO' }] }),
     json(entry()),
     json(callback()),
+    json(refreshed()),
     json(user()),
     json(bootstrap()),
   ]);
@@ -253,10 +260,11 @@ test('repeat login rejects malicious selectors and credential-bearing discovery 
   assert.equal(mismatch.storage.values.size, 0);
 });
 
-test('shared success posts only code/state, relies on cookies, and proves exact tenant bootstrap', async () => {
+test('shared success posts only code/state, proves exact tenant bootstrap with one bearer credential', async () => {
   const harness = dependencies([
     json(entry()),
     json(callback()),
+    json(refreshed()),
     json(user()),
     json(bootstrap()),
   ]);
@@ -289,24 +297,39 @@ test('shared success posts only code/state, relies on cookies, and proves exact 
     code: 'one-time-code',
     state: 'opaque-server-state',
   });
-  assert.equal(harness.requests[2].url, '/api/auth/me');
-  assert.equal(harness.requests[3].url, '/api/auth/tenant-bootstrap');
-  for (const request of harness.requests) {
+  // NAN-3905: the cookie-only callback is followed by a tenant-selected
+  // refresh (cookies: it rotates this tenant's refresh cookie), and the
+  // identity/bootstrap proof then carries ONLY the tab bearer — never the
+  // ambient cookie jar, which on the pooled host holds every signed-in
+  // tenant's access_token__<d> cookie.
+  assert.equal(harness.requests[2].url, '/api/auth/refresh');
+  assert.equal(harness.requests[2].init?.credentials, 'include');
+  assert.deepEqual(JSON.parse(String(harness.requests[2].init?.body)), { tenant_slug: 'tenant-a' });
+  assert.equal(harness.requests[3].url, '/api/auth/me');
+  assert.equal(harness.requests[4].url, '/api/auth/tenant-bootstrap');
+  for (const request of harness.requests.slice(3)) {
+    assert.equal(request.init?.credentials, 'omit');
+    assert.deepEqual(request.init?.headers, { Authorization: `Bearer ${TAB_BEARER}` });
+  }
+  for (const request of harness.requests.slice(0, 3)) {
     assert.equal(request.init?.headers instanceof Headers, false);
     assert.equal(JSON.stringify(request).includes('Authorization'), false);
   }
+  assert.deepEqual(result.session, { accessToken: TAB_BEARER, expiresIn: 900 });
 
   const browserWrites = JSON.stringify(harness.storage.writes);
   assert.equal(browserWrites.includes('one-time-code'), false);
   assert.equal(browserWrites.includes('opaque-server-state'), false);
   assert.equal(browserWrites.includes(ENTRY_TOKEN), false);
   assert.doesNotMatch(browserWrites, /access.?token|refresh.?token|bearer/i);
+  assert.equal(browserWrites.includes(TAB_BEARER), false);
 });
 
 test('callback replay and IdP errors clear pending intent without another exchange', async () => {
   const replay = dependencies([
     json(entry()),
     json(callback()),
+    json(refreshed()),
     json(user()),
     json(bootstrap()),
   ]);
@@ -322,7 +345,7 @@ test('callback replay and IdP errors clear pending intent without another exchan
     ),
     SharedOidcBrowserError,
   );
-  assert.equal(replay.requests.length, 4);
+  assert.equal(replay.requests.length, 5);
 
   const providerError = dependencies([
     json(entry()),
@@ -367,8 +390,8 @@ test('malicious fragments never reach the entry endpoint and response authority 
 
 test('wrong tenant, assignment revision, and stale tenant runtime fail closed', async () => {
   for (const responses of [
-    [callback(TENANT_B), user(TENANT_B), bootstrap(TENANT_B)],
-    [callback(TENANT_A, 8), user(), bootstrap(TENANT_A, 7)],
+    [callback(TENANT_B), refreshed(), user(TENANT_B), bootstrap(TENANT_B)],
+    [callback(TENANT_A, 8), refreshed(), user(), bootstrap(TENANT_A, 7)],
   ]) {
     const harness = dependencies([
       json(entry()),
@@ -385,6 +408,7 @@ test('wrong tenant, assignment revision, and stale tenant runtime fail closed', 
   const stale = dependencies([
     json(entry()),
     json(callback()),
+    json(refreshed()),
     json(user()),
     json(bootstrap()),
   ]);
@@ -403,6 +427,22 @@ test('wrong tenant, assignment revision, and stale tenant runtime fail closed', 
     new URLSearchParams({ code: 'code', state: 'opaque' }),
     stale.deps,
   ), SharedOidcBrowserError);
+});
+
+test('a refresh that does not yield a usable bearer fails closed before any identity proof', async () => {
+  for (const bad of [
+    json({ error: 'refresh_failed' }, 401),
+    json({ access_token: 'has space in it, not a token', expires_in: 900 }),
+    json({ access_token: TAB_BEARER, expires_in: 0 }),
+  ]) {
+    const harness = dependencies([json(entry()), json(callback()), bad]);
+    await begin(harness.deps);
+    await assert.rejects(completeEnterpriseSharedOidc(
+      new URLSearchParams({ code: 'code', state: 'opaque' }),
+      harness.deps,
+    ), SharedOidcBrowserError);
+    assert.equal(harness.requests.length, 3, 'no /auth/me without a bearer');
+  }
 });
 
 test('token-shaped callback fields are rejected and never persisted', async () => {
@@ -463,11 +503,11 @@ test('dedicated login stays unchanged while shared tenant login uses only the te
   assert.match(app, /path="\/auth\/shared\/oidc\/entry"/);
   assert.match(app, /path="\/auth\/shared\/oidc\/callback"/);
   assert.match(login, /const ssoEnabled = tenantSlug !== undefined \|\| capabilities\.sso;/);
-  assert.match(login, /tenantSlug === undefined\s*\? fetch\(`\$\{API_BASE_URL\}\/api\/auth\/oidc\/providers`/);
+  assert.match(login, /tenantSlug === undefined\s*\? authenticatedFetch\('\/api\/auth\/oidc\/providers', `\$\{API_BASE_URL\}\/api\/auth\/oidc\/providers`/);
   assert.match(login, /discoverEnterpriseSharedLoginMethods\(tenantSlug, sharedOidcDependencies\(\)\)/);
   // NAN-2361 wave 8: on a tenant URL the password flag comes from the same
   // discovery call; the dedicated `/api/auth/methods` fetch is not used.
-  assert.match(login, /if \(tenantSlug !== undefined\) return;\s*let cancelled = false;\s*fetch\(`\$\{API_BASE_URL\}\/api\/auth\/methods`\)/);
+  assert.match(login, /if \(tenantSlug !== undefined\) return;\s*let cancelled = false;\s*authenticatedFetch\('\/api\/auth\/methods', `\$\{API_BASE_URL\}\/api\/auth\/methods`\)/);
   assert.doesNotMatch(login, /if \(tenantSlug !== undefined\) \{\s*setLocalPasswordEnabled\(true\);/);
   assert.match(login, /startEnterpriseSharedOidcLogin\(/);
   assert.match(login, /window\.location\.assign\(authorizeUrl\)/);

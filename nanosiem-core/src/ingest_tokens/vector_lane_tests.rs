@@ -137,7 +137,7 @@ fn platform_pull_credential_keeps_its_declared_type() {
     assert_eq!(event["source_type"], "okta");
     let (event, _) = kept(run(
         &transform_source(HEC, "hec_normalize"),
-        json!({"event": {"a": 1}, "splunk_sourcetype": "okta"}),
+        json!({"message": "{\"a\":1}", "splunk_sourcetype": "okta"}),
         Some((&platform, PLATFORM_PULL_ROUTE)),
     ));
     assert_eq!(event["source_type"], "okta");
@@ -148,10 +148,10 @@ fn hec_spoofed_sourcetype_lands_in_the_tokens_source() {
     let program = transform_source(HEC, "hec_normalize");
     let route = stamped_route("pan_traffic");
     for event in [
-        json!({"event": {"msg": "x"}, "splunk_sourcetype": "windows_sysmon"}),
-        json!({"event": "raw line", "sourcetype": "windows_sysmon"}),
+        json!({"message": "{\"msg\":\"x\"}", "splunk_sourcetype": "windows_sysmon"}),
+        json!({"message": "raw line", "sourcetype": "windows_sysmon"}),
         // A payload key cannot smuggle a routing field back in.
-        json!({"event": {"source_type": "windows_sysmon", "claimed_source_type": "y"}, "splunk_sourcetype": "windows_sysmon"}),
+        json!({"message": "{\"source_type\":\"windows_sysmon\",\"claimed_source_type\":\"y\"}", "splunk_sourcetype": "windows_sysmon"}),
     ] {
         let (event, metadata) = kept(run(&program, event, Some((TOKEN, &route))));
         assert_eq!(event["source_type"], "pan_traffic", "{event}");
@@ -160,7 +160,7 @@ fn hec_spoofed_sourcetype_lands_in_the_tokens_source() {
         assert_eq!(event["auth_status"], "authenticated");
     }
     // No sourcetype at all: still the token's source.
-    let (event, _) = kept(run(&program, json!({"event": "raw"}), Some((TOKEN, &route))));
+    let (event, _) = kept(run(&program, json!({"message": "raw"}), Some((TOKEN, &route))));
     assert_eq!(event["source_type"], "pan_traffic");
     assert!(event.get("claimed_source_type").is_none());
 }
@@ -168,7 +168,7 @@ fn hec_spoofed_sourcetype_lands_in_the_tokens_source() {
 #[test]
 fn hec_unbound_or_unstamped_token_is_refused() {
     let program = transform_source(HEC, "hec_normalize");
-    let event = json!({"event": "raw", "splunk_sourcetype": "apache_access"});
+    let event = json!({"message": "raw", "splunk_sourcetype": "apache_access"});
     for route in ["", "*"] {
         assert!(matches!(run(&program, event.clone(), Some((TOKEN, route))), Outcome::Aborted));
     }
@@ -186,4 +186,19 @@ fn http_source_auth_never_accepts_a_static_token() {
     let source = table["sources"]["http_ingest"]["auth"]["source"].as_str().unwrap();
     assert!(!source.contains("auth_header"), "{source}");
     assert!(source.contains("expected_token == \"\" && allow_unauthenticated"));
+}
+
+#[test]
+fn hec_bytes_codec_preserves_string_and_object_payloads() {
+    assert_eq!(parse(HEC)["sources"]["splunk_hec_ingest"]["event"]["decoding"]["codec"].as_str(), Some("bytes"));
+    let payload = json!({"message": "hello", "nested": {"id": 42}, "source_type": "spoofed"});
+    for event in [json!(payload.to_string()), payload.clone()] {
+        let log = crate::parsers::tenant_bundle::bronze_row_contract::splunk_hec_log(
+            &json!({"event": event, "sourcetype": "okta"})
+        ).unwrap();
+        let (normalized, metadata) = kept(run(&transform_source(HEC, "hec_normalize"), log, Some((TOKEN, "okta"))));
+        assert_eq!(serde_json::from_str::<Value>(normalized["message"].as_str().unwrap()).unwrap(), payload);
+        assert_eq!(normalized["source_type"], "okta");
+        assert_eq!(metadata["source_type"], "okta");
+    }
 }

@@ -9,7 +9,7 @@ by the lake-cell ingestor. ClickHouse is gone. The old `to_clickhouse` path
 below) does not work on a lean install.
 
 Field mappings follow the parser set in the **parsers repo**
-(`parsers-ocsf/<source>/parser.yaml`, `ocsf-1.9` branch).
+(`parsers-ocsf/<source>/parser.yaml`, `main` branch).
 
 ---
 

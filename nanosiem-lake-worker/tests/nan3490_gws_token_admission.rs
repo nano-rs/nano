@@ -12,11 +12,8 @@
 //! `_ocsf_prepare` and `ocsf_lake_storage_prepare`, Vector's Parquet encode,
 //! and the real salvaging admission.
 //!
-//! The live failure: the runner sent `event` as a JSON OBJECT. Vector spreads
-//! an object over the log root and leaves `.message` unset, `hec_normalize`
-//! sets `message = ""`, the parser (which reads `.message`) emits a Base Event
-//! with an empty `raw_data`, and the lake refuses every row
-//! (`raw_data_missing`). The runner now sends the event as JSON text.
+//! NAN-3912: both object and string HEC event forms must retain raw_data
+//! with the bytes codec and be admitted by the lake.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -29,15 +26,15 @@ use nanosiem_core::parsers::tenant_bundle::archive::{self, BundleTree};
 use nanosiem_core::parsers::tenant_bundle::bronze_row_contract::{lake_rows, LakeRow, LaneInput};
 use nanosiem_core::parsers::tenant_bundle::model::TenantSource;
 use nanosiem_core::parsers::tenant_bundle::overlay;
-use nanosiem_lake_worker::bronze::{admit_bronze_files_salvaging, NoCanonicalEvents, RowRefusal};
+use nanosiem_lake_worker::bronze::admit_bronze_files_salvaging;
 use nanosiem_lake_worker::enrichment::BronzeIngestEnricher;
 use parquet::arrow::ArrowWriter;
 use serde_json::{json, Value};
 
 const TENANT: &str = "6f1c1e2a-5b8e-4d4c-9a3e-0e2b7c9d1f10";
 const SLUG: &str = "gws_token";
-/// The release base hosted tenants run (zero-nan3523).
-const BASE: &str = "selected-parser-zero-nan3523.js";
+/// NAN-3912 hosted base, derived from zero-nan3745 with the bytes codec.
+const BASE: &str = "selected-parser-zero-nan3912.js";
 const PARSER: &str = include_str!("fixtures/nan3490/google_workspace_ocsf.vrl");
 const MODULES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -197,8 +194,8 @@ fn token_activities() -> Vec<Value> {
 
 /// One activity as the hosted runner POSTs it: the engine's ingest-id stamp
 /// (`stamp_ingest_id` with the stream's `ingest_id` fields), then
-/// `hec_envelope` (`event` as JSON text). `as_object` reproduces the envelope
-/// the runner sent before NAN-3490 (`event` as a JSON object).
+/// `hec_envelope` (`event` as JSON text). `as_object` also exercises the
+/// standard HEC object payload accepted after NAN-3912.
 fn runner_envelope(activity: &Value, as_object: bool) -> Value {
     let mut event = activity.clone();
     let id = &activity["id"];
@@ -228,16 +225,18 @@ fn admit(envelopes: Vec<Value>) -> anyhow::Result<(nanosiem_lake_worker::bronze:
     admit_bronze_files_salvaging(&[path], TENANT, &BronzeIngestEnricher::disabled())
 }
 
-/// The live refusal, reproduced: the pre-NAN-3490 envelope loses `raw_data`
-/// and the lake refuses every row of the object.
+/// Object payloads now follow the same bytes-decoding path as string payloads.
 #[test]
-fn object_event_envelopes_are_refused_raw_data_missing() {
-    let envelopes = token_activities().iter().map(|a| runner_envelope(a, true)).collect();
-    let Err(error) = admit(envelopes) else {
-        panic!("the object-event envelope must not be admitted");
-    };
-    let refused = error.downcast_ref::<NoCanonicalEvents>().unwrap_or_else(|| panic!("{error:#}"));
-    assert_eq!(refused.first_row, Some(RowRefusal::new("raw_data_missing", Some("raw_data"))));
+fn object_event_envelopes_are_admitted_with_raw_data() {
+    let activities = token_activities();
+    let envelopes = activities.iter().map(|a| runner_envelope(a, true)).collect();
+    let (admission, refused) = admit(envelopes).unwrap_or_else(|e| panic!("{e:#}"));
+    assert!(refused.is_empty(), "{refused:?}");
+    assert_eq!(admission.batch.rows().len(), activities.len());
+    for row in admission.batch.rows() {
+        assert!(!row.ocsf_event["raw_data"].as_str().unwrap().is_empty());
+        assert_eq!(row.ocsf_event["metadata"]["log_source"], SLUG);
+    }
 }
 
 #[test]

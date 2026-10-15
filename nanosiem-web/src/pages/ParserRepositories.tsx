@@ -757,7 +757,7 @@ export function ParserRepositories() {
                         name: 'nano parsers',
                         url: 'https://github.com/nano-rs/parsers',
                         description: 'Official nano parsers for common log sources',
-                        branch: 'ocsf-1.9',
+                        branch: 'main',
                         parsers_path: 'parsers/',
                         auto_sync_enabled: true,
                       })
